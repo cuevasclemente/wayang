@@ -1,0 +1,97 @@
+#!/usr/bin/env node
+import { accessSync, constants, existsSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
+let failures = 0;
+let warnings = 0;
+
+function ok(message) { console.log(`ok    ${message}`); }
+function warn(message) { warnings += 1; console.log(`warn  ${message}`); }
+function fail(message) { failures += 1; console.log(`FAIL  ${message}`); }
+
+function executable(name) {
+  for (const directory of (process.env.PATH || "").split(delimiter)) {
+    if (!directory) continue;
+    const candidate = join(directory, name);
+    try { accessSync(candidate, constants.X_OK); return candidate; } catch {}
+  }
+  return null;
+}
+
+function version(command, args = ["--version"]) {
+  const result = spawnSync(command, args, { encoding: "utf8", env: process.env });
+  return result.status === 0 ? `${result.stdout || result.stderr}`.trim().split(/\r?\n/)[0] : null;
+}
+
+function atLeastNode(versionString) {
+  const [major, minor] = versionString.replace(/^v/, "").split(".").map(Number);
+  return major > 22 || (major === 22 && minor >= 19);
+}
+
+console.log(`Wayang doctor (${process.platform}/${process.arch})`);
+if (process.platform === "linux" || process.platform === "darwin") ok("supported operating system");
+else fail("v0.1 supports Linux and macOS only");
+
+if (atLeastNode(process.version)) {
+  ok(`Node ${process.version} (minimum 22.19.0)`);
+} else fail(`Node ${process.version} is too old; install Node >=22.19.0`);
+
+for (const command of ["npm", "git", "make"]) {
+  const path = executable(command);
+  if (!path) fail(`${command} is not available on PATH`);
+  else ok(`${command}: ${version(path) || path}`);
+}
+
+const compiler = executable("cc") || executable("clang") || executable("gcc");
+const python = executable("python3") || executable("python");
+if (compiler && python) ok("native addon build tools are available");
+else warn("native addon fallback builds may need a C/C++ toolchain and Python 3");
+
+for (const [directory, requiredBinary] of [["backend", "tsx"], ["frontend", "vite"], ["e2e", "playwright"]]) {
+  if (existsSync(join(root, directory, "node_modules", ".bin", requiredBinary))) ok(`${directory} dependencies installed`);
+  else warn(`${directory} development dependencies absent (run make install)`);
+}
+
+if (existsSync(join(root, "backend", "node_modules", "better-sqlite3"))) {
+  const nativeCheck = spawnSync(process.execPath, ["--input-type=module", "-e", "import Database from 'better-sqlite3'; const db=new Database(':memory:'); db.close();"], {
+    cwd: join(root, "backend"), encoding: "utf8", env: process.env,
+  });
+  if (nativeCheck.status === 0) ok("better-sqlite3 native binding loads for this Node runtime");
+  else fail("better-sqlite3 native binding is unavailable; use Node 22 LTS or install native build prerequisites and reinstall");
+}
+
+const envFile = join(root, ".env");
+if (existsSync(envFile)) {
+  const mode = statSync(envFile).mode & 0o777;
+  if (process.platform !== "win32" && mode !== 0o600) warn(`.env exists but mode is ${mode.toString(8)}; run chmod 600 .env`);
+  else ok("private .env exists with mode 0600 (contents not inspected)");
+} else warn(".env is not configured (run make configure)");
+
+const piDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+const authFile = join(piDir, "auth.json");
+if (existsSync(authFile)) ok("pi auth storage exists (contents not inspected)");
+else warn("pi auth storage not found; use make pi-login or configure an API key in .env");
+
+const providerVariables = [
+  "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY",
+  "DEEPSEEK_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
+  "XAI_API_KEY", "FIREWORKS_API_KEY",
+];
+const presentProviders = providerVariables.filter((name) => Boolean(process.env[name]));
+if (presentProviders.length > 0) ok(`provider environment present: ${presentProviders.join(", ")} (values hidden)`);
+
+const chromium = ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"].find(executable);
+if (process.env.WAYANG_CHROMIUM_PATH) ok("WAYANG_CHROMIUM_PATH is present (value hidden; not inspected)");
+else if (chromium) ok(`optional Chromium browser found: ${chromium}`);
+else warn("optional browser workbench requires Chromium/Chrome or WAYANG_CHROMIUM_PATH");
+
+if (existsSync(join(root, "backend", "dist", "index.js")) && existsSync(join(root, "frontend", "dist", "index.html"))) {
+  ok("production build output exists");
+} else warn("production build output is absent or incomplete (run make build)");
+
+console.log(`\nDoctor completed with ${failures} failure(s), ${warnings} warning(s).`);
+if (failures > 0) process.exitCode = 1;

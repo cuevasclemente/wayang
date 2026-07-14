@@ -1,0 +1,24 @@
+{
+  "name": "wayang-e2e",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Playwright end-to-end tests for Wayang.",
+  "license": "MPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cuevasclemente/wayang.git",
+    "directory": "e2e"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:debug": "PWDEBUG=1 playwright test --headed --workers=1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0"
+  }
+}

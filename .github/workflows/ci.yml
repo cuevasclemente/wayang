@@ -1,0 +1,190 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux / Node 22.19
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Build and test tooling is intentionally installed even if a caller sets NODE_ENV.
+      NPM_CONFIG_INCLUDE: dev
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+          # setup-node caches npm's download cache, not node_modules.
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+            e2e/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install end-to-end test dependencies
+        working-directory: e2e
+        run: npm ci
+
+      - name: Run backend tests
+        working-directory: backend
+        run: npm test
+
+      - name: Build backend
+        working-directory: backend
+        run: npm run build
+
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Run bootstrap and configuration tests
+        run: npm run test:scripts
+
+  macos-smoke:
+    name: macOS smoke / Node 22.19
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      # Build and test tooling is intentionally installed even if a caller sets NODE_ENV.
+      NPM_CONFIG_INCLUDE: dev
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+          # setup-node caches npm's download cache, not node_modules.
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+            e2e/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install end-to-end test dependencies
+        working-directory: e2e
+        run: npm ci
+
+      - name: Run backend tests
+        working-directory: backend
+        run: npm test
+
+      - name: Build backend
+        working-directory: backend
+        run: npm run build
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Exercise configuration wizard dry-run
+        env:
+          HOME: ${{ runner.temp }}/wayang-config-home
+        run: node scripts/configure.mjs --dry-run
+
+      - name: Run isolated production smoke test
+        run: make smoke
+
+  playwright:
+    name: Playwright / Linux / Node 22.19
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Build and test tooling is intentionally installed even if a caller sets NODE_ENV.
+      NPM_CONFIG_INCLUDE: dev
+      PLAYWRIGHT_BROWSERS_PATH: /tmp/wayang-playwright-browsers-${{ github.run_id }}-${{ github.run_attempt }}
+      WAYANG_E2E_PRODUCTION: "1"
+      WAYANG_E2E_TEMP_ROOT: /tmp/wayang-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+          # setup-node caches npm's download cache, not node_modules or browsers.
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+            e2e/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install end-to-end test dependencies
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Create isolated synthetic home
+        env:
+          HOME: /tmp/wayang-home-${{ github.run_id }}-${{ github.run_attempt }}
+        run: >-
+          node -e "require('node:fs').mkdirSync(process.env.HOME, { recursive: true, mode: 0o700 })"
+
+      - name: Run Playwright tests
+        working-directory: e2e
+        env:
+          HOME: /tmp/wayang-home-${{ github.run_id }}-${{ github.run_attempt }}
+        run: npm test
+
+      - name: Upload Playwright artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: |
+            ${{ env.WAYANG_E2E_TEMP_ROOT }}/playwright-results
+            ${{ env.WAYANG_E2E_TEMP_ROOT }}/session-latency-aggregate.json
+          if-no-files-found: ignore
+          retention-days: 7

@@ -1,0 +1,53 @@
+# Private configuration and agent state
+.env*
+!.env.example
+.mcp.json
+.pi/
+
+# Dependencies and build output
+**/node_modules/
+**/dist/
+*.tsbuildinfo
+coverage/
+
+# Tests and browser artifacts
+playwright-report/
+test-results/
+**/playwright-results/
+blob-report/
+.pi/browser-workbench/
+.pi/browser-artifacts/
+.pi/secret-browser/
+browser-profiles/
+browser-artifacts/
+
+# Local runtime data
+.wayang/
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Internal/private material excluded from the public source distribution
+PLAN.md
+wayang.service
+docs/JOURNAL.md
+docs/journals/
+docs/plans/
+docs/parity/
+extensions/orchestrator/
+
+# Editor and OS clutter
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

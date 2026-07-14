@@ -1,0 +1,39 @@
+{
+  "name": "wayang-backend",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Backend server and pi SDK integration for Wayang.",
+  "license": "MPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cuevasclemente/wayang.git",
+    "directory": "backend"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "dev:e2e": "tsx src/index.ts",
+    "build": "tsc",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "benchmark:session-catalog": "tsx src/scripts/benchmark-session-catalog.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.80.6",
+    "@earendil-works/pi-ai": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "better-sqlite3": "^12.10.0",
+    "express": "^4.21.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^4.17.21",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.6.0"
+  }
+}

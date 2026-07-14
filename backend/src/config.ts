@@ -1,0 +1,154 @@
+import * as path from "node:path";
+import * as os from "node:os";
+import { isPasswordHashRecord } from "./auth/password.js";
+
+export interface TtsConfig {
+  /** Shared TTS broker base URL; preferred for streaming/job-based playback. */
+  brokerUrl: string;
+  /** Legacy direct Chatterbox base URL, retained as a fallback when brokerUrl is unset. */
+  baseUrl: string;
+  voice: string;
+  model: string;
+  format: string;
+  speed: number;
+  maxChars: number;
+}
+
+export interface AuthConfig {
+  enabled: boolean;
+  passwordHash: string;
+  sessionSecret: string;
+  sessionDays: number;
+  sessionStorePath: string;
+  trustProxy: "loopback" | false;
+  cookieSecure: "auto" | "always" | "never";
+  allowedOrigins: string[];
+}
+
+export interface Config {
+  port: number;
+  host: string;
+  dataDir: string;
+  dbPath: string;
+  /** Root for filesystem operations (default: user home) */
+  fsRoot: string;
+  /** Max file read size in bytes */
+  maxReadSize: number;
+  tts: TtsConfig;
+  auth: AuthConfig;
+}
+
+function getDataDir(): string {
+  return (
+    process.env.WAYANG_DATA_DIR ||
+    process.env.PI_WEB_UI_DATA_DIR ||
+    path.join(os.homedir(), ".wayang")
+  );
+}
+
+function getEnvInt(name: string, fallback: number, legacyName?: string): number {
+  const raw = process.env[name] || (legacyName ? process.env[legacyName] : undefined);
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function getAuthSessionDays(): number {
+  const raw = process.env.WAYANG_AUTH_SESSION_DAYS;
+  if (raw === undefined) return 30;
+  if (!/^[0-9]+$/.test(raw)) throw new Error("WAYANG_AUTH_SESSION_DAYS must be an integer between 1 and 365");
+  return Number(raw);
+}
+
+function authEnabled(): boolean {
+  const raw = process.env.WAYANG_AUTH_ENABLED ?? "0";
+  if (raw !== "0" && raw !== "1") throw new Error("WAYANG_AUTH_ENABLED must be 0 or 1");
+  return raw === "1";
+}
+
+function trustProxy(): "loopback" | false {
+  const raw = process.env.WAYANG_TRUST_PROXY ?? "loopback";
+  if (raw === "loopback") return "loopback";
+  if (raw === "0") return false;
+  throw new Error("WAYANG_TRUST_PROXY must be loopback or 0");
+}
+
+function cookieSecure(): AuthConfig["cookieSecure"] {
+  const raw = process.env.WAYANG_AUTH_COOKIE_SECURE ?? "auto";
+  if (raw === "auto") return "auto";
+  if (raw === "1") return "always";
+  if (raw === "0") return "never";
+  throw new Error("WAYANG_AUTH_COOKIE_SECURE must be auto, 1, or 0");
+}
+
+function allowedOrigins(port: number): string[] {
+  const configured = process.env.WAYANG_PUBLIC_ORIGIN?.trim();
+  if (!configured) {
+    return [
+      `http://127.0.0.1:${port}`,
+      `http://localhost:${port}`,
+      `http://[::1]:${port}`,
+    ];
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(configured);
+  } catch {
+    throw new Error("WAYANG_PUBLIC_ORIGIN must be an absolute http(s) origin");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+    throw new Error("WAYANG_PUBLIC_ORIGIN must be an absolute http(s) origin without credentials, path, query, or fragment");
+  }
+  return [parsed.origin];
+}
+
+export function validateAuthConfig(auth: AuthConfig): void {
+  if (!Array.isArray(auth.allowedOrigins) || auth.allowedOrigins.length === 0) {
+    throw new Error("WAYANG_PUBLIC_ORIGIN must resolve to at least one allowed browser origin");
+  }
+  if (!Number.isInteger(auth.sessionDays) || auth.sessionDays < 1 || auth.sessionDays > 365) {
+    throw new Error("WAYANG_AUTH_SESSION_DAYS must be an integer between 1 and 365");
+  }
+  if (!auth.enabled) return;
+  if (!isPasswordHashRecord(auth.passwordHash)) {
+    throw new Error("WAYANG_AUTH_PASSWORD_HASH is missing or invalid");
+  }
+  if (Buffer.byteLength(auth.sessionSecret, "utf8") < 32) {
+    throw new Error("WAYANG_AUTH_SESSION_SECRET must contain at least 32 UTF-8 bytes");
+  }
+}
+
+export function getConfig(overrides?: Partial<Config>): Config {
+  const dataDir = getDataDir();
+  const port = getEnvInt("WAYANG_PORT", 8787, "PI_WEB_UI_PORT");
+  const config: Config = {
+    port,
+    host: process.env.WAYANG_HOST || process.env.PI_WEB_UI_HOST || "127.0.0.1",
+    dataDir,
+    dbPath: path.join(dataDir, "wayang.db"),
+    fsRoot: os.homedir(),
+    maxReadSize: 2 * 1024 * 1024, // 2 MiB
+    tts: {
+      brokerUrl: process.env.WAYANG_TTS_BROKER_URL || "",
+      baseUrl: process.env.WAYANG_TTS_BASE_URL || "",
+      voice: process.env.WAYANG_TTS_VOICE || "Ava.mp3",
+      model: process.env.WAYANG_TTS_MODEL || "chatterbox-turbo",
+      format: process.env.WAYANG_TTS_FORMAT || "mp3",
+      speed: parseFloat(process.env.WAYANG_TTS_SPEED || "1.0"),
+      maxChars: getEnvInt("WAYANG_TTS_MAX_CHARS", 500),
+    },
+    auth: {
+      enabled: authEnabled(),
+      passwordHash: process.env.WAYANG_AUTH_PASSWORD_HASH || "",
+      sessionSecret: process.env.WAYANG_AUTH_SESSION_SECRET || "",
+      sessionDays: getAuthSessionDays(),
+      sessionStorePath: path.join(dataDir, "auth-sessions.json"),
+      trustProxy: trustProxy(),
+      cookieSecure: cookieSecure(),
+      allowedOrigins: allowedOrigins(port),
+    },
+    ...overrides,
+  };
+  validateAuthConfig(config.auth);
+  return config;
+}

@@ -1,0 +1,61 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+:root {
+  --wayang-viewport-height: 100dvh;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+#root {
+  height: var(--wayang-viewport-height, 100%);
+}
+
+body {
+  margin: 0;
+  overscroll-behavior: none;
+}
+
+@supports (height: 100dvh) {
+  :root {
+    --wayang-viewport-height: 100dvh;
+  }
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #404040 transparent;
+}
+
+/* xterm overrides */
+.xterm {
+  padding: 8px;
+}
+
+.xterm-viewport::-webkit-scrollbar {
+  width: 8px;
+}
+
+.xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: #404040;
+  border-radius: 4px;
+}
+
+/* react-arborist overrides */
+[role="tree"] {
+  outline: none;
+}
+
+[role="treeitem"] {
+  outline: none;
+}

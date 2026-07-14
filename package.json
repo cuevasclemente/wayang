@@ -1,0 +1,27 @@
+{
+  "name": "wayang",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A single-user web workbench for the pi coding-agent harness",
+  "license": "MPL-2.0",
+  "author": "Wayang contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cuevasclemente/wayang.git"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "doctor": "node scripts/doctor.mjs",
+    "bootstrap": "sh scripts/bootstrap.sh",
+    "configure": "node scripts/configure.mjs",
+    "build": "npm --prefix backend run build && npm --prefix frontend run build",
+    "start": "node scripts/run-with-env.mjs -- node backend/dist/index.js",
+    "dev": "node scripts/dev.mjs",
+    "test:scripts": "node --test scripts/tests/*.test.mjs",
+    "test": "npm --prefix backend test && npm --prefix frontend run lint && npm --prefix frontend run build && npm run test:scripts",
+    "test:e2e": "npm --prefix e2e test",
+    "check": "npm test && npm run build"
+  }
+}
