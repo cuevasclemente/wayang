@@ -829,14 +829,18 @@ test("action approval accepts exact runtime admission boundaries", async () => {
     workspace: "w".repeat(256),
     toolName: "t".repeat(256),
     target: "x".repeat(2_048),
-    summary: "é".repeat(16_384),
+    summary: "é".repeat(32_768),
     argumentsHash: "maximum-boundary",
   });
+  assert.equal(Buffer.byteLength(maximumInput.summary, "utf8"), 64 * 1_024);
+
   const maximumPending = bridge.requestApproval(sessionId, maximumInput, {
     timeoutMs: 300_000,
   });
-  assert.equal(Buffer.byteLength(requests[0].summary, "utf8"), 32 * 1_024);
+  assert.equal(requests.length, 1);
+  assert.equal(Buffer.byteLength(requests[0].summary, "utf8"), 64 * 1_024);
   assert.equal(requests[0].timeoutMs, 300_000);
+  assert.deepEqual(bridge.getPendingRequests(sessionId), [requests[0]]);
   assert.equal(
     bridge.respondForSession(sessionId, requests[0].requestId, maximumInput.argumentsHash, false).status,
     "denied",
@@ -860,8 +864,15 @@ test("action approval accepts exact runtime admission boundaries", async () => {
   );
 });
 
-test("action approval rejects oversized UTF-8 summaries before cloning or emitting", async () => {
-  for (const summary of ["a".repeat(32 * 1_024 + 1), "é".repeat(16_385)]) {
+test("action approval rejects summaries one UTF-8 byte above 64 KiB before cloning or emitting", async () => {
+  const maximumSummaryBytes = 64 * 1_024;
+  const oversizedSummaries = [
+    "a".repeat(maximumSummaryBytes + 1),
+    `${"é".repeat(maximumSummaryBytes / 2)}a`,
+  ];
+
+  for (const summary of oversizedSummaries) {
+    assert.equal(Buffer.byteLength(summary, "utf8"), maximumSummaryBytes + 1);
     const bridge = new PiActionApprovalBridge();
     bridge.attachClient("session-oversized", "client-a");
     const requests: ExternalActionRequest[] = [];
