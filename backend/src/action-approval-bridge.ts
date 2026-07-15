@@ -57,11 +57,12 @@ export interface ActionApprovalBridge {
     input: ExternalActionRequestInput,
     options?: ApprovalRequestOptions,
   ): Promise<ApprovalTerminalStatus>;
+  /** Accepts untrusted transport input and resolves only literal boolean decisions. */
   respondForSession(
     sessionId: string,
     requestId: string,
     argumentsHash: string,
-    approved: boolean,
+    approved: unknown,
   ): ApprovalResponse;
   cancelRequest(requestId: string, reason?: string): boolean;
   cancelSession(sessionId: string, reason?: string): void;
@@ -75,6 +76,7 @@ type TerminalCallback = (event: ApprovalTerminalEvent) => void;
 
 interface PendingApproval {
   request: ExternalActionRequest;
+  expiresAt: number;
   resolve: (status: ApprovalTerminalStatus) => void;
   timer: ReturnType<typeof setTimeout>;
   signal?: AbortSignal;
@@ -179,6 +181,7 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
 
       this.pending.set(request.requestId, {
         request,
+        expiresAt: request.createdAt + request.timeoutMs,
         resolve,
         timer,
         signal: options.signal,
@@ -196,10 +199,14 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
     sessionId: string,
     requestId: string,
     argumentsHash: string,
-    approved: boolean,
+    approved: unknown,
   ): ApprovalResponse {
     const pending = this.pending.get(requestId);
     if (!pending) {
+      return { status: "stale", reason: "request is no longer pending" };
+    }
+    if (Date.now() >= pending.expiresAt) {
+      this.finish(requestId, "timeout");
       return { status: "stale", reason: "request is no longer pending" };
     }
     if (
@@ -207,6 +214,9 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
       pending.request.argumentsHash !== argumentsHash
     ) {
       return { status: "rejected", reason: "request identity mismatch" };
+    }
+    if (approved !== true && approved !== false) {
+      return { status: "rejected", reason: "approval decision must be boolean" };
     }
 
     const status: ApprovalTerminalStatus = approved ? "approved" : "denied";

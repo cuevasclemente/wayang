@@ -90,6 +90,77 @@ test("action approval replays pending metadata and requires the exact session an
   assert.deepEqual(bridge.getPendingRequests("session-a"), []);
 });
 
+test("action approval survives last-client detach and replays after reconnect", async () => {
+  const bridge = new PiActionApprovalBridge();
+  const detachFirstClient = bridge.attachClient("session-reconnect", "client-a");
+
+  const pending = bridge.requestApproval("session-reconnect", actionInput(), {
+    timeoutMs: 1_000,
+  });
+  const [originalRequest] = bridge.getPendingRequests("session-reconnect");
+  assert.ok(originalRequest);
+
+  detachFirstClient();
+  assert.equal(bridge.hasClient("session-reconnect"), false);
+  assert.deepEqual(bridge.getPendingRequests("session-reconnect"), [originalRequest]);
+
+  const detachReconnectedClient = bridge.attachClient(
+    "session-reconnect",
+    "client-b",
+  );
+  assert.equal(bridge.hasClient("session-reconnect"), true);
+  const [replayedRequest] = bridge.getPendingRequests("session-reconnect");
+  assert.deepEqual(replayedRequest, originalRequest);
+  assert.equal(
+    bridge.respondForSession(
+      "session-reconnect",
+      replayedRequest.requestId,
+      replayedRequest.argumentsHash,
+      true,
+    ).status,
+    "approved",
+  );
+  assert.equal(await pending, "approved");
+  detachReconnectedClient();
+});
+
+test("action approval rejects malformed runtime decisions without resolving", async () => {
+  const bridge = new PiActionApprovalBridge();
+  bridge.attachClient("session-malformed", "client-a");
+  const terminals: ApprovalTerminalStatus[] = [];
+  bridge.onTerminal((event) => terminals.push(event.status));
+
+  const pending = bridge.requestApproval("session-malformed", actionInput());
+  const [request] = bridge.getPendingRequests("session-malformed");
+  assert.ok(request);
+
+  for (const malformed of ["false", 1] as const) {
+    assert.equal(
+      bridge.respondForSession(
+        "session-malformed",
+        request.requestId,
+        request.argumentsHash,
+        malformed,
+      ).status,
+      "rejected",
+    );
+  }
+  assert.equal(bridge.getPendingRequests("session-malformed").length, 1);
+  assert.deepEqual(terminals, []);
+
+  assert.equal(
+    bridge.respondForSession(
+      "session-malformed",
+      request.requestId,
+      request.argumentsHash,
+      false,
+    ).status,
+    "denied",
+  );
+  assert.equal(await pending, "denied");
+  assert.deepEqual(terminals, ["denied"]);
+});
+
 test("action approval times out and removes the pending request", async () => {
   const bridge = new PiActionApprovalBridge();
   bridge.attachClient("session-timeout", "client-a");
@@ -128,9 +199,11 @@ test("action approval abort cancellation removes the request and makes responses
   bridge.attachClient("session-abort", "client-a");
   const controller = new AbortController();
   let request: ExternalActionRequest | undefined;
+  const terminals: ApprovalTerminalStatus[] = [];
   bridge.onRequest((value) => {
     request = value;
   });
+  bridge.onTerminal((event) => terminals.push(event.status));
 
   const pending = bridge.requestApproval("session-abort", actionInput(), {
     timeoutMs: 1_000,
@@ -140,6 +213,7 @@ test("action approval abort cancellation removes the request and makes responses
   controller.abort();
 
   assert.equal(await pending, "cancelled");
+  assert.deepEqual(terminals, ["cancelled"]);
   assert.deepEqual(bridge.getPendingRequests("session-abort"), []);
   assert.equal(
     bridge.respondForSession(
@@ -222,7 +296,7 @@ test("action approval broadcasts cloned terminal events without request metadata
   bridge.onRequest((value) => {
     request = value;
   });
-  bridge.onTerminal((event) => {
+  const unsubscribeMutatingListener = bridge.onTerminal((event) => {
     event.sessionId = "mutated-by-listener";
   });
   const unsubscribe = bridge.onTerminal((event) => terminals.push(event));
@@ -245,7 +319,22 @@ test("action approval broadcasts cloned terminal events without request metadata
     },
   ]);
   assert.deepEqual(Object.keys(terminals[0]).sort(), ["requestId", "sessionId", "status"]);
+  unsubscribeMutatingListener();
   unsubscribe();
+
+  const denied = bridge.requestApproval(
+    "session-terminal",
+    actionInput({ argumentsHash: "sha256:after-unsubscribe" }),
+  );
+  const [deniedRequest] = bridge.getPendingRequests("session-terminal");
+  bridge.respondForSession(
+    "session-terminal",
+    deniedRequest.requestId,
+    deniedRequest.argumentsHash,
+    false,
+  );
+  assert.equal(await denied, "denied");
+  assert.equal(terminals.length, 1);
 });
 
 test("action approval session cleanup cancels only matching requests", async () => {
@@ -321,6 +410,37 @@ test("action approval defensively clones input, request events, and pending repl
     "approved",
   );
   assert.equal(await pending, "approved");
+});
+
+test("action approval synchronously rejects a response after its deadline", async () => {
+  const bridge = new PiActionApprovalBridge();
+  bridge.attachClient("session-deadline", "client-a");
+  const terminals: ApprovalTerminalStatus[] = [];
+  bridge.onTerminal((event) => terminals.push(event.status));
+
+  const pending = bridge.requestApproval("session-deadline", actionInput(), {
+    timeoutMs: 5,
+  });
+  const [request] = bridge.getPendingRequests("session-deadline");
+  assert.ok(request);
+
+  const deadline = request.createdAt + request.timeoutMs;
+  while (Date.now() <= deadline) {
+    // Keep the event loop blocked so the timer callback cannot enforce the deadline first.
+  }
+
+  assert.equal(
+    bridge.respondForSession(
+      "session-deadline",
+      request.requestId,
+      request.argumentsHash,
+      true,
+    ).status,
+    "stale",
+  );
+  assert.equal(await pending, "timeout");
+  assert.deepEqual(terminals, ["timeout"]);
+  assert.deepEqual(bridge.getPendingRequests("session-deadline"), []);
 });
 
 test("action approval responses are stale after timeout", async () => {
