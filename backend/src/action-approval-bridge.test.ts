@@ -277,6 +277,86 @@ test("action approval supports explicit denial", async () => {
   );
 });
 
+const malformedAbortSignals: Array<{
+  name: string;
+  create: () => Record<string, unknown>;
+}> = [
+  { name: "a plain object", create: () => ({}) },
+  {
+    name: "a non-boolean aborted property",
+    create: () => ({
+      aborted: "false",
+      addEventListener() {},
+      removeEventListener() {},
+    }),
+  },
+  {
+    name: "a missing removeEventListener method",
+    create: () => ({
+      aborted: false,
+      addEventListener() {},
+    }),
+  },
+  {
+    name: "a throwing addEventListener method",
+    create: () => ({
+      aborted: false,
+      addEventListener() {
+        throw new Error("synthetic add failure");
+      },
+      removeEventListener() {},
+    }),
+  },
+  {
+    name: "a throwing removeEventListener method",
+    create: () => ({
+      aborted: false,
+      addEventListener() {},
+      removeEventListener() {
+        throw new Error("synthetic remove failure");
+      },
+    }),
+  },
+];
+
+for (const malformed of malformedAbortSignals) {
+  test(`action approval rejects ${malformed.name} before pending creation`, async () => {
+    const bridge = new PiActionApprovalBridge();
+    const sessionId = "session-malformed-signal";
+    bridge.attachClient(sessionId, "client-a");
+    const requests: ExternalActionRequest[] = [];
+    const terminals: ApprovalTerminalStatus[] = [];
+    bridge.onRequest((request) => requests.push(request));
+    bridge.onTerminal((event) => terminals.push(event.status));
+    const input = actionInput({ argumentsHash: malformed.name });
+    const signal = malformed.create();
+    let approval: Promise<ApprovalDecision> | undefined;
+
+    try {
+      approval = bridge.requestApproval(sessionId, input, {
+        timeoutMs: 1_000,
+        signal: signal as unknown as AbortSignal,
+      });
+
+      assert.deepEqual(requests, []);
+      assert.deepEqual(terminals, []);
+      assert.deepEqual(bridge.getPendingRequests(sessionId), []);
+      assert.deepEqual(
+        await approval,
+        decision("denied", null, sessionId, input.argumentsHash),
+      );
+    } finally {
+      Object.defineProperties(signal, {
+        aborted: { configurable: true, value: false },
+        addEventListener: { configurable: true, value() {} },
+        removeEventListener: { configurable: true, value() {} },
+      });
+      bridge.cancelSession(sessionId, "test cleanup");
+      await approval?.catch(() => undefined);
+    }
+  });
+}
+
 test("action approval abort cancellation removes the request and makes responses stale", async () => {
   const bridge = new PiActionApprovalBridge();
   bridge.attachClient("session-abort", "client-a");

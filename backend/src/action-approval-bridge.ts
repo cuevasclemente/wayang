@@ -86,8 +86,7 @@ interface PendingApproval {
   expiresAt: number;
   resolve: (decision: ApprovalDecision) => void;
   timer: ReturnType<typeof setTimeout>;
-  signal?: AbortSignal;
-  abortHandler?: () => void;
+  removeAbortListener?: () => void;
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -103,6 +102,85 @@ const ARGUMENTS_HASH_PATTERN = /^[0-9a-fA-F]{64}$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+type AbortListenerMethod = (
+  this: Record<string, unknown>,
+  type: "abort",
+  listener: () => void,
+  options?: { once: boolean },
+) => unknown;
+
+interface ValidatedAbortSignal {
+  aborted: boolean;
+  add(listener: () => void): boolean;
+  remove(listener: () => void): void;
+  readAborted(): boolean | null;
+}
+
+function validateAbortSignal(value: unknown): ValidatedAbortSignal | null {
+  if (!isRecord(value)) return null;
+
+  let aborted: unknown;
+  let addEventListener: unknown;
+  let removeEventListener: unknown;
+  try {
+    aborted = value.aborted;
+    addEventListener = value.addEventListener;
+    removeEventListener = value.removeEventListener;
+  } catch {
+    return null;
+  }
+  if (
+    typeof aborted !== "boolean"
+    || typeof addEventListener !== "function"
+    || typeof removeEventListener !== "function"
+  ) {
+    return null;
+  }
+
+  const add = addEventListener as AbortListenerMethod;
+  const remove = removeEventListener as AbortListenerMethod;
+  const tryRemove = (listener: () => void): boolean => {
+    try {
+      remove.call(value, "abort", listener);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const probe = () => {};
+  try {
+    add.call(value, "abort", probe, { once: true });
+  } catch {
+    tryRemove(probe);
+    return null;
+  }
+  if (!tryRemove(probe)) return null;
+
+  return {
+    aborted,
+    add(listener) {
+      try {
+        add.call(value, "abort", listener, { once: true });
+        return true;
+      } catch {
+        tryRemove(listener);
+        return false;
+      }
+    },
+    remove(listener) {
+      tryRemove(listener);
+    },
+    readAborted() {
+      try {
+        const current = value.aborted;
+        return typeof current === "boolean" ? current : null;
+      } catch {
+        return null;
+      }
+    },
+  };
 }
 
 function isBoundedMetadata(value: unknown, maxBytes: number): value is string {
@@ -222,6 +300,12 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
       return Promise.resolve(deniedAdmissionDecision(sessionId, argumentsHash));
     }
 
+    const signalValue = runtimeOptions.signal;
+    const signal = signalValue === undefined ? undefined : validateAbortSignal(signalValue);
+    if (signalValue !== undefined && !signal) {
+      return Promise.resolve(deniedAdmissionDecision(sessionId, argumentsHash));
+    }
+
     if (!this.hasClient(sessionId)) {
       const requestId = randomUUID();
       this.emitTerminal({ requestId, sessionId, status: "denied" });
@@ -238,8 +322,7 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
       return Promise.resolve(deniedAdmissionDecision(sessionId, argumentsHash));
     }
 
-    const signal = runtimeOptions.signal as AbortSignal | undefined;
-    const request: ExternalActionRequest = {
+    const createRequest = (): ExternalActionRequest => ({
       requestId: randomUUID(),
       sessionId,
       connector,
@@ -250,9 +333,45 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
       argumentsHash,
       createdAt: now,
       timeoutMs,
-    };
+    });
 
     if (signal?.aborted) {
+      const request = createRequest();
+      this.emitTerminal({ requestId: request.requestId, sessionId, status: "cancelled" });
+      return Promise.resolve({
+        status: "cancelled",
+        requestId: request.requestId,
+        sessionId: request.sessionId,
+        argumentsHash: request.argumentsHash,
+      });
+    }
+
+    let pendingCreated = false;
+    let abortedDuringSetup = false;
+    let requestId: string | undefined;
+    const abortHandler = signal
+      ? () => {
+          if (!pendingCreated || !requestId) {
+            abortedDuringSetup = true;
+            return;
+          }
+          this.finish(requestId, "cancelled");
+        }
+      : undefined;
+    if (signal && abortHandler && !signal.add(abortHandler)) {
+      return Promise.resolve(deniedAdmissionDecision(sessionId, argumentsHash));
+    }
+
+    const abortedAfterRegistration = signal?.readAborted();
+    if (abortedAfterRegistration === null) {
+      if (signal && abortHandler) signal.remove(abortHandler);
+      return Promise.resolve(deniedAdmissionDecision(sessionId, argumentsHash));
+    }
+
+    const request = createRequest();
+    requestId = request.requestId;
+    if (abortedDuringSetup || abortedAfterRegistration === true) {
+      if (signal && abortHandler) signal.remove(abortHandler);
       this.emitTerminal({ requestId: request.requestId, sessionId, status: "cancelled" });
       return Promise.resolve({
         status: "cancelled",
@@ -266,24 +385,17 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
       const timer = setTimeout(() => {
         this.finish(request.requestId, "timeout");
       }, request.timeoutMs);
-      const abortHandler = signal
-        ? () => {
-            this.finish(request.requestId, "cancelled");
-          }
-        : undefined;
 
       this.pending.set(request.requestId, {
         request,
         expiresAt: request.createdAt + request.timeoutMs,
         resolve,
         timer,
-        signal,
-        abortHandler,
+        ...(signal && abortHandler
+          ? { removeAbortListener: () => signal.remove(abortHandler) }
+          : {}),
       });
-      if (signal && abortHandler) {
-        signal.addEventListener("abort", abortHandler, { once: true });
-      }
-
+      pendingCreated = true;
       this.emitRequest(request);
     });
   }
@@ -363,9 +475,7 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
 
     this.pending.delete(requestId);
     clearTimeout(pending.timer);
-    if (pending.signal && pending.abortHandler) {
-      pending.signal.removeEventListener("abort", pending.abortHandler);
-    }
+    pending.removeAbortListener?.();
 
     pending.resolve({
       status,
