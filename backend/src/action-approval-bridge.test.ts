@@ -283,6 +283,22 @@ const malformedAbortSignals: Array<{
 }> = [
   { name: "a plain object", create: () => ({}) },
   {
+    name: "a structurally complete fake",
+    create: () => ({
+      aborted: false,
+      addEventListener() {},
+      removeEventListener() {},
+    }),
+  },
+  {
+    name: "an AbortSignal-prototype structural fake",
+    create: () => Object.setPrototypeOf({
+      aborted: false,
+      addEventListener() {},
+      removeEventListener() {},
+    }, AbortSignal.prototype),
+  },
+  {
     name: "a non-boolean aborted property",
     create: () => ({
       aborted: "false",

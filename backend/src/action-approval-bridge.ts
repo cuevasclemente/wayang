@@ -118,22 +118,36 @@ interface ValidatedAbortSignal {
   readAborted(): boolean | null;
 }
 
-function validateAbortSignal(value: unknown): ValidatedAbortSignal | null {
-  if (!isRecord(value)) return null;
+const abortSignalAbortedGetter = Object.getOwnPropertyDescriptor(
+  AbortSignal.prototype,
+  "aborted",
+)?.get;
 
-  let aborted: unknown;
+function readAbortSignalAborted(value: AbortSignal): boolean | null {
+  try {
+    const aborted = abortSignalAbortedGetter?.call(value);
+    return typeof aborted === "boolean" ? aborted : null;
+  } catch {
+    return null;
+  }
+}
+
+function validateAbortSignal(value: unknown): ValidatedAbortSignal | null {
+  if (!isRecord(value) || !(value instanceof AbortSignal)) return null;
+
+  const aborted = readAbortSignalAborted(value);
+  if (aborted === null) return null;
+
   let addEventListener: unknown;
   let removeEventListener: unknown;
   try {
-    aborted = value.aborted;
     addEventListener = value.addEventListener;
     removeEventListener = value.removeEventListener;
   } catch {
     return null;
   }
   if (
-    typeof aborted !== "boolean"
-    || typeof addEventListener !== "function"
+    typeof addEventListener !== "function"
     || typeof removeEventListener !== "function"
   ) {
     return null;
@@ -173,12 +187,7 @@ function validateAbortSignal(value: unknown): ValidatedAbortSignal | null {
       tryRemove(listener);
     },
     readAborted() {
-      try {
-        const current = value.aborted;
-        return typeof current === "boolean" ? current : null;
-      } catch {
-        return null;
-      }
+      return readAbortSignalAborted(value);
     },
   };
 }
