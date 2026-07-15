@@ -598,6 +598,55 @@ test("action approval synchronously rejects a response after its deadline", asyn
   assert.deepEqual(bridge.getPendingRequests("session-deadline"), []);
 });
 
+test("action approval synchronously hides expired requests from replay", async () => {
+  const bridge = new PiActionApprovalBridge();
+  bridge.attachClient("session-replay-deadline", "client-a");
+  const terminals: Array<{
+    requestId: string;
+    sessionId: string;
+    status: ApprovalTerminalStatus;
+  }> = [];
+  bridge.onTerminal((event) => terminals.push(event));
+
+  const pending = bridge.requestApproval("session-replay-deadline", actionInput(), {
+    timeoutMs: 5,
+  });
+  const [request] = bridge.getPendingRequests("session-replay-deadline");
+  assert.ok(request);
+
+  const deadline = request.createdAt + request.timeoutMs;
+  while (Date.now() <= deadline) {
+    // Keep the event loop blocked so replay observes expiry before the timer callback.
+  }
+
+  assert.deepEqual(bridge.getPendingRequests("session-replay-deadline"), []);
+  assert.deepEqual(
+    await pending,
+    decision(
+      "timeout",
+      request.requestId,
+      request.sessionId,
+      request.argumentsHash,
+    ),
+  );
+  assert.deepEqual(terminals, [
+    {
+      requestId: request.requestId,
+      sessionId: request.sessionId,
+      status: "timeout",
+    },
+  ]);
+
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(terminals, [
+    {
+      requestId: request.requestId,
+      sessionId: request.sessionId,
+      status: "timeout",
+    },
+  ]);
+});
+
 test("action approval responses are stale after timeout", async () => {
   const bridge = new PiActionApprovalBridge();
   bridge.attachClient("session-stale", "client-a");

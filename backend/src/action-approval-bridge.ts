@@ -269,10 +269,14 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
 
   getPendingRequests(sessionId: string): ExternalActionRequest[] {
     const requests: ExternalActionRequest[] = [];
-    for (const pending of this.pending.values()) {
-      if (pending.request.sessionId === sessionId) {
-        requests.push(cloneRequest(pending.request));
+    const now = Date.now();
+    for (const [requestId, pending] of this.pending) {
+      if (pending.request.sessionId !== sessionId) continue;
+      if (now >= pending.expiresAt) {
+        this.finish(requestId, "timeout");
+        continue;
       }
+      requests.push(cloneRequest(pending.request));
     }
     return requests;
   }
