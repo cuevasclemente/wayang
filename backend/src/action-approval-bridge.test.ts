@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   PiActionApprovalBridge,
   getActionApprovalBridge,
+  type ActionApprovalBridge,
   type ApprovalTerminalStatus,
   type ExternalActionRequest,
   type ExternalActionRequestInput,
@@ -385,8 +386,8 @@ test("action approval exposes no secret-capable request fields beyond display me
   assert.equal(await pending, "denied");
 });
 
-test("action approval singleton is exposed through globalThis", () => {
-  const first = getActionApprovalBridge();
+test("action approval singleton satisfies the exported bridge contract", () => {
+  const first: ActionApprovalBridge = getActionApprovalBridge();
   const second = getActionApprovalBridge();
 
   assert.strictEqual(first, second);

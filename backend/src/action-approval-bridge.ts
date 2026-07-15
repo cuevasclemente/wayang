@@ -49,6 +49,27 @@ export interface ApprovalRequestOptions {
   signal?: AbortSignal;
 }
 
+export interface ActionApprovalBridge {
+  attachClient(sessionId: string, clientId: string): () => void;
+  hasClient(sessionId: string): boolean;
+  requestApproval(
+    sessionId: string,
+    input: ExternalActionRequestInput,
+    options?: ApprovalRequestOptions,
+  ): Promise<ApprovalTerminalStatus>;
+  respondForSession(
+    sessionId: string,
+    requestId: string,
+    argumentsHash: string,
+    approved: boolean,
+  ): ApprovalResponse;
+  cancelRequest(requestId: string, reason?: string): boolean;
+  cancelSession(sessionId: string, reason?: string): void;
+  onRequest(callback: (request: ExternalActionRequest) => void): () => void;
+  onTerminal(callback: (event: ApprovalTerminalEvent) => void): () => void;
+  getPendingRequests(sessionId: string): ExternalActionRequest[];
+}
+
 type RequestCallback = (request: ExternalActionRequest) => void;
 type TerminalCallback = (event: ApprovalTerminalEvent) => void;
 
@@ -85,7 +106,7 @@ function cloneTerminalEvent(event: ApprovalTerminalEvent): ApprovalTerminalEvent
   };
 }
 
-export class PiActionApprovalBridge {
+export class PiActionApprovalBridge implements ActionApprovalBridge {
   private readonly clients = new Map<string, Map<string, number>>();
   private readonly pending = new Map<string, PendingApproval>();
   private readonly requestListeners = new Set<RequestCallback>();
