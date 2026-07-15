@@ -32,6 +32,10 @@ import {
   type InterviewSubmissionState,
 } from "../components/InterviewForm";
 import { BashModeStatus } from "../components/BashModeStatus";
+import {
+  ExternalActionApproval,
+  type ExternalActionApprovalRequest,
+} from "../components/ExternalActionApproval";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -369,6 +373,65 @@ function isAcceptedInterviewAck(msg: InterviewResponseAck): boolean {
   // submitted/delivered record. Do not clear local answers for an ambiguous
   // or legacy response that lacks one of these explicit statuses.
   return !interviewAckError(msg) && (msg.status === "submitted" || msg.status === "delivered");
+}
+
+function externalActionKey(request: Pick<ExternalActionApprovalRequest, "sessionId" | "selectionId" | "requestId">): string {
+  return `${request.sessionId}\0${request.selectionId}\0${request.requestId}`;
+}
+
+function parseExternalActionRequest(
+  value: unknown,
+  expectedSessionId: string,
+  expectedSelectionId: string,
+): ExternalActionApprovalRequest | null {
+  if (!value || typeof value !== "object") return null;
+  const request = value as Record<string, unknown>;
+  if (
+    request.sessionId !== expectedSessionId
+    || typeof request.requestId !== "string"
+    || typeof request.connector !== "string"
+    || typeof request.toolName !== "string"
+    || typeof request.summary !== "string"
+    || typeof request.argumentsHash !== "string"
+    || typeof request.createdAt !== "number"
+    || !Number.isFinite(request.createdAt)
+    || typeof request.timeoutMs !== "number"
+    || !Number.isFinite(request.timeoutMs)
+    || (request.workspace !== undefined && typeof request.workspace !== "string")
+    || (request.target !== undefined && typeof request.target !== "string")
+  ) return null;
+
+  return {
+    requestId: request.requestId,
+    sessionId: expectedSessionId,
+    selectionId: expectedSelectionId,
+    connector: request.connector,
+    ...(request.workspace === undefined ? {} : { workspace: request.workspace as string }),
+    toolName: request.toolName,
+    ...(request.target === undefined ? {} : { target: request.target as string }),
+    summary: request.summary,
+    argumentsHash: request.argumentsHash,
+    createdAt: request.createdAt,
+    timeoutMs: request.timeoutMs,
+    submitting: false,
+  };
+}
+
+function upsertExternalAction(
+  current: ExternalActionApprovalRequest[],
+  incoming: ExternalActionApprovalRequest,
+): ExternalActionApprovalRequest[] {
+  const key = externalActionKey(incoming);
+  const index = current.findIndex((request) => externalActionKey(request) === key);
+  if (index === -1) return [...current, incoming].sort((a, b) => a.createdAt - b.createdAt);
+  const existing = current[index];
+  const next = [...current];
+  next[index] = {
+    ...incoming,
+    submitting: existing.submitting,
+    responseError: existing.responseError,
+  };
+  return next.sort((a, b) => a.createdAt - b.createdAt);
 }
 
 function loadChatDraft(sessionId: string | null): string {
@@ -2270,6 +2333,7 @@ export function ChatPanel({
   const [goalInput, setGoalInput] = useState("");
   const [showGoalInput, setShowGoalInput] = useState(false);
   const [interviewQueue, setInterviewQueue] = useState<QueuedInterview[]>([]);
+  const [externalActionApprovals, setExternalActionApprovals] = useState<ExternalActionApprovalRequest[]>([]);
   const [activeSudoPrompt, setActiveSudoPrompt] = useState<{
     requestId: string;
     sessionId: string;
@@ -2435,6 +2499,7 @@ export function ChatPanel({
   const deferredUserMessagesRef = useRef<ChatMessage[]>([]);
   const streamingBlocksRef = useRef<StreamingBlocks>({ content: [] });
   const interviewQueueRef = useRef<QueuedInterview[]>([]);
+  const externalActionApprovalsRef = useRef<ExternalActionApprovalRequest[]>([]);
   const isRestoringDraftRef = useRef(false);
   activeSessionErrorRef.current = activeSession?.error ?? null;
   activeSessionRuntimeStreamingRef.current = Boolean(activeSession?.runtime_is_streaming);
@@ -2483,6 +2548,22 @@ export function ChatPanel({
     interviewQueueRef.current = next;
     setInterviewQueue(next);
   }, []);
+
+  const setExternalActionApprovalsSynced = useCallback((
+    updater: (prev: ExternalActionApprovalRequest[]) => ExternalActionApprovalRequest[],
+  ) => {
+    const next = updater(externalActionApprovalsRef.current);
+    externalActionApprovalsRef.current = next;
+    setExternalActionApprovals(next);
+  }, []);
+
+  const visibleExternalActionApprovals = useMemo(() => {
+    const selectionId = selectionIdRef.current;
+    if (!activeSessionId || !selectionId) return [];
+    return externalActionApprovals.filter((request) => (
+      request.sessionId === activeSessionId && request.selectionId === selectionId
+    ));
+  }, [activeSessionId, externalActionApprovals]);
 
   const hasActiveAssistantOutput = useCallback(() => {
     const blocks = streamingBlocksRef.current;
@@ -2637,7 +2718,7 @@ export function ChatPanel({
     if (isScrolledToBottom(container)) {
       scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [messages, deferredUserMessages, streamingBlocks, interviewQueue, activeSudoPrompt, activeCommandGuardPinPrompt, activeTurnScrollAnchorText]);
+  }, [messages, deferredUserMessages, streamingBlocks, interviewQueue, externalActionApprovals, activeSudoPrompt, activeCommandGuardPinPrompt, activeTurnScrollAnchorText]);
 
   // ------------------------------------------------------------------
   // WS connection
@@ -3050,6 +3131,75 @@ export function ChatPanel({
           return;
         }
 
+        if (msg.type === "external_action_request") {
+          const sessionId = typeof msg.sessionId === "string" ? msg.sessionId : null;
+          const selectionId = typeof msg.selection_id === "string" ? msg.selection_id : null;
+          if (
+            !sessionId
+            || !selectionId
+            || sessionId !== activeSessionIdRef.current
+            || selectionId !== selectionIdRef.current
+          ) return;
+          const request = parseExternalActionRequest(msg, sessionId, selectionId);
+          if (!request) return;
+          setExternalActionApprovalsSynced((current) => upsertExternalAction(current, request));
+          window.setTimeout(() => scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" }), 0);
+          return;
+        }
+
+        if (msg.type === "external_action_snapshot") {
+          const sessionId = typeof msg.sessionId === "string" ? msg.sessionId : null;
+          const selectionId = typeof msg.selection_id === "string" ? msg.selection_id : null;
+          if (
+            !sessionId
+            || !selectionId
+            || msg.syncComplete !== true
+            || !Array.isArray(msg.requests)
+            || sessionId !== activeSessionIdRef.current
+            || selectionId !== selectionIdRef.current
+          ) return;
+          const requests = msg.requests.flatMap((value: unknown) => {
+            const request = parseExternalActionRequest(value, sessionId, selectionId);
+            return request ? [request] : [];
+          });
+          // A sync-complete snapshot is authoritative. Re-enable requests that
+          // remain pending (the old response did not settle), and remove a
+          // locally disabled card when its acknowledgement was lost after the
+          // backend had already resolved it.
+          setExternalActionApprovalsSynced((current) => [
+            ...current.filter((request) => (
+              request.sessionId !== sessionId || request.selectionId !== selectionId
+            )),
+            ...requests,
+          ]);
+          return;
+        }
+
+        if (msg.type === "external_action_response_ack") {
+          const requestId = typeof msg.requestId === "string" ? msg.requestId : null;
+          const sessionId = typeof msg.sessionId === "string" ? msg.sessionId : null;
+          const selectionId = typeof msg.selection_id === "string" ? msg.selection_id : null;
+          const status = typeof msg.status === "string" ? msg.status : null;
+          if (
+            !requestId
+            || !sessionId
+            || !selectionId
+            || sessionId !== activeSessionIdRef.current
+            || selectionId !== selectionIdRef.current
+            || !["approved", "denied", "stale", "rejected"].includes(status ?? "")
+          ) return;
+          setExternalActionApprovalsSynced((current) => {
+            const key = `${sessionId}\0${selectionId}\0${requestId}`;
+            if (status !== "rejected") {
+              return current.filter((request) => externalActionKey(request) !== key);
+            }
+            return current.map((request) => externalActionKey(request) === key
+              ? { ...request, submitting: false, responseError: "The server rejected this response. Review the action and try again." }
+              : request);
+          });
+          return;
+        }
+
         // Durable interview requests are session-scoped and queued in creation
         // order. A replay refreshes the question schema but cannot overwrite a
         // locally retained final response for the same immutable request id.
@@ -3295,6 +3445,10 @@ export function ChatPanel({
       wsConnected: wsConnectedRef.current,
     });
     setBashMode("unavailable");
+    // External action previews are intentionally memory-only and scoped to one
+    // selection generation. The new selection's snapshot repopulates only
+    // requests that are still live on the backend.
+    setExternalActionApprovalsSynced(() => []);
     if (!activeSessionId) {
       setMessagesOwnerSessionId(null);
       setMessages([]);
@@ -3356,7 +3510,7 @@ export function ChatPanel({
       chatWsProfile("invoke_connect", { activeSessionId });
       connectRef.current();
     }
-  }, [activeSessionId, sendWs, clearQueuedAndDeferredUserMessages, setInterviewQueueSynced, setStreamingBlocksSynced]);
+  }, [activeSessionId, sendWs, clearQueuedAndDeferredUserMessages, setExternalActionApprovalsSynced, setInterviewQueueSynced, setStreamingBlocksSynced]);
 
   // Mark a sent response retryable when a connected socket never returns the
   // required durable acknowledgement. This does not resend in a loop; the
@@ -3679,6 +3833,40 @@ export function ChatPanel({
     }));
     sendWs({ type: "command_guard", mode: nextMode });
   }, [commandGuardSaving, commandGuardState?.mode, sendWs, wsStatus]);
+
+  const handleExternalActionRespond = useCallback((
+    request: ExternalActionApprovalRequest,
+    approved: boolean,
+  ) => {
+    let exactRequest: ExternalActionApprovalRequest | undefined;
+    setExternalActionApprovalsSynced((current) => current.map((candidate) => {
+      if (
+        externalActionKey(candidate) !== externalActionKey(request)
+        || candidate.submitting
+        || candidate.sessionId !== activeSessionIdRef.current
+        || candidate.selectionId !== selectionIdRef.current
+      ) return candidate;
+      exactRequest = candidate;
+      return { ...candidate, submitting: true, responseError: undefined };
+    }));
+    if (!exactRequest) return;
+
+    const sent = sendWs({
+      type: "external_action_response",
+      requestId: exactRequest.requestId,
+      sessionId: exactRequest.sessionId,
+      selection_id: exactRequest.selectionId,
+      argumentsHash: exactRequest.argumentsHash,
+      approved,
+    });
+    if (!sent) {
+      setExternalActionApprovalsSynced((current) => current.map((candidate) => (
+        externalActionKey(candidate) === externalActionKey(exactRequest!)
+          ? { ...candidate, submitting: false, responseError: "Reconnect before responding to this action." }
+          : candidate
+      )));
+    }
+  }, [sendWs, setExternalActionApprovalsSynced]);
 
   const handleInterviewSubmit = useCallback(
     (answers: InterviewAnswer[]) => {
@@ -4338,7 +4526,7 @@ export function ChatPanel({
         className="flex-1 overflow-y-auto px-3 py-3 space-y-3"
         onScroll={handleMessagesScroll}
       >
-        {displayMessages.length === 0 && deferredUserMessages.length === 0 && !hasStreamingContent && !activeInterview && !activeSudoPrompt && !activeCommandGuardPinPrompt && (
+        {displayMessages.length === 0 && deferredUserMessages.length === 0 && !hasStreamingContent && visibleExternalActionApprovals.length === 0 && !activeInterview && !activeSudoPrompt && !activeCommandGuardPinPrompt && (
           <div data-testid={isTranscriptLoading ? "chat-loading-shell" : undefined} className="flex items-center justify-center h-full text-neutral-600 text-sm font-mono">
             {isTranscriptLoading ? "Loading session…" : "No messages yet"}
           </div>
@@ -4438,6 +4626,17 @@ export function ChatPanel({
       <QueuedUserMessages messages={queuedUserMessages} />
 
       {/* ---- Interactive prompts: never persisted into chat history ---- */}
+      {visibleExternalActionApprovals.length > 0 && (
+        <div data-testid="external-action-approvals" className="max-h-[50vh] shrink-0 space-y-2 overflow-y-auto border-t border-amber-900/60 bg-neutral-950 px-3 py-2">
+          {visibleExternalActionApprovals.map((request) => (
+            <ExternalActionApproval
+              key={externalActionKey(request)}
+              request={request}
+              onRespond={handleExternalActionRespond}
+            />
+          ))}
+        </div>
+      )}
       {activeInterview && (
         <div data-testid="interview-queue" className="shrink-0 border-t border-blue-900/40 bg-neutral-950 px-3 py-2">
           {visibleInterviews.length > 1 && (

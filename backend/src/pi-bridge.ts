@@ -89,6 +89,7 @@ import {
   resolveBrowserTurnPiUserEntry,
   type BrowserTurnProvenance,
 } from "./interactive-turn-provenance.js";
+import { getActionApprovalBridge } from "./action-approval-bridge.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -229,6 +230,11 @@ const piSessionFileToWebSessionId = new Map<string, string>();
 (globalThis as any).__wayang_command_guard_human_input_authority = Object.freeze({
   resolveInterviewSubmission: (sessionId: string, entry: unknown) => resolveInterviewSubmissionEvidence(sessionId, entry) ?? null,
 });
+// External-action approvals intentionally expose exact Pi session identities
+// only. A cwd is shared by interactive and headless sessions and must never be
+// accepted as approval-presence evidence.
+(globalThis as any).__pi_action_pi_sessions = piSessionToWebSessionId;
+(globalThis as any).__pi_action_session_files = piSessionFileToWebSessionId;
 
 // Lazy-initialized singletons
 let _authStorage: AuthStorage | null = null;
@@ -2824,6 +2830,10 @@ export async function closePiSessionAuthorities(handle: PiSessionHandle): Promis
 }
 
 export async function destroyPiSession(id: string): Promise<void> {
+  // Resolve waiting external writes before abort/disposal can block on their
+  // extension hooks. This is deliberately safe even when no live handle exists
+  // (for example a stop/archive racing a just-finished session).
+  getActionApprovalBridge().cancelSession(id, "session destroyed");
   const handle = sessions.get(id);
   if (!handle) return;
   await closePiSessionAuthorities(handle);
@@ -2859,6 +2869,7 @@ export async function destroyPiSession(id: string): Promise<void> {
 }
 
 export async function stopPiSession(id: string): Promise<void> {
+  getActionApprovalBridge().cancelSession(id, "session stopped");
   const pending = sessionCreations.get(id);
   if (pending) {
     // Stop is itself a synchronous starting-runtime denial, not permission for
@@ -3211,6 +3222,7 @@ export async function abortSession(
   const handle = sessions.get(id);
   if (!handle) throw new Error(`Session ${id} not found`);
   markSessionActivity(id);
+  getActionApprovalBridge().cancelSession(id, "session interrupted");
   return abortInteractiveTurn(handle, options);
 }
 

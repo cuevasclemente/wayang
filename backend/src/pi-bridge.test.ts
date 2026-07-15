@@ -685,6 +685,18 @@ test("listModels does not execute an unrelated installed extension factory", asy
   }
 });
 
+test("action approvals expose only exact pi session identity mappings", () => {
+  const scope = globalThis as typeof globalThis & {
+    __pi_action_pi_sessions?: Map<string, string>;
+    __pi_action_session_files?: Map<string, string>;
+    __pi_action_cwd_sessions?: Map<string, string>;
+  };
+
+  assert.ok(scope.__pi_action_pi_sessions instanceof Map);
+  assert.ok(scope.__pi_action_session_files instanceof Map);
+  assert.equal(scope.__pi_action_cwd_sessions, undefined);
+});
+
 test("stopped session snapshot parses once for messages and todos and invalidates on fingerprint change", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-snapshot-test-"));
   const projectDir = path.join(dir, "project");

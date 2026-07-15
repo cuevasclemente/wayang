@@ -9,6 +9,7 @@
  *     { type: "set_permission", mode: string }
  *     { type: "set_goal", goal: string }
  *     { type: "subagent_spawn", agent: string, task: string, mode: "single"|"parallel"|"chain" }
+ *     { type: "external_action_response", requestId, sessionId, selection_id, argumentsHash, approved }
  *
  *   Server → Client:
  *     { type: "history", messages: [...] }
@@ -27,6 +28,9 @@
  *     { type: "compaction_end", reason, succeeded, aborted, will_retry, error? }
  *     { type: "agent_settled" }
  *     { type: "queue_update", steering: string[], followUp: string[] }
+ *     { type: "external_action_request", requestId, sessionId, selection_id, argumentsHash, ...displayMetadata }
+ *     { type: "external_action_response_ack", requestId, sessionId, selection_id, status }
+ *     { type: "external_action_snapshot", sessionId, selection_id, requests, syncComplete: true }
  */
 
 import * as fs from "node:fs";
@@ -76,6 +80,7 @@ import {
 } from "../interview-provenance.js";
 import { getSudoBridge, type SudoRequest } from "../sudo-bridge.js";
 import { getCommandGuardIdentityBridge, type CommandGuardIdentityRequest } from "../command-guard-bridge.js";
+import { getActionApprovalBridge, type ExternalActionRequest } from "../action-approval-bridge.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
 import { authorizeProjectAction } from "../policy.js";
 import type { AuthService } from "../auth/service.js";
@@ -198,6 +203,10 @@ function handleConnection(
   let interviewBridgeUnsub: (() => void) | null = null;
   let sudoBridgeUnsub: (() => void) | null = null;
   let commandGuardIdentityBridgeUnsub: (() => void) | null = null;
+  const actionApprovalClientId = randomUUID();
+  let actionApprovalDetach: (() => void) | null = null;
+  let actionApprovalRequestUnsub: (() => void) | null = null;
+  let actionApprovalTerminalUnsub: (() => void) | null = null;
   let filePollTimer: NodeJS.Timeout | null = null;
   let runtimeEventUnsub: (() => void) | null = null;
   const pendingMessages: any[] = [];
@@ -219,6 +228,12 @@ function handleConnection(
     sudoBridgeUnsub = null;
     commandGuardIdentityBridgeUnsub?.();
     commandGuardIdentityBridgeUnsub = null;
+    actionApprovalDetach?.();
+    actionApprovalDetach = null;
+    actionApprovalRequestUnsub?.();
+    actionApprovalRequestUnsub = null;
+    actionApprovalTerminalUnsub?.();
+    actionApprovalTerminalUnsub = null;
     stopFilePoll();
   };
 
@@ -448,6 +463,67 @@ function handleConnection(
       wsProfile(nextSessionId, "sent_session_ready", `setup_elapsed=${elapsedMs(setupStart)}`);
       flushPending();
 
+      // External actions bind only to an exact, non-empty selection
+      // generation. Legacy/invalid sockets without one can still read chat but
+      // are never counted as interactive approvers.
+      if (selectionId) {
+        // Register listeners before advertising this browser as interactive,
+        // then publish an authoritative snapshot so a request cannot fall into
+        // an attach/reconnect race.
+        const actionBridge = getActionApprovalBridge();
+        const actionSessionId = nextSessionId;
+        const actionSelectionId = selectionId;
+        const isCurrentActionSelection = () => (
+          alive
+          && version === setupVersion
+          && currentSessionId === actionSessionId
+          && currentSelectionId === actionSelectionId
+        );
+        const sendActionSnapshot = () => {
+          if (!isCurrentActionSelection()) return;
+          sendSafe(ws, {
+            type: "external_action_snapshot",
+            sessionId: actionSessionId,
+            selection_id: actionSelectionId,
+            requests: actionBridge.getPendingRequests(actionSessionId),
+            syncComplete: true,
+          });
+        };
+        const sendActionRequest = (request: ExternalActionRequest) => {
+          if (!isCurrentActionSelection() || request.sessionId !== actionSessionId) return;
+          // A different tab can resolve the request while listeners are being
+          // notified. Never resurrect a request that is already terminal.
+          const stillPending = actionBridge.getPendingRequests(actionSessionId).some((pending) => (
+            pending.requestId === request.requestId
+            && pending.argumentsHash === request.argumentsHash
+          ));
+          if (!stillPending) return;
+          sendSafe(ws, {
+            type: "external_action_request",
+            requestId: request.requestId,
+            sessionId: request.sessionId,
+            selection_id: actionSelectionId,
+            connector: request.connector,
+            workspace: request.workspace,
+            toolName: request.toolName,
+            target: request.target,
+            summary: request.summary,
+            argumentsHash: request.argumentsHash,
+            createdAt: request.createdAt,
+            timeoutMs: request.timeoutMs,
+          });
+        };
+        actionApprovalRequestUnsub = actionBridge.onRequest(sendActionRequest);
+        actionApprovalTerminalUnsub = actionBridge.onTerminal((event) => {
+          if (event.sessionId !== actionSessionId || !isCurrentActionSelection()) return;
+          // Snapshot is the terminal broadcast: every attached tab receives the
+          // same authoritative pending set without adding another protocol type.
+          sendActionSnapshot();
+        });
+        actionApprovalDetach = actionBridge.attachClient(actionSessionId, actionApprovalClientId);
+        sendActionSnapshot();
+      }
+
       // Subscribe to extension UI bridge requests for this session's project cwd.
       // This is cheap and does not require constructing a live AgentSession.
       if (sessionInfo.cwd && !quarantined) {
@@ -641,6 +717,11 @@ function handleConnection(
     }
 
     // Route extension UI bridge responses directly to their bridges.
+    if (msg.type === "external_action_response") {
+      handleExternalActionResponse(ws, currentSessionId, currentSelectionId, msg);
+      return;
+    }
+
     if (msg.type === "interview_response") {
       handleInterviewResponse(ws, currentSessionId, msg, submissionContext);
       return;
@@ -966,6 +1047,10 @@ async function handleClientMessage(
       }
 
       case "interrupt": {
+        // Cancel approval waiters first. In particular, an approval can remain
+        // pending briefly after a Pi turn settles even when no live handle is
+        // visible to this transport.
+        getActionApprovalBridge().cancelSession(sessionId, "session interrupted");
         if (getPiSession(sessionId)) {
           abortSession(sessionId, { clearQueue: msg.clear_queue !== false }).catch(() => {});
         }
@@ -1096,6 +1181,44 @@ function handleInterviewCancel(ws: WebSocket, sessionId: string, msg: any): void
   }
   getInterviewBridge().cancel(requestId);
   sendSafe(ws, { type: "interview_cancel_ack", requestId, sessionId, status: "cancelled" });
+}
+
+/** Resolve only an exact request/session/selection/hash tuple and acknowledge every response. */
+function handleExternalActionResponse(
+  ws: WebSocket,
+  currentSessionId: string,
+  currentSelectionId: string | null,
+  msg: any,
+): void {
+  const requestId = typeof msg?.requestId === "string" ? msg.requestId : "";
+  const sessionId = typeof msg?.sessionId === "string" ? msg.sessionId : currentSessionId;
+  const selectionId = typeof msg?.selection_id === "string" ? msg.selection_id : null;
+  const argumentsHash = typeof msg?.argumentsHash === "string" ? msg.argumentsHash : "";
+
+  let status: "approved" | "denied" | "stale" | "rejected" = "rejected";
+  if (
+    requestId
+    && argumentsHash
+    && selectionId.length > 0
+    && currentSelectionId !== null
+    && sessionId === currentSessionId
+    && selectionId === currentSelectionId
+  ) {
+    status = getActionApprovalBridge().respondForSession(
+      currentSessionId,
+      requestId,
+      argumentsHash,
+      msg.approved,
+    ).status;
+  }
+
+  sendSafe(ws, {
+    type: "external_action_response_ack",
+    requestId: requestId || null,
+    sessionId,
+    selection_id: selectionId,
+    status,
+  });
 }
 
 /**

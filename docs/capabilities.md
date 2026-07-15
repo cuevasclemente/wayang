@@ -39,6 +39,7 @@ Wayang contains adapters or UI affordances for the following extension-provided 
 | Optional capability | Behavior when a compatible extension is installed | Behavior when absent |
 |---|---|---|
 | Interview/questionnaire tools | A bridge renders structured questions as inline web forms and returns responses to the tool. | No interview tools are offered to the model; normal chat continues. |
+| Exact external-action approvals | A compatible extension can pause one exact external call and present its display metadata and full bounded summary for approval in Wayang. Requests are bound to the exact session, selection generation, request ID, and argument hash; reconnects replay only requests that remain pending. | No external-action tools are offered by Wayang itself. A compatible extension must deny the action when that exact session has no connected interactive browser. |
 | App companion tools | A source-session-attributed agent can register, stop, list, and update app state through Wayang's HTTP API. Start/restart is available only when no project is protected; otherwise the reviewed manual Apps-pane action is required because app commands are unsandboxed. | Apps remain manually discoverable and controllable in the Apps pane. |
 | Browser companion tools | An agent can use the Wayang-managed browser through reviewed tool wrappers. | The Browser pane and human controls remain usable. |
 | TODO tool | Wayang recognizes compatible TODO state and tool results. | The TODO-specific state is empty; chat and sessions are unaffected. |
@@ -47,6 +48,8 @@ Wayang contains adapters or UI affordances for the following extension-provided 
 | Skills, agents, team templates, and other pi packages | Pi loads resources from its documented global, project, npm, and Git package locations. | Only the checkout and the user's standard pi resources are present. |
 
 The Capabilities screen is an inventory aid. A bridge card can describe the Wayang side of an integration even when its companion tool is not installed; it is not an installation or compatibility guarantee.
+
+External-action approvals are ephemeral UI state, not chat messages or browser storage. Disconnecting does not approve an action: a live request may replay on reconnect until its bounded timeout, while interruption or session teardown cancels it. The bridge does not turn unrelated shell or browser activity into approved external actions.
 
 Pi extensions and packages execute with the user's full system permissions. Review their source, license, dependencies, network access, and non-interactive/SDK behavior before installation. Extensions that require terminal-only `ctx.ui` dialogs need an explicit Wayang web bridge or another safe non-interactive path.
 
