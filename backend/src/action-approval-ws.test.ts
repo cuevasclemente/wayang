@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -24,6 +25,25 @@ interface ServerMessage {
 
 class CountingActionApprovalBridge extends PiActionApprovalBridge {
   responseCalls = 0;
+  private readonly attachedClients = new Map<string, number>();
+
+  override attachClient(sessionId: string, clientId: string): () => void {
+    const detach = super.attachClient(sessionId, clientId);
+    this.attachedClients.set(sessionId, (this.attachedClients.get(sessionId) ?? 0) + 1);
+    let detached = false;
+    return () => {
+      if (detached) return;
+      detached = true;
+      detach();
+      const count = (this.attachedClients.get(sessionId) ?? 1) - 1;
+      if (count === 0) this.attachedClients.delete(sessionId);
+      else this.attachedClients.set(sessionId, count);
+    };
+  }
+
+  attachedClientCount(sessionId: string): number {
+    return this.attachedClients.get(sessionId) ?? 0;
+  }
 
   override respondForSession(
     sessionId: string,
@@ -131,14 +151,14 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 3_000): Promise<v
   assert.ok(predicate(), "condition did not become true before timeout");
 }
 
-function actionInput(argumentsHash: string): ExternalActionRequestInput {
+function actionInput(hashLabel: string): ExternalActionRequestInput {
   return {
     connector: "synthetic-connector",
     workspace: "synthetic-workspace",
     toolName: "create_synthetic_record",
     target: "synthetic-target",
     summary: "Synthetic full action preview; must not be logged",
-    argumentsHash,
+    argumentsHash: createHash("sha256").update(hashLabel).digest("hex"),
   };
 }
 
@@ -236,6 +256,19 @@ function withoutField(packet: Record<string, unknown>, field: string): Record<st
   return Object.fromEntries(Object.entries(packet).filter(([key]) => key !== field));
 }
 
+test("closing the sole chat socket detaches the old session approval client", async (t) => {
+  const { bridge, interactiveSession, connect } = await fixture(t);
+  const client = await connect(interactiveSession.id, "selection-close-detach");
+  await client.inbox.take(isSnapshotFor(interactiveSession.id, "selection-close-detach", 0));
+  assert.equal(bridge.attachedClientCount(interactiveSession.id), 1);
+  assert.equal(bridge.hasClient(interactiveSession.id), true);
+
+  await closeSocket(client.ws);
+  await waitUntil(() => bridge.attachedClientCount(interactiveSession.id) === 0);
+  assert.equal(bridge.attachedClientCount(interactiveSession.id), 0);
+  assert.equal(bridge.hasClient(interactiveSession.id), false);
+});
+
 test("external action responses do not default a missing session identity", async (t) => {
   const { bridge, interactiveSession, connect } = await fixture(t);
   const selectionId = "selection-missing-session";
@@ -325,6 +358,7 @@ test("external action WebSocket transport is reconnect-safe and exact-session fa
   const first = await connect(interactiveSession.id, firstSelection);
   await first.inbox.take(isSnapshotFor(interactiveSession.id, firstSelection, 0));
   assert.equal(bridge.hasClient(interactiveSession.id), true);
+  assert.equal(bridge.attachedClientCount(interactiveSession.id), 1);
 
   // Sharing a cwd is never enough to make a scheduled/headless session interactive.
   const headlessInput = actionInput("sha256:headless-same-cwd");
@@ -352,6 +386,7 @@ test("external action WebSocket transport is reconnect-safe and exact-session fa
 
   const second = await connect(interactiveSession.id, secondSelection);
   await second.inbox.take(isSnapshotFor(interactiveSession.id, secondSelection, 0));
+  assert.equal(bridge.attachedClientCount(interactiveSession.id), 2);
 
   const exactPending = bridge.requestApproval(interactiveSession.id, actionInput("sha256:exact"), { timeoutMs: 5_000 });
   const [exactRequest] = bridge.getPendingRequests(interactiveSession.id);
@@ -416,10 +451,16 @@ test("external action WebSocket transport is reconnect-safe and exact-session fa
     sessionId: exactRequest.sessionId,
     argumentsHash: exactRequest.argumentsHash,
   } satisfies ApprovalDecision);
+  // respondForSession emits its terminal event synchronously. The terminal
+  // listener therefore queues the authoritative snapshot before this socket's
+  // response handler queues its acknowledgement. Clients reconcile from the
+  // snapshot first and treat the later ack as secondary status confirmation.
+  const firstResolutionFrame = await first.inbox.take((message) => (
+    isSnapshotFor(interactiveSession.id, firstSelection, 0)(message)
+    || isAck(exactRequest.requestId, "approved", exactRequest.sessionId, firstSelection)(message)
+  ));
+  assert.equal(firstResolutionFrame.type, "external_action_snapshot");
   await first.inbox.take(isAck(exactRequest.requestId, "approved", exactRequest.sessionId, firstSelection));
-  // The bridge terminal event is broadcast to every attached tab as an
-  // authoritative snapshot, so tabs that did not submit also clear the card.
-  await first.inbox.take(isSnapshotFor(interactiveSession.id, firstSelection, 0));
   await second.inbox.take(isSnapshotFor(interactiveSession.id, secondSelection, 0));
 
   // Replay a still-live request after reconnect, then process a response while
@@ -430,7 +471,8 @@ test("external action WebSocket transport is reconnect-safe and exact-session fa
   await first.inbox.take(isRequest(replayRequest.requestId, interactiveSession.id, firstSelection));
   await second.inbox.take(isRequest(replayRequest.requestId, interactiveSession.id, secondSelection));
   await closeSocket(first.ws);
-  await waitUntil(() => bridge.hasClient(interactiveSession.id)); // the second tab remains attached
+  await waitUntil(() => bridge.attachedClientCount(interactiveSession.id) === 1);
+  assert.equal(bridge.hasClient(interactiveSession.id), true); // the second tab remains attached
 
   const replaySelection = "selection-reconnected";
   const reconnected = await connect(interactiveSession.id, replaySelection);
@@ -456,7 +498,7 @@ test("external action WebSocket transport is reconnect-safe and exact-session fa
   const afterLostAck = await connect(interactiveSession.id, afterLostAckSelection);
   await afterLostAck.inbox.take(isSnapshotFor(interactiveSession.id, afterLostAckSelection, 0));
 
-  const timeoutPending = bridge.requestApproval(interactiveSession.id, actionInput("sha256:timeout"), { timeoutMs: 100 });
+  const timeoutPending = bridge.requestApproval(interactiveSession.id, actionInput("sha256:timeout"), { timeoutMs: 500 });
   const [timeoutRequest] = bridge.getPendingRequests(interactiveSession.id);
   assert.ok(timeoutRequest);
   await second.inbox.take(isRequest(timeoutRequest.requestId, interactiveSession.id, secondSelection));
@@ -486,8 +528,11 @@ test("external action WebSocket transport is reconnect-safe and exact-session fa
     selection_id: "selection-other-session",
   }));
   await second.inbox.take(isSnapshotFor(otherSession.id, "selection-other-session", 0));
-  await waitUntil(() => !bridge.hasClient(interactiveSession.id));
+  await waitUntil(() => bridge.attachedClientCount(interactiveSession.id) === 0);
+  assert.equal(bridge.hasClient(interactiveSession.id), false);
+  assert.equal(bridge.attachedClientCount(otherSession.id), 1);
   assert.equal(bridge.hasClient(otherSession.id), true);
   await closeSocket(second.ws);
-  await waitUntil(() => !bridge.hasClient(otherSession.id));
+  await waitUntil(() => bridge.attachedClientCount(otherSession.id) === 0);
+  assert.equal(bridge.hasClient(otherSession.id), false);
 });

@@ -9,6 +9,30 @@ async function installExternalActionSocketMock(context: BrowserContext): Promise
     const state = {
       sockets: [] as MockWebSocket[],
       sent: [] as Array<Record<string, unknown>>,
+      closeCount: 0,
+      autoResolveResponses: false,
+    };
+    const serverChannel = new BroadcastChannel("wayang-external-action-test-server");
+
+    const emitForSession = (sessionId: string, payload: Record<string, unknown>) => {
+      for (const socket of state.sockets) {
+        if (socket.readyState !== MockWebSocket.OPEN || socket.sessionId !== sessionId) continue;
+        socket.emit({
+          ...payload,
+          sessionId,
+          selection_id: socket.selectionId,
+        });
+      }
+    };
+
+    serverChannel.onmessage = (event: MessageEvent) => {
+      const message = event.data as { sessionId?: unknown; payload?: unknown };
+      if (
+        typeof message?.sessionId !== "string"
+        || !message.payload
+        || typeof message.payload !== "object"
+      ) return;
+      emitForSession(message.sessionId, message.payload as Record<string, unknown>);
     };
 
     class MockWebSocket {
@@ -17,6 +41,7 @@ async function installExternalActionSocketMock(context: BrowserContext): Promise
       static readonly CLOSING = 2;
       static readonly CLOSED = 3;
       readonly url: string;
+      readonly isChat: boolean;
       sessionId: string;
       selectionId: string | null;
       readyState = MockWebSocket.CONNECTING;
@@ -28,6 +53,7 @@ async function installExternalActionSocketMock(context: BrowserContext): Promise
       constructor(url: string) {
         this.url = url;
         const parsed = new URL(url, window.location.href);
+        this.isChat = parsed.pathname === "/ws/chat";
         this.sessionId = parsed.searchParams.get("session_id") ?? "";
         this.selectionId = parsed.searchParams.get("selection_id");
         state.sockets.push(this);
@@ -50,11 +76,38 @@ async function installExternalActionSocketMock(context: BrowserContext): Promise
           this.sessionId = message.session_id;
           this.selectionId = typeof message.selection_id === "string" ? message.selection_id : null;
           this.syncSelection();
+          return;
+        }
+        if (
+          state.autoResolveResponses
+          && message.type === "external_action_response"
+          && typeof message.requestId === "string"
+          && typeof message.sessionId === "string"
+          && typeof message.selection_id === "string"
+          && typeof message.approved === "boolean"
+        ) {
+          const terminalSnapshot = {
+            type: "external_action_snapshot",
+            requests: [],
+            syncComplete: true,
+          };
+          // Match the backend contract: the synchronous terminal broadcast
+          // queues the authoritative snapshot before the submitter's ack.
+          emitForSession(message.sessionId, terminalSnapshot);
+          this.emit({
+            type: "external_action_response_ack",
+            requestId: message.requestId,
+            sessionId: message.sessionId,
+            selection_id: message.selection_id,
+            status: message.approved ? "approved" : "denied",
+          });
+          serverChannel.postMessage({ sessionId: message.sessionId, payload: terminalSnapshot });
         }
       }
 
       close(): void {
         if (this.readyState === MockWebSocket.CLOSED) return;
+        if (this.isChat) state.closeCount += 1;
         this.readyState = MockWebSocket.CLOSED;
         this.onclose?.(new CloseEvent("close"));
       }
@@ -82,7 +135,10 @@ async function installExternalActionSocketMock(context: BrowserContext): Promise
       current: () => { sessionId: string; selectionId: string | null };
       emit: (payload: Record<string, unknown>) => void;
       emitCurrent: (payload: Record<string, unknown>) => void;
+      emitBroadcast: (payload: Record<string, unknown>) => void;
       closeLatest: () => void;
+      setAutoResolveResponses: (enabled: boolean) => void;
+      stats: () => { closeCount: number; socketCount: number; openCount: number };
     } }).__externalActionSocketTest = Object.assign(state, {
       current() {
         const socket = state.sockets.at(-1);
@@ -100,8 +156,24 @@ async function installExternalActionSocketMock(context: BrowserContext): Promise
           selection_id: socket.selectionId,
         });
       },
+      emitBroadcast(payload: Record<string, unknown>) {
+        const socket = state.sockets.at(-1);
+        if (!socket) return;
+        emitForSession(socket.sessionId, payload);
+        serverChannel.postMessage({ sessionId: socket.sessionId, payload });
+      },
       closeLatest() {
         state.sockets.at(-1)?.close();
+      },
+      setAutoResolveResponses(enabled: boolean) {
+        state.autoResolveResponses = enabled;
+      },
+      stats() {
+        return {
+          closeCount: state.closeCount,
+          socketCount: state.sockets.filter((socket) => socket.isChat).length,
+          openCount: state.sockets.filter((socket) => socket.isChat && socket.readyState === MockWebSocket.OPEN).length,
+        };
       },
     });
   });
@@ -120,7 +192,27 @@ async function emitCurrentRequest(page: Page, requestId: string, summary: string
       toolName: "create_record",
       target: "Project beta",
       summary,
-      argumentsHash: `sha256:${requestId}`,
+      argumentsHash: "a".repeat(64),
+      createdAt: Date.now(),
+      timeoutMs: 120_000,
+    });
+  }, { requestId, summary });
+}
+
+async function emitBroadcastRequest(page: Page, requestId: string, summary: string): Promise<void> {
+  await page.evaluate(({ requestId, summary }) => {
+    const testSocket = (window as unknown as {
+      __externalActionSocketTest: { emitBroadcast: (payload: Record<string, unknown>) => void };
+    }).__externalActionSocketTest;
+    testSocket.emitBroadcast({
+      type: "external_action_request",
+      requestId,
+      connector: "Example connector",
+      workspace: "Workspace alpha",
+      toolName: "create_record",
+      target: "Project beta",
+      summary,
+      argumentsHash: "a".repeat(64),
       createdAt: Date.now(),
       timeoutMs: 120_000,
     });
@@ -161,6 +253,12 @@ test("external action approval is exact, ephemeral, reconnect-safe, and selectio
 
   const card = page.getByTestId("external-action-approval");
   await expect(card).toHaveCount(1);
+  await expect(card).toHaveAccessibleName("External action approval required");
+  await expect(card.getByRole("heading", { name: "External action approval required", level: 2 })).toBeVisible();
+  await expect(page.getByTestId("external-action-approvals")).toHaveAttribute("aria-label", "External action approvals");
+  await expect(card.getByTestId("external-action-arrival-announcement")).toHaveAttribute("role", "alert");
+  await expect(card.getByTestId("external-action-arrival-announcement")).toHaveAttribute("aria-live", "assertive");
+  await expect(card.getByTestId("external-action-arrival-announcement")).toContainText("Review required");
   await expect(card).toContainText("Example connector");
   await expect(card).toContainText("Workspace alpha");
   await expect(card).toContainText("create_record");
@@ -186,7 +284,7 @@ test("external action approval is exact, ephemeral, reconnect-safe, and selectio
     toolName: "create_record",
     target: "Project beta",
     summary,
-    argumentsHash: "sha256:action-approve",
+    argumentsHash: "a".repeat(64),
     createdAt: Date.now(),
     timeoutMs: 120_000,
   }]);
@@ -195,13 +293,15 @@ test("external action approval is exact, ephemeral, reconnect-safe, and selectio
   await card.getByRole("button", { name: "Approve" }).click();
   await expect(card.getByRole("button", { name: "Approve" })).toBeDisabled();
   await expect(card.getByRole("button", { name: "Deny" })).toBeDisabled();
+  await expect(card.getByRole("status")).toHaveAttribute("aria-live", "polite");
+  await expect(card.getByRole("status")).toContainText("Waiting for acknowledgement");
   await expect.poll(() => sentResponses(page, "action-approve")).toHaveLength(1);
   const [approvedResponse] = await sentResponses(page, "action-approve");
   expect(approvedResponse).toMatchObject({
     type: "external_action_response",
     requestId: "action-approve",
     sessionId: firstSession.id,
-    argumentsHash: "sha256:action-approve",
+    argumentsHash: "a".repeat(64),
     approved: true,
   });
   expect(typeof approvedResponse.selection_id).toBe("string");
@@ -221,7 +321,7 @@ test("external action approval is exact, ephemeral, reconnect-safe, and selectio
   expect(deniedResponse).toMatchObject({
     requestId: "action-deny",
     sessionId: firstSession.id,
-    argumentsHash: "sha256:action-deny",
+    argumentsHash: "a".repeat(64),
     approved: false,
   });
   await page.evaluate(() => {
@@ -263,7 +363,7 @@ test("external action approval is exact, ephemeral, reconnect-safe, and selectio
       connector: "Stale connector",
       toolName: "stale_tool",
       summary: "late stale summary",
-      argumentsHash: "sha256:late",
+      argumentsHash: "a".repeat(64),
       createdAt: Date.now(),
       timeoutMs: 120_000,
     });
@@ -271,7 +371,26 @@ test("external action approval is exact, ephemeral, reconnect-safe, and selectio
   await expect(card).toHaveCount(0);
 });
 
-test("terminal snapshots reconcile the same external action in two tabs", async ({ context, page, request }) => {
+test("deselecting the active session closes its approval WebSocket without reconnecting", async ({ context, page, request }) => {
+  await installExternalActionSocketMock(context);
+  const session = await createE2eSession(request, "e2e external action deselect");
+  await openSessionInUi(page, session);
+  await expect(page.getByTestId("chat-input")).toBeEnabled();
+
+  const sessionRow = page.getByText(session.title, { exact: true }).locator("xpath=ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' group ')][1]");
+  await sessionRow.hover();
+  page.once("dialog", (dialog) => dialog.accept());
+  await sessionRow.getByRole("button", { name: "Archive session" }).click();
+  await expect(page.getByText("Select a session or create a new one", { exact: true })).toBeVisible();
+
+  await expect.poll(() => page.evaluate(() => (
+    (window as unknown as {
+      __externalActionSocketTest: { stats: () => { closeCount: number; socketCount: number; openCount: number } };
+    }).__externalActionSocketTest.stats()
+  ))).toEqual({ closeCount: 1, socketCount: 1, openCount: 0 });
+});
+
+test("approving in one tab reconciles the same external action in another tab", async ({ context, page, request }) => {
   await installExternalActionSocketMock(context);
   const session = await createE2eSession(request, "e2e external action two tabs");
   const secondPage = await context.newPage();
@@ -279,15 +398,21 @@ test("terminal snapshots reconcile the same external action in two tabs", async 
   await openSessionInUi(secondPage, session);
   await expect(page.getByTestId("chat-input")).toBeEnabled();
   await expect(secondPage.getByTestId("chat-input")).toBeEnabled();
+  await page.evaluate(() => {
+    (window as unknown as {
+      __externalActionSocketTest: { setAutoResolveResponses: (enabled: boolean) => void };
+    }).__externalActionSocketTest.setAutoResolveResponses(true);
+  });
 
-  await emitCurrentRequest(page, "action-two-tabs", "Visible in both tabs");
-  await emitCurrentRequest(secondPage, "action-two-tabs", "Visible in both tabs");
-  await expect(page.getByTestId("external-action-approval")).toHaveCount(1);
-  await expect(secondPage.getByTestId("external-action-approval")).toHaveCount(1);
+  await emitBroadcastRequest(page, "action-two-tabs", "Visible in both tabs");
+  const firstCard = page.getByTestId("external-action-approval");
+  const secondCard = secondPage.getByTestId("external-action-approval");
+  await expect(firstCard).toHaveCount(1);
+  await expect(secondCard).toHaveCount(1);
 
-  // The backend broadcasts an authoritative snapshot on every terminal event.
-  await emitCurrentSnapshot(page, []);
-  await emitCurrentSnapshot(secondPage, []);
-  await expect(page.getByTestId("external-action-approval")).toHaveCount(0);
-  await expect(secondPage.getByTestId("external-action-approval")).toHaveCount(0);
+  await firstCard.getByRole("button", { name: "Approve" }).click();
+  await expect.poll(() => sentResponses(page, "action-two-tabs")).toHaveLength(1);
+  await expect(firstCard).toHaveCount(0);
+  await expect(secondCard).toHaveCount(0);
+  await expect.poll(() => sentResponses(secondPage, "action-two-tabs")).toHaveLength(0);
 });

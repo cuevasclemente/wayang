@@ -1,3 +1,5 @@
+import { useId } from "react";
+
 export interface ExternalActionApprovalRequest {
   requestId: string;
   sessionId: string;
@@ -20,6 +22,7 @@ interface ExternalActionApprovalProps {
 }
 
 export function ExternalActionApproval({ request, onRespond }: ExternalActionApprovalProps) {
+  const headingId = useId();
   const metadata = [
     ["Connector", request.connector],
     ["Workspace", request.workspace],
@@ -31,13 +34,23 @@ export function ExternalActionApproval({ request, onRespond }: ExternalActionApp
     <article
       data-testid="external-action-approval"
       data-approval-kind="external-action"
+      aria-labelledby={headingId}
       className="rounded-lg border border-amber-700/70 bg-amber-950/35 p-3 text-amber-50 shadow-lg shadow-amber-950/20"
     >
+      <p
+        data-testid="external-action-arrival-announcement"
+        role="alert"
+        aria-live="assertive"
+        aria-atomic="true"
+        className="sr-only"
+      >
+        Review required: an external action approval arrived. No action has been approved.
+      </p>
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
-          <div className="text-[10px] font-semibold uppercase tracking-wider text-amber-300">
+          <h2 id={headingId} className="text-[10px] font-semibold uppercase tracking-wider text-amber-300">
             External action approval required
-          </div>
+          </h2>
           <p className="mt-1 text-xs text-amber-100/80">
             Review the exact action below. Approval applies only to this request.
           </p>
@@ -62,6 +75,7 @@ export function ExternalActionApproval({ request, onRespond }: ExternalActionApp
         </div>
         <pre
           data-testid="external-action-summary"
+          aria-label="Full action summary"
           className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded border border-amber-900/70 bg-neutral-950/70 p-2 font-mono text-xs leading-relaxed text-amber-50"
         >
           {request.summary}
@@ -69,12 +83,12 @@ export function ExternalActionApproval({ request, onRespond }: ExternalActionApp
       </div>
 
       {request.responseError && (
-        <div className="mb-2 text-xs text-amber-200" role="status">
+        <div className="mb-2 text-xs text-amber-200" role="status" aria-live="polite" aria-atomic="true">
           {request.responseError}
         </div>
       )}
       {request.submitting && (
-        <div className="mb-2 text-xs text-amber-200" role="status">
+        <div className="mb-2 text-xs text-amber-200" role="status" aria-live="polite" aria-atomic="true">
           Waiting for acknowledgement…
         </div>
       )}

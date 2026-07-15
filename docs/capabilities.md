@@ -49,7 +49,11 @@ Wayang contains adapters or UI affordances for the following extension-provided 
 
 The Capabilities screen is an inventory aid. A bridge card can describe the Wayang side of an integration even when its companion tool is not installed; it is not an installation or compatibility guarantee.
 
-External-action approvals are ephemeral UI state, not chat messages or browser storage. Disconnecting does not approve an action: a live request may replay on reconnect until its bounded timeout, while interruption or session teardown cancels it. The bridge does not turn unrelated shell or browser activity into approved external actions.
+External-action approvals are ephemeral UI state, not chat messages or browser storage. Disconnecting does not approve an action: a live request may replay on reconnect until its bounded timeout, while interruption or session teardown cancels it. Deselecting the active session closes its chat transport so the old session is no longer counted as having an interactive approver.
+
+Bridge admission is fail-closed before request creation: v1 permits one pending request per session, a 32 KiB UTF-8 summary, 512-byte session IDs, 256-byte connector/workspace/tool names, 2 KiB targets, exact 64-hex argument hashes, and integer timeouts from 1 through 300,000 ms. Metadata containing control characters is rejected; values are never truncated to fit. On a terminal decision, the authoritative pending snapshot is sent before the submitter's acknowledgement, making multi-tab and lost-ack reconciliation deterministic.
+
+The bridge does not turn unrelated shell or browser activity into approved external actions.
 
 Pi extensions and packages execute with the user's full system permissions. Review their source, license, dependencies, network access, and non-interactive/SDK behavior before installation. Extensions that require terminal-only `ctx.ui` dialogs need an explicit Wayang web bridge or another safe non-interactive path.
 

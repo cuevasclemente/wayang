@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   PiActionApprovalBridge,
   getActionApprovalBridge,
@@ -10,17 +11,22 @@ import {
   type ExternalActionRequestInput,
 } from "./action-approval-bridge.js";
 
+function argumentsHash(label: string): string {
+  return createHash("sha256").update(label).digest("hex");
+}
+
 function actionInput(
   overrides: Partial<ExternalActionRequestInput> = {},
 ): ExternalActionRequestInput {
+  const { argumentsHash: hashLabel = "arguments-a", ...rest } = overrides;
   return {
     connector: "linear",
     workspace: "workspace-a",
     toolName: "create_issue",
     target: "TEAM-1",
     summary: "Create a synthetic issue",
-    argumentsHash: "sha256:arguments-a",
-    ...overrides,
+    ...rest,
+    argumentsHash: argumentsHash(hashLabel),
   };
 }
 
@@ -78,7 +84,7 @@ test("action approval replays pending metadata and requires the exact session an
   assert.equal(emitted.toolName, "create_issue");
   assert.equal(emitted.target, "TEAM-1");
   assert.equal(emitted.summary, "Create a synthetic issue");
-  assert.equal(emitted.argumentsHash, "sha256:arguments-a");
+  assert.equal(emitted.argumentsHash, argumentsHash("arguments-a"));
   assert.equal(typeof emitted.createdAt, "number");
   assert.equal(emitted.timeoutMs, 1_000);
   assert.deepEqual(bridge.getPendingRequests("session-a"), [emitted]);
@@ -317,13 +323,14 @@ test("action approval cancellation targets exactly one request", async () => {
   const requests: ExternalActionRequest[] = [];
   bridge.onRequest((request) => requests.push(request));
 
+  bridge.attachClient("session-cancel-other", "client-b");
   const first = bridge.requestApproval(
     "session-cancel",
-    actionInput({ argumentsHash: "sha256:first" }),
+    actionInput({ argumentsHash: "first" }),
   );
   const second = bridge.requestApproval(
-    "session-cancel",
-    actionInput({ argumentsHash: "sha256:second" }),
+    "session-cancel-other",
+    actionInput({ argumentsHash: "second" }),
   );
 
   assert.equal(bridge.cancelRequest(requests[0].requestId, "test cleanup"), true);
@@ -339,12 +346,12 @@ test("action approval cancellation targets exactly one request", async () => {
   );
   assert.deepEqual(
     bridge.getPendingRequests("session-cancel").map((request) => request.requestId),
-    [requests[1].requestId],
+    [],
   );
 
   assert.equal(
     bridge.respondForSession(
-      "session-cancel",
+      "session-cancel-other",
       requests[1].requestId,
       requests[1].argumentsHash,
       true,
@@ -464,32 +471,20 @@ test("action approval session cleanup cancels only matching requests", async () 
 
   const first = bridge.requestApproval(
     "session-one",
-    actionInput({ argumentsHash: "sha256:one" }),
-  );
-  const second = bridge.requestApproval(
-    "session-one",
-    actionInput({ argumentsHash: "sha256:two" }),
+    actionInput({ argumentsHash: "one" }),
   );
   const otherSession = bridge.requestApproval(
     "session-two",
-    actionInput({ argumentsHash: "sha256:other" }),
+    actionInput({ argumentsHash: "other" }),
   );
 
   bridge.cancelSession("session-one", "session closed");
-  assert.deepEqual(await Promise.all([first, second]), [
-    decision(
-      "cancelled",
-      requests[0].requestId,
-      requests[0].sessionId,
-      requests[0].argumentsHash,
-    ),
-    decision(
-      "cancelled",
-      requests[1].requestId,
-      requests[1].sessionId,
-      requests[1].argumentsHash,
-    ),
-  ]);
+  assert.deepEqual(await first, decision(
+    "cancelled",
+    requests[0].requestId,
+    requests[0].sessionId,
+    requests[0].argumentsHash,
+  ));
   assert.deepEqual(bridge.getPendingRequests("session-one"), []);
   assert.equal(bridge.getPendingRequests("session-two").length, 1);
 
@@ -528,7 +523,7 @@ test("action approval defensively clones input, request events, and pending repl
   const pending = bridge.requestApproval("session-clone", input);
   assert.ok(secondListenerRequest);
   assert.equal(secondListenerRequest.summary, "Create a synthetic issue");
-  assert.equal(secondListenerRequest.argumentsHash, "sha256:clone");
+  assert.equal(secondListenerRequest.argumentsHash, argumentsHash("sha256:clone"));
 
   input.summary = "caller mutation";
   input.argumentsHash = "sha256:caller-mutation";
@@ -537,13 +532,13 @@ test("action approval defensively clones input, request events, and pending repl
   firstReplay.argumentsHash = "sha256:replay-mutation";
   const secondReplay = bridge.getPendingRequests("session-clone")[0];
   assert.equal(secondReplay.summary, "Create a synthetic issue");
-  assert.equal(secondReplay.argumentsHash, "sha256:clone");
+  assert.equal(secondReplay.argumentsHash, argumentsHash("sha256:clone"));
 
   assert.equal(
     bridge.respondForSession(
       "session-clone",
       secondReplay.requestId,
-      "sha256:clone",
+      argumentsHash("sha256:clone"),
       true,
     ).status,
     "approved",
@@ -723,6 +718,196 @@ test("action approval exposes no secret-capable request fields beyond display me
       emitted.sessionId,
       emitted.argumentsHash,
     ),
+  );
+});
+
+test("action approval accepts exact runtime admission boundaries", async () => {
+  const sessionId = "s".repeat(512);
+  const bridge = new PiActionApprovalBridge();
+  bridge.attachClient(sessionId, "client-a");
+  const requests: ExternalActionRequest[] = [];
+  bridge.onRequest((request) => requests.push(request));
+
+  const maximumInput = actionInput({
+    connector: "c".repeat(256),
+    workspace: "w".repeat(256),
+    toolName: "t".repeat(256),
+    target: "x".repeat(2_048),
+    summary: "é".repeat(16_384),
+    argumentsHash: "maximum-boundary",
+  });
+  const maximumPending = bridge.requestApproval(sessionId, maximumInput, {
+    timeoutMs: 300_000,
+  });
+  assert.equal(Buffer.byteLength(requests[0].summary, "utf8"), 32 * 1_024);
+  assert.equal(requests[0].timeoutMs, 300_000);
+  assert.equal(
+    bridge.respondForSession(sessionId, requests[0].requestId, maximumInput.argumentsHash, false).status,
+    "denied",
+  );
+  assert.deepEqual(
+    await maximumPending,
+    decision("denied", requests[0].requestId, sessionId, maximumInput.argumentsHash),
+  );
+
+  const minimumInput = actionInput({ argumentsHash: "minimum-timeout" });
+  const minimumPending = bridge.requestApproval(sessionId, minimumInput, { timeoutMs: 1 });
+  const minimumRequest = requests[1];
+  assert.equal(minimumRequest.timeoutMs, 1);
+  assert.equal(
+    bridge.respondForSession(sessionId, minimumRequest.requestId, minimumInput.argumentsHash, true).status,
+    "approved",
+  );
+  assert.deepEqual(
+    await minimumPending,
+    decision("approved", minimumRequest.requestId, sessionId, minimumInput.argumentsHash),
+  );
+});
+
+test("action approval rejects oversized UTF-8 summaries before cloning or emitting", async () => {
+  for (const summary of ["a".repeat(32 * 1_024 + 1), "é".repeat(16_385)]) {
+    const bridge = new PiActionApprovalBridge();
+    bridge.attachClient("session-oversized", "client-a");
+    const requests: ExternalActionRequest[] = [];
+    const terminals: ApprovalTerminalStatus[] = [];
+    bridge.onRequest((request) => requests.push(request));
+    bridge.onTerminal((event) => terminals.push(event.status));
+    const source = actionInput({ summary, argumentsHash: "oversized-summary" });
+    let enumerated = false;
+    const input = new Proxy(source, {
+      ownKeys(target) {
+        enumerated = true;
+        return Reflect.ownKeys(target);
+      },
+    });
+
+    const result = await bridge.requestApproval("session-oversized", input, {
+      signal: AbortSignal.abort(),
+    });
+
+    assert.deepEqual(
+      result,
+      decision("denied", null, "session-oversized", source.argumentsHash),
+    );
+    assert.equal(enumerated, false);
+    assert.equal(input.summary, summary);
+    assert.deepEqual(requests, []);
+    assert.deepEqual(terminals, []);
+    assert.deepEqual(bridge.getPendingRequests("session-oversized"), []);
+  }
+});
+
+test("action approval rejects oversized or control-bearing metadata before emitting", async () => {
+  const oversizedCases: Array<{ sessionId?: string; input: ExternalActionRequestInput }> = [
+    { sessionId: "s".repeat(513), input: actionInput({ argumentsHash: "session-too-long" }) },
+    { input: actionInput({ connector: "c".repeat(257), argumentsHash: "connector-too-long" }) },
+    { input: actionInput({ workspace: "w".repeat(257), argumentsHash: "workspace-too-long" }) },
+    { input: actionInput({ toolName: "t".repeat(257), argumentsHash: "tool-too-long" }) },
+    { input: actionInput({ target: "x".repeat(2_049), argumentsHash: "target-too-long" }) },
+  ];
+  const controlCases: Array<{ sessionId?: string; input: ExternalActionRequestInput }> = [
+    { sessionId: "session\ncontrol", input: actionInput({ argumentsHash: "session-control" }) },
+    { input: actionInput({ connector: "connector\u0000control", argumentsHash: "connector-control" }) },
+    { input: actionInput({ workspace: "workspace\tcontrol", argumentsHash: "workspace-control" }) },
+    { input: actionInput({ toolName: "tool\u007fcontrol", argumentsHash: "tool-control" }) },
+    { input: actionInput({ target: "target\u0085control", argumentsHash: "target-control" }) },
+  ];
+
+  for (const { sessionId = "session-metadata", input } of [...oversizedCases, ...controlCases]) {
+    const bridge = new PiActionApprovalBridge();
+    bridge.attachClient(sessionId, "client-a");
+    let emitted = false;
+    bridge.onRequest(() => { emitted = true; });
+    bridge.onTerminal(() => { emitted = true; });
+
+    assert.deepEqual(
+      await bridge.requestApproval(sessionId, input, { signal: AbortSignal.abort() }),
+      decision("denied", null, sessionId, input.argumentsHash),
+    );
+    assert.equal(emitted, false);
+    assert.deepEqual(bridge.getPendingRequests(sessionId), []);
+  }
+});
+
+test("action approval requires an exact 64-hex arguments hash", async () => {
+  for (const invalidHash of [
+    "a".repeat(63),
+    "a".repeat(65),
+    `${"a".repeat(63)}g`,
+    `sha256:${"a".repeat(64)}`,
+  ]) {
+    const bridge = new PiActionApprovalBridge();
+    bridge.attachClient("session-hash", "client-a");
+    const input = { ...actionInput(), argumentsHash: invalidHash };
+    let emitted = false;
+    bridge.onRequest(() => { emitted = true; });
+    bridge.onTerminal(() => { emitted = true; });
+
+    assert.deepEqual(
+      await bridge.requestApproval("session-hash", input, { signal: AbortSignal.abort() }),
+      decision("denied", null, "session-hash", invalidHash),
+    );
+    assert.equal(emitted, false);
+    assert.deepEqual(bridge.getPendingRequests("session-hash"), []);
+  }
+});
+
+test("action approval rejects non-integer and out-of-range timeouts", async () => {
+  for (const timeoutMs of [-1, 0, 1.5, 300_001, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const bridge = new PiActionApprovalBridge();
+    bridge.attachClient("session-timeout-admission", "client-a");
+    const input = actionInput({ argumentsHash: `timeout-${String(timeoutMs)}` });
+    let emitted = false;
+    bridge.onRequest(() => { emitted = true; });
+    bridge.onTerminal(() => { emitted = true; });
+
+    assert.deepEqual(
+      await bridge.requestApproval("session-timeout-admission", input, {
+        timeoutMs,
+        signal: AbortSignal.abort(),
+      }),
+      decision("denied", null, "session-timeout-admission", input.argumentsHash),
+    );
+    assert.equal(emitted, false);
+    assert.deepEqual(bridge.getPendingRequests("session-timeout-admission"), []);
+  }
+});
+
+test("action approval admits only one pending request per session", async () => {
+  const bridge = new PiActionApprovalBridge();
+  bridge.attachClient("session-concurrent", "client-a");
+  const requests: ExternalActionRequest[] = [];
+  const terminals: ApprovalTerminalStatus[] = [];
+  bridge.onRequest((request) => requests.push(request));
+  bridge.onTerminal((event) => terminals.push(event.status));
+  const firstInput = actionInput({ argumentsHash: "concurrent-first" });
+  const secondInput = actionInput({ argumentsHash: "concurrent-second" });
+
+  const firstPending = bridge.requestApproval("session-concurrent", firstInput);
+  const secondDecision = await bridge.requestApproval("session-concurrent", secondInput, {
+    timeoutMs: 20,
+  });
+
+  assert.deepEqual(
+    secondDecision,
+    decision("denied", null, "session-concurrent", secondInput.argumentsHash),
+  );
+  assert.equal(requests.length, 1);
+  assert.deepEqual(terminals, []);
+  assert.deepEqual(bridge.getPendingRequests("session-concurrent"), [requests[0]]);
+
+  assert.equal(
+    bridge.respondForSession(
+      "session-concurrent",
+      requests[0].requestId,
+      requests[0].argumentsHash,
+      false,
+    ).status,
+    "denied",
+  );
+  assert.deepEqual(
+    await firstPending,
+    decision("denied", requests[0].requestId, "session-concurrent", firstInput.argumentsHash),
   );
 });
 

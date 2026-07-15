@@ -1183,7 +1183,13 @@ function handleInterviewCancel(ws: WebSocket, sessionId: string, msg: any): void
   sendSafe(ws, { type: "interview_cancel_ack", requestId, sessionId, status: "cancelled" });
 }
 
-/** Resolve only an exact request/session/selection/hash tuple and acknowledge every response. */
+/**
+ * Resolve only an exact request/session/selection/hash tuple and acknowledge
+ * every response. respondForSession emits terminal listeners synchronously, so
+ * each attached socket's authoritative terminal snapshot is queued before this
+ * submitting socket's acknowledgement. Frontends reconcile from that snapshot;
+ * the later ack is secondary status confirmation.
+ */
 function handleExternalActionResponse(
   ws: WebSocket,
   currentSessionId: string,

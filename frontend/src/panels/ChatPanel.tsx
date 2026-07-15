@@ -3450,6 +3450,32 @@ export function ChatPanel({
     // requests that are still live on the backend.
     setExternalActionApprovalsSynced(() => []);
     if (!activeSessionId) {
+      // A durable chat socket may switch directly between selected sessions,
+      // but a null selection has no backend identity to bind to. Retire the
+      // old transport explicitly so its approval-client attachment is removed.
+      // Clear handlers before close so this intentional deselection cannot
+      // schedule a reconnect or let an old close event clobber a new socket.
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      reconnectAttemptRef.current = 0;
+      const staleSocket = wsRef.current;
+      wsRef.current = null;
+      wsConnectedRef.current = false;
+      connectingSessionIdRef.current = null;
+      if (staleSocket) {
+        try {
+          staleSocket.onclose = null;
+          staleSocket.onmessage = null;
+          staleSocket.onopen = null;
+          staleSocket.onerror = null;
+          staleSocket.close();
+        } catch {
+          // ignore
+        }
+      }
+      setWsStatus("disconnected");
       setMessagesOwnerSessionId(null);
       setMessages([]);
       setIsSessionHistoryLoading(false);
@@ -4627,7 +4653,11 @@ export function ChatPanel({
 
       {/* ---- Interactive prompts: never persisted into chat history ---- */}
       {visibleExternalActionApprovals.length > 0 && (
-        <div data-testid="external-action-approvals" className="max-h-[50vh] shrink-0 space-y-2 overflow-y-auto border-t border-amber-900/60 bg-neutral-950 px-3 py-2">
+        <section
+          data-testid="external-action-approvals"
+          aria-label="External action approvals"
+          className="max-h-[50vh] shrink-0 space-y-2 overflow-y-auto border-t border-amber-900/60 bg-neutral-950 px-3 py-2"
+        >
           {visibleExternalActionApprovals.map((request) => (
             <ExternalActionApproval
               key={externalActionKey(request)}
@@ -4635,7 +4665,7 @@ export function ChatPanel({
               onRespond={handleExternalActionRespond}
             />
           ))}
-        </div>
+        </section>
       )}
       {activeInterview && (
         <div data-testid="interview-queue" className="shrink-0 border-t border-blue-900/40 bg-neutral-950 px-3 py-2">

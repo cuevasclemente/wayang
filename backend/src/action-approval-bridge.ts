@@ -91,6 +91,40 @@ interface PendingApproval {
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
+const MAX_TIMEOUT_MS = 300_000;
+const MAX_SUMMARY_BYTES = 32 * 1_024;
+const MAX_SESSION_ID_BYTES = 512;
+const MAX_CONNECTOR_BYTES = 256;
+const MAX_WORKSPACE_BYTES = 256;
+const MAX_TOOL_NAME_BYTES = 256;
+const MAX_TARGET_BYTES = 2_048;
+const CONTROL_CHARACTER_PATTERN = /\p{Cc}/u;
+const ARGUMENTS_HASH_PATTERN = /^[0-9a-fA-F]{64}$/;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isBoundedMetadata(value: unknown, maxBytes: number): value is string {
+  return (
+    typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= maxBytes
+    && !CONTROL_CHARACTER_PATTERN.test(value)
+  );
+}
+
+function deniedAdmissionDecision(
+  sessionId: unknown,
+  argumentsHash: unknown,
+): ApprovalDecision {
+  return {
+    status: "denied",
+    requestId: null,
+    sessionId: typeof sessionId === "string" ? sessionId : "",
+    argumentsHash: typeof argumentsHash === "string" ? argumentsHash : "",
+  };
+}
 
 function cloneRequest(request: ExternalActionRequest): ExternalActionRequest {
   return {
@@ -153,30 +187,72 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
     input: ExternalActionRequestInput,
     options: ApprovalRequestOptions = {},
   ): Promise<ApprovalDecision> {
+    const runtimeInput: unknown = input;
+    const runtimeOptions: unknown = options;
+    const inputRecord = isRecord(runtimeInput) ? runtimeInput : null;
+    const argumentsHash = inputRecord?.argumentsHash;
+    if (!inputRecord || !isRecord(runtimeOptions)) {
+      return Promise.resolve(deniedAdmissionDecision(sessionId, argumentsHash));
+    }
+
+    const connector = inputRecord.connector;
+    const workspace = inputRecord.workspace;
+    const toolName = inputRecord.toolName;
+    const target = inputRecord.target;
+    const summary = inputRecord.summary;
+    const timeoutValue = runtimeOptions.timeoutMs;
+    const timeoutMs = timeoutValue === undefined ? DEFAULT_TIMEOUT_MS : timeoutValue;
+    if (
+      !isBoundedMetadata(sessionId, MAX_SESSION_ID_BYTES)
+      || !isBoundedMetadata(connector, MAX_CONNECTOR_BYTES)
+      || (workspace !== undefined && !isBoundedMetadata(workspace, MAX_WORKSPACE_BYTES))
+      || !isBoundedMetadata(toolName, MAX_TOOL_NAME_BYTES)
+      || (target !== undefined && !isBoundedMetadata(target, MAX_TARGET_BYTES))
+      || typeof summary !== "string"
+      || Buffer.byteLength(summary, "utf8") === 0
+      || Buffer.byteLength(summary, "utf8") > MAX_SUMMARY_BYTES
+      || typeof argumentsHash !== "string"
+      || !ARGUMENTS_HASH_PATTERN.test(argumentsHash)
+      || typeof timeoutMs !== "number"
+      || !Number.isFinite(timeoutMs)
+      || !Number.isInteger(timeoutMs)
+      || timeoutMs < 1
+      || timeoutMs > MAX_TIMEOUT_MS
+    ) {
+      return Promise.resolve(deniedAdmissionDecision(sessionId, argumentsHash));
+    }
+
+    if (!this.hasClient(sessionId)) {
+      const requestId = randomUUID();
+      this.emitTerminal({ requestId, sessionId, status: "denied" });
+      return Promise.resolve(deniedAdmissionDecision(sessionId, argumentsHash));
+    }
+
+    const now = Date.now();
+    for (const [requestId, pending] of this.pending) {
+      if (pending.request.sessionId !== sessionId) continue;
+      if (now >= pending.expiresAt) {
+        this.finish(requestId, "timeout");
+        continue;
+      }
+      return Promise.resolve(deniedAdmissionDecision(sessionId, argumentsHash));
+    }
+
+    const signal = runtimeOptions.signal as AbortSignal | undefined;
     const request: ExternalActionRequest = {
       requestId: randomUUID(),
       sessionId,
-      connector: input.connector,
-      ...(input.workspace === undefined ? {} : { workspace: input.workspace }),
-      toolName: input.toolName,
-      ...(input.target === undefined ? {} : { target: input.target }),
-      summary: input.summary,
-      argumentsHash: input.argumentsHash,
-      createdAt: Date.now(),
-      timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      connector,
+      ...(workspace === undefined ? {} : { workspace }),
+      toolName,
+      ...(target === undefined ? {} : { target }),
+      summary,
+      argumentsHash,
+      createdAt: now,
+      timeoutMs,
     };
 
-    if (!this.hasClient(sessionId)) {
-      this.emitTerminal({ requestId: request.requestId, sessionId, status: "denied" });
-      return Promise.resolve({
-        status: "denied",
-        requestId: null,
-        sessionId: request.sessionId,
-        argumentsHash: request.argumentsHash,
-      });
-    }
-
-    if (options.signal?.aborted) {
+    if (signal?.aborted) {
       this.emitTerminal({ requestId: request.requestId, sessionId, status: "cancelled" });
       return Promise.resolve({
         status: "cancelled",
@@ -190,7 +266,7 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
       const timer = setTimeout(() => {
         this.finish(request.requestId, "timeout");
       }, request.timeoutMs);
-      const abortHandler = options.signal
+      const abortHandler = signal
         ? () => {
             this.finish(request.requestId, "cancelled");
           }
@@ -201,11 +277,11 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
         expiresAt: request.createdAt + request.timeoutMs,
         resolve,
         timer,
-        signal: options.signal,
+        signal,
         abortHandler,
       });
-      if (options.signal && abortHandler) {
-        options.signal.addEventListener("abort", abortHandler, { once: true });
+      if (signal && abortHandler) {
+        signal.addEventListener("abort", abortHandler, { once: true });
       }
 
       this.emitRequest(request);
