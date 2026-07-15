@@ -4,6 +4,7 @@ import {
   PiActionApprovalBridge,
   getActionApprovalBridge,
   type ActionApprovalBridge,
+  type ApprovalDecision,
   type ApprovalTerminalStatus,
   type ExternalActionRequest,
   type ExternalActionRequestInput,
@@ -23,15 +24,40 @@ function actionInput(
   };
 }
 
-test("action approval denies immediately when no client is attached", async () => {
+function decision(
+  status: ApprovalTerminalStatus,
+  requestId: string | null,
+  sessionId: string,
+  argumentsHash: string,
+): ApprovalDecision {
+  return { status, requestId, sessionId, argumentsHash };
+}
+
+test("action approval returns an exact denied proof when no client is attached", async () => {
   const bridge = new PiActionApprovalBridge();
   const requests: ExternalActionRequest[] = [];
+  const terminals: Array<{
+    requestId: string;
+    sessionId: string;
+    status: ApprovalTerminalStatus;
+  }> = [];
   bridge.onRequest((request) => requests.push(request));
+  bridge.onTerminal((event) => terminals.push(event));
+  const input = actionInput();
 
-  const result = await bridge.requestApproval("session-a", actionInput());
+  const result = await bridge.requestApproval("session-a", input);
 
-  assert.equal(result, "denied");
+  assert.deepEqual(
+    result,
+    decision("denied", null, "session-a", input.argumentsHash),
+  );
   assert.deepEqual(requests, []);
+  assert.equal(terminals.length, 1);
+  assert.match(terminals[0].requestId, /^[0-9a-f-]{36}$/);
+  assert.deepEqual(
+    { sessionId: terminals[0].sessionId, status: terminals[0].status },
+    { sessionId: "session-a", status: "denied" },
+  );
   assert.deepEqual(bridge.getPendingRequests("session-a"), []);
 });
 
@@ -86,7 +112,15 @@ test("action approval replays pending metadata and requires the exact session an
     ).status,
     "approved",
   );
-  assert.equal(await pending, "approved");
+  assert.deepEqual(
+    await pending,
+    decision(
+      "approved",
+      emitted.requestId,
+      emitted.sessionId,
+      emitted.argumentsHash,
+    ),
+  );
   assert.deepEqual(bridge.getPendingRequests("session-a"), []);
 });
 
@@ -120,7 +154,15 @@ test("action approval survives last-client detach and replays after reconnect", 
     ).status,
     "approved",
   );
-  assert.equal(await pending, "approved");
+  assert.deepEqual(
+    await pending,
+    decision(
+      "approved",
+      replayedRequest.requestId,
+      replayedRequest.sessionId,
+      replayedRequest.argumentsHash,
+    ),
+  );
   detachReconnectedClient();
 });
 
@@ -134,6 +176,15 @@ test("action approval rejects malformed runtime decisions without resolving", as
   const [request] = bridge.getPendingRequests("session-malformed");
   assert.ok(request);
 
+  assert.equal(
+    bridge.respondForSession(
+      "session-malformed",
+      "stale-request-id",
+      "sha256:stale-arguments",
+      true,
+    ).status,
+    "stale",
+  );
   for (const malformed of ["false", 1] as const) {
     assert.equal(
       bridge.respondForSession(
@@ -157,7 +208,15 @@ test("action approval rejects malformed runtime decisions without resolving", as
     ).status,
     "denied",
   );
-  assert.equal(await pending, "denied");
+  assert.deepEqual(
+    await pending,
+    decision(
+      "denied",
+      request.requestId,
+      request.sessionId,
+      request.argumentsHash,
+    ),
+  );
   assert.deepEqual(terminals, ["denied"]);
 });
 
@@ -166,9 +225,19 @@ test("action approval times out and removes the pending request", async () => {
   bridge.attachClient("session-timeout", "client-a");
 
   const pending = bridge.requestApproval("session-timeout", actionInput(), { timeoutMs: 10 });
+  const [request] = bridge.getPendingRequests("session-timeout");
+  assert.ok(request);
 
   assert.equal(bridge.getPendingRequests("session-timeout").length, 1);
-  assert.equal(await pending, "timeout");
+  assert.deepEqual(
+    await pending,
+    decision(
+      "timeout",
+      request.requestId,
+      request.sessionId,
+      request.argumentsHash,
+    ),
+  );
   assert.deepEqual(bridge.getPendingRequests("session-timeout"), []);
 });
 
@@ -191,7 +260,15 @@ test("action approval supports explicit denial", async () => {
     ).status,
     "denied",
   );
-  assert.equal(await pending, "denied");
+  assert.deepEqual(
+    await pending,
+    decision(
+      "denied",
+      request.requestId,
+      request.sessionId,
+      request.argumentsHash,
+    ),
+  );
 });
 
 test("action approval abort cancellation removes the request and makes responses stale", async () => {
@@ -212,7 +289,15 @@ test("action approval abort cancellation removes the request and makes responses
   assert.ok(request);
   controller.abort();
 
-  assert.equal(await pending, "cancelled");
+  assert.deepEqual(
+    await pending,
+    decision(
+      "cancelled",
+      request.requestId,
+      request.sessionId,
+      request.argumentsHash,
+    ),
+  );
   assert.deepEqual(terminals, ["cancelled"]);
   assert.deepEqual(bridge.getPendingRequests("session-abort"), []);
   assert.equal(
@@ -243,7 +328,15 @@ test("action approval cancellation targets exactly one request", async () => {
 
   assert.equal(bridge.cancelRequest(requests[0].requestId, "test cleanup"), true);
   assert.equal(bridge.cancelRequest(requests[0].requestId, "duplicate cleanup"), false);
-  assert.equal(await first, "cancelled");
+  assert.deepEqual(
+    await first,
+    decision(
+      "cancelled",
+      requests[0].requestId,
+      requests[0].sessionId,
+      requests[0].argumentsHash,
+    ),
+  );
   assert.deepEqual(
     bridge.getPendingRequests("session-cancel").map((request) => request.requestId),
     [requests[1].requestId],
@@ -258,7 +351,15 @@ test("action approval cancellation targets exactly one request", async () => {
     ).status,
     "approved",
   );
-  assert.equal(await second, "approved");
+  assert.deepEqual(
+    await second,
+    decision(
+      "approved",
+      requests[1].requestId,
+      requests[1].sessionId,
+      requests[1].argumentsHash,
+    ),
+  );
 });
 
 test("action approval duplicate and multi-client detach closures are idempotent", async () => {
@@ -278,9 +379,10 @@ test("action approval duplicate and multi-client detach closures are idempotent"
   detachOtherClient();
   assert.equal(bridge.hasClient("session-clients"), false);
 
-  assert.equal(
-    await bridge.requestApproval("session-clients", actionInput()),
-    "denied",
+  const input = actionInput();
+  assert.deepEqual(
+    await bridge.requestApproval("session-clients", input),
+    decision("denied", null, "session-clients", input.argumentsHash),
   );
 });
 
@@ -310,7 +412,15 @@ test("action approval broadcasts cloned terminal events without request metadata
     true,
   );
 
-  assert.equal(await pending, "approved");
+  assert.deepEqual(
+    await pending,
+    decision(
+      "approved",
+      request.requestId,
+      request.sessionId,
+      request.argumentsHash,
+    ),
+  );
   assert.deepEqual(terminals, [
     {
       requestId: request.requestId,
@@ -333,7 +443,15 @@ test("action approval broadcasts cloned terminal events without request metadata
     deniedRequest.argumentsHash,
     false,
   );
-  assert.equal(await denied, "denied");
+  assert.deepEqual(
+    await denied,
+    decision(
+      "denied",
+      deniedRequest.requestId,
+      deniedRequest.sessionId,
+      deniedRequest.argumentsHash,
+    ),
+  );
   assert.equal(terminals.length, 1);
 });
 
@@ -358,7 +476,20 @@ test("action approval session cleanup cancels only matching requests", async () 
   );
 
   bridge.cancelSession("session-one", "session closed");
-  assert.deepEqual(await Promise.all([first, second]), ["cancelled", "cancelled"]);
+  assert.deepEqual(await Promise.all([first, second]), [
+    decision(
+      "cancelled",
+      requests[0].requestId,
+      requests[0].sessionId,
+      requests[0].argumentsHash,
+    ),
+    decision(
+      "cancelled",
+      requests[1].requestId,
+      requests[1].sessionId,
+      requests[1].argumentsHash,
+    ),
+  ]);
   assert.deepEqual(bridge.getPendingRequests("session-one"), []);
   assert.equal(bridge.getPendingRequests("session-two").length, 1);
 
@@ -370,7 +501,15 @@ test("action approval session cleanup cancels only matching requests", async () 
     remaining.argumentsHash,
     true,
   );
-  assert.equal(await otherSession, "approved");
+  assert.deepEqual(
+    await otherSession,
+    decision(
+      "approved",
+      remaining.requestId,
+      remaining.sessionId,
+      remaining.argumentsHash,
+    ),
+  );
 });
 
 test("action approval defensively clones input, request events, and pending replay", async () => {
@@ -409,7 +548,15 @@ test("action approval defensively clones input, request events, and pending repl
     ).status,
     "approved",
   );
-  assert.equal(await pending, "approved");
+  assert.deepEqual(
+    await pending,
+    decision(
+      "approved",
+      secondReplay.requestId,
+      secondReplay.sessionId,
+      secondReplay.argumentsHash,
+    ),
+  );
 });
 
 test("action approval synchronously rejects a response after its deadline", async () => {
@@ -438,7 +585,15 @@ test("action approval synchronously rejects a response after its deadline", asyn
     ).status,
     "stale",
   );
-  assert.equal(await pending, "timeout");
+  assert.deepEqual(
+    await pending,
+    decision(
+      "timeout",
+      request.requestId,
+      request.sessionId,
+      request.argumentsHash,
+    ),
+  );
   assert.deepEqual(terminals, ["timeout"]);
   assert.deepEqual(bridge.getPendingRequests("session-deadline"), []);
 });
@@ -453,7 +608,15 @@ test("action approval responses are stale after timeout", async () => {
 
   const pending = bridge.requestApproval("session-stale", actionInput(), { timeoutMs: 10 });
   assert.ok(request);
-  assert.equal(await pending, "timeout");
+  assert.deepEqual(
+    await pending,
+    decision(
+      "timeout",
+      request.requestId,
+      request.sessionId,
+      request.argumentsHash,
+    ),
+  );
   assert.equal(
     bridge.respondForSession(
       "session-stale",
@@ -503,7 +666,15 @@ test("action approval exposes no secret-capable request fields beyond display me
     emitted.argumentsHash,
     false,
   );
-  assert.equal(await pending, "denied");
+  assert.deepEqual(
+    await pending,
+    decision(
+      "denied",
+      emitted.requestId,
+      emitted.sessionId,
+      emitted.argumentsHash,
+    ),
+  );
 });
 
 test("action approval singleton satisfies the exported bridge contract", () => {

@@ -33,6 +33,13 @@ export interface ExternalActionRequestInput {
 export type ApprovalTerminalStatus = "approved" | "denied" | "timeout" | "cancelled";
 export type ApprovalResponseStatus = "approved" | "denied" | "stale" | "rejected";
 
+export interface ApprovalDecision {
+  status: ApprovalTerminalStatus;
+  requestId: string | null;
+  sessionId: string;
+  argumentsHash: string;
+}
+
 export interface ApprovalResponse {
   status: ApprovalResponseStatus;
   reason?: string;
@@ -56,7 +63,7 @@ export interface ActionApprovalBridge {
     sessionId: string,
     input: ExternalActionRequestInput,
     options?: ApprovalRequestOptions,
-  ): Promise<ApprovalTerminalStatus>;
+  ): Promise<ApprovalDecision>;
   /** Accepts untrusted transport input and resolves only literal boolean decisions. */
   respondForSession(
     sessionId: string,
@@ -77,7 +84,7 @@ type TerminalCallback = (event: ApprovalTerminalEvent) => void;
 interface PendingApproval {
   request: ExternalActionRequest;
   expiresAt: number;
-  resolve: (status: ApprovalTerminalStatus) => void;
+  resolve: (decision: ApprovalDecision) => void;
   timer: ReturnType<typeof setTimeout>;
   signal?: AbortSignal;
   abortHandler?: () => void;
@@ -145,7 +152,7 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
     sessionId: string,
     input: ExternalActionRequestInput,
     options: ApprovalRequestOptions = {},
-  ): Promise<ApprovalTerminalStatus> {
+  ): Promise<ApprovalDecision> {
     const request: ExternalActionRequest = {
       requestId: randomUUID(),
       sessionId,
@@ -161,15 +168,25 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
 
     if (!this.hasClient(sessionId)) {
       this.emitTerminal({ requestId: request.requestId, sessionId, status: "denied" });
-      return Promise.resolve("denied");
+      return Promise.resolve({
+        status: "denied",
+        requestId: null,
+        sessionId: request.sessionId,
+        argumentsHash: request.argumentsHash,
+      });
     }
 
     if (options.signal?.aborted) {
       this.emitTerminal({ requestId: request.requestId, sessionId, status: "cancelled" });
-      return Promise.resolve("cancelled");
+      return Promise.resolve({
+        status: "cancelled",
+        requestId: request.requestId,
+        sessionId: request.sessionId,
+        argumentsHash: request.argumentsHash,
+      });
     }
 
-    return new Promise<ApprovalTerminalStatus>((resolve) => {
+    return new Promise<ApprovalDecision>((resolve) => {
       const timer = setTimeout(() => {
         this.finish(request.requestId, "timeout");
       }, request.timeoutMs);
@@ -270,7 +287,12 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
       pending.signal.removeEventListener("abort", pending.abortHandler);
     }
 
-    pending.resolve(status);
+    pending.resolve({
+      status,
+      requestId: pending.request.requestId,
+      sessionId: pending.request.sessionId,
+      argumentsHash: pending.request.argumentsHash,
+    });
     this.emitTerminal({
       requestId: pending.request.requestId,
       sessionId: pending.request.sessionId,
