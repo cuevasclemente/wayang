@@ -5,7 +5,12 @@ import * as path from "node:path";
 import { createServer as createNetServer, type AddressInfo } from "node:net";
 import test, { type TestContext } from "node:test";
 import { WebSocket } from "ws";
-import { PiActionApprovalBridge, type ApprovalDecision, type ExternalActionRequestInput } from "./action-approval-bridge.js";
+import {
+  PiActionApprovalBridge,
+  type ApprovalDecision,
+  type ApprovalResponse,
+  type ExternalActionRequestInput,
+} from "./action-approval-bridge.js";
 import { createApp } from "./app.js";
 import { AuthService } from "./auth/service.js";
 import { close, init } from "./db.js";
@@ -15,6 +20,20 @@ import { createSession } from "./sessions.js";
 interface ServerMessage {
   type: string;
   [key: string]: unknown;
+}
+
+class CountingActionApprovalBridge extends PiActionApprovalBridge {
+  responseCalls = 0;
+
+  override respondForSession(
+    sessionId: string,
+    requestId: string,
+    argumentsHash: string,
+    approved: unknown,
+  ): ApprovalResponse {
+    this.responseCalls += 1;
+    return super.respondForSession(sessionId, requestId, argumentsHash, approved);
+  }
 }
 
 class MessageInbox {
@@ -159,7 +178,7 @@ async function fixture(t: TestContext) {
   const previousDataDir = process.env.WAYANG_DATA_DIR;
   process.env.WAYANG_DATA_DIR = dataDir;
 
-  const bridge = new PiActionApprovalBridge();
+  const bridge = new CountingActionApprovalBridge();
   (globalThis as typeof globalThis & { __pi_action_approval_bridge?: PiActionApprovalBridge }).__pi_action_approval_bridge = bridge;
   init();
   const interactiveSession = createSession(sharedCwd, "interactive action session");
@@ -212,6 +231,92 @@ async function fixture(t: TestContext) {
 
   return { bridge, interactiveSession, otherSession, headlessSession, connect };
 }
+
+function withoutField(packet: Record<string, unknown>, field: string): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(packet).filter(([key]) => key !== field));
+}
+
+test("external action responses do not default a missing session identity", async (t) => {
+  const { bridge, interactiveSession, connect } = await fixture(t);
+  const selectionId = "selection-missing-session";
+  const client = await connect(interactiveSession.id, selectionId);
+  await client.inbox.take(isSnapshotFor(interactiveSession.id, selectionId, 0));
+
+  const pending = bridge.requestApproval(
+    interactiveSession.id,
+    actionInput("sha256:missing-session"),
+    { timeoutMs: 5_000 },
+  );
+  const [request] = bridge.getPendingRequests(interactiveSession.id);
+  assert.ok(request);
+  await client.inbox.take(isRequest(request.requestId, interactiveSession.id, selectionId));
+
+  client.ws.send(JSON.stringify({
+    type: "external_action_response",
+    requestId: request.requestId,
+    selection_id: selectionId,
+    argumentsHash: request.argumentsHash,
+    approved: true,
+  }));
+  const ack = await client.inbox.take((message) => message.type === "external_action_response_ack");
+  assert.equal(ack.status, "rejected");
+  assert.equal(ack.sessionId, null);
+  assert.equal(bridge.responseCalls, 0);
+  assert.equal(bridge.getPendingRequests(interactiveSession.id).length, 1);
+
+  bridge.cancelRequest(request.requestId, "test cleanup");
+  assert.equal((await pending).status, "cancelled");
+});
+
+test("external action responses validate every identity field and decision before bridge dispatch", async (t) => {
+  const identityFields = ["requestId", "sessionId", "selection_id", "argumentsHash"] as const;
+  const malformedCases: Array<{ name: string; mutate: (packet: Record<string, unknown>) => Record<string, unknown> }> = [];
+  for (const field of identityFields) {
+    malformedCases.push(
+      { name: `missing ${field}`, mutate: (packet) => withoutField(packet, field) },
+      { name: `non-string ${field}`, mutate: (packet) => ({ ...packet, [field]: 42 }) },
+    );
+  }
+  malformedCases.push(
+    { name: "missing approved", mutate: (packet) => withoutField(packet, "approved") },
+    { name: "non-boolean approved", mutate: (packet) => ({ ...packet, approved: "true" }) },
+  );
+
+  for (const malformedCase of malformedCases) {
+    await t.test(malformedCase.name, async (t) => {
+      const { bridge, interactiveSession, connect } = await fixture(t);
+      const selectionId = `selection-${malformedCase.name.replaceAll(" ", "-")}`;
+      const client = await connect(interactiveSession.id, selectionId);
+      await client.inbox.take(isSnapshotFor(interactiveSession.id, selectionId, 0));
+
+      const pending = bridge.requestApproval(
+        interactiveSession.id,
+        actionInput(`sha256:${malformedCase.name}`),
+        { timeoutMs: 5_000 },
+      );
+      const [request] = bridge.getPendingRequests(interactiveSession.id);
+      assert.ok(request);
+      await client.inbox.take(isRequest(request.requestId, interactiveSession.id, selectionId));
+
+      const validPacket: Record<string, unknown> = {
+        type: "external_action_response",
+        requestId: request.requestId,
+        sessionId: request.sessionId,
+        selection_id: selectionId,
+        argumentsHash: request.argumentsHash,
+        approved: true,
+      };
+      client.ws.send(JSON.stringify(malformedCase.mutate(validPacket)));
+      const ack = await client.inbox.take((message) => message.type === "external_action_response_ack");
+      assert.equal(ack.status, "rejected", malformedCase.name);
+      assert.equal(bridge.responseCalls, 0, malformedCase.name);
+      assert.equal(bridge.getPendingRequests(interactiveSession.id).length, 1, malformedCase.name);
+
+      bridge.cancelRequest(request.requestId, "test cleanup");
+      assert.equal((await pending).status, "cancelled");
+    });
+  }
+});
 
 test("external action WebSocket transport is reconnect-safe and exact-session fail-closed", async (t) => {
   const { bridge, interactiveSession, otherSession, headlessSession, connect } = await fixture(t);

@@ -1190,33 +1190,40 @@ function handleExternalActionResponse(
   currentSelectionId: string | null,
   msg: any,
 ): void {
-  const requestId = typeof msg?.requestId === "string" ? msg.requestId : "";
-  const sessionId = typeof msg?.sessionId === "string" ? msg.sessionId : currentSessionId;
-  const selectionId = typeof msg?.selection_id === "string" ? msg.selection_id : null;
-  const argumentsHash = typeof msg?.argumentsHash === "string" ? msg.argumentsHash : "";
+  const requestId: unknown = msg?.requestId;
+  const sessionId: unknown = msg?.sessionId;
+  const selectionId: unknown = msg?.selection_id;
+  const argumentsHash: unknown = msg?.argumentsHash;
+  const approved: unknown = msg?.approved;
 
   let status: "approved" | "denied" | "stale" | "rejected" = "rejected";
   if (
-    requestId
-    && argumentsHash
+    typeof requestId === "string"
+    && typeof sessionId === "string"
+    && typeof selectionId === "string"
+    && typeof argumentsHash === "string"
+    && typeof approved === "boolean"
+    && requestId.length > 0
+    && sessionId.length > 0
     && selectionId.length > 0
+    && argumentsHash.length > 0
     && currentSelectionId !== null
     && sessionId === currentSessionId
     && selectionId === currentSelectionId
   ) {
     status = getActionApprovalBridge().respondForSession(
-      currentSessionId,
+      sessionId,
       requestId,
       argumentsHash,
-      msg.approved,
+      approved,
     ).status;
   }
 
   sendSafe(ws, {
     type: "external_action_response_ack",
-    requestId: requestId || null,
-    sessionId,
-    selection_id: selectionId,
+    requestId: typeof requestId === "string" && requestId.length > 0 ? requestId : null,
+    sessionId: typeof sessionId === "string" ? sessionId : null,
+    selection_id: typeof selectionId === "string" ? selectionId : null,
     status,
   });
 }
