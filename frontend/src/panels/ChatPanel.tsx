@@ -140,7 +140,7 @@ interface RuntimeErrorState {
 type WsStatus = "connecting" | "connected" | "disconnected";
 
 function isBashMode(value: unknown): value is BashMode {
-  return value === "host" || value === "sandboxed" || value === "sandboxed-unix" || value === "unavailable";
+  return value === "host" || value === "sandboxed" || value === "sandboxed-wren" || value === "unavailable";
 }
 
 type InterviewSubmission = {

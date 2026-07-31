@@ -7,7 +7,7 @@
 // ---------------------------------------------------------------------------
 
 export type SessionRuntimeStatus = "active" | "starting" | "stopped";
-export type BashMode = "host" | "sandboxed" | "sandboxed-unix" | "unavailable";
+export type BashMode = "host" | "sandboxed" | "sandboxed-wren" | "unavailable";
 export type BrowserSurfaceMode = "standard" | "protected" | "unavailable";
 
 export interface PendingAgentSwitch {

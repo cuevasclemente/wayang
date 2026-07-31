@@ -5,7 +5,7 @@ const projectId = "project-host-status";
 const profileId = "profile-host-status";
 const sessionId = "session-host-status";
 
-type RuntimeMode = "host" | "sandboxed" | "sandboxed-unix" | "unavailable" | "wren_host";
+type RuntimeMode = "host" | "sandboxed" | "sandboxed-wren" | "unavailable" | "wren_host";
 
 function session() {
   const now = Date.now();
@@ -182,10 +182,10 @@ test("renders generic host authority and rejects legacy or stale runtime claims"
   await expect(status).toHaveAttribute("data-bash-mode", "sandboxed");
   await expect(status).toContainText("Sandboxed bash");
 
-  await emitRuntimeState(page, "sandboxed-unix");
-  await expect(status).toHaveAttribute("data-bash-mode", "sandboxed-unix");
-  await expect(status).toContainText("Sandboxed bash · Unix IPC");
-  await expect(status).toHaveAttribute("title", /same-user authority/);
+  await emitRuntimeState(page, "sandboxed-wren");
+  await expect(status).toHaveAttribute("data-bash-mode", "sandboxed-wren");
+  await expect(status).toContainText("Wren workspace access");
+  await expect(status).toHaveAttribute("title", /ordinary host paths/);
 
   // A legacy identity-specific value is not a host mode. It must fail closed
   // even when it arrives on the current authoritative selection.
