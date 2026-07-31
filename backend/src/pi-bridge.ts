@@ -43,7 +43,6 @@ import { getProjectByCwd } from "./projects.js";
 import { authorizeProjectAction, resolveEffectiveSessionConfig } from "./policy.js";
 import { buildAgentResourceLoader, installAgentToolPolicyGuard } from "./agent-runtime.js";
 import {
-  allowsLegacyWrenUnixSockets,
   createPolicySandboxedBashToolDefinition,
   getBashSandboxAvailability,
   selectWayangBashMode,
@@ -59,6 +58,7 @@ import {
   type HostExecutionMode,
 } from "./host-execution.js";
 import { isSessionCapabilityEligible, resolveWorkspaceCapability } from "./workspace-capabilities.js";
+import { isLegacyWrenStandardRuntime } from "./legacy-wren.js";
 import { WorkspaceStoreError, type AgentProfileRow, type PendingAgentSwitch, type ProjectRow } from "./workspace-types.js";
 import { REVIEWED_PROVIDER_EXTENSION_PATHS } from "./reviewed-provider-extensions.js";
 import { getSudoBridge } from "./sudo-bridge.js";
@@ -1895,12 +1895,12 @@ export async function createPiSession(
     const bashSandbox = getBashSandboxAvailability();
     const selectedBashMode = selectWayangBashMode(hostCreationDecision, bashSandbox);
     const bashMode: HostExecutionMode = selectedBashMode === "sandboxed"
-      && allowsLegacyWrenUnixSockets({
+      && isLegacyWrenStandardRuntime({
         session: runtimeIdentity.row,
         profile: runtimeIdentity.agentProfile,
         project: runtimeIdentity.project,
       })
-      ? "sandboxed-unix"
+      ? "sandboxed-wren"
       : selectedBashMode;
     const excludeTools = [
       ...(runtimeResources.excludeTools ?? []),
@@ -2000,7 +2000,7 @@ export async function createPiSession(
         ...(pendingRestrictedMcpRuntime ? [pendingRestrictedMcpRuntime.tool] : []),
         ...(pendingProtectedBrowserRuntime ? [pendingProtectedBrowserRuntime.tool] : []),
         ...(hostBashTool ? [hostBashTool] : []),
-        ...(bashMode === "sandboxed" || bashMode === "sandboxed-unix"
+        ...(bashMode === "sandboxed" || bashMode === "sandboxed-wren"
           ? [createPolicySandboxedBashToolDefinition(cwd, id, bashMode)]
           : []),
       ]),

@@ -3,8 +3,8 @@ export const STORE_SCHEMA_VERSION = 2;
 /**
  * Legacy stable IDs retained so schema-1 stores keep their references. Names
  * never confer authority. The exact Wren ID plus its non-user-settable
- * historical kind is also the narrow interactive Standard-project Unix-IPC
- * compatibility identity; it never grants host execution or capabilities.
+ * historical kind is also the Standard-project global workspace compatibility
+ * identity; it never grants a PIN-backed capability or direct host mode.
  */
 export const WREN_AGENT_PROFILE_ID = "00000000-0000-4000-8000-000000000001";
 export const NEUTRAL_AGENT_PROFILE_ID = "00000000-0000-4000-8000-000000000002";
@@ -21,7 +21,7 @@ export type MemoryAccess = "none" | "read" | "read_write";
 export type ResourceMode = "standard" | "project_only" | "custom";
 
 /** Historical migration metadata. Only the exact seeded Wren ID+kind pair may
- * participate in the narrow Unix-IPC compatibility check. */
+ * participate in Standard-project global workspace compatibility. */
 export type BuiltinAgentKind = "wren" | "neutral" | null;
 
 export interface WorkspaceSettingsRow {

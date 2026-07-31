@@ -12,7 +12,7 @@ import type { SessionRow } from "./sessions.js";
 
 export const HOST_EXECUTION_CAPABILITY_ID = "wayang.host-execution.v1" as const;
 
-export type HostExecutionMode = "host" | "sandboxed" | "sandboxed-unix" | "unavailable";
+export type HostExecutionMode = "host" | "sandboxed" | "sandboxed-wren" | "unavailable";
 
 /**
  * Backend-issued proof that the closed workspace capability resolver found the

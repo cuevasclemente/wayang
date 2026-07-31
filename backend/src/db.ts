@@ -724,7 +724,7 @@ function normalizeLegacyStore(raw: Record<string, unknown>): StoreData {
   const data = emptyStore(now);
   // Schema-0 had no profile control plane. Preserve its former default as
   // stable migration rows. Migration creates no capability grant; the exact
-  // Wren row retains only the documented sandboxed Unix-IPC compatibility.
+  // Wren row retains only the documented Standard-project global workspace compatibility.
   data.agentProfiles = legacySeededProfiles(now);
   data.workspaceSettings = { default_agent_profile_id: WREN_AGENT_PROFILE_ID };
   const legacyKeys = new Set<string>(ARRAY_KEYS.filter((key) =>

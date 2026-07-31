@@ -27,7 +27,7 @@ import {
 } from "./protected-artifacts.js";
 import type { SandboxExecRequest, SandboxNetworkMode } from "./sandbox-exec-protocol.js";
 import type { HostExecutionAuthorizationDecision, HostExecutionMode } from "./host-execution.js";
-import { WREN_AGENT_PROFILE_ID, type AgentProfileRow, type ProjectRow } from "./workspace-types.js";
+import { isLegacyWrenStandardRuntime } from "./legacy-wren.js";
 import type { WayangBashMode as LegacyWayangBashMode } from "./wren-host-bash.js";
 
 export interface BashSandboxAvailability {
@@ -64,31 +64,6 @@ export function selectWayangBashMode(
 ): HostExecutionMode {
   if (typeof hostAuthorization !== "boolean" && hostAuthorization.allowed === true) return "host";
   return sandboxAvailability.available ? "sandboxed" : "unavailable";
-}
-
-export function allowsLegacyWrenUnixSockets(input: {
-  session: {
-    agent_profile_id?: string | null;
-    pending_agent_switch: unknown;
-    legacy_private_session_quarantine?: boolean;
-    legacy_capability_ineligible?: boolean;
-    scheduled_job_id: string | null;
-    scheduled_run_id: string | null;
-  };
-  profile: Pick<AgentProfileRow, "id" | "builtin_kind" | "enabled">;
-  project: Pick<ProjectRow, "access_policy">;
-}): boolean {
-  const { session, profile, project } = input;
-  return profile.id === WREN_AGENT_PROFILE_ID
-    && profile.builtin_kind === "wren"
-    && profile.enabled === true
-    && session.agent_profile_id === profile.id
-    && session.pending_agent_switch === null
-    && session.legacy_private_session_quarantine === false
-    && session.legacy_capability_ineligible === false
-    && session.scheduled_job_id === null
-    && session.scheduled_run_id === null
-    && project.access_policy.privacy_mode === "standard";
 }
 
 function canonicalExistingOrResolved(target: string): string {
@@ -144,13 +119,16 @@ export function buildBashSandboxPolicy(
   if (!sourceAuthorization.allowed) throw new Error(sourceAuthorization.reason ?? "Session is no longer authorized");
 
   const projects = listProjects();
-  const legacyWrenUnixSockets = sourceAuthorization.project
-    ? allowsLegacyWrenUnixSockets({ session, profile, project: sourceAuthorization.project })
+  const legacyWrenStandard = sourceAuthorization.project
+    ? isLegacyWrenStandardRuntime({ session, profile, project: sourceAuthorization.project })
     : false;
   const deniedRead = new Set<string>();
   const deniedWrite = new Set<string>();
   for (const project of projects) {
-    if (!projectAllowsAgentProfile(project, profile.id)) {
+    const otherProtectedProject = project.access_policy.privacy_mode === "protected"
+      && project.id !== sourceAuthorization.project?.id;
+    const deniedProject = otherProtectedProject || !projectAllowsAgentProfile(project, profile.id);
+    if (deniedProject) {
       deniedRead.add(project.cwd);
       deniedWrite.add(project.cwd);
     }
@@ -170,7 +148,7 @@ export function buildBashSandboxPolicy(
         agent_profile_id: profile.id,
       })
     : null;
-  const standardResourcesAuthorized = standardResources?.authorized === true;
+  const standardResourcesAuthorized = standardResources?.authorized === true || legacyWrenStandard;
   if (!standardResourcesAuthorized) {
     for (const root of getRestrictedAgentArtifactRoots()) {
       deniedRead.add(root);
@@ -205,9 +183,10 @@ export function buildBashSandboxPolicy(
     for (const root of memoryRoots) deniedWrite.add(root);
   }
 
-  // A bash command may not replace project-local Pi extension/config code and
-  // then ask the host process to reload it outside the sandbox.
-  deniedWrite.add(path.join(session.cwd, ".pi"));
+  // Restricted runtimes may not replace project-local Pi extension/config code
+  // and then ask the host process to reload it outside the sandbox. Exact Wren
+  // intentionally retains its pre-policy ability to maintain Pi projects.
+  if (!legacyWrenStandard) deniedWrite.add(path.join(session.cwd, ".pi"));
 
   const deniedReadRoots = outermostCanonicalPaths(deniedRead);
   const deniedWriteRoots = outermostCanonicalPaths(deniedWrite);
@@ -230,11 +209,7 @@ export function buildBashSandboxPolicy(
         deniedDomains: networkMode === "allow_all_proxy" ? [] : ["*"],
         strictAllowlist: networkMode !== "allow_all_proxy",
         allowUnixSockets: [],
-        // Preserve the seeded legacy Wren profile's interactive Standard-project
-        // IPC compatibility without restoring unsandboxed host execution. The
-        // exact stable profile ID plus non-user-settable historical kind prevents
-        // a rename, clone, or ordinary profile CRUD operation from acquiring it.
-        allowAllUnixSockets: legacyWrenUnixSockets,
+        allowAllUnixSockets: legacyWrenStandard,
         allowLocalBinding: false,
       },
       filesystem: {
@@ -247,9 +222,13 @@ export function buildBashSandboxPolicy(
         // host backing remains hidden and unmodifiable: on Linux, a directory
         // that is both read-denied and beneath writable /tmp appears as an empty
         // disposable tmpfs, so writes there never reach the protected host path.
-        allowWrite: uniqueCanonicalPaths([canonicalCwd, os.tmpdir()]),
+        allowWrite: legacyWrenStandard
+          ? [path.parse(canonicalCwd).root]
+          : sourceAuthorization.project?.access_policy.privacy_mode === "protected"
+            ? [canonicalCwd]
+            : uniqueCanonicalPaths([canonicalCwd, os.tmpdir()]),
         denyWrite: deniedWriteRoots,
-        allowGitConfig: false,
+        allowGitConfig: legacyWrenStandard,
       },
       enableWeakerNestedSandbox: false,
       enableWeakerNetworkIsolation: false,
@@ -333,15 +312,19 @@ export function createPolicySandboxedBashOperations(
 export function createPolicySandboxedBashToolDefinition(
   cwd: string,
   sessionId: string,
-  mode: "sandboxed" | "sandboxed-unix" = "sandboxed",
+  mode: "sandboxed" | "sandboxed-wren" = "sandboxed",
 ): any {
   const tool = createBashToolDefinition(cwd, { operations: createPolicySandboxedBashOperations(sessionId) });
-  const socketDescription = mode === "sandboxed-unix"
-    ? "The seeded legacy Wren profile may create and connect to Unix sockets visible inside the sandbox; those IPC services can carry same-user authority."
-    : "Unix sockets are blocked.";
+  if (mode === "sandboxed-wren") {
+    return {
+      ...tool,
+      label: "bash (Wren host workspace)",
+      description: `${tool.description} Exact seeded Wren may read and write ordinary host paths and use visible Unix IPC services. Every registered Protected project and protected control-plane artifact remains masked. Commands run as the Wayang OS user; this is broad same-user authority, not containment.`,
+    };
+  }
   return {
     ...tool,
-    label: mode === "sandboxed-unix" ? "bash (Wayang sandboxed + Unix IPC)" : "bash (Wayang sandboxed)",
-    description: `${tool.description} Wayang runs each command in an independent OS sandbox: writes are limited to the current project and shared host temporary storage, and protected/control-plane roots are masked even beneath temporary storage. ${socketDescription} Outbound TCP destinations are allowed through HTTP/SOCKS proxies.`,
+    label: "bash (Wayang sandboxed)",
+    description: `${tool.description} Wayang runs each command in an independent OS sandbox: writes are limited to the current project and shared host temporary storage, protected/control-plane roots are masked even beneath temporary storage, Unix sockets are blocked, and outbound TCP destinations are allowed through HTTP/SOCKS proxies.`,
   };
 }

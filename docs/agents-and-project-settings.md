@@ -4,7 +4,7 @@ Wayang has durable, editable Projects and reusable Agent Profiles. An agent prof
 
 ## Defaults
 
-Fresh installations seed one restricted **Default** profile with a generated stable ID, project-only resources, and no memory or privileged capability grants. Newly discovered projects use that profile. Existing Wren and Neutral rows may remain after migration under their stable IDs and labels. Neither name grants authority, and neither row receives a capability association automatically. One narrow compatibility behavior remains: only the exact migration-seeded Wren stable ID together with its non-user-settable historical kind may use Unix IPC while filesystem-sandboxed in an interactive Standard project. Renames preserve that exact row; clones and lookalikes do not inherit it.
+Fresh installations seed one restricted **Default** profile with a generated stable ID, project-only resources, and no memory or privileged capability grants. Newly discovered projects use that profile. Existing Wren and Neutral rows may remain after migration under their stable IDs and labels. Neither name grants authority, and neither row receives a capability association automatically. One compatibility behavior remains: only the exact migration-seeded Wren stable ID together with its non-user-settable historical kind receives global Pi resources and broad ordinary-host filesystem/Unix-IPC access in Standard projects, including scheduled runs. Every registered Protected project and protected backing artifact remains masked. Renames preserve that exact row; copied profiles and lookalikes do not inherit it.
 
 Project paths are canonical and immutable. Project name, description, color, defaults, allowed agents, privacy mode, and `AGENTS.md` are editable.
 
@@ -119,13 +119,13 @@ This applies to participating Wayang/mypi children, not arbitrary independently 
 
 ## Bash and control-plane restrictions
 
-Standard and restricted Wayang sessions replace Pi's bash backend with a fresh per-command OS sandbox unless the exact Standard Project-Agent pair has an active `wayang.host-execution.v1` association. Provider/model changes preserve that association but destroy stale runtime handles before rebuilding. The exact seeded legacy Wren row remains filesystem-sandboxed but retains Unix IPC for eligible interactive Standard-project runtimes; this is compatibility authority, not host execution. The sandbox:
+Wayang sessions replace Pi's bash backend with a fresh per-command OS sandbox unless the exact Standard Project-Agent pair has an active `wayang.host-execution.v1` association. Provider/model changes preserve that association but destroy stale runtime handles before rebuilding. Ordinary restricted profiles remain project-scoped. The exact seeded Wren row in a Standard project—including scheduled runs—uses a broader sandbox view with ordinary host reads/writes, global Pi resources, Git configuration, and Unix IPC, while all registered Protected projects and protected backing artifacts remain masked. This compatibility mode is not direct host execution. The sandbox:
 
-- masks unauthorized allowlisted projects, Pi sessions/transcripts, Wayang data, attachments from other sessions, browser profiles, and the command-guard identity PIN;
-- enforces memory write mode;
-- permits host writes inside the current project and shared host temporary storage, while protected host backing remains hidden and unmodifiable (Linux may present an empty disposable overlay at a masked temporary path);
+- masks unauthorized projects plus Pi sessions/transcripts, Wayang data, attachments from other sessions, browser profiles, and the command-guard identity PIN; exact Wren Standard compatibility masks every Protected project regardless of allowlist;
+- enforces memory write mode for ordinary restricted profiles;
+- permits ordinary Standard restricted writes inside the current project and shared host temporary storage; Protected runtimes persist writes only inside their current project; exact Wren Standard compatibility permits ordinary host writes while protected host backing remains hidden and unmodifiable;
 - strips internal capabilities and PIN-like environment variables;
-- blocks Unix-domain sockets for every profile except that exact eligible legacy Wren runtime, and blocks raw `sudo` for all profiles;
+- blocks Unix-domain sockets for ordinary restricted profiles, permits them for exact eligible Wren Standard-project compatibility, and blocks raw `sudo` for all profiles;
 - allows every outbound TCP destination through sandbox-runtime's HTTP/SOCKS proxies, including public Internet, loopback, LAN, and VPN services.
 
 This networking supports proxy-aware tools such as `curl`, package managers, Git HTTPS/SSH, and most web/API clients. It does not provide raw sockets, inbound listeners, UDP-dependent protocols, or transparent networking for programs that ignore proxy settings.

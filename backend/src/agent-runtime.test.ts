@@ -11,7 +11,7 @@ import {
   createReadTool,
   createWriteTool,
 } from "@earendil-works/pi-coding-agent";
-import { createAgentProfile } from "./agent-profiles.js";
+import { createAgentProfile, getAgentProfile } from "./agent-profiles.js";
 import {
   authorizeAgentToolCall,
   buildAgentResourceLoader,
@@ -20,12 +20,12 @@ import {
   RESTRICTED_BUILTIN_TOOLS,
 } from "./agent-runtime.js";
 import { commandGuardIdentityPinPath } from "./command-guard-pin.js";
-import { close, init } from "./db.js";
+import { close, commitStoreMutation, init } from "./db.js";
 import { createProject } from "./projects.js";
 import { commitWorkspaceCapabilityActivation, revokeWorkspaceCapabilityAssociation } from "./workspace-capabilities.js";
 import { createSession, updatePiSessionFile } from "./sessions.js";
 import { getSessionAttachmentRoot, LEGACY_ATTACHMENT_ROOT } from "./protected-artifacts.js";
-import type { AgentProfileRow } from "./workspace-types.js";
+import { WREN_AGENT_PROFILE_ID, type AgentProfileRow } from "./workspace-types.js";
 import { WAYANG_RUNTIME_CONTEXT_TOOL_NAME } from "./wayang-runtime-context.js";
 import { RESTRICTED_MCP_TOOL_NAME, type RestrictedMcpRuntime } from "./restricted-mcp/index.js";
 
@@ -148,6 +148,83 @@ test("pair association loads standard resources independent of resource mode and
       cwd: f.cwd, agentDir: f.agentDir, agentProfile: profile, project, sourceSessionId: row.id,
     });
     assert.equal(stale.restricted, true);
+  } finally { f.cleanup(); }
+});
+
+test("exact Wren loads standard resources for interactive and scheduled Standard sessions", async () => {
+  const f = fixture("wayang-runtime-legacy-wren-standard-");
+  try {
+    fs.writeFileSync(path.join(f.agentDir, "AGENTS.md"), "synthetic Wren global resources");
+    const now = Date.now();
+    commitStoreMutation((draft) => {
+      draft.agentProfiles.push({
+        id: WREN_AGENT_PROFILE_ID,
+        name: "Arbitrarily renamed Wren",
+        description: null,
+        builtin_kind: "wren",
+        deletable: false,
+        enabled: true,
+        resource_mode: "standard",
+        instructions: null,
+        memory_access: "read_write",
+        default_provider: null,
+        default_model: null,
+        allowed_tools: null,
+        allowed_extensions: null,
+        created_at: now,
+        updated_at: now,
+      });
+    });
+    const profile = getAgentProfile(WREN_AGENT_PROFILE_ID)!;
+    const project = createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
+    const protectedRoot = path.join(f.dir, "protected-project");
+    const ordinarySibling = path.join(f.dir, "ordinary-sibling.txt");
+    fs.mkdirSync(protectedRoot);
+    fs.writeFileSync(path.join(protectedRoot, "private.txt"), "protected");
+    fs.writeFileSync(ordinarySibling, "ordinary");
+    createProject({
+      cwd: protectedRoot,
+      default_agent_profile_id: profile.id,
+      access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [profile.id] },
+    });
+    assert.equal(authorizeAgentToolCall({
+      cwd: f.cwd,
+      project,
+      agentProfile: profile,
+      toolName: "read",
+      params: { path: ordinarySibling },
+      standardResourcesAuthorized: true,
+    }).allowed, true);
+    assert.equal(authorizeAgentToolCall({
+      cwd: f.cwd,
+      project,
+      agentProfile: profile,
+      toolName: "read",
+      params: { path: path.join(protectedRoot, "private.txt") },
+      standardResourcesAuthorized: true,
+    }).allowed, false);
+    const interactive = createSession(f.cwd, { agentProfileId: profile.id });
+    const scheduled = createSession(f.cwd, { agentProfileId: profile.id });
+    commitStoreMutation((draft) => {
+      const row = draft.sessions.find((candidate) => candidate.id === scheduled.id)!;
+      row.scheduled_job_id = "synthetic-job";
+      row.scheduled_run_id = "synthetic-run";
+    });
+
+    for (const sourceSessionId of [interactive.id, scheduled.id]) {
+      const loaded = await buildAgentResourceLoader({
+        cwd: f.cwd,
+        agentDir: f.agentDir,
+        agentProfile: profile,
+        project,
+        sourceSessionId,
+      });
+      assert.equal(loaded.restricted, false);
+      assert.equal(loaded.standardResourcesWitness?.authoritySource, "legacy-wren");
+      assert.equal(loaded.resourceLoader.getAgentsFiles().agentsFiles.some(
+        (entry) => entry.path === path.join(f.agentDir, "AGENTS.md")
+      ), true);
+    }
   } finally { f.cleanup(); }
 });
 

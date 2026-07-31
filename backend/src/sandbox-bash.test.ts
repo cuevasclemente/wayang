@@ -7,15 +7,15 @@ import * as path from "node:path";
 import { createAgentProfile } from "./agent-profiles.js";
 import { buildManagedAppChildEnvironment } from "./apps/process-manager.js";
 import { commandGuardIdentityPinPath } from "./command-guard-pin.js";
-import { close, getWorkspaceCapabilityStoreProjectionPath, init } from "./db.js";
+import { close, commitStoreMutation, getWorkspaceCapabilityStoreProjectionPath, init } from "./db.js";
 import { createProject } from "./projects.js";
 import {
-  allowsLegacyWrenUnixSockets,
   buildBashSandboxPolicy,
   createPolicySandboxedBashOperations,
   getBashSandboxAvailability,
   selectWayangBashMode,
 } from "./sandbox-bash.js";
+import { isLegacyWrenStandardRuntime } from "./legacy-wren.js";
 import { createSession, updatePiSessionFile } from "./sessions.js";
 import { getPiAgentRoot, getSessionAttachmentRoot, LEGACY_ATTACHMENT_ROOT } from "./protected-artifacts.js";
 import type { SandboxNetworkMode } from "./sandbox-exec-protocol.js";
@@ -362,6 +362,7 @@ test("actual concurrent sandboxes isolate an allowed Standard project from an un
   assert.ok(standardPolicy.deniedWriteRoots.includes(fs.realpathSync(projectB)));
   assert.equal(protectedPolicy.deniedReadRoots.includes(fs.realpathSync(projectB)), false);
   assert.equal(protectedPolicy.deniedWriteRoots.includes(fs.realpathSync(projectB)), false);
+  assert.deepEqual(protectedPolicy.config.filesystem.allowWrite, [fs.realpathSync(projectB)]);
 
   const aOwn = path.join(projectA, "only-a.txt");
   const bOwn = path.join(projectB, "only-b.txt");
@@ -442,7 +443,7 @@ test("sandbox global Pi visibility requires the live standard-resources pair ass
   assert.equal(revoked.config.filesystem.allowRead?.includes(exactProjection), false);
 });
 
-test("only the exact seeded interactive Wren profile retains Unix IPC inside Standard sandboxing", () => {
+test("only exact seeded Wren receives broad Standard compatibility, including scheduled runs", () => {
   const session = {
     agent_profile_id: WREN_AGENT_PROFILE_ID,
     pending_agent_switch: null,
@@ -453,18 +454,79 @@ test("only the exact seeded interactive Wren profile retains Unix IPC inside Sta
   };
   const profile = { id: WREN_AGENT_PROFILE_ID, builtin_kind: "wren" as const, enabled: true };
   const project = { access_policy: { privacy_mode: "standard" as const, allowed_agent_profile_ids: null } };
-  const allowed = () => allowsLegacyWrenUnixSockets({ session, profile, project });
+  const allowed = () => isLegacyWrenStandardRuntime({ session, profile, project });
 
   assert.equal(allowed(), true);
-  assert.equal(allowsLegacyWrenUnixSockets({ ...{ session }, profile: { ...profile, id: "lookalike" }, project }), false);
-  assert.equal(allowsLegacyWrenUnixSockets({ ...{ session }, profile: { ...profile, builtin_kind: null }, project }), false);
-  assert.equal(allowsLegacyWrenUnixSockets({ session: { ...session, pending_agent_switch: {} }, profile, project }), false);
-  assert.equal(allowsLegacyWrenUnixSockets({ session: { ...session, scheduled_job_id: "job" }, profile, project }), false);
-  assert.equal(allowsLegacyWrenUnixSockets({
+  assert.equal(isLegacyWrenStandardRuntime({
+    session: { ...session, scheduled_job_id: "scheduled-job", scheduled_run_id: "scheduled-run" },
+    profile,
+    project,
+  }), true);
+  assert.equal(isLegacyWrenStandardRuntime({ session, profile: { ...profile, id: "lookalike" }, project }), false);
+  assert.equal(isLegacyWrenStandardRuntime({ session, profile: { ...profile, builtin_kind: null }, project }), false);
+  assert.equal(isLegacyWrenStandardRuntime({ session: { ...session, pending_agent_switch: {} as never }, profile, project }), false);
+  assert.equal(isLegacyWrenStandardRuntime({
     session,
     profile,
     project: { access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [profile.id] } },
   }), false);
+});
+
+test("exact Wren sandbox spans ordinary host paths while masking every Protected project", (t) => {
+  close();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-wren-host-workspace-"));
+  const standardRoot = path.join(root, "standard");
+  const protectedRoot = path.join(root, "protected");
+  fs.mkdirSync(standardRoot);
+  fs.mkdirSync(protectedRoot);
+  const previousData = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = path.join(root, "data");
+  init();
+  const now = Date.now();
+  commitStoreMutation((draft) => {
+    draft.agentProfiles.push({
+      id: WREN_AGENT_PROFILE_ID,
+      name: "Renamed legacy profile",
+      description: null,
+      builtin_kind: "wren",
+      deletable: false,
+      enabled: true,
+      resource_mode: "standard",
+      instructions: null,
+      memory_access: "read_write",
+      default_provider: null,
+      default_model: null,
+      allowed_tools: null,
+      allowed_extensions: null,
+      created_at: now,
+      updated_at: now,
+    });
+  });
+  createProject({
+    cwd: standardRoot,
+    default_agent_profile_id: WREN_AGENT_PROFILE_ID,
+    access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [WREN_AGENT_PROFILE_ID] },
+  });
+  createProject({
+    cwd: protectedRoot,
+    default_agent_profile_id: WREN_AGENT_PROFILE_ID,
+    access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [WREN_AGENT_PROFILE_ID] },
+  });
+  const session = createSession(standardRoot, { agentProfileId: WREN_AGENT_PROFILE_ID });
+  t.after(() => {
+    close();
+    if (previousData === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousData;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const policy = buildBashSandboxPolicy(session.id);
+  assert.equal(policy.config.network.allowAllUnixSockets, true);
+  assert.equal(policy.config.filesystem.allowGitConfig, true);
+  assert.deepEqual(policy.config.filesystem.allowWrite, [path.parse(fs.realpathSync(standardRoot)).root]);
+  assert.ok(policy.deniedReadRoots.includes(fs.realpathSync(protectedRoot)));
+  assert.ok(policy.deniedWriteRoots.includes(fs.realpathSync(protectedRoot)));
+  assert.equal(policy.deniedWriteRoots.includes(path.join(fs.realpathSync(standardRoot), ".pi")), false);
 });
 
 test("bash selector requires the complete host decision and never launders a legacy boolean into host mode", () => {

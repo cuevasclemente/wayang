@@ -8,6 +8,7 @@ import {
   type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
 import { getSessionById } from "./sessions.js";
+import { isLegacyWrenStandardRuntime } from "./legacy-wren.js";
 import {
   getProtectedArtifactReadRoots,
   getProtectedArtifactWriteRoots,
@@ -39,6 +40,8 @@ export interface ExactStandardResourcesWitness {
   readonly projectId: string;
   readonly agentProfileId: string;
   readonly associationRevision: number;
+  /** Omitted for a durable capability association. */
+  readonly authoritySource?: "legacy-wren";
 }
 
 function standardResourcesWitnessFromResolution(
@@ -59,7 +62,8 @@ function exactStandardResourcesWitnessEqual(left: ExactStandardResourcesWitness,
   return left.capabilityId === right.capabilityId
     && left.projectId === right.projectId
     && left.agentProfileId === right.agentProfileId
-    && left.associationRevision === right.associationRevision;
+    && left.associationRevision === right.associationRevision
+    && left.authoritySource === right.authoritySource;
 }
 
 function resolveCurrentStandardResourcesWitness(options: {
@@ -70,11 +74,23 @@ function resolveCurrentStandardResourcesWitness(options: {
   const row = getSessionById(options.sourceSessionId);
   if (!row || !isSessionCapabilityEligible(row) || row.pending_agent_switch !== null
     || row.agent_profile_id !== options.agentProfile.id || row.cwd !== options.project.cwd) return null;
-  return standardResourcesWitnessFromResolution(resolveWorkspaceCapability({
+  const associated = standardResourcesWitnessFromResolution(resolveWorkspaceCapability({
     capability_id: STANDARD_RESOURCES_CAPABILITY_ID,
     project_id: options.project.id,
     agent_profile_id: options.agentProfile.id,
   }));
+  if (associated) return associated;
+  return isLegacyWrenStandardRuntime({
+    session: row,
+    profile: options.agentProfile,
+    project: options.project,
+  }) ? Object.freeze({
+      capabilityId: STANDARD_RESOURCES_CAPABILITY_ID,
+      projectId: options.project.id,
+      agentProfileId: options.agentProfile.id,
+      associationRevision: 1,
+      authoritySource: "legacy-wren" as const,
+    }) : null;
 }
 
 export const RESTRICTED_BUILTIN_TOOLS = ["read", "edit", "write", "grep", "find", "ls", "bash"] as const;
@@ -280,6 +296,9 @@ export function authorizeAgentToolCall(options: {
   }
 
   for (const targetProject of listProjects().filter((candidate) => intersects(candidate.cwd))) {
+    if (targetProject.access_policy.privacy_mode === "protected" && targetProject.id !== project.id) {
+      return { allowed: false, reason: "Agents outside a Protected project cannot access its path", canonicalPath };
+    }
     if (!projectAllowsAgentProfile(targetProject, agentProfile.id)) {
       return { allowed: false, reason: "Agent is not allowed to access the project path", canonicalPath };
     }
