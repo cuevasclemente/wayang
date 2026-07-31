@@ -22,6 +22,7 @@ function authConfig(dataDir: string, overrides: Partial<AuthConfig> = {}): AuthC
     sessionDays: 30,
     sessionStorePath: path.join(dataDir, "auth-sessions.json"),
     trustProxy: "loopback",
+    proxyIdentityHeader: "",
     cookieSecure: "auto",
     allowedOrigins: [],
     ...overrides,
@@ -186,13 +187,14 @@ test("public allowlist stays public and every privileged REST router is centrall
 
   const protectedPaths = [
     "/api/me", "/api/latency/metrics", "/api/models", "/api/sessions", "/api/sessions/search",
-    "/api/fs/tree", "/api/capabilities", "/api/apps",
+    "/api/projects", "/api/agent-profiles", "/api/fs/tree", "/api/capabilities", "/api/apps",
     "/api/apps/example/proxy/example/", "/api/scheduled-agent-jobs", "/api/scheduled-jobs",
     "/api/tts/audio/example", "/api/browser/status", "/api/unknown",
   ];
   for (const route of protectedPaths) {
     const response = await fetch(`${baseUrl}${route}`);
     assert.equal(response.status, 401, route);
+    assert.equal(response.headers.get("x-wayang-authentication-required"), "1", route);
     assert.deepEqual(await response.json(), { error: "Authentication required" }, route);
   }
 });
@@ -205,6 +207,7 @@ test("login, persistent status, cookie flags, logout, revocation, and store perm
 
   const failure = await login(baseUrl, "wrong password");
   assert.equal(failure.status, 401);
+  assert.equal(failure.headers.get("x-wayang-authentication-required"), null);
   assert.deepEqual(await failure.json(), { error: "Invalid password" });
 
   const success = await login(baseUrl);

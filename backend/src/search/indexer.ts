@@ -18,12 +18,15 @@ import * as fs from "node:fs";
 import { getStore, type SessionRow } from "../db.js";
 import { listSessions } from "../sessions.js";
 import { getSearchDb, SCHEMA_VERSION } from "./db.js";
+import { isSessionIndexable } from "./policy-filter.js";
 import { chunkJsonlFile, type MetaForChunker } from "./chunker.js";
+import { writeDreamPolicyProjection } from "./policy-projection.js";
 
 export interface IndexResult {
   sessionId: string;
   chunkCount: number;
   skipped: boolean;
+  policySkipped?: boolean;
   error?: string;
 }
 
@@ -69,12 +72,20 @@ export async function indexSession(
   sessionId: string,
   options: IndexerOptions = {},
 ): Promise<IndexResult> {
-  const db = getSearchDb();
   const row = await loadSessionRow(sessionId);
   if (!row) {
     return { sessionId, chunkCount: 0, skipped: true, error: "session not found" };
   }
 
+  // Publish the current complete path decision before this background path can
+  // touch transcript metadata. Unknown paths remain denied by the Dream runner.
+  writeDreamPolicyProjection();
+
+  // Authorization precedes search DB lookup, transcript stat/read, and the
+  // unchanged shortcut. Denial removes stale indexed content.
+  const initialDenial = policyDenial(row);
+  if (initialDenial) return purgePolicyDeniedSession(sessionId, initialDenial);
+  const db = getSearchDb();
   const filePath = row.pi_session_file;
   let fileMtime: number | null = null;
   let fileSize: number | null = null;
@@ -88,6 +99,11 @@ export async function indexSession(
       // session is searchable by title/goal.
     }
   }
+
+  // Recheck after stat and before the unchanged shortcut so a policy change
+  // cannot preserve stale searchable content merely because bytes are stable.
+  const postStatDenial = policyDenial(row);
+  if (postStatDenial) return purgePolicyDeniedSession(sessionId, postStatDenial);
 
   // Skip if unchanged.
   const existing = db
@@ -120,6 +136,8 @@ export async function indexSession(
 
   const meta = makeMeta(row);
   if (filePath && fileMtime != null) {
+    const preReadDenial = policyDenial(row);
+    if (preReadDenial) return purgePolicyDeniedSession(sessionId, preReadDenial);
     try {
       const result = await chunkJsonlFile(filePath, meta, {
         includeThinking: _includeThinking || options.includeThinking,
@@ -155,6 +173,11 @@ export async function indexSession(
       },
     ];
   }
+
+  // chunkJsonlFile yields while streaming. Reauthorize after all transcript
+  // bytes have been processed and before any derived text is committed.
+  const preCommitDenial = policyDenial(row);
+  if (preCommitDenial) return purgePolicyDeniedSession(sessionId, preCommitDenial);
 
   const insertStmt = db.prepare(
     `INSERT INTO chunks (
@@ -222,9 +245,23 @@ export async function indexSession(
 }
 
 export async function removeSession(sessionId: string): Promise<void> {
-  const db = getSearchDb();
-  db.prepare("DELETE FROM chunks WHERE session_id = ?").run(sessionId);
-  db.prepare("DELETE FROM session_index_state WHERE session_id = ?").run(sessionId);
+  purgeSessionIndex(sessionId);
+}
+
+export function purgePolicyDeniedSessions(): { purged: number; errors: number } {
+  let purged = 0;
+  let errors = 0;
+  for (const row of listSessions(true)) {
+    if (!policyDenial(row)) continue;
+    try {
+      purgeSessionIndex(row.id);
+      purged++;
+    } catch (error) {
+      errors++;
+      console.error(`[search] policy purge failed for ${row.id}:`, error);
+    }
+  }
+  return { purged, errors };
 }
 
 export async function reindexAll(options: IndexerOptions = {}): Promise<IndexBatchSummary> {
@@ -251,4 +288,36 @@ export async function reindexAll(options: IndexerOptions = {}): Promise<IndexBat
     errors,
     durationMs: Date.now() - start,
   };
+}
+
+function policyDenial(row: SessionRow): string | null {
+  // Re-resolve the durable row on every phase check so a quarantine committed
+  // while the streaming chunker yields cannot publish derived private text.
+  const current = getStore().sessions.find((candidate) => candidate.id === row.id);
+  return current && isSessionIndexable(current)
+    ? null
+    : "Session indexing denied by project or legacy private-data policy";
+}
+
+function purgeSessionIndex(sessionId: string): void {
+  const db = getSearchDb();
+  db.transaction(() => {
+    db.prepare("DELETE FROM chunks WHERE session_id = ?").run(sessionId);
+    db.prepare("DELETE FROM session_index_state WHERE session_id = ?").run(sessionId);
+  })();
+}
+
+function purgePolicyDeniedSession(sessionId: string, reason: string): IndexResult {
+  try {
+    purgeSessionIndex(sessionId);
+    return { sessionId, chunkCount: 0, skipped: true, policySkipped: true };
+  } catch (error) {
+    return {
+      sessionId,
+      chunkCount: 0,
+      skipped: true,
+      policySkipped: true,
+      error: `Policy denied indexing and stale-index purge failed: ${error instanceof Error ? error.message : String(error)} (${reason})`,
+    };
+  }
 }

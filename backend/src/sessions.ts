@@ -3,10 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { getStore, flush, type SessionRow } from "./db.js";
-import { removeInterviewsForSession } from "./interviews.js";
+import { commitStoreMutation, getStore, flush, type SessionRow } from "./db.js";
 import { SessionCatalog, type CatalogScanCommit, type CatalogScanResult } from "./session-catalog.js";
 import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
+import { ensureProjectForCwd, ensureProjectForCwdDraft, resolveEffectiveSessionDefaults } from "./projects.js";
+import { WorkspaceStoreError, type PendingAgentSwitch } from "./workspace-types.js";
 
 export type { SessionRow };
 
@@ -15,6 +16,7 @@ export interface CreateSessionOptions {
   model?: string;
   goal?: string;
   provider?: string;
+  agentProfileId?: string;
   scheduledJobId?: string | null;
   scheduledRunId?: string | null;
 }
@@ -42,42 +44,66 @@ export function createSession(
   goal?: string,
   provider?: string,
 ): SessionRow {
-  const store = getStore();
-  const now = Date.now();
-  const normalizedCwd = normalizeSessionCwd(cwd);
+  const requestedCwd = normalizeSessionCwd(cwd);
   const options: CreateSessionOptions =
     typeof titleOrOptions === "object" && titleOrOptions !== null
       ? titleOrOptions
       : { title: titleOrOptions, model, goal, provider };
-  const session: SessionRow = {
-    id: randomUUID(),
-    pi_session_file: null,
-    title: options.title || "",
-    cwd: normalizedCwd,
-    provider: options.provider || null,
-    model: options.model || null,
-    created_at: now,
-    last_active: now,
-    archived: 0,
-    archived_at: null,
-    goal: options.goal || null,
-    goal_status: options.goal ? "pending" : null,
-    scheduled_job_id: options.scheduledJobId || null,
-    scheduled_run_id: options.scheduledRunId || null,
-    error: null,
-  };
-  store.sessions.push(session);
-  markDirectMutation(session);
-  flush();
-  return { ...session };
+  const session = commitStoreMutation((draft) => {
+    const { project } = ensureProjectForCwdDraft(draft, requestedCwd);
+    const effective = resolveEffectiveSessionDefaults({
+      project,
+      agentProfileId: options.agentProfileId,
+      explicitProvider: options.provider ?? null,
+      explicitModel: options.model ?? null,
+    });
+    const now = Date.now();
+    const created: SessionRow = {
+      id: randomUUID(),
+      pi_session_file: null,
+      title: options.title || "",
+      cwd: project.cwd,
+      provider: effective.provider,
+      model: effective.model,
+      agent_profile_id: effective.agent_profile_id,
+      pending_agent_switch: null,
+      legacy_private_session_quarantine: false,
+      legacy_capability_ineligible: false,
+      created_at: now,
+      last_active: now,
+      archived: 0,
+      archived_at: null,
+      goal: options.goal || null,
+      goal_status: options.goal ? "pending" : null,
+      scheduled_job_id: options.scheduledJobId || null,
+      scheduled_run_id: options.scheduledRunId || null,
+      error: null,
+      catalog_mutation_version: 1,
+    };
+    draft.sessions.push(created);
+    return cloneSession(created);
+  });
+  publishDirectMutation(false);
+  return session;
 }
 
 export function getSessionById(id: string): SessionRow | undefined {
   const store = getStore();
   for (const row of store.sessions) {
-    if (row.id === id) return { ...row };
+    if (row.id === id) return cloneSession(row);
   }
   return undefined;
+}
+
+/**
+ * Legacy imported private sessions are permanently runtime-ineligible.
+ * Only an exact durable `false` proves that a row is not quarantined; missing,
+ * malformed, or truthy markers fail closed.
+ */
+export function isLegacyPrivateSessionQuarantined(
+  row: Pick<SessionRow, "legacy_private_session_quarantine"> | null | undefined,
+): boolean {
+  return row?.legacy_private_session_quarantine !== false;
 }
 
 export function listSessions(includeArchived = false): SessionRow[] {
@@ -87,7 +113,7 @@ export function listSessions(includeArchived = false): SessionRow[] {
     list = list.filter((row: SessionRow) => !row.archived);
   }
   // Sort by the most recent human/agent interaction, descending.
-  return [...list].sort(
+  return list.map(cloneSession).sort(
     (a: SessionRow, b: SessionRow) => b.last_active - a.last_active,
   );
 }
@@ -171,10 +197,18 @@ function rowMutationVersion(row: SessionRow): number {
   return row.catalog_mutation_version ?? 0;
 }
 
-function markDirectMutation(row: SessionRow, triggerScan = false): void {
+function incrementDirectMutation(row: SessionRow): void {
   row.catalog_mutation_version = rowMutationVersion(row) + 1;
+}
+
+function publishDirectMutation(triggerScan = false): void {
   sessionCatalog?.bumpGeneration();
   if (triggerScan) sessionCatalog?.requestScan("internal-write", 0);
+}
+
+function markDirectMutation(row: SessionRow, triggerScan = false): void {
+  incrementDirectMutation(row);
+  publishDirectMutation(triggerScan);
 }
 
 function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; updated: number; archivedLegacy: number; changed: boolean } {
@@ -228,7 +262,9 @@ function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; upda
     row ??= byId.get(info.id);
     if (matchedByPath && row && rowMutationVersion(row) !== parsed.expectedMutationVersion) continue;
 
-    const cwd = normalizeSessionCwd(info.cwd);
+    const projectResult = ensureProjectForCwd(normalizeSessionCwd(info.cwd), false);
+    if (projectResult.created) changed = true;
+    const cwd = projectResult.project.cwd;
     const derivedTitle = (info.name || info.firstMessage || "(empty session)").slice(0, 120);
     if (!row) {
       row = {
@@ -238,6 +274,10 @@ function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; upda
         cwd,
         provider: info.provider,
         model: info.model,
+        agent_profile_id: null,
+        pending_agent_switch: null,
+        legacy_private_session_quarantine: false,
+        legacy_capability_ineligible: true,
         created_at: info.createdAt,
         last_active: info.lastInteractionAt,
         archived: 0,
@@ -366,6 +406,7 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
   let imported = 0;
   let updated = 0;
   let archivedLegacy = 0;
+  let projectsCreated = false;
 
   // Hide legacy web-only rows and dangling file links. Recently-created rows
   // are allowed to be temporarily web-only because /api/sessions now warms the
@@ -406,7 +447,9 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
     if (deletedSessionIds.has(info.id) || deletedSessionFiles.has(sessionFile)) {
       continue;
     }
-    const cwd = normalizeSessionCwd(info.cwd);
+    const projectResult = ensureProjectForCwd(normalizeSessionCwd(info.cwd), false);
+    if (projectResult.created) projectsCreated = true;
+    const cwd = projectResult.project.cwd;
     const title = (info.name || info.firstMessage || "(empty session)").slice(0, 120);
     const rawCreated = info.created instanceof Date ? info.created.getTime() : Date.now();
     const createdAt = Number.isFinite(rawCreated) ? rawCreated : Date.now();
@@ -504,6 +547,10 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
       cwd,
       provider: currentModel?.provider ?? null,
       model: currentModel?.model ?? null,
+      agent_profile_id: null,
+      pending_agent_switch: null,
+      legacy_private_session_quarantine: false,
+      legacy_capability_ineligible: true,
       created_at: createdAt,
       last_active: lastInteractionAt,
       archived: 0,
@@ -517,7 +564,7 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
     imported++;
   }
 
-  const changed = imported > 0 || updated > 0 || archivedLegacy > 0;
+  const changed = imported > 0 || updated > 0 || archivedLegacy > 0 || projectsCreated;
   syncProfile("process_done", `duration=${elapsedMs(processStart)} imported=${imported} updated=${updated} archivedLegacy=${archivedLegacy} changed=${changed}`);
   if (changed) {
     const flushStart = nowMs();
@@ -584,11 +631,150 @@ export function updateSessionTitle(id: string, title: string): void {
   }
 }
 
+function cloneSession(row: SessionRow): SessionRow {
+  return {
+    ...row,
+    pending_agent_switch: row.pending_agent_switch ? { ...row.pending_agent_switch } : null,
+  };
+}
+
+function switchableSession(id: string): SessionRow {
+  const row = getStore().sessions.find((session) => session.id === id);
+  if (!row) throw new WorkspaceStoreError("Session not found", 404);
+  return row;
+}
+
+function validatePendingAgentSwitch(pending: PendingAgentSwitch): void {
+  const store = getStore();
+  if (
+    !pending || typeof pending !== "object" || typeof pending.switch_id !== "string" || !pending.switch_id
+    || !(pending.from_agent_profile_id === null || typeof pending.from_agent_profile_id === "string")
+    || !(pending.from_provider === null || typeof pending.from_provider === "string")
+    || !(pending.from_model === null || typeof pending.from_model === "string")
+    || typeof pending.to_agent_profile_id !== "string" || !pending.to_agent_profile_id
+    || typeof pending.target_provider !== "string" || !pending.target_provider
+    || typeof pending.target_model !== "string" || !pending.target_model
+    || typeof pending.changed_at !== "number" || !Number.isFinite(pending.changed_at)
+  ) {
+    throw new WorkspaceStoreError("Invalid pending agent switch");
+  }
+  if ((pending.from_provider === null) !== (pending.from_model === null)) {
+    throw new WorkspaceStoreError("Pending switch source provider and model must both be set or both be null");
+  }
+  const target = store.agentProfiles.find((profile) => profile.id === pending.to_agent_profile_id);
+  if (!target || !target.enabled) throw new WorkspaceStoreError("Target agent profile must exist and be enabled", 409);
+}
+
+function pendingSwitchesEqual(a: PendingAgentSwitch, b: PendingAgentSwitch): boolean {
+  return a.switch_id === b.switch_id
+    && a.from_agent_profile_id === b.from_agent_profile_id
+    && a.from_provider === b.from_provider
+    && a.from_model === b.from_model
+    && a.to_agent_profile_id === b.to_agent_profile_id
+    && a.target_provider === b.target_provider
+    && a.target_model === b.target_model
+    && a.changed_at === b.changed_at;
+}
+
+/** Compare-and-set a durable switch marker against the session's current assignment. */
+export function beginAgentSwitch(id: string, pending: PendingAgentSwitch): SessionRow {
+  const row = switchableSession(id);
+  if (isLegacyPrivateSessionQuarantined(row)) {
+    throw new WorkspaceStoreError("Quarantined legacy sessions cannot switch agent profiles", 403);
+  }
+  validatePendingAgentSwitch(pending);
+  const current = row.pending_agent_switch ?? null;
+  if (current) {
+    if (current.switch_id !== pending.switch_id) throw new WorkspaceStoreError("A different agent switch is already pending", 409);
+    if (!pendingSwitchesEqual(current, pending)) throw new WorkspaceStoreError("Pending agent switch payload conflicts with the existing switch id", 409);
+    return cloneSession(row);
+  }
+  if (
+    (row.agent_profile_id ?? null) !== pending.from_agent_profile_id
+    || row.provider !== pending.from_provider
+    || row.model !== pending.from_model
+  ) {
+    throw new WorkspaceStoreError("Session assignment changed before the agent switch began", 409);
+  }
+  const committed = commitStoreMutation((draft) => {
+    const target = draft.sessions.find((session) => session.id === id);
+    if (!target) throw new WorkspaceStoreError("Session not found", 404);
+    target.pending_agent_switch = { ...pending };
+    incrementDirectMutation(target);
+    return cloneSession(target);
+  });
+  publishDirectMutation(false);
+  return committed;
+}
+
+/** Commit only the matching pending switch and atomically clear its marker. */
+export function completeAgentSwitch(id: string, switchId: string): SessionRow {
+  const row = switchableSession(id);
+  if (isLegacyPrivateSessionQuarantined(row)) {
+    throw new WorkspaceStoreError("Quarantined legacy sessions cannot switch agent profiles", 403);
+  }
+  const pending = row.pending_agent_switch ?? null;
+  if (!pending || pending.switch_id !== switchId) throw new WorkspaceStoreError("Stale or missing pending agent switch id", 409);
+  const committed = commitStoreMutation((draft) => {
+    const target = draft.sessions.find((session) => session.id === id);
+    if (!target) throw new WorkspaceStoreError("Session not found", 404);
+    target.agent_profile_id = pending.to_agent_profile_id;
+    target.provider = pending.target_provider;
+    target.model = pending.target_model;
+    target.pending_agent_switch = null;
+    incrementDirectMutation(target);
+    return cloneSession(target);
+  });
+  publishDirectMutation(true);
+  return committed;
+}
+
+/** Restore the recorded source assignment only for the matching switch id. */
+export function rollbackAgentSwitch(id: string, switchId: string): SessionRow {
+  const row = switchableSession(id);
+  if (isLegacyPrivateSessionQuarantined(row)) {
+    throw new WorkspaceStoreError("Quarantined legacy sessions cannot switch agent profiles", 403);
+  }
+  const pending = row.pending_agent_switch ?? null;
+  if (!pending || pending.switch_id !== switchId) throw new WorkspaceStoreError("Stale or missing pending agent switch id", 409);
+  const committed = commitStoreMutation((draft) => {
+    const target = draft.sessions.find((session) => session.id === id);
+    if (!target) throw new WorkspaceStoreError("Session not found", 404);
+    target.agent_profile_id = pending.from_agent_profile_id;
+    target.provider = pending.from_provider;
+    target.model = pending.from_model;
+    target.pending_agent_switch = null;
+    incrementDirectMutation(target);
+    return cloneSession(target);
+  });
+  publishDirectMutation(true);
+  return committed;
+}
+
+export function updateSessionAgentProfile(id: string, agentProfileId: string | null): void {
+  const row = getStore().sessions.find((session) => session.id === id);
+  if (!row) return;
+  if ((row.agent_profile_id ?? null) === agentProfileId) return;
+  if (isLegacyPrivateSessionQuarantined(row)) {
+    throw new WorkspaceStoreError("Quarantined legacy sessions cannot switch agent profiles", 403);
+  }
+  commitStoreMutation((draft) => {
+    const target = draft.sessions.find((session) => session.id === id);
+    if (!target) return;
+    target.agent_profile_id = agentProfileId;
+    incrementDirectMutation(target);
+  });
+  publishDirectMutation(false);
+}
+
 export function updateSessionModel(id: string, model: string | null, provider?: string | null): void {
   const store = getStore();
   for (const row of store.sessions) {
     if (row.id === id) {
       if (row.model === model && (provider === undefined || row.provider === provider)) return;
+      if (isLegacyPrivateSessionQuarantined(row)) {
+        throw new WorkspaceStoreError("Quarantined legacy sessions cannot change models", 403);
+      }
       row.model = model;
       if (provider !== undefined) row.provider = provider;
       markDirectMutation(row, true);
@@ -694,11 +880,17 @@ export function deleteSession(id: string): DeleteSessionResult | null {
   }
 
   deletedSessionIds.add(session.id);
-  markDirectMutation(session);
-  // Archive intentionally retains durable submissions. Permanent deletion
-  // removes them in the same StoreData mutation as the session row.
-  removeInterviewsForSession(session.id, { flush: false });
-  store.sessions.splice(index, 1);
-  flush();
-  return { session: { ...session }, deletedSessionFile };
+  const deleted = commitStoreMutation((draft) => {
+    const draftIndex = draft.sessions.findIndex((row) => row.id === id);
+    if (draftIndex < 0) throw new WorkspaceStoreError("Session disappeared during deletion", 409);
+    const target = draft.sessions[draftIndex]!;
+    incrementDirectMutation(target);
+    // Archive intentionally retains durable submissions. Permanent deletion
+    // removes them atomically with the session row in the store transaction.
+    draft.interviews = draft.interviews.filter((record) => record.session_id !== target.id);
+    draft.sessions.splice(draftIndex, 1);
+    return cloneSession(target);
+  });
+  publishDirectMutation(false);
+  return { session: deleted, deletedSessionFile };
 }

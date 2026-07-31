@@ -20,7 +20,10 @@ import {
   getMessageHistory,
   getSessionFileMessageHistory,
 } from "../pi-bridge.js";
-import { getSessionById } from "../sessions.js";
+import {
+  getSessionById,
+  isLegacyPrivateSessionQuarantined,
+} from "../sessions.js";
 
 export const router = Router();
 
@@ -128,6 +131,13 @@ router.post("/tts/synthesize", async (req: Request, res: Response) => {
     const dbSession = getSessionById(sessionId);
     if (!dbSession) {
       res.status(404).json({ error: "Session not found" });
+      return;
+    }
+
+    // Legacy private sessions are permanent non-egress targets. Keep this
+    // durable denial before live/file history, broker/provider, and cache work.
+    if (isLegacyPrivateSessionQuarantined(dbSession)) {
+      res.status(403).json({ error: "Read aloud is unavailable for quarantined legacy sessions" });
       return;
     }
 

@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { diagnoseCapabilityApprovalMetadata } from "./lib/capability-approval.mjs";
+import { diagnoseLinuxUserBus } from "./lib/doctor.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 let failures = 0;
@@ -27,8 +29,15 @@ function version(command, args = ["--version"]) {
   return result.status === 0 ? `${result.stdout || result.stderr}`.trim().split(/\r?\n/)[0] : null;
 }
 
+const CI_TESTED_NODE_MAJORS = new Set([22, 26]);
+
+function parseNodeVersion(versionString) {
+  const [major, minor, patch] = versionString.replace(/^v/, "").split(".").map(Number);
+  return { major, minor, patch };
+}
+
 function atLeastNode(versionString) {
-  const [major, minor] = versionString.replace(/^v/, "").split(".").map(Number);
+  const { major, minor } = parseNodeVersion(versionString);
   return major > 22 || (major === 22 && minor >= 19);
 }
 
@@ -37,7 +46,11 @@ if (process.platform === "linux" || process.platform === "darwin") ok("supported
 else fail("v0.1 supports Linux and macOS only");
 
 if (atLeastNode(process.version)) {
-  ok(`Node ${process.version} (minimum 22.19.0)`);
+  const { major } = parseNodeVersion(process.version);
+  ok(`Node ${process.version} (module ABI ${process.versions.modules}; minimum 22.19.0)`);
+  if (!CI_TESTED_NODE_MAJORS.has(major)) {
+    warn(`Node ${major} satisfies the engine range but CI currently covers majors 22 and 26`);
+  }
 } else fail(`Node ${process.version} is too old; install Node >=22.19.0`);
 
 for (const command of ["npm", "git", "make"]) {
@@ -50,6 +63,21 @@ const compiler = executable("cc") || executable("clang") || executable("gcc");
 const python = executable("python3") || executable("python");
 if (compiler && python) ok("native addon build tools are available");
 else warn("native addon fallback builds may need a C/C++ toolchain and Python 3");
+
+if (process.platform === "linux") {
+  const sandboxCommands = ["bwrap", "socat", "rg"];
+  const missing = sandboxCommands.filter((command) => !executable(command));
+  const supportedArch = process.arch === "x64" || process.arch === "arm64";
+  if (missing.length === 0 && supportedArch) ok("per-exec bash sandbox prerequisites are available");
+  else warn(`bash will be removed from Wayang sessions because sandbox prerequisites are unavailable${missing.length ? ` (missing: ${missing.join(", ")})` : " (requires x64 or arm64)"}`);
+} else if (process.platform === "darwin") {
+  if (existsSync("/usr/bin/sandbox-exec")) ok("per-exec bash sandbox prerequisite is available");
+  else warn("bash will be removed from Wayang sessions because sandbox-exec is unavailable");
+}
+
+const userBusDiagnostic = diagnoseLinuxUserBus();
+if (userBusDiagnostic?.level === "ok") ok(userBusDiagnostic.message);
+else if (userBusDiagnostic?.level === "warn") warn(userBusDiagnostic.message);
 
 for (const [directory, requiredBinary] of [["backend", "tsx"], ["frontend", "vite"], ["e2e", "playwright"]]) {
   if (existsSync(join(root, directory, "node_modules", ".bin", requiredBinary))) ok(`${directory} dependencies installed`);
@@ -75,6 +103,18 @@ const piDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent")
 const authFile = join(piDir, "auth.json");
 if (existsSync(authFile)) ok("pi auth storage exists (contents not inspected)");
 else warn("pi auth storage not found; use make pi-login or configure an API key in .env");
+
+const capabilityApproval = diagnoseCapabilityApprovalMetadata();
+if (capabilityApproval.pin.ok) {
+  ok("command-guard identity PIN metadata is owner-only and safe (contents not inspected)");
+} else {
+  warn(`workspace capability approval PIN metadata is unavailable or unsafe (${capabilityApproval.pin.reason}); provision the PIN outside Wayang`);
+}
+if (capabilityApproval.state.ok) {
+  ok("workspace capability approval cooldown metadata is owner-only and safe (contents not inspected)");
+} else {
+  warn(`workspace capability approval cooldown metadata is unavailable or unsafe (${capabilityApproval.state.reason}); run make setup-capability-approval after provisioning the identity PIN`);
+}
 
 const providerVariables = [
   "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY",

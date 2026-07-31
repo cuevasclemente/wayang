@@ -1,3 +1,4 @@
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import type { Request, RequestHandler } from "express";
@@ -7,6 +8,7 @@ import { SessionStore } from "./session-store.js";
 
 export const SESSION_COOKIE_NAME = "wayang_session";
 const UNAUTHORIZED_BODY = JSON.stringify({ error: "Authentication required" });
+const PASSWORDLESS_SETTINGS_OWNER_REALM = `passwordless-loopback:${randomUUID()}`;
 
 interface RateBucket {
   attempts: number;
@@ -26,6 +28,18 @@ export type LoginResult =
   | { status: "invalid" }
   | { status: "rate_limited"; retryAfterSeconds: number };
 
+export interface AuthenticatedSettingsOwner {
+  /** Opaque, server-derived identity; never a username, address, or raw token. */
+  sessionId: string;
+  /** Exact canonical browser Origin validated against the request authority. */
+  origin: string;
+}
+
+export type SettingsOwnerResolution =
+  | { status: "authenticated"; owner: AuthenticatedSettingsOwner }
+  | { status: "unauthenticated"; previousOwner?: AuthenticatedSettingsOwner }
+  | { status: "invalid_origin" };
+
 function firstHeader(value: string | string[] | undefined): string | undefined {
   const item = Array.isArray(value) ? value[0] : value;
   return item?.split(",", 1)[0]?.trim();
@@ -33,9 +47,18 @@ function firstHeader(value: string | string[] | undefined): string | undefined {
 
 function isLoopbackAddress(address: string | undefined): boolean {
   if (!address) return false;
-  const normalized = address.toLowerCase().split("%", 1)[0];
+  const normalized = address.toLowerCase().split("%", 1)[0].replace(/^\[|\]$/gu, "");
   return normalized === "127.0.0.1" || normalized === "::1" || normalized === "::ffff:127.0.0.1" ||
     normalized.startsWith("127.") || normalized.startsWith("::ffff:127.");
+}
+
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const hostname = new URL(origin).hostname.toLowerCase();
+    return hostname === "localhost" || isLoopbackAddress(hostname);
+  } catch {
+    return false;
+  }
 }
 
 function cookieValue(header: string | undefined, name: string): string | undefined {
@@ -66,6 +89,7 @@ export class AuthService {
   private readonly rateLimitWindowMs: number;
   private readonly maxRateLimitSources: number;
   private readonly allowedOrigins: ReadonlySet<string>;
+  private readonly proxyOwnerSecret = randomBytes(32);
   private readonly rateBuckets = new Map<string, RateBucket>();
 
   constructor(config: AuthConfig, options: AuthServiceOptions = {}) {
@@ -92,6 +116,42 @@ export class AuthService {
 
   status(request: IncomingMessage): { enabled: boolean; authenticated: boolean } {
     return { enabled: this.config.enabled, authenticated: this.isAuthenticated(request) };
+  }
+
+  /**
+   * Resolve the exact Settings approval owner before request-body parsing.
+   * Password-authenticated owners are keyed by an HMAC of the verified cookie;
+   * passwordless operation receives one process-local realm and is accepted only
+   * from a loopback peer at a loopback browser Origin.
+   */
+  resolveSettingsOwner(request: IncomingMessage): SettingsOwnerResolution {
+    const origin = this.exactSettingsOrigin(request);
+    if (!origin) return { status: "invalid_origin" };
+
+    const token = this.sessionToken(request);
+    if (this.config.enabled) {
+      const previousOwner = token && token.length <= 256
+        ? { sessionId: this.settingsSessionHandle(token), origin }
+        : undefined;
+      if (!this.store?.verify(token)) {
+        return previousOwner ? { status: "unauthenticated", previousOwner } : { status: "unauthenticated" };
+      }
+      return { status: "authenticated", owner: previousOwner! };
+    }
+
+    if (isLoopbackAddress(request.socket.remoteAddress) && isLoopbackOrigin(origin)) {
+      return {
+        status: "authenticated",
+        owner: { sessionId: PASSWORDLESS_SETTINGS_OWNER_REALM, origin },
+      };
+    }
+
+    const proxyIdentity = this.trustedProxyIdentity(request, origin);
+    if (!proxyIdentity) return { status: "unauthenticated" };
+    return {
+      status: "authenticated",
+      owner: { sessionId: this.proxySettingsOwnerHandle(proxyIdentity, origin), origin },
+    };
   }
 
   async login(password: unknown, request: IncomingMessage): Promise<LoginResult> {
@@ -154,6 +214,10 @@ export class AuthService {
       next();
       return;
     }
+    // Distinguish instance-login expiry from route-local 401 responses (for
+    // example an owner-only Protected browser control). The SPA may open its
+    // login gate only for this server-derived marker.
+    res.setHeader("X-Wayang-Authentication-Required", "1");
     res.status(401).json({ error: "Authentication required" });
   };
 
@@ -230,6 +294,52 @@ export class AuthService {
     } catch {
       return "invalid://request-origin";
     }
+  }
+
+  private exactSettingsOrigin(request: IncomingMessage): string | null {
+    const authorityOrigin = this.requestOrigin(request);
+    if (!this.allowedOrigins.has(authorityOrigin)) return null;
+    const header = request.headers.origin;
+    // Same-origin browsers commonly omit Origin on safe GET/HEAD requests. In
+    // that case the already-validated effective authority is the exact owner
+    // origin; state-changing requests must carry an exact Origin header.
+    if (header === undefined && !unsafeMethod(request.method)) return authorityOrigin;
+    if (typeof header !== "string" || !header || header !== header.trim() || header.includes(",") || header === "null") return null;
+    try {
+      const parsed = new URL(header);
+      if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.origin !== header) return null;
+      if (!this.allowedOrigins.has(parsed.origin) || parsed.origin !== authorityOrigin) return null;
+      return parsed.origin;
+    } catch {
+      return null;
+    }
+  }
+
+  private settingsSessionHandle(token: string): string {
+    return `authenticated:${createHmac("sha256", this.config.sessionSecret)
+      .update("wayang-settings-owner-v1\0", "utf8")
+      .update(token, "utf8")
+      .digest("base64url")}`;
+  }
+
+  private trustedProxyIdentity(request: IncomingMessage, origin: string): string | null {
+    const header = this.config.proxyIdentityHeader;
+    if (!header || isLoopbackOrigin(origin) || !this.isTrustedProxy(request)) return null;
+    const raw = request.headers[header];
+    if (typeof raw !== "string" || !raw || raw !== raw.trim()) return null;
+    if (Buffer.byteLength(raw, "utf8") > 512 || raw.includes(",") || /[\u0000-\u001f\u007f]/u.test(raw)) return null;
+    return raw;
+  }
+
+  private proxySettingsOwnerHandle(identity: string, origin: string): string {
+    return `authenticated-proxy:${createHmac("sha256", this.proxyOwnerSecret)
+      .update("wayang-proxy-settings-owner-v1\0", "utf8")
+      .update(this.config.proxyIdentityHeader, "utf8")
+      .update("\0", "utf8")
+      .update(origin, "utf8")
+      .update("\0", "utf8")
+      .update(identity, "utf8")
+      .digest("base64url")}`;
   }
 
   private cookieIsSecure(request: IncomingMessage): boolean {

@@ -6,7 +6,7 @@ Wayang v0.1 supports source checkouts on Linux and macOS. It does not install a 
 
 Required:
 
-- Node.js `>=22.19.0`; the minimum tested release is recorded in `.nvmrc`
+- Node.js `>=22.19.0`; `.nvmrc` selects the preferred Node 26.4.0 runtime, while CI covers Node 22.19.0 and 26.4.0
 - npm supplied with Node
 - Git
 - Make (GNU Make or the common BSD Make interface used by this project)
@@ -36,7 +36,7 @@ sh scripts/bootstrap.sh --dry-run
 node scripts/configure.mjs --dry-run
 ```
 
-The bootstrap performs this sequence:
+The bootstrap performs this sequence (optional capability approval state is deliberately not provisioned automatically):
 
 1. verifies Linux/macOS, Node, npm, Git, Make, and native-build readiness;
 2. runs `npm ci` in `backend/`, `frontend/`, and `e2e/` using committed lockfiles;
@@ -64,6 +64,17 @@ Choose pi authentication:
 - **Later:** the web server can start, but an agent session cannot use a provider until pi authentication exists.
 
 The checkout's pinned pi CLI is used; a globally installed `pi` is not required.
+
+### Optional privileged capability approval setup
+
+Ordinary sandboxed Wayang use needs no capability approval setup. If this installation will activate a reviewed privileged workspace capability, first provision the command-guard identity PIN using its supported human-local flow outside Wayang. Then initialize only Wayang's private attempt/cooldown state:
+
+```sh
+make setup-capability-approval
+make doctor
+```
+
+The initializer never reads or creates the PIN and accepts no PIN argument. It validates the existing PIN authority by filesystem metadata, uses owner-only no-follow/no-overwrite creation, and safely leaves valid existing cooldown state unchanged. Missing, unsafe, symlinked, hard-linked, incorrectly permissioned, or malformed authority is refused rather than repaired or replaced. This command does not assign or activate a capability, configure a project/profile tuple, launch Wayang, or restart anything. `make doctor` checks metadata only; see [Configuration](configuration.md#provision-capability-approval-cooldown-state) for the exact contract.
 
 Pi 0.80.6 requires explicit trust before a Wayang SDK session loads executable or configuration-bearing project `.pi` resources. After reviewing a project, save trust from a local terminal:
 
@@ -114,20 +125,22 @@ E2E tests create synthetic pi and Wayang directories and do not forward provider
 
 ## Troubleshooting
 
-### Node is too old
+### Node is unsupported or changed
 
-Use your preferred version manager and the repository version hint:
+Use your preferred version manager and the repository's preferred runtime:
 
 ```sh
 nvm install
 nvm use
 ```
 
-Any manager is acceptable if `node --version` is at least 22.19.0.
+Any manager is acceptable if `node --version` is at least 22.19.0. CI exercises the compatibility floor (22.19.0) and preferred current runtime (26.4.0); `make doctor` warns when a satisfying Node major is not covered by CI.
+
+Native addons are tied to the Node module ABI. After changing Node major versions—even when both versions satisfy `engines`—rerun `make install` before starting Wayang, then verify `make doctor` reports the active Node ABI and a working `better-sqlite3` binding.
 
 ### `better-sqlite3` installation fails
 
-Confirm that Node is supported and that Python 3 plus a compiler toolchain are available. Remove nothing from the checkout blindly; after fixing prerequisites, rerun `make install`, which recreates dependencies from lockfiles.
+Confirm that Node is supported and that Python 3 plus a compiler toolchain are available. Remove nothing from the checkout blindly; after fixing prerequisites, rerun `make install`, which recreates dependencies from lockfiles for the active Node runtime.
 
 ### No usable model
 

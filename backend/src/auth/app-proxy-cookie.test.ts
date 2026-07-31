@@ -5,7 +5,7 @@ import {
   shouldForwardAppProxyResponseHeader,
 } from "../routes/apps.js";
 
-test("app proxy does not disclose browser credentials upstream", () => {
+test("app proxy does not disclose browser credentials or internal capabilities upstream", () => {
   for (const header of [
     "Cookie",
     "Authorization",
@@ -14,6 +14,11 @@ test("app proxy does not disclose browser credentials upstream", () => {
     "X-Forwarded-For",
     "X-Forwarded-Host",
     "X-Forwarded-Proto",
+    "X-Wayang-Apps-Actor",
+    "X-Wayang-Apps-Agent-Token",
+    "X-Wayang-Browser-Actor",
+    "X-Wayang-Browser-Agent-Token",
+    "X-Wayang-Source-Session-Id",
   ]) {
     assert.equal(shouldForwardAppProxyRequestHeader(header), false, header);
   }

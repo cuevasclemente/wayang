@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { close, init } from "./db.js";
+import { close, flush, getStore, init } from "./db.js";
 import {
   cancelInterview,
   createOpenInterview,
@@ -13,14 +13,25 @@ import {
   markDelivered,
   normalizeAnswers,
   removeInterviewsForSession,
-  submitInterview,
+  submitInterview as submitInterviewWithContext,
+  type SubmitInterviewResult,
 } from "./interviews.js";
+import {
+  WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL,
+  WAYANG_WEBSOCKET_SUBMISSION_CHANNEL,
+  WAYANG_WEBSOCKET_SUBMISSION_CONTEXT,
+  type InterviewSubmissionContext,
+} from "./interview-provenance.js";
 
 const QUESTIONS = [{
   id: "q1", label: "Scope", prompt: "Which scope?",
   options: [{ value: "small", label: "Small" }, { value: "large", label: "Large" }],
   allowOther: true,
 }];
+
+function submitInterview(sessionId: string, requestId: string, answers: unknown): SubmitInterviewResult {
+  return submitInterviewWithContext(sessionId, requestId, answers, WAYANG_WEBSOCKET_SUBMISSION_CONTEXT);
+}
 
 function withStore(fn: () => void): void {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-interviews-test-"));
@@ -53,11 +64,65 @@ test("interviews persist open, submitted, cancelled, and delivered state", () =>
   assert.equal(getInterviewForSession("s1", delivered.request_id)?.status, "delivered");
   assert.equal(getInterviewForSession("s1", delivered.request_id)?.delivery_entry_id, "pi-entry");
   assert.equal(getInterviewForSession("s1", submitted.request_id)?.status, "submitted");
+  assert.equal(getInterviewForSession("s1", submitted.request_id)?.submission_channel, WAYANG_WEBSOCKET_SUBMISSION_CHANNEL);
+  assert.equal(getInterviewForSession("s1", submitted.request_id)?.authenticated_principal, WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL);
   assert.equal(getInterviewForSession("s1", cancelled.request_id)?.status, "cancelled");
   assert.deepEqual(listSubmittedUndeliveredInterviews("s1").map((record) => record.request_id), ["submitted"]);
 }));
 
-test("submission validates session, canonicalizes answers, and is idempotent", () => withStore(() => {
+test("legacy submitted records load but duplicate retry cannot grant them authority", () => withStore(() => {
+  getStore().interviews.push({
+    request_id: "legacy-submitted",
+    submission_id: "legacy-submission-id",
+    session_id: "owner",
+    origin_tool_name: "questionnaire",
+    questions: QUESTIONS,
+    answers: [{ id: "q1", value: "small", label: "Small", wasCustom: false, index: 0 }],
+    status: "submitted",
+    created_at: 1,
+    submitted_at: 2,
+  });
+  flush();
+  close();
+  init();
+
+  const retry = submitInterview("owner", "legacy-submitted", [{ id: "q1", value: "small", wasCustom: false }]);
+  assert.equal(retry.ok, true);
+  if (retry.ok) {
+    assert.equal(retry.kind, "duplicate");
+    assert.equal(retry.record.submission_id, "legacy-submission-id");
+    assert.equal(retry.record.submission_channel, undefined);
+    assert.equal(retry.record.authenticated_principal, undefined);
+  }
+  const persisted = getInterviewForSession("owner", "legacy-submitted");
+  assert.equal(persisted?.submission_channel, undefined);
+  assert.equal(persisted?.authenticated_principal, undefined);
+}));
+
+test("first submission requires the server-owned WebSocket context and rejects structural forgeries", () => withStore(() => {
+  createOpenInterview({ requestId: "missing-context", sessionId: "owner", toolName: "questionnaire", questions: QUESTIONS });
+  // @ts-expect-error Intentional runtime regression: direct callers cannot omit the server capability.
+  const missing = submitInterviewWithContext("owner", "missing-context", [{ id: "q1", value: "small", wasCustom: false }]);
+  assert.equal(missing.ok, false);
+  if (!missing.ok) assert.equal(missing.code, "unauthorized_submission");
+  assert.equal(getInterviewForSession("owner", "missing-context")?.status, "open");
+
+  const forged = {
+    submission_channel: WAYANG_WEBSOCKET_SUBMISSION_CHANNEL,
+    authenticated_principal: WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL,
+  } as InterviewSubmissionContext;
+  const forgedResult = submitInterviewWithContext(
+    "owner",
+    "missing-context",
+    [{ id: "q1", value: "small", wasCustom: false }],
+    forged,
+  );
+  assert.equal(forgedResult.ok, false);
+  if (!forgedResult.ok) assert.equal(forgedResult.code, "unauthorized_submission");
+  assert.equal(getInterviewForSession("owner", "missing-context")?.submission_channel, undefined);
+}));
+
+test("submission validates session, canonicalizes answers, persists provenance, and is idempotent", () => withStore(() => {
   createOpenInterview({ requestId: "request", sessionId: "owner", toolName: "interview", questions: QUESTIONS });
   assert.equal(submitInterview("other", "request", []).ok, false);
   assert.equal(submitInterview("owner", "request", [{ id: "q1", value: "nope", label: "Nope", wasCustom: false }]).ok, false);
@@ -66,10 +131,18 @@ test("submission validates session, canonicalizes answers, and is idempotent", (
   assert.equal(first.ok, true);
   if (!first.ok) return;
   assert.deepEqual(first.record.answers, [{ id: "q1", value: "small", label: "Small", wasCustom: false, index: 0 }]);
+  assert.equal(first.record.submission_channel, WAYANG_WEBSOCKET_SUBMISSION_CHANNEL);
+  assert.equal(first.record.authenticated_principal, WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL);
+  const submissionId = first.record.submission_id;
 
   const duplicate = submitInterview("owner", "request", [{ id: "q1", value: "small", label: "anything", wasCustom: false }]);
   assert.equal(duplicate.ok, true);
-  if (duplicate.ok) assert.equal(duplicate.kind, "duplicate");
+  if (duplicate.ok) {
+    assert.equal(duplicate.kind, "duplicate");
+    assert.equal(duplicate.record.submission_id, submissionId);
+    assert.equal(duplicate.record.submission_channel, WAYANG_WEBSOCKET_SUBMISSION_CHANNEL);
+    assert.equal(duplicate.record.authenticated_principal, WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL);
+  }
   const conflict = submitInterview("owner", "request", [{ id: "q1", value: "large", label: "Large", wasCustom: false }]);
   assert.equal(conflict.ok, false);
   if (!conflict.ok) assert.equal(conflict.code, "conflict");

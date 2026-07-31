@@ -1,6 +1,7 @@
 export type BrowserLifecycleStatus = "stopped" | "starting" | "running" | "errored";
 export type BrowserControlMode = "agent" | "user" | "paused";
 export type BrowserViewerTransport = "vnc" | "cdp-screencast";
+export type BrowserPersistence = "shared" | "project" | "session";
 
 export interface BrowserProfileMetadata {
   key: string;
@@ -10,7 +11,7 @@ export interface BrowserProfileMetadata {
   downloadsDir: string;
   artifactsDir: string;
   runtimePath: string;
-  persistence: "project" | "session";
+  persistence: BrowserPersistence;
 }
 
 export interface BrowserSessionState {
@@ -39,12 +40,116 @@ export interface BrowserSessionState {
   updatedAt: number;
   lastError?: string;
   logs: string[];
+  /** Internal cooperative-control epoch. Never returned by public routes. */
+  controlGeneration: number;
+  /** Internal CDP target selected for viewer and agent actions. */
+  activeTargetId?: string;
+}
+
+export interface BrowserPublicState {
+  sessionId: string | null;
+  projectCwd: string;
+  status: BrowserLifecycleStatus;
+  controlMode: BrowserControlMode;
+  secretTainted: boolean;
+  localOnlyRecommended: boolean;
+  needsUser: boolean;
+  needsUserReason?: string;
+  lastResumeAt?: number;
+  activeUrl?: string;
+  activeTitle?: string;
+  cdpReady: boolean;
+  viewerTransport: BrowserViewerTransport;
+  viewerWsPath?: string;
+  cdpScreencastWsPath?: string;
+  vncReady: boolean;
+  profile: { persistence: BrowserPersistence };
+  startedAt?: number;
+  updatedAt: number;
+  lastError?: string;
+  credentialInspection?: "blocked" | "text-allowed";
+  /** Backend capability metadata; absence/false means credential UI must stay hidden. */
+  credentialBroker?: { supported: boolean; guarded: true };
 }
 
 export interface BrowserSessionLookup {
   sessionId?: string | null;
   projectCwd?: string | null;
-  persistence?: "project" | "session";
+  persistence?: BrowserPersistence;
+}
+
+export const PROTECTED_BROWSER_CAPABILITY_ID = "wayang.protected-browser.v1" as const;
+export type ProtectedBrowserCapabilityId = typeof PROTECTED_BROWSER_CAPABILITY_ID;
+export type ProtectedBrowserControlMode = "agent" | "user" | "paused";
+export type ProtectedBrowserAuthorityCheckpoint =
+  | "prequeue"
+  | "dequeue"
+  | "pre-cdp"
+  | "prerelease"
+  | "viewer-attach"
+  | "viewer-message"
+  | "control-handoff"
+  | "control-resume"
+  | "credential-handoff"
+  | "credential-resume";
+
+/**
+ * Exact pair-authorized runtime lease captured when protected browser control
+ * is injected. Provider/model are deliberately absent: they select a Pi
+ * runtime, but never identify browser authority or a persistent realm.
+ */
+export interface ProtectedBrowserBinding {
+  capabilityId: ProtectedBrowserCapabilityId;
+  sourceSessionId: string;
+  projectId: string;
+  projectCwd: string;
+  agentProfileId: string;
+  /** Sole durable Project-Agent capability ABA clock. */
+  associationRevision: number;
+  /** Fresh process-local Pi runtime lease clock. */
+  runtimeGeneration: string;
+  processBootNonce: string;
+  /** Persistent pair-realm human/agent control clock. */
+  controlGeneration: number;
+}
+
+/** Resolver result. Every positive invariant is explicit and fail-closed. */
+export interface ProtectedBrowserAuthoritySnapshot extends ProtectedBrowserBinding {
+  authorized: boolean;
+  privacyMode: "standard" | "protected";
+  sourceSessionDurable: boolean;
+  sourceQuarantined: boolean;
+  profileEnabled: boolean;
+  projectAllowsProfile: boolean;
+}
+
+export interface ProtectedBrowserStorage {
+  persistence: "protected";
+  rootDir: string;
+  profileDir: string;
+  artifactsDir: string;
+  runtimeDir: string;
+}
+
+export type ProtectedBrowserOperation =
+  | { kind: "status" }
+  | { kind: "start" }
+  | { kind: "stop" }
+  | { kind: "navigate"; url: string }
+  | { kind: "snapshot"; mode?: "text" | "screenshot" }
+  | { kind: "dom_snapshot"; includeText?: boolean; limit?: number }
+  | { kind: "links"; limit?: number }
+  | { kind: "accessibility"; limit?: number }
+  | { kind: "query_selector"; selector: string; limit?: number }
+  | { kind: "click"; x: number; y: number }
+  | { kind: "click_selector"; selector: string; index?: number }
+  | { kind: "fill_selector"; selector: string; text: string; index?: number }
+  | { kind: "type_public"; text: string };
+
+export interface ProtectedBrowserDispatchResult<T = unknown> {
+  value: T;
+  /** Required after every CDP-backed operation and checked before result release. */
+  topLevelUrl?: string;
 }
 
 export interface BrowserSnapshot {

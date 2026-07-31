@@ -4,13 +4,18 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { close, init } from "./db.js";
-import { getInterviewForSession, submitInterview } from "./interviews.js";
+import { getInterviewForSession, markDelivered, submitInterview as submitInterviewWithContext } from "./interviews.js";
 import { PiInterviewBridge } from "./interview-bridge.js";
+import { WAYANG_WEBSOCKET_SUBMISSION_CONTEXT } from "./interview-provenance.js";
 
 const QUESTIONS = [{
   id: "q1", label: "scope", prompt: "Scope?",
   options: [{ value: "a", label: "A" }, { value: "b", label: "B" }], allowOther: true,
 }];
+
+function submitInterview(sessionId: string, requestId: string, answers: unknown) {
+  return submitInterviewWithContext(sessionId, requestId, answers, WAYANG_WEBSOCKET_SUBMISSION_CONTEXT);
+}
 
 async function withStore(fn: () => Promise<void>): Promise<void> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-interview-bridge-test-"));
@@ -40,12 +45,48 @@ test("bridge persists before notifying and resolves only a matching live waiter"
   const submitted = submitInterview("session-1", requestId, [{ id: "q1", value: "a", label: "ignored", wasCustom: false }]);
   assert.equal(submitted.ok, true);
   if (!submitted.ok) return;
-  assert.equal(bridge.resolveSubmitted(submitted.record), true);
+  assert.equal(bridge.resolveSubmitted({ ...submitted.record, submission_id: undefined }), false);
+  assert.equal(bridge.resolveSubmitted({ ...submitted.record, submission_id: "forged-submission" }), false);
+  assert.equal(bridge.resolveSubmitted({
+    ...submitted.record,
+    answers: [{ id: "q1", value: "b", label: "B", wasCustom: false, index: 1 }],
+  }), true);
 
   const outcome = await waiting;
   assert.equal(outcome.status, "submitted");
-  if (outcome.status === "submitted") assert.deepEqual(outcome.answers, [{ id: "q1", value: "a", label: "A", wasCustom: false, index: 0 }]);
+  if (outcome.status === "submitted") {
+    assert.equal(outcome.submission.submissionId, submitted.record.submission_id);
+    assert.deepEqual(outcome.answers, [{ id: "q1", value: "a", label: "A", wasCustom: false, index: 0 }]);
+  }
   assert.equal(getInterviewForSession("session-1", requestId)?.delivery_mode, "tool_result");
+}));
+
+test("delivery persistence failure leaves the live waiter recoverable for retry", async () => withStore(async () => {
+  let deliveryAttempts = 0;
+  const bridge = new PiInterviewBridge({
+    getInterviewForSession,
+    markDelivered(...args) {
+      deliveryAttempts++;
+      if (deliveryAttempts === 1) throw new Error("synthetic delivery persistence failure");
+      return markDelivered(...args);
+    },
+  });
+  const waiting = bridge.createRequestWithOutcome("session-1", QUESTIONS, { timeoutMs: 1_000 });
+  const [request] = bridge.getPendingRequests("session-1");
+  const submitted = submitInterview("session-1", request!.requestId, [{ id: "q1", value: "a", wasCustom: false }]);
+  assert.equal(submitted.ok, true);
+  if (!submitted.ok) return;
+
+  assert.equal(bridge.resolveSubmitted(submitted.record), false);
+  assert.equal(getInterviewForSession("session-1", request!.requestId)?.status, "submitted");
+  assert.equal(bridge.resolveSubmitted(submitted.record), true);
+  const outcome = await waiting;
+  assert.equal(outcome.status, "submitted");
+  if (outcome.status === "submitted") {
+    assert.equal(outcome.submission.submissionId, submitted.record.submission_id);
+    assert.equal(outcome.answers[0]?.value, "a");
+  }
+  assert.equal(deliveryAttempts, 2);
 }));
 
 test("grace expiry leaves the durable request open and reports pending", async () => withStore(async () => {

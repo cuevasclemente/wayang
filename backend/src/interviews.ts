@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { flush, getStore, type InterviewRecord as StoredInterviewRecord } from "./db.js";
+import { commitStoreMutation, getStore, type InterviewRecord as StoredInterviewRecord, type StoreData } from "./db.js";
+import {
+  isWayangWebSocketSubmissionContext,
+  type InterviewSubmissionContext,
+} from "./interview-provenance.js";
 
 export type InterviewStatus = "open" | "submitted" | "cancelled" | "delivered";
 export type InterviewToolName = "interview" | "questionnaire";
@@ -44,7 +48,10 @@ export interface CreateOpenInterviewInput {
 
 export type SubmitInterviewResult =
   | { ok: true; kind: "accepted" | "duplicate"; record: InterviewRecord }
-  | { ok: false; code: "not_found" | "wrong_session" | "cancelled" | "conflict" | "invalid_answers"; message: string };
+  | { ok: false; code: "unauthorized_submission" | "not_found" | "wrong_session" | "cancelled" | "conflict" | "invalid_answers"; message: string };
+
+type InterviewMutationCommit = <T>(mutate: (draft: StoreData) => T) => T;
+const interviewMutationCommit: InterviewMutationCommit = commitStoreMutation;
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -113,8 +120,6 @@ export function normalizeAnswers(questions: InterviewQuestion[], raw: unknown): 
     if (!value) throw new Error(`Answer for ${question.id} is required`);
 
     if (answer.wasCustom === true) {
-      // Stored interviews may predate universal free-text support and retain
-      // allowOther: false, so this intentionally does not consult that flag.
       return { id: question.id, value, label: value, wasCustom: true };
     }
 
@@ -125,15 +130,14 @@ export function normalizeAnswers(questions: InterviewQuestion[], raw: unknown): 
   });
 }
 
-function records(): InterviewRecord[] {
-  return getStore().interviews as InterviewRecord[];
+function records(store = getStore()): InterviewRecord[] {
+  return store.interviews as InterviewRecord[];
 }
 
 export function createOpenInterview(input: CreateOpenInterviewInput): InterviewRecord {
   const sessionId = input.sessionId.trim();
   if (!sessionId) throw new Error("Interview session ID is required");
   const requestId = input.requestId?.trim() || randomUUID();
-  if (records().some((record) => record.request_id === requestId)) throw new Error("Interview request ID already exists");
   const record: InterviewRecord = {
     request_id: requestId,
     session_id: sessionId,
@@ -145,9 +149,11 @@ export function createOpenInterview(input: CreateOpenInterviewInput): InterviewR
     status: "open",
     created_at: Date.now(),
   };
-  records().push(record);
-  flush();
-  return clone(record);
+  return interviewMutationCommit((draft) => {
+    if (records(draft).some((candidate) => candidate.request_id === requestId)) throw new Error("Interview request ID already exists");
+    records(draft).push(clone(record));
+    return clone(record);
+  });
 }
 
 export function getInterviewForSession(sessionId: string, requestId: string): InterviewRecord | undefined {
@@ -178,7 +184,16 @@ function sameAnswers(a: InterviewAnswer[] | undefined, b: InterviewAnswer[]): bo
   return JSON.stringify(a ?? []) === JSON.stringify(b);
 }
 
-export function submitInterview(sessionId: string, requestId: string, rawAnswers: unknown): SubmitInterviewResult {
+export function submitInterview(
+  sessionId: string,
+  requestId: string,
+  rawAnswers: unknown,
+  context: InterviewSubmissionContext,
+): SubmitInterviewResult {
+  if (!isWayangWebSocketSubmissionContext(context)) {
+    return { ok: false, code: "unauthorized_submission", message: "Interview submission requires the authorized Wayang WebSocket boundary" };
+  }
+
   const record = records().find((candidate) => candidate.request_id === requestId);
   if (!record) return { ok: false, code: "not_found", message: "Interview request was not found" };
   if (record.session_id !== sessionId) return { ok: false, code: "wrong_session", message: "Interview request belongs to another session" };
@@ -198,21 +213,34 @@ export function submitInterview(sessionId: string, requestId: string, rawAnswers
     return { ok: true, kind: "duplicate", record: clone(record) };
   }
 
-  record.answers = answers;
-  record.submission_id = randomUUID();
-  record.submitted_at = Date.now();
-  record.status = "submitted";
-  flush();
-  return { ok: true, kind: "accepted", record: clone(record) };
+  const submissionId = randomUUID();
+  const submittedAt = Date.now();
+  const committed = interviewMutationCommit((draft) => {
+    const target = records(draft).find((candidate) => candidate.request_id === requestId);
+    if (!target || target.session_id !== sessionId || target.status !== "open") {
+      throw new Error("Interview state changed before submission could be persisted");
+    }
+    target.answers = clone(answers);
+    target.submission_id = submissionId;
+    target.submission_channel = context.submission_channel;
+    target.authenticated_principal = context.authenticated_principal;
+    target.submitted_at = submittedAt;
+    target.status = "submitted";
+    return clone(target);
+  });
+  return { ok: true, kind: "accepted", record: committed };
 }
 
 export function cancelInterview(sessionId: string, requestId: string): InterviewRecord | undefined {
   const record = records().find((candidate) => candidate.request_id === requestId && candidate.session_id === sessionId);
   if (!record || record.status !== "open") return undefined;
-  record.status = "cancelled";
-  record.cancelled_at = Date.now();
-  flush();
-  return clone(record);
+  return interviewMutationCommit((draft) => {
+    const target = records(draft).find((candidate) => candidate.request_id === requestId && candidate.session_id === sessionId);
+    if (!target || target.status !== "open") return undefined;
+    target.status = "cancelled";
+    target.cancelled_at = Date.now();
+    return clone(target);
+  });
 }
 
 export function markDelivered(requestId: string, mode: "tool_result" | "custom_message", entryId?: string): InterviewRecord | undefined {
@@ -220,19 +248,23 @@ export function markDelivered(requestId: string, mode: "tool_result" | "custom_m
   if (!record || record.status === "cancelled") return undefined;
   if (record.status === "delivered") return clone(record);
   if (record.status !== "submitted") return undefined;
-  record.status = "delivered";
-  record.delivered_at = Date.now();
-  record.delivery_mode = mode;
-  if (entryId) record.delivery_entry_id = entryId;
-  flush();
-  return clone(record);
+  return interviewMutationCommit((draft) => {
+    const target = records(draft).find((candidate) => candidate.request_id === requestId);
+    if (!target || target.status !== "submitted") return target?.status === "delivered" ? clone(target) : undefined;
+    target.status = "delivered";
+    target.delivered_at = Date.now();
+    target.delivery_mode = mode;
+    if (entryId) target.delivery_entry_id = entryId;
+    return clone(target);
+  });
 }
 
-export function removeInterviewsForSession(sessionId: string, options: { flush?: boolean } = {}): number {
-  const store = getStore();
-  const before = store.interviews.length;
-  store.interviews = store.interviews.filter((record) => record.session_id !== sessionId);
-  const removed = before - store.interviews.length;
-  if (removed && options.flush !== false) flush();
-  return removed;
+export function removeInterviewsForSession(sessionId: string, _options: { flush?: boolean } = {}): number {
+  const count = records().filter((record) => record.session_id === sessionId).length;
+  if (count === 0) return 0;
+  return interviewMutationCommit((draft) => {
+    const before = draft.interviews.length;
+    draft.interviews = draft.interviews.filter((record) => record.session_id !== sessionId);
+    return before - draft.interviews.length;
+  });
 }

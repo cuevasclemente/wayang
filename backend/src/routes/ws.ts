@@ -12,6 +12,7 @@
  *
  *   Server → Client:
  *     { type: "history", messages: [...] }
+ *     { type: "session_runtime_state", session_id, selection_id, bash_mode }
  *     { type: "text_delta", delta: string }
  *     { type: "thinking_delta", delta: string }
  *     { type: "tool_execution_start", tool_call_id, tool_name, input }
@@ -22,18 +23,20 @@
  *     { type: "subagent_event", subagent_id, event }
  *     { type: "goal_update", goal_id, status }
  *     { type: "context_usage", tokens: number|null, contextWindow: number, percent: number|null }
+ *     { type: "compaction_start", reason: "manual"|"threshold"|"overflow" }
+ *     { type: "compaction_end", reason, succeeded, aborted, will_retry, error? }
+ *     { type: "agent_settled" }
  *     { type: "queue_update", steering: string[], followUp: string[] }
  */
 
 import * as fs from "node:fs";
-import { randomUUID } from "node:crypto";
 import { Router } from "express";
-import type { ImageContent } from "@earendil-works/pi-ai";
 import { WebSocketServer, WebSocket } from "ws";
 import type { Server } from "http";
 import {
   createPiSession,
   getPiSession,
+  getPiSessionBashMode,
   sendMessage,
   resendMessage,
   abortSession,
@@ -45,6 +48,7 @@ import {
   getCommandGuardState,
   setCommandGuardMode,
   ensureInteractiveCommandGuardEnabled,
+  onPiSessionRuntimeEvent,
   setSessionModel,
   type CommandGuardMode,
   type PiSessionHandle,
@@ -52,20 +56,26 @@ import {
 } from "../pi-bridge.js";
 import {
   getSessionById,
+  isLegacyPrivateSessionQuarantined,
   touchSession,
   updateGoal,
   updatePiSessionFile,
   updateSessionError,
-  updateSessionModel,
   updateSessionTitle,
 } from "../sessions.js";
 import { getInterviewBridge } from "../interview-bridge.js";
 import { deliverSubmittedInterview, drainSubmittedInterviews } from "../interview-delivery.js";
 import { cancelInterview, submitInterview } from "../interviews.js";
+import {
+  WAYANG_WEBSOCKET_SUBMISSION_CONTEXT,
+  type InterviewSubmissionContext,
+} from "../interview-provenance.js";
 import { getSudoBridge, type SudoRequest } from "../sudo-bridge.js";
 import { getCommandGuardIdentityBridge, type CommandGuardIdentityRequest } from "../command-guard-bridge.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
+import { authorizeProjectAction } from "../policy.js";
 import type { AuthService } from "../auth/service.js";
+import { prepareAttachments } from "../attachments.js";
 
 export const router = Router();
 
@@ -90,121 +100,14 @@ function wsProfile(sessionId: string | null | undefined, event: string, details 
   );
 }
 
-const ATTACHMENT_UPLOAD_DIR = "/tmp/wayang-attachments";
-const MAX_ATTACHMENTS = 40;
-// Keep inline image payloads under provider limits; the frontend attempts to
-// downscale/compress larger raster images before sending them here.
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
-// General files are saved to disk and referenced from the prompt. They are not
-// sent to the LLM as multimodal blocks, but the agent can inspect them with tools.
-const MAX_FILE_BYTES = 25 * 1024 * 1024;
-const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
-const ALLOWED_IMAGE_MIME_TYPES = new Map([
-  ["image/png", "png"],
-  ["image/jpeg", "jpg"],
-  ["image/webp", "webp"],
-  ["image/gif", "gif"],
-]);
-const MIME_EXTENSION_HINTS = new Map([
-  ["application/pdf", "pdf"],
-  ["message/rfc822", "eml"],
-  ["text/plain", "txt"],
-]);
-
-interface PreparedAttachments {
-  images: ImageContent[];
-  notes: string[];
-  count: number;
-}
-
-function sanitizeUploadName(name: unknown): string {
-  if (typeof name !== "string") return "attachment";
-  const sanitized = name.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
-  return sanitized.slice(0, 120) || "attachment";
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function normalizeBase64AttachmentData(value: unknown): string {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new Error("Attachment is missing data");
-  }
-  const withoutDataUrl = value.includes(",") ? value.slice(value.indexOf(",") + 1) : value;
-  const normalized = withoutDataUrl.replace(/\s+/g, "");
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized) || normalized.length % 4 !== 0) {
-    throw new Error("Attachment data must be base64-encoded");
-  }
-  return normalized;
-}
-
-function ensureUploadNameHasExtension(name: string, extension: string | undefined): string {
-  if (!extension || /\.[a-zA-Z0-9]{1,12}$/.test(name)) return name;
-  return `${name}.${extension}`;
-}
-
-function prepareAttachments(sessionId: string, attachments: unknown): PreparedAttachments {
-  if (!Array.isArray(attachments) || attachments.length === 0) {
-    return { images: [], notes: [], count: 0 };
-  }
-  if (attachments.length > MAX_ATTACHMENTS) {
-    throw new Error(`Too many attachments (max ${MAX_ATTACHMENTS})`);
-  }
-
-  fs.mkdirSync(ATTACHMENT_UPLOAD_DIR, { recursive: true });
-
-  const images: ImageContent[] = [];
-  const notes: string[] = [];
-  let totalBytes = 0;
-  for (const rawAttachment of attachments) {
-    if (!rawAttachment || typeof rawAttachment !== "object") {
-      throw new Error("Invalid attachment");
-    }
-    const attachment = rawAttachment as Record<string, unknown>;
-    const mimeType = typeof attachment.mimeType === "string" && attachment.mimeType.trim()
-      ? attachment.mimeType.toLowerCase()
-      : "application/octet-stream";
-    const imageExtension = ALLOWED_IMAGE_MIME_TYPES.get(mimeType);
-    const isImage = Boolean(imageExtension);
-
-    if (mimeType.startsWith("image/") && !imageExtension) {
-      throw new Error(`Unsupported image type: ${mimeType}`);
-    }
-
-    const data = normalizeBase64AttachmentData(attachment.data);
-    const buffer = Buffer.from(data, "base64");
-    if (buffer.length === 0) {
-      throw new Error("Attachment is empty");
-    }
-    const maxBytes = isImage ? MAX_IMAGE_BYTES : MAX_FILE_BYTES;
-    if (buffer.length > maxBytes) {
-      throw new Error(`Attachment is too large (${formatBytes(buffer.length)}; max ${formatBytes(maxBytes)})`);
-    }
-    totalBytes += buffer.length;
-    if (totalBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
-      throw new Error(`Attachments are too large (${formatBytes(totalBytes)} total; max ${formatBytes(MAX_TOTAL_ATTACHMENT_BYTES)})`);
-    }
-
-    const originalName = ensureUploadNameHasExtension(
-      sanitizeUploadName(attachment.name),
-      imageExtension ?? MIME_EXTENSION_HINTS.get(mimeType),
-    );
-    const fileName = `${Date.now()}-${sessionId.slice(0, 8)}-${randomUUID()}-${originalName}`;
-    const filePath = `${ATTACHMENT_UPLOAD_DIR}/${fileName}`;
-    fs.writeFileSync(filePath, buffer, { mode: 0o600 });
-
-    if (isImage) {
-      images.push({ type: "image", mimeType, data: buffer.toString("base64") });
-      notes.push(`<file name="${filePath}">[Uploaded image ${originalName}; ${mimeType}; ${formatBytes(buffer.length)}]</file>`);
-    } else {
-      notes.push(`<file name="${filePath}">[Uploaded file ${originalName}; ${mimeType}; ${formatBytes(buffer.length)}. Saved at this path for tool access.]</file>`);
-    }
-  }
-
-  return { images, notes, count: notes.length };
+/** @internal Exported for focused wire-contract tests. */
+export function serializeSessionRuntimeState(sessionId: string, selectionId: string | null) {
+  return {
+    type: "session_runtime_state" as const,
+    session_id: sessionId,
+    ...(selectionId ? { selection_id: selectionId } : {}),
+    bash_mode: getPiSessionBashMode(sessionId),
+  };
 }
 
 // We attach this to the HTTP server in app.ts
@@ -259,7 +162,7 @@ export function attachWs(httpServer: Server, auth: AuthService): void {
     }
 
     wsProfile(sessionId, "handle_connection_start", `connection_event_duration=${elapsedMs(connectionStart)}`);
-    handleConnection(ws, sessionId, selectionId);
+    handleConnection(ws, sessionId, selectionId, WAYANG_WEBSOCKET_SUBMISSION_CONTEXT);
   });
 }
 
@@ -272,7 +175,12 @@ interface PendingMessage {
   thinking?: string;
 }
 
-function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: string | null): void {
+function handleConnection(
+  ws: WebSocket,
+  sessionId: string,
+  initialSelectionId: string | null,
+  submissionContext: InterviewSubmissionContext,
+): void {
   const connectionStart = nowMs();
   wsProfile(sessionId, "handle_connection_enter");
   let alive = true;
@@ -287,6 +195,7 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
   let sudoBridgeUnsub: (() => void) | null = null;
   let commandGuardIdentityBridgeUnsub: (() => void) | null = null;
   let filePollTimer: NodeJS.Timeout | null = null;
+  let runtimeEventUnsub: (() => void) | null = null;
   const pendingMessages: any[] = [];
 
   const stopFilePoll = () => {
@@ -322,6 +231,7 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
     cwd: string | null | undefined,
     version: number,
     selectionId: string | null,
+    runtimeEligible: boolean,
   ) => {
     const pollStart = nowMs();
     stopFilePoll();
@@ -341,7 +251,7 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
     wsProfile(nextSessionId, "file_poll_started", `duration=${elapsedMs(pollStart)}`);
     filePollTimer = setInterval(() => {
       if (!alive || version !== setupVersion) return;
-      if (getPiSession(nextSessionId)) return;
+      if (runtimeEligible && getPiSession(nextSessionId)) return;
 
       try {
         const mtimeMs = fs.statSync(sessionFile).mtimeMs;
@@ -375,6 +285,11 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
     selectionId: string | null,
     sendInitialSnapshot = true,
   ): Promise<boolean> => {
+    const durable = getSessionById(nextSessionId);
+    if (durable && isLegacyPrivateSessionQuarantined(durable)) {
+      wsProfile(nextSessionId, "attach_live_skip", "reason=legacy_quarantine");
+      return false;
+    }
     const attachStart = nowMs();
     wsProfile(nextSessionId, "attach_live_start", `createIfMissing=${createIfMissing} hasLive=${Boolean(getPiSession(nextSessionId))}`);
     if (!getPiSession(nextSessionId)) {
@@ -407,18 +322,25 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
     let bufferOverflow = false;
     const deliverLiveEvent = (msg: SerializedMessage) => {
       if (!alive || version !== setupVersion) return;
-      if (msg.type === "turn_end" || msg.type === "agent_end") touchSession(nextSessionId);
+      if (msg.type === "turn_end" || msg.type === "agent_end" || msg.type === "agent_settled") {
+        touchSession(nextSessionId);
+      }
       sendSafe(ws, msg);
-      if (msg.type === "turn_end" || msg.type === "agent_end") {
+      if (msg.type === "turn_end" || msg.type === "agent_end" || msg.type === "agent_settled") {
         sendSafe(ws, { ...getTodoState(nextSessionId), session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
       }
-      if (msg.type === "agent_end") {
+
+      // Pi's agent_end is intermediate: retry and auto-compaction run after it.
+      // Reconcile context usage only once the top-level run settles. Manual
+      // compaction has no agent_settled event, so a successful compaction_end
+      // is also an authoritative reconciliation point.
+      if (shouldReconcileLiveSessionState(msg)) {
         const reconciled = getMessageHistory(nextSessionId);
         sendSafe(ws, {
           type: "history",
           session_id: nextSessionId,
           ...(selectionId ? { selection_id: selectionId } : {}),
-          reason: "agent_end_reconciliation",
+          reason: msg.type === "agent_settled" ? "agent_settled_reconciliation" : "compaction_end_reconciliation",
           message_count: reconciled.length,
           payload_bytes: Buffer.byteLength(JSON.stringify(reconciled)),
           messages: reconciled,
@@ -500,6 +422,15 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
       const sessionInfo = getSessionById(nextSessionId);
       wsProfile(nextSessionId, "setup_session_lookup", `duration=${elapsedMs(lookupStart)} found=${Boolean(sessionInfo)}`);
       if (!sessionInfo) throw new Error("Session not found");
+      const quarantined = isLegacyPrivateSessionQuarantined(sessionInfo);
+      if (!quarantined) {
+        const authorization = authorizeProjectAction({
+          cwd: sessionInfo.cwd,
+          actor: "interactive",
+          agentProfileId: sessionInfo.agent_profile_id,
+        });
+        if (!authorization.allowed) throw new Error(authorization.reason ?? "Session is no longer authorized");
+      }
 
       // Mark the selected session ready before loading/parsing transcript
       // history. Large JSONL session files and Firefox websocket scheduling can
@@ -507,6 +438,7 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
       // server has accepted the selection and can queue/send messages.
       sendSafe(ws, { type: "session_loading", session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
       wsProfile(nextSessionId, "sent_session_loading", `setup_elapsed=${elapsedMs(setupStart)}`);
+      if (!quarantined) sendSafe(ws, serializeSessionRuntimeState(nextSessionId, selectionId));
       ready = true;
       sendSafe(ws, { type: "session_ready", session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
       wsProfile(nextSessionId, "sent_session_ready", `setup_elapsed=${elapsedMs(setupStart)}`);
@@ -514,7 +446,7 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
 
       // Subscribe to extension UI bridge requests for this session's project cwd.
       // This is cheap and does not require constructing a live AgentSession.
-      if (sessionInfo.cwd) {
+      if (sessionInfo.cwd && !quarantined) {
         const bridgeStart = nowMs();
         const deliveredInterviewRequestIds = new Set<string>();
         const sendInterviewRequest = (req: { requestId: string; sessionId: string; questions: unknown; createdAt: number }) => {
@@ -610,7 +542,9 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
         try {
           // A live session subscribes before snapshot capture and emits exactly
           // one initial history payload for this selection generation.
-          const attachedLive = await attachLiveSession(nextSessionId, version, false, selectionId, true);
+          const attachedLive = quarantined
+            ? false
+            : await attachLiveSession(nextSessionId, version, false, selectionId, true);
           if (!alive || version !== setupVersion) return;
           if (!attachedLive) {
             const fileHistoryStart = nowMs();
@@ -629,9 +563,9 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
             });
             sendSafe(ws, { ...(snapshot?.todoState ?? getSessionFileTodoState(sessionInfo.pi_session_file, sessionInfo.cwd)), session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
             wsProfile(nextSessionId, "sent_history", `duration=${elapsedMs(sendHistoryStart)} messages=${messages.length}`);
-            startFilePoll(nextSessionId, sessionInfo.pi_session_file, sessionInfo.cwd, version, selectionId);
+            startFilePoll(nextSessionId, sessionInfo.pi_session_file, sessionInfo.cwd, version, selectionId, !quarantined);
           }
-          sendContextUsage(ws, nextSessionId);
+          if (!quarantined) sendContextUsage(ws, nextSessionId);
           wsProfile(nextSessionId, "deferred_history_done", `duration=${elapsedMs(deferredStart)}`);
         } catch (err: any) {
           if (!alive || version !== setupVersion) return;
@@ -678,6 +612,12 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
       return;
     }
 
+    const durable = getSessionById(currentSessionId);
+    if (durable && isLegacyPrivateSessionQuarantined(durable)) {
+      sendSafe(ws, { type: "error", error: "Quarantined legacy sessions are view-only" });
+      return;
+    }
+
     if (readyError) {
       sendSafe(ws, {
         type: "error",
@@ -698,7 +638,7 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
 
     // Route extension UI bridge responses directly to their bridges.
     if (msg.type === "interview_response") {
-      handleInterviewResponse(ws, currentSessionId, msg);
+      handleInterviewResponse(ws, currentSessionId, msg, submissionContext);
       return;
     }
 
@@ -722,6 +662,21 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
     });
   };
 
+  runtimeEventUnsub = onPiSessionRuntimeEvent((event) => {
+    if (!alive || event.sessionId !== currentSessionId) return;
+    const durable = getSessionById(currentSessionId);
+    if (!durable || isLegacyPrivateSessionQuarantined(durable)) return;
+    if (event.type === "runtime_state_changed") {
+      sendSafe(ws, serializeSessionRuntimeState(currentSessionId, currentSelectionId));
+      return;
+    }
+    if (event.type === "agent_switched") {
+      setupSession(currentSessionId, currentSelectionId).catch((err) => {
+        sendSafe(ws, { type: "error", error: err.message || String(err) });
+      });
+    }
+  });
+
   setupSession(sessionId, initialSelectionId).catch((err) => {
     sendSafe(ws, { type: "error", error: err.message || String(err) });
   });
@@ -742,30 +697,29 @@ function handleConnection(ws: WebSocket, sessionId: string, initialSelectionId: 
   ws.on("close", (code, reason) => {
     wsProfile(currentSessionId, "socket_close", `code=${code} reason=${reason.toString()} lifetime=${elapsedMs(connectionStart)}`);
     alive = false;
-    // A WebSocket connection is only a transport/subscriber, not the owner of
-    // interactive prompts. Do not cancel pending interview/sudo/PIN requests on
-    // close: browser refreshes, reconnects, and diagnostic observers would
-    // otherwise resolve security prompts as cancelled. The setup path replays
-    // still-pending prompts for the selected session; session shutdown remains
-    // responsible for cancellation via destroyPiSession().
     cleanupSubscriptions();
+    runtimeEventUnsub?.();
+    runtimeEventUnsub = null;
   });
 
   ws.on("error", (err) => {
     wsProfile(currentSessionId, "socket_error", `error=${err instanceof Error ? err.message : String(err)} lifetime=${elapsedMs(connectionStart)}`);
     alive = false;
-    // Keep pending prompts alive across transport errors; they timeout or are
-    // cancelled when the owning pi session is destroyed.
     cleanupSubscriptions();
+    runtimeEventUnsub?.();
+    runtimeEventUnsub = null;
   });
 }
 
 async function getOrCreatePiSession(id: string): Promise<void> {
-  const existing = getPiSession(id);
-  if (existing) return;
-
   const session = getSessionById(id);
   if (!session) throw new Error("Session not found in DB");
+  if (isLegacyPrivateSessionQuarantined(session)) {
+    throw new Error("Quarantined legacy sessions cannot start a runtime");
+  }
+
+  const existing = getPiSession(id);
+  if (existing) return;
 
   const handle = await createPiSession(
     id,
@@ -801,6 +755,14 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
   const parsed = parseSlashCommand(content);
   if (!parsed) return false;
 
+  const durable = getSessionById(sessionId);
+  if (durable && isLegacyPrivateSessionQuarantined(durable)) {
+    // Deny before looking up a live handle: every built-in, extension command,
+    // prompt template, and skill is unavailable to quarantined sessions.
+    sendSafe(ws, { type: "error", error: "Commands are unavailable for quarantined legacy sessions" });
+    return true;
+  }
+
   const handle = getPiSession(sessionId);
   if (!handle) return false;
 
@@ -819,7 +781,6 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
       const provider = modelRef.slice(0, slashIndex);
       const model = modelRef.slice(slashIndex + 1);
       const selected = await setSessionModel(sessionId, provider, model);
-      updateSessionModel(sessionId, selected.model, selected.provider);
       sendCommandNotice(ws, `Model set to ${selected.provider}/${selected.model}`);
       sendSafe(ws, { type: "command_guard_state", ...getCommandGuardState(sessionId) });
       return true;
@@ -859,7 +820,10 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
           sendCommandNotice(ws, "Compaction complete.");
           sendContextUsage(ws, sessionId);
         })
-        .catch((err: any) => sendSafe(ws, { type: "error", error: err?.message || String(err) }));
+        .catch((err: any) => sendSafe(ws, {
+          type: "error",
+          error: err?.message || String(err),
+        }));
       return true;
     }
 
@@ -883,6 +847,13 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
   }
 }
 
+function safeSessionError(sessionId: string, error: unknown, prefix = ""): string {
+  const row = getSessionById(sessionId);
+  if (row && isLegacyPrivateSessionQuarantined(row)) return "Quarantined legacy session operation denied";
+  const message = error instanceof Error ? error.message : String(error);
+  return `${prefix}${message}`;
+}
+
 async function handleClientMessage(
   ws: WebSocket,
   sessionId: string,
@@ -890,6 +861,18 @@ async function handleClientMessage(
   ensureLiveSession: () => Promise<void>,
 ): Promise<void> {
   try {
+    const row = getSessionById(sessionId);
+    if (!row) throw new Error("Session not found");
+    if (isLegacyPrivateSessionQuarantined(row)) {
+      throw new Error("Quarantined legacy sessions are view-only");
+    }
+    const authorization = authorizeProjectAction({
+      cwd: row.cwd,
+      actor: "interactive",
+      agentProfileId: row.agent_profile_id,
+    });
+    if (!authorization.allowed) throw new Error(authorization.reason ?? "Session is no longer authorized");
+
     switch (msg.type) {
       case "message": {
         const rawContent = typeof msg.content === "string" ? msg.content : "";
@@ -907,7 +890,7 @@ async function handleClientMessage(
           await ensureLiveSession();
           updateSessionError(sessionId, null);
         } catch (err: any) {
-          throw new Error(`Failed to start pi session: ${err?.message || String(err)}`);
+          throw new Error(safeSessionError(sessionId, err, "Failed to start pi session: "));
         }
 
         if (trimmedContent && await handleBuiltinSlashCommand(ws, sessionId, trimmedContent)) {
@@ -937,7 +920,7 @@ async function handleClientMessage(
         ).then(() => {
           updateSessionError(sessionId, null);
         }).catch((err) => {
-          const error = `Agent turn failed: ${err?.message || String(err)}`;
+          const error = safeSessionError(sessionId, err, "Agent turn failed: ");
           updateSessionError(sessionId, error);
           sendSafe(ws, { type: "error", error });
         });
@@ -952,7 +935,7 @@ async function handleClientMessage(
           await ensureLiveSession();
           updateSessionError(sessionId, null);
         } catch (err: any) {
-          throw new Error(`Failed to start pi session: ${err?.message || String(err)}`);
+          throw new Error(safeSessionError(sessionId, err, "Failed to start pi session: "));
         }
 
         const result = await resendMessage(sessionId, messageId);
@@ -967,7 +950,7 @@ async function handleClientMessage(
         result.turn.then(() => {
           updateSessionError(sessionId, null);
         }).catch((err) => {
-          const error = `Agent turn failed: ${err?.message || String(err)}`;
+          const error = safeSessionError(sessionId, err, "Agent turn failed: ");
           updateSessionError(sessionId, error);
           sendSafe(ws, { type: "error", error });
           sendSafe(ws, {
@@ -1017,7 +1000,7 @@ async function handleClientMessage(
         break;
     }
   } catch (err: any) {
-    const error = err?.message || String(err);
+    const error = safeSessionError(sessionId, err);
     updateSessionError(sessionId, error);
     sendSafe(ws, { type: "error", error });
   }
@@ -1044,14 +1027,19 @@ function normalizeCommandGuardMode(value: unknown): CommandGuardMode | null {
  * The acknowledgement is the browser durability boundary and is sent for both
  * first submit and same-payload retries.
  */
-function handleInterviewResponse(ws: WebSocket, sessionId: string, msg: any): void {
+function handleInterviewResponse(
+  ws: WebSocket,
+  sessionId: string,
+  msg: any,
+  submissionContext: InterviewSubmissionContext,
+): void {
   const requestId = typeof msg?.requestId === "string" ? msg.requestId : "";
   if (!requestId || !Array.isArray(msg?.answers)) {
     sendSafe(ws, { type: "interview_response_ack", requestId: requestId || null, sessionId, status: "rejected", errorCode: "invalid_answers", error: "requestId and answers are required" });
     return;
   }
 
-  const submitted = submitInterview(sessionId, requestId, msg.answers);
+  const submitted = submitInterview(sessionId, requestId, msg.answers, submissionContext);
   if (!submitted.ok) {
     sendSafe(ws, { type: "interview_response_ack", requestId, sessionId, status: "rejected", errorCode: submitted.code, error: submitted.message });
     return;
@@ -1127,6 +1115,11 @@ function handleCommandGuardPinResponse(sessionId: string, msg: any): void {
   }
 
   bridge.resolveForSession(sessionId, requestId, typeof msg.pin === "string" ? msg.pin : null);
+}
+
+export function shouldReconcileLiveSessionState(msg: SerializedMessage): boolean {
+  return msg.type === "agent_settled"
+    || (msg.type === "compaction_end" && msg.succeeded === true);
 }
 
 function sendContextUsage(ws: WebSocket, sessionId: string): void {

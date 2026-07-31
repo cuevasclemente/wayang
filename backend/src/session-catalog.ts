@@ -4,7 +4,10 @@ import { promises as fsp } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
+import { authorizeProjectAction, getPolicyGeneration } from "./policy.js";
+import { ensureProjectForCwd } from "./projects.js";
 import { recordLatencyMetric } from "./latency-metrics.js";
+import { writeDreamPolicyProjection } from "./search/policy-projection.js";
 import {
   SessionMetadataWorkerPool,
   fingerprintsEqual,
@@ -36,6 +39,7 @@ export interface CatalogScanResult {
   discovered: number;
   parsed: number;
   parseBytes: number;
+  headerBytes: number;
   parseFailures: number;
   durationMs: number;
   generation: number;
@@ -49,6 +53,93 @@ export interface SessionCatalogAdapter {
 const SAFETY_SCAN_MS = Math.max(1_000, Number.parseInt(process.env.WAYANG_SESSION_CATALOG_SCAN_MS || "30000", 10) || 30_000);
 const COMPLETION_COOLDOWN_MS = Math.max(100, Number.parseInt(process.env.WAYANG_SESSION_CATALOG_COOLDOWN_MS || "1000", 10) || 1_000);
 const WATCH_DEBOUNCE_MS = 250;
+export const MAX_SESSION_HEADER_BYTES = 64 * 1024;
+
+export interface SessionCatalogOptions {
+  /** Test seams; production uses the central evaluator and atomic projection. */
+  authorizeCwd?: (cwd: string) => boolean;
+  getPolicyGeneration?: () => number;
+  refreshProjection?: () => void;
+  observePreAuthorizationBytes?: (bytes: Uint8Array) => void;
+  onAuthorizedBodyTransferred?: () => void;
+}
+
+function authorizeCatalogCwd(cwd: string): boolean {
+  let decision = authorizeProjectAction({ cwd, actor: "indexer" });
+  if (decision.code === "project_not_registered") {
+    // Catalog discovery has always reconciled new cwd values into Projects.
+    // Registration happens after bounded header parsing and before body access.
+    ensureProjectForCwd(cwd);
+    decision = authorizeProjectAction({ cwd, actor: "indexer" });
+  }
+  return decision.allowed;
+}
+
+function readAuthorizedContent(
+  filePath: string,
+  fingerprint: FileFingerprint,
+  authorizeCwd: (cwd: string) => boolean,
+  observePreAuthorizationBytes?: (bytes: Uint8Array) => void,
+): { content: Uint8Array | null; headerBytes: number; denied: boolean } {
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const fd = fs.openSync(filePath, flags);
+  try {
+    const before = fingerprintFromStat(fs.fstatSync(fd));
+    if (!fingerprintsEqual(before, fingerprint)) throw new Error("Session file changed before header authorization");
+    // Read exactly through LF, one byte at a time. Chunked pread/read calls may
+    // fill their buffer with body bytes after a short header, which would cross
+    // the authorization boundary even if those bytes were not parsed.
+    const maximum = Math.min(MAX_SESSION_HEADER_BYTES, fingerprint.size);
+    const headerBuffer = new Uint8Array(maximum);
+    const singleByte = new Uint8Array(1);
+    let headerLength = 0;
+    let foundNewline = false;
+    while (headerLength < maximum) {
+      const count = fs.readSync(fd, singleByte, 0, 1, null);
+      if (count === 0) break;
+      headerBuffer[headerLength++] = singleByte[0]!;
+      if (singleByte[0] === 0x0a) {
+        foundNewline = true;
+        break;
+      }
+    }
+    if (!foundNewline && fingerprint.size > headerLength) {
+      throw new Error("Session header exceeds the bounded authorization limit");
+    }
+    const authorizedPrefix = headerBuffer.subarray(0, headerLength);
+    observePreAuthorizationBytes?.(authorizedPrefix);
+    const lineLength = foundNewline ? headerLength - 1 : headerLength;
+    const headerLine = Buffer.from(authorizedPrefix.subarray(0, lineLength)).toString("utf8").replace(/\r$/, "").trim();
+    let header: unknown;
+    try { header = JSON.parse(headerLine); } catch { throw new Error("Session header is malformed"); }
+    if (!header || typeof header !== "object" || (header as { type?: unknown }).type !== "session") {
+      throw new Error("Session header is missing");
+    }
+    const cwd = (header as { cwd?: unknown }).cwd;
+    if (typeof cwd !== "string" || !cwd.trim()) throw new Error("Session header cwd is missing");
+    if (!authorizeCwd(cwd)) return { content: null, headerBytes: headerLength, denied: true };
+
+    // No await/yield occurs between the central decision and this read. Policy
+    // writes run on the same main event loop, so tightening cannot interleave.
+    // The fd offset is exactly after the header LF; continue from there and
+    // prepend only the already-authorized header for off-thread parsing.
+    const content = new Uint8Array(fingerprint.size);
+    content.set(authorizedPrefix, 0);
+    let offset = headerLength;
+    while (offset < content.byteLength) {
+      const count = fs.readSync(fd, content, offset, content.byteLength - offset, null);
+      if (count === 0) break;
+      offset += count;
+    }
+    const after = fingerprintFromStat(fs.fstatSync(fd));
+    if (!fingerprintsEqual(after, fingerprint) || offset !== fingerprint.size) {
+      throw new Error("Session file changed during authorized metadata read");
+    }
+    return { content, headerBytes: headerLength, denied: false };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 
 export function getCanonicalSessionsRoot(): string {
   const explicitSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR;
@@ -122,7 +213,11 @@ export class SessionCatalog {
   private pendingScan = false;
   private started = false;
 
-  constructor(private readonly adapter: SessionCatalogAdapter, private readonly root = getCanonicalSessionsRoot()) {}
+  constructor(
+    private readonly adapter: SessionCatalogAdapter,
+    private readonly root = getCanonicalSessionsRoot(),
+    private readonly options: SessionCatalogOptions = {},
+  ) {}
 
   getGeneration(): number {
     return this.generation;
@@ -203,13 +298,27 @@ export class SessionCatalog {
     }
 
     const workerStartedAt = performance.now();
-    const parsed: CatalogParsedFile[] = [];
+    const parsedCandidates: Array<CatalogParsedFile & { authorizationGeneration: number }> = [];
     let parseBytes = 0;
+    let headerBytes = 0;
     let parseFailures = 0;
+    const authorizeCwd = this.options.authorizeCwd ?? authorizeCatalogCwd;
+    const policyGeneration = this.options.getPolicyGeneration ?? getPolicyGeneration;
     const results = await Promise.all(changed.map(async (task) => {
       try {
-        const metadata = await this.workerPool.parse(task.filePath, task.fingerprint);
-        return metadata ? { metadata, expectedMutationVersion: task.mutationVersion } : null;
+        const authorizationGeneration = policyGeneration();
+        const gated = readAuthorizedContent(
+          task.filePath,
+          task.fingerprint,
+          authorizeCwd,
+          this.options.observePreAuthorizationBytes,
+        );
+        headerBytes += gated.headerBytes;
+        if (gated.denied || gated.content === null) return null;
+        const metadataPromise = this.workerPool.parseAuthorizedContent(task.filePath, task.fingerprint, gated.content);
+        this.options.onAuthorizedBodyTransferred?.();
+        const metadata = await metadataPromise;
+        return metadata ? { metadata, expectedMutationVersion: task.mutationVersion, authorizationGeneration } : null;
       } catch {
         parseFailures++;
         return null;
@@ -228,13 +337,14 @@ export class SessionCatalog {
         this.pendingScan = true;
         continue;
       }
-      parsed.push(result);
+      parsedCandidates.push(result);
       parseBytes += result.metadata.approximateBytes;
     }
     const workerDuration = performance.now() - workerStartedAt;
     recordLatencyMetric("catalog_worker_ms", workerDuration);
-    recordLatencyMetric("catalog_parse_count", parsed.length);
+    recordLatencyMetric("catalog_parse_count", parsedCandidates.length);
     recordLatencyMetric("catalog_parse_bytes", parseBytes);
+    recordLatencyMetric("catalog_header_bytes", headerBytes);
 
     // Any direct create/title/model/archive/delete mutation bumps the catalog
     // generation. Do not let work started before that mutation overwrite it;
@@ -248,12 +358,29 @@ export class SessionCatalog {
         updated: 0,
         archivedLegacy: 0,
         discovered: discovered.size,
-        parsed: parsed.length,
+        parsed: 0,
         parseBytes,
+        headerBytes,
         parseFailures,
         durationMs,
         generation: this.generation,
       };
+    }
+
+    // Worker parsing is deliberately asynchronous. Immediately before commit,
+    // require both a fresh cwd authorization and the exact generation captured
+    // before authorized body transfer. No await occurs between this barrier and
+    // adapter.commit(), so a policy write cannot interleave on the main thread.
+    const parsed: CatalogParsedFile[] = [];
+    for (const candidate of parsedCandidates) {
+      const generationBefore = policyGeneration();
+      const stillAllowed = authorizeCwd(candidate.metadata.cwd);
+      const generationAfter = policyGeneration();
+      if (!stillAllowed || candidate.authorizationGeneration !== generationBefore || generationBefore !== generationAfter) {
+        this.pendingScan = true;
+        continue;
+      }
+      parsed.push({ metadata: candidate.metadata, expectedMutationVersion: candidate.expectedMutationVersion });
     }
 
     const committed = this.adapter.commit({
@@ -262,12 +389,18 @@ export class SessionCatalog {
       parsed,
       parseFailures,
     });
-    if (committed.changed) this.bumpGeneration();
+    if (committed.changed) {
+      // The projection is atomic and complete; publish after catalog metadata
+      // commits. Until publication, a newly seen path is unknown-deny.
+      try { (this.options.refreshProjection ?? writeDreamPolicyProjection)(); }
+      catch (error) { console.error("[session-catalog] policy projection refresh failed", error); }
+      this.bumpGeneration();
+    }
 
     const durationMs = performance.now() - startedAt;
     recordLatencyMetric("catalog_scan_ms", durationMs);
     if (process.env.WAYANG_LATENCY_PROFILE_VERBOSE === "1") {
-      console.log(`[session-catalog] discovered=${discovered.size} parsed=${parsed.length} bytes=${parseBytes} failures=${parseFailures} duration_ms=${durationMs.toFixed(1)}`);
+      console.log(`[session-catalog] discovered=${discovered.size} parsed=${parsed.length} bytes=${parseBytes} header_bytes=${headerBytes} failures=${parseFailures} duration_ms=${durationMs.toFixed(1)}`);
     }
     return {
       imported: committed.imported,
@@ -276,6 +409,7 @@ export class SessionCatalog {
       discovered: discovered.size,
       parsed: parsed.length,
       parseBytes,
+      headerBytes,
       parseFailures,
       durationMs,
       generation: this.generation,

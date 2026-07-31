@@ -11,7 +11,7 @@ Wayang v0.1 is early-stage, single-user software. Contributions that improve por
 
 ## Development setup
 
-Linux and macOS are supported. Node `>=22.19.0` is required.
+Linux and macOS are supported. Node `>=22.19.0` is required; `.nvmrc` selects the preferred Node 26.4.0 runtime, and CI covers Node 22.19.0 and 26.4.0.
 
 ```sh
 make doctor

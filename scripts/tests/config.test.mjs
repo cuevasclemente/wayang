@@ -6,7 +6,14 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { createPasswordHash, isLoopbackHost, normalizePublicOrigin, parseEnv, updateEnv, writePrivateAtomic } from "../lib/config.mjs";
+import {
+  createPasswordHash,
+  isLoopbackHost,
+  normalizePublicOrigin,
+  parseEnv,
+  updateEnv,
+  writePrivateAtomic,
+} from "../lib/config.mjs";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 
@@ -62,5 +69,6 @@ test("configuration dry-run is non-interactive and secret-free", () => {
     env: { PATH: process.env.PATH || "" },
   });
   assert.match(output, /writes nothing|not read or changed/i);
+  assert.doesNotMatch(output, /Wren host bash|Finance export/i);
   assert.doesNotMatch(output, /API_KEY=.*[^\s]/);
 });

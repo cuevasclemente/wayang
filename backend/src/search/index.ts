@@ -12,6 +12,7 @@ export {
   indexSession,
   reindexAll,
   removeSession,
+  purgePolicyDeniedSessions,
   setIncludeThinking,
   getIncludeThinking,
 } from "./indexer.js";

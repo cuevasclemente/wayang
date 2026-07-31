@@ -178,6 +178,23 @@ async function main() {
     updates.WAYANG_PUBLIC_ORIGIN = normalizePublicOrigin(await ask("Public browser origin", currentPublicOrigin || undefined));
   }
 
+  const currentProxyIdentityHeader = existing.get("WAYANG_AUTH_PROXY_IDENTITY_HEADER") || "";
+  const canUseProxyOwner = !enableAuth && Boolean(updates.WAYANG_PUBLIC_ORIGIN);
+  if (canUseProxyOwner && await confirm(
+    "Trust an authenticated loopback reverse proxy as the Settings/browser owner?",
+    Boolean(currentProxyIdentityHeader),
+  )) {
+    console.log("\nThe proxy must authenticate every Wayang path, connect from loopback, preserve the exact public Host,");
+    console.log("replace X-Forwarded-* metadata, strip the identity header supplied by clients, and inject it only after authentication.");
+    const acknowledgement = await ask('Type "I UNDERSTAND" to trust the proxy identity boundary');
+    if (acknowledgement !== "I UNDERSTAND") throw new Error("Reverse-proxy identity trust was not acknowledged");
+    const header = await ask("Proxy-injected stable identity header", currentProxyIdentityHeader || "X-Authentik-UID");
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u.test(header)) throw new Error("Proxy identity header must be one valid HTTP header name");
+    updates.WAYANG_AUTH_PROXY_IDENTITY_HEADER = header.toLowerCase();
+  } else {
+    updates.WAYANG_AUTH_PROXY_IDENTITY_HEADER = undefined;
+  }
+
   if (!isLoopbackHost(host) && !enableAuth) {
     console.log("\nWARNING: This exposes a privileged agent control surface without built-in authentication.");
     console.log("Protect every HTTP and WebSocket path with a VPN and/or authenticated reverse proxy.");

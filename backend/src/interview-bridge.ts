@@ -15,6 +15,10 @@ import {
   type InterviewQuestion,
   type InterviewRecord,
 } from "./interviews.js";
+import {
+  WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL,
+  WAYANG_WEBSOCKET_SUBMISSION_CHANNEL,
+} from "./interview-provenance.js";
 
 export type { InterviewAnswer, InterviewQuestion } from "./interviews.js";
 
@@ -26,7 +30,12 @@ export interface InterviewRequest {
 }
 
 export type InterviewWaitOutcome =
-  | { status: "submitted"; request: InterviewRequest; answers: InterviewAnswer[] }
+  | {
+    status: "submitted";
+    request: InterviewRequest;
+    submission: { submissionId: string };
+    answers: InterviewAnswer[];
+  }
   | { status: "pending"; request: InterviewRequest }
   | { status: "cancelled"; request: InterviewRequest };
 
@@ -46,6 +55,16 @@ interface PendingInterview {
 
 type RequestCallback = (req: InterviewRequest) => void;
 
+interface InterviewBridgeStore {
+  getInterviewForSession: typeof getInterviewForSession;
+  markDelivered: typeof markDelivered;
+}
+
+const DEFAULT_INTERVIEW_BRIDGE_STORE: InterviewBridgeStore = {
+  getInterviewForSession,
+  markDelivered,
+};
+
 function requestFrom(record: InterviewRecord): InterviewRequest {
   return {
     requestId: record.request_id,
@@ -58,6 +77,8 @@ function requestFrom(record: InterviewRecord): InterviewRequest {
 export class PiInterviewBridge {
   private pending = new Map<string, PendingInterview>();
   private listeners = new Set<RequestCallback>();
+
+  constructor(private readonly store: InterviewBridgeStore = DEFAULT_INTERVIEW_BRIDGE_STORE) {}
 
   /**
    * Durable request API for updated extensions. On grace expiry the request
@@ -107,11 +128,41 @@ export class PiInterviewBridge {
   /** Resolve exactly the live waiter for a durably accepted submission. */
   resolveSubmitted(record: InterviewRecord): boolean {
     const pending = this.pending.get(record.request_id);
-    if (!pending || pending.request.sessionId !== record.session_id || !record.answers) return false;
+    if (!pending || pending.request.sessionId !== record.session_id || !record.submission_id) return false;
+
+    const authoritative = this.store.getInterviewForSession(pending.request.sessionId, pending.request.requestId);
+    if (
+      !authoritative
+      || authoritative.status !== "submitted"
+      || authoritative.submission_id !== record.submission_id
+      || authoritative.submission_channel !== WAYANG_WEBSOCKET_SUBMISSION_CHANNEL
+      || authoritative.authenticated_principal !== WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL
+      || !authoritative.answers
+    ) return false;
+
+    let delivered: InterviewRecord | undefined;
+    try {
+      delivered = this.store.markDelivered(authoritative.request_id, "tool_result");
+    } catch {
+      // Keep the waiter and timer live. The WebSocket path will retain the
+      // durable submission for custom-message delivery/retry instead.
+      return false;
+    }
+    if (
+      !delivered
+      || delivered.status !== "delivered"
+      || delivered.delivery_mode !== "tool_result"
+      || delivered.submission_id !== authoritative.submission_id
+    ) return false;
+
     clearTimeout(pending.timer);
-    this.pending.delete(record.request_id);
-    markDelivered(record.request_id, "tool_result");
-    pending.resolve({ status: "submitted", request: pending.request, answers: record.answers });
+    this.pending.delete(authoritative.request_id);
+    pending.resolve({
+      status: "submitted",
+      request: pending.request,
+      submission: { submissionId: authoritative.submission_id },
+      answers: authoritative.answers,
+    });
     return true;
   }
 
@@ -146,7 +197,7 @@ export class PiInterviewBridge {
   }
 
   getRequest(sessionId: string, requestId: string): InterviewRequest | undefined {
-    const record = getInterviewForSession(sessionId, requestId);
+    const record = this.store.getInterviewForSession(sessionId, requestId);
     return record ? requestFrom(record) : undefined;
   }
 }
