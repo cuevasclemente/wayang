@@ -232,7 +232,7 @@ test("per-exec bash sandbox denies protected files and capabilities while allowi
   assert.deepEqual(policy.config.network.allowedDomains, []);
   assert.deepEqual(policy.config.network.deniedDomains, []);
   assert.equal(policy.config.network.strictAllowlist, false);
-  assert.ok(policy.config.filesystem.allowWrite.includes(fs.realpathSync(os.tmpdir())));
+  assert.deepEqual(policy.config.filesystem.allowWrite, [fs.realpathSync(projectA)]);
   assert.ok(policy.deniedReadRoots.includes(fs.realpathSync(projectB)));
   assert.ok(policy.deniedWriteRoots.includes(fs.realpathSync(memory)));
   assert.ok(policy.deniedReadRoots.includes(fs.realpathSync(process.env.WAYANG_DATA_DIR)));
@@ -267,13 +267,10 @@ test("per-exec bash sandbox denies protected files and capabilities while allowi
     `(test ! -e ${quote(browserProfile)}) || { echo browser-profile-visible; exit 25; }`,
     `(grep -R TRANSCRIPT_CANARY ${quote(transcriptDir)} 2>/dev/null && { echo transcript-grep-visible; exit 22; }) || true`,
     `(cat ${quote(ownAttachment)} | grep -q OWN_ATTACHMENT_CANARY) || { echo own-attachment-hidden; exit 23; }`,
-    // A read-denied directory beneath writable /tmp is an empty tmpfs inside
-    // sandbox-runtime. Writes may succeed only in that disposable overlay;
-    // host-side assertions below prove that protected backing data is unchanged.
     `(printf bypass > ${quote(path.join(process.env.WAYANG_DATA_DIR, "sandbox-write.txt"))}) || true`,
     `(printf bypass > ${quote(path.join(ownAttachmentRoot, "sandbox-write.txt"))}) || true`,
     ...(legacyAttachmentScratch ? [`(printf bypass > ${quote(legacyAttachmentScratch)}) || true`] : []),
-    `(printf scratch > ${quote(scratchFile)} && grep -q '^scratch$' ${quote(scratchFile)} && rm -f ${quote(scratchFile)}) || { echo shared-tmp-write-failed; exit 34; }`,
+    `(! printf scratch > ${quote(scratchFile)}) || { echo protected-shared-tmp-write-succeeded; exit 34; }`,
     `(node -e ${quote(socketCreateScript)}) || { echo unix-socket-create-succeeded-or-uncertain; exit 35; }`,
     `(node -e ${quote(socketConnectScript)}) || { echo unix-socket-connect-succeeded-or-uncertain; exit 36; }`,
     `(test -z \"\${WAYANG_BROWSER_AGENT_TOKEN-}\") || { echo capability-env-visible; exit 16; }`,
