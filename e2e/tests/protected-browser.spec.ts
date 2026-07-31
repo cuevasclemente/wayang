@@ -256,7 +256,7 @@ test("backend-issued protected runtime selects the generic protected-browser UX 
   const downloads = page.getByTestId("protected-downloads");
   await expect(downloads).toContainText(".wayang/browser-downloads/");
   await expect(downloads.getByTestId("protected-download-status")).toContainText("completed");
-  await expect(downloads.getByTestId("protected-download-status")).toContainText("2 KB");
+  await expect(downloads.getByTestId("protected-download-status")).toContainText("2.0 KiB");
   await expect(downloads.getByRole("button", { name: /Recover|Discard|quarantine/i })).toHaveCount(0);
   await expect(page.getByText("Protected capability", { exact: true })).toBeVisible();
   await expect(page.getByText("Start the backend-issued protected browser runtime.", { exact: true })).toBeVisible();
