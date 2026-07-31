@@ -79,6 +79,8 @@ async function installApi(page: Page) {
     if (path === "/api/sessions" && request.method() === "GET") return route.fulfill({ json: [session()] });
     if (path === "/api/sessions/events") return route.fulfill({ status: 204 });
     if (path === "/api/models") return route.fulfill({ json: { models: [], defaultModel: null } });
+    if (path === "/api/projects") return route.fulfill({ json: [] });
+    if (path === "/api/agent-profiles") return route.fulfill({ json: [] });
     if (path === "/api/scheduled-agent-jobs") return route.fulfill({ json: { jobs: [] } });
     if (path === "/api/apps") return route.fulfill({ json: [app()] });
     if (path === `/api/apps/${appId}/events` && request.method() === "GET") return route.fulfill({ json: [] });

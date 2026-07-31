@@ -7,7 +7,10 @@ interface AuthMock {
   expireSession(): void;
 }
 
-async function installAuthApi(page: Page, options: { sessions?: boolean } = {}): Promise<AuthMock> {
+async function installAuthApi(
+  page: Page,
+  options: { sessions?: boolean; routeLocalSessionsUnauthorized?: boolean } = {},
+): Promise<AuthMock> {
   let sessionValid = true;
 
   await page.route((url) => url.pathname.startsWith("/api/"), async (route: Route) => {
@@ -45,7 +48,16 @@ async function installAuthApi(page: Page, options: { sessions?: boolean } = {}):
     }
 
     if (!hasSession) {
-      await route.fulfill({ status: 401, json: { error: "Unauthorized" } });
+      await route.fulfill({
+        status: 401,
+        headers: { "x-wayang-authentication-required": "1" },
+        json: { error: "Unauthorized" },
+      });
+      return;
+    }
+
+    if (path === "/api/sessions" && options.routeLocalSessionsUnauthorized) {
+      await route.fulfill({ status: 401, json: { error: "Exact authenticated owner is unavailable" } });
       return;
     }
 
@@ -55,8 +67,12 @@ async function installAuthApi(page: Page, options: { sessions?: boolean } = {}):
       await route.fulfill({ json: { mode: "default" } });
     } else if (path === "/api/sessions" && request.method() === "GET") {
       await route.fulfill({ json: options.sessions ? [syntheticSession()] : [] });
+    } else if (path === `/api/sessions/${encodeURIComponent(syntheticSession().id)}` && request.method() === "GET") {
+      await route.fulfill({ json: syntheticSession() });
     } else if (path === "/api/models") {
       await route.fulfill({ json: { models: [], defaultModel: null } });
+    } else if (path === "/api/projects" || path === "/api/agent-profiles") {
+      await route.fulfill({ json: [] });
     } else if (path === "/api/scheduled-agent-jobs") {
       await route.fulfill({ json: { jobs: [] } });
     } else if (path === "/api/fs/tree") {
@@ -106,9 +122,9 @@ async function signIn(page: Page): Promise<void> {
   await expect(page.getByRole("button", { name: "Log out" })).toBeVisible();
 }
 
-test("login preserves the requested URL, persists across reload, and logs out", async ({ page }) => {
-  await installAuthApi(page);
-  const requestedUrl = "/requested/session?panel=files#message-42";
+test("login preserves a canonical session deep link, persists across reload, and logs out", async ({ page }) => {
+  await installAuthApi(page, { sessions: true });
+  const requestedUrl = `/sessions/${encodeURIComponent(syntheticSession().id)}?panel=files#message-42`;
 
   await page.goto(requestedUrl);
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
@@ -119,6 +135,7 @@ test("login preserves the requested URL, persists across reload, and logs out", 
 
   await signIn(page);
   expect(new URL(page.url()).pathname + new URL(page.url()).search + new URL(page.url()).hash).toBe(requestedUrl);
+  await expect(page.locator(`[data-testid="session-row"][data-session-id="${syntheticSession().id}"]`)).toHaveAttribute("aria-current", "page");
 
   const browserStorage = await page.evaluate(() => ({
     local: Object.values(localStorage),
@@ -132,6 +149,15 @@ test("login preserves the requested URL, persists across reload, and logs out", 
 
   await page.getByRole("button", { name: "Log out" }).click();
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+});
+
+test("a route-local 401 does not masquerade as Wayang login expiry", async ({ page }) => {
+  await installAuthApi(page, { routeLocalSessionsUnauthorized: true });
+  await page.goto("/");
+  await signIn(page);
+
+  await expect(page.getByRole("heading", { name: "Sign in" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Log out" })).toBeVisible();
 });
 
 test("an expired WebSocket session stops reconnects and returns to login", async ({ page }) => {

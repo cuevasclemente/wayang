@@ -2,21 +2,31 @@ import { useCallback, useEffect, useState } from "react";
 import {
   ArrowLeft,
   Bot,
+  ChevronDown,
   Folder,
   FolderPlus,
   GitBranch,
   Loader2,
+  Lock,
   Plus,
+  SlidersHorizontal,
 } from "lucide-react";
 import {
   ApiError,
+  createProject as createWorkspaceProject,
   createSession,
+  fetchAgentProfiles,
   fetchDiscoveredProjects,
-  groupSessionsIntoProjects,
+  fetchModels,
+  fetchProjects as fetchWorkspaceProjects,
+  joinSessionsIntoProjects,
   listSessions,
+  type AgentProfileSummary,
   type DiscoveredProject,
+  type ModelOption,
   type Project,
   type Session,
+  type WorkspaceProject,
 } from "../api/client";
 
 interface NewSessionPanelProps {
@@ -28,13 +38,20 @@ type LoadState = "loading" | "ready" | "error";
 
 export function NewSessionPanel({ onCreated, onCancel }: NewSessionPanelProps) {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [durableProjects, setDurableProjects] = useState<WorkspaceProject[]>([]);
+  const [profiles, setProfiles] = useState<AgentProfileSummary[]>([]);
+  const [models, setModels] = useState<ModelOption[]>([]);
   const [discovered, setDiscovered] = useState<DiscoveredProject[]>([]);
   const [loadState, setLoadState] = useState<LoadState>("loading");
   const [errorMsg, setErrorMsg] = useState("");
 
   const [showNewProjectInput, setShowNewProjectInput] = useState(false);
   const [newProjectPath, setNewProjectPath] = useState("");
+  const [newProjectName, setNewProjectName] = useState("");
   const [newProjectTitle, setNewProjectTitle] = useState("");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [agentProfileId, setAgentProfileId] = useState("");
+  const [modelSelection, setModelSelection] = useState("");
 
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState("");
@@ -43,17 +60,23 @@ export function NewSessionPanel({ onCreated, onCancel }: NewSessionPanelProps) {
     setLoadState("loading");
     setErrorMsg("");
     try {
-      const [sessions, discoveredProjects] = await Promise.all([
+      const [sessions, discoveredProjects, projectRows, profileRows, modelResult] = await Promise.all([
         listSessions(),
         fetchDiscoveredProjects(),
+        fetchWorkspaceProjects(),
+        fetchAgentProfiles(),
+        fetchModels(),
       ]);
-      const existingCwds = new Set(sessions.map((s) => s.cwd));
+      const existingCwds = new Set([...sessions.map((session) => session.cwd), ...projectRows.map((project) => project.cwd)]);
       // Filter discovered to only show dirs that don't already have sessions
       const newDiscoveries = discoveredProjects.filter(
         (d) => !existingCwds.has(d.cwd),
       );
       setDiscovered(newDiscoveries);
-      setProjects(groupSessionsIntoProjects(sessions));
+      setDurableProjects(projectRows);
+      setProfiles(profileRows.filter((profile) => profile.enabled));
+      setModels(modelResult.models.filter((model) => model.available));
+      setProjects(joinSessionsIntoProjects(sessions, projectRows));
       setLoadState("ready");
     } catch (err) {
       setLoadState("error");
@@ -72,17 +95,29 @@ export function NewSessionPanel({ onCreated, onCancel }: NewSessionPanelProps) {
       setCreating(true);
       setCreateError("");
       try {
-        const session = await createSession(cwd, title);
+        const project = durableProjects.find((candidate) => candidate.cwd === cwd);
+        const allowed = project?.access_policy.allowed_agent_profile_ids;
+        if (agentProfileId && allowed && !allowed.includes(agentProfileId)) {
+          const profile = profiles.find((candidate) => candidate.id === agentProfileId);
+          throw new Error(`${profile?.name ?? "The selected agent"} is not allowed for ${project?.name ?? cwd}.`);
+        }
+        let provider: string | undefined;
+        let model: string | undefined;
+        if (modelSelection) {
+          const parsed = JSON.parse(modelSelection) as [string, string];
+          [provider, model] = parsed;
+        }
+        const session = await createSession(cwd, title, model, provider, agentProfileId || undefined);
         onCreated(session);
       } catch (err) {
         setCreateError(
-          err instanceof ApiError ? `HTTP ${err.status}` : String(err),
+          err instanceof ApiError ? err.message || `HTTP ${err.status}` : String(err),
         );
       } finally {
         setCreating(false);
       }
     },
-    [onCreated],
+    [agentProfileId, durableProjects, modelSelection, onCreated, profiles],
   );
 
   const handleNewProjectSubmit = useCallback(
@@ -90,9 +125,22 @@ export function NewSessionPanel({ onCreated, onCancel }: NewSessionPanelProps) {
       e.preventDefault();
       const trimmed = newProjectPath.trim();
       if (!trimmed) return;
+      setCreating(true);
+      setCreateError("");
+      try {
+        await createWorkspaceProject({ cwd: trimmed, name: newProjectName.trim() || undefined });
+      } catch (error) {
+        // Canonical cwd uniqueness makes retries safe after a project was
+        // created but its first session failed (or another tab registered it).
+        if (!(error instanceof ApiError && error.status === 409)) {
+          setCreateError(error instanceof ApiError ? error.message : String(error));
+          setCreating(false);
+          return;
+        }
+      }
       await handleCreateSession(trimmed, newProjectTitle.trim() || undefined);
     },
-    [newProjectPath, newProjectTitle, handleCreateSession],
+    [handleCreateSession, newProjectName, newProjectPath, newProjectTitle],
   );
 
   const hasExistingProjects = projects.length > 0;
@@ -130,10 +178,42 @@ export function NewSessionPanel({ onCreated, onCancel }: NewSessionPanelProps) {
           </div>
         )}
 
-        <p className="text-sm text-neutral-400 mb-6">
-          Choose an existing project or create a new one. The session will use
-          pi's AgentSession with structured chat.
+        <p className="text-sm text-neutral-400 mb-4">
+          Choose a project to create a session with its defaults. Ordinary sessions remain one click.
         </p>
+
+        <div className="mb-6 rounded-lg border border-neutral-800 bg-neutral-900/30">
+          <button
+            type="button"
+            onClick={() => setAdvancedOpen((open) => !open)}
+            aria-expanded={advancedOpen}
+            className="flex w-full items-center gap-2 px-4 py-3 text-left text-sm font-medium text-neutral-300 hover:text-neutral-100"
+          >
+            <SlidersHorizontal size={15} />
+            <span className="flex-1">Advanced</span>
+            <span className="text-xs font-normal text-neutral-500">optional agent/model override</span>
+            <ChevronDown size={14} className={`transition-transform ${advancedOpen ? "rotate-180" : ""}`} />
+          </button>
+          {advancedOpen && (
+            <div className="grid gap-4 border-t border-neutral-800 px-4 py-4 sm:grid-cols-2">
+              <label className="space-y-1.5 text-xs font-medium text-neutral-300">
+                <span className="block">Agent</span>
+                <select value={agentProfileId} onChange={(event) => setAgentProfileId(event.target.value)} className="w-full rounded border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 focus:border-blue-600 focus:outline-none">
+                  <option value="">Project default</option>
+                  {profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name} — {profile.memory_access.replace("read_write", "read/write")}</option>)}
+                </select>
+                <span className="block font-normal leading-relaxed text-neutral-500">A project allowlist still applies. With no override, the project&apos;s default profile is used.</span>
+              </label>
+              <label className="space-y-1.5 text-xs font-medium text-neutral-300">
+                <span className="block">Provider/model</span>
+                <select value={modelSelection} onChange={(event) => setModelSelection(event.target.value)} className="w-full rounded border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 focus:border-blue-600 focus:outline-none">
+                  <option value="">Project / agent default</option>
+                  {models.map((model) => <option key={`${model.provider}:${model.id}`} value={JSON.stringify([model.provider, model.id])}>{model.name || model.id} — {model.provider}</option>)}
+                </select>
+              </label>
+            </div>
+          )}
+        </div>
 
         {/* Loading state */}
         {loadState === "loading" && (
@@ -215,7 +295,18 @@ export function NewSessionPanel({ onCreated, onCancel }: NewSessionPanelProps) {
                   disabled={creating}
                 />
                 <label className="text-xs font-medium text-neutral-400">
-                  Session title (optional)
+                  Project name (optional)
+                </label>
+                <input
+                  type="text"
+                  value={newProjectName}
+                  onChange={(e) => setNewProjectName(e.target.value)}
+                  placeholder="Defaults to the folder name"
+                  className="w-full rounded border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 focus:border-neutral-500 focus:outline-none"
+                  disabled={creating}
+                />
+                <label className="text-xs font-medium text-neutral-400">
+                  First session title (optional)
                 </label>
                 <input
                   type="text"
@@ -238,6 +329,7 @@ export function NewSessionPanel({ onCreated, onCancel }: NewSessionPanelProps) {
                     onClick={() => {
                       setShowNewProjectInput(false);
                       setNewProjectPath("");
+                      setNewProjectName("");
                       setNewProjectTitle("");
                     }}
                     disabled={creating}
@@ -293,8 +385,9 @@ function ProjectCard({ project, disabled, onClick }: ProjectCardProps) {
           className="shrink-0 text-neutral-500 group-hover:text-neutral-300 transition-colors mt-0.5"
         />
         <div className="min-w-0 flex-1">
-          <div className="text-sm font-medium text-neutral-100 truncate">
-            {project.name}
+          <div className="flex items-center gap-1.5 text-sm font-medium text-neutral-100">
+            <span className="truncate">{project.name}</span>
+            {project.access_policy.privacy_mode === "protected" && <Lock size={12} className="shrink-0 text-amber-400" aria-label="Protected project" />}
           </div>
           <div className="text-xs text-neutral-500 truncate mt-0.5">
             {project.cwd}

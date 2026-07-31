@@ -34,10 +34,26 @@ test("synthetic catalog and transcript latency remain responsive", async ({ page
   ];
   const switchTargets = histories.slice(0, 2);
 
-  const importResponse = await request.post("/api/sessions/import");
-  expect(importResponse.ok(), await importResponse.text()).toBe(true);
-  const importPayload = await importResponse.json() as { parsed?: number };
-  expect(importPayload.parsed).toBe(fixtures.length + histories.length);
+  const expectedFixtures = [...fixtures, ...histories];
+  let missingFixtureIds = expectedFixtures.map((fixture) => fixture.id);
+  // The live catalog watcher may consume part of this generated corpus while
+  // files are still being written. Explicit scans are coalesced with that work,
+  // and project-policy generation changes can deliberately defer candidates to
+  // the next scan. Synchronize on the exact catalog end state rather than
+  // assuming all parsing is attributed to one HTTP response.
+  for (let attempt = 0; attempt < 10 && missingFixtureIds.length > 0; attempt++) {
+    const importResponse = await request.post("/api/sessions/import");
+    expect(importResponse.ok(), await importResponse.text()).toBe(true);
+    const importPayload = await importResponse.json() as { parsed?: number };
+    expect(typeof importPayload.parsed).toBe("number");
+
+    const importedSessionsResponse = await request.get("/api/sessions");
+    expect(importedSessionsResponse.ok(), await importedSessionsResponse.text()).toBe(true);
+    const importedSessions = await importedSessionsResponse.json() as Array<{ id?: string }>;
+    const importedIds = new Set(importedSessions.map((session) => session.id));
+    missingFixtureIds = expectedFixtures.filter((fixture) => !importedIds.has(fixture.id)).map((fixture) => fixture.id);
+  }
+  expect(missingFixtureIds).toEqual([]);
 
   const listDurations: number[] = [];
   for (let index = 0; index < 200; index++) {
