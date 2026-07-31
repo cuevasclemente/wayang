@@ -272,7 +272,7 @@ test("backend-issued protected runtime selects the generic protected-browser UX 
   await page.getByRole("button", { name: "Start", exact: true }).click();
   await expect(page.getByRole("button", { name: "Human control", exact: true })).toBeEnabled();
   await page.getByRole("button", { name: "Human control", exact: true }).click();
-  await expect(page.getByTestId("protected-human-handoff")).toContainText("owner-only route");
+  await expect(page.getByTestId("protected-human-handoff")).toContainText("Owner-only Direct Paste uses an authenticated route");
   await expect(page.getByTestId("protected-human-handoff")).toContainText("fresh safe page");
 
   await page.getByRole("button", { name: "Paste…", exact: true }).click();
