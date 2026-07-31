@@ -472,7 +472,7 @@ test("only exact seeded Wren receives broad Standard compatibility, including sc
   }), false);
 });
 
-test("exact Wren sandbox spans ordinary host paths while masking every Protected project", (t) => {
+test("exact Wren sandbox spans ordinary host paths while masking every Protected project", async (t) => {
   close();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-wren-host-workspace-"));
   const standardRoot = path.join(root, "standard");
@@ -527,6 +527,23 @@ test("exact Wren sandbox spans ordinary host paths while masking every Protected
   assert.ok(policy.deniedReadRoots.includes(fs.realpathSync(protectedRoot)));
   assert.ok(policy.deniedWriteRoots.includes(fs.realpathSync(protectedRoot)));
   assert.equal(policy.deniedWriteRoots.includes(path.join(fs.realpathSync(standardRoot), ".pi")), false);
+
+  const ordinaryWrite = path.join(root, "ordinary-host-write.txt");
+  const protectedFile = path.join(protectedRoot, "private.txt");
+  const protectedWrite = path.join(protectedRoot, "blocked.txt");
+  const socketPath = path.join(root, "wren-ipc.sock");
+  fs.writeFileSync(protectedFile, "protected");
+  const socketScript = `const net=require("node:net");const s=net.createServer();s.listen(${JSON.stringify(socketPath)},()=>s.close(()=>process.exit(0)));setTimeout(()=>process.exit(9),2000);`;
+  const result = await run(session.id, [
+    `printf ordinary > ${quote(ordinaryWrite)}`,
+    `test ! -e ${quote(protectedFile)}`,
+    `(printf blocked > ${quote(protectedWrite)}) || true`,
+    `node -e ${quote(socketScript)}`,
+  ].join("; "));
+  assert.equal(result.code, 0, result.output);
+  assert.equal(fs.readFileSync(ordinaryWrite, "utf8"), "ordinary");
+  assert.equal(fs.readFileSync(protectedFile, "utf8"), "protected");
+  assert.equal(fs.existsSync(protectedWrite), false);
 });
 
 test("bash selector requires the complete host decision and never launders a legacy boolean into host mode", () => {
