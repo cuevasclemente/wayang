@@ -9,8 +9,11 @@ import { fileURLToPath } from "node:url";
 import {
   createPasswordHash,
   isLoopbackHost,
+  normalizeCompanionUrl,
   normalizePublicOrigin,
   parseEnv,
+  promptForCompanionUrl,
+  recommendCompanionUrl,
   updateEnv,
   writePrivateAtomic,
 } from "../lib/config.mjs";
@@ -58,8 +61,237 @@ test("loopback detection and public-origin validation reject ambiguous exposure"
   assert.equal(isLoopbackHost("::1"), true);
   assert.equal(isLoopbackHost("0.0.0.0"), false);
   assert.equal(normalizePublicOrigin("https://wayang.example"), "https://wayang.example");
-  assert.throws(() => normalizePublicOrigin("https://wayang.example/path"), /origin/i);
-  assert.throws(() => normalizePublicOrigin("javascript:alert(1)"), /origin/i);
+  assert.throws(() => normalizePublicOrigin("not a URL"), {
+    message: "Public browser origin must be an absolute http(s) origin",
+  });
+  assert.throws(() => normalizePublicOrigin("https://wayang.example/path"), {
+    message: "Public browser origin must not contain credentials, a path, query, or fragment",
+  });
+  assert.throws(() => normalizePublicOrigin("javascript:alert(1)"), {
+    message: "Public browser origin must not contain credentials, a path, query, or fragment",
+  });
+});
+
+test("companion URL recommendations follow the authorized browser authority", () => {
+  assert.equal(recommendCompanionUrl({ publicOrigin: "https://wayang.example", port: 8787 }), "https://wayang.example");
+  assert.equal(recommendCompanionUrl({ publicOrigin: "", port: 9000 }), "http://127.0.0.1:9000");
+  const validCompanionUrls = [
+    ["http://wayang-host.test:8787", "http://wayang-host.test:8787"],
+    ["https://wayang.example/", "https://wayang.example"],
+    ["http://[::1]:8787", "http://[::1]:8787"],
+    ["https://[2001:db8::1]/", "https://[2001:db8::1]"],
+  ];
+  for (const [value, expected] of validCompanionUrls) {
+    assert.equal(normalizeCompanionUrl(value), expected, JSON.stringify(value));
+  }
+  const invalidCompanionUrls = [
+    "http://example.com:",
+    "http://example.com:/",
+    "http://[::1]:",
+    "http://example.com\u0001",
+    "http://example.com\u007f",
+    "https://wayang.example\\",
+    "https://wayang .example",
+    "https://wayang.example ",
+    "https://wayang.example\t",
+    "https://wayang.example\n",
+    "https://wayang.example\r",
+    "http://user:password@example.com",
+    "https://wayang.example?mode=1",
+    "https://wayang.example#section",
+    "http://@example.com",
+    "http://:@example.com",
+    "https://wayang.example/path",
+    "https://wayang.example?",
+    "https://wayang.example#",
+    "https://wayang.example/a/..",
+    "file:///tmp/wayang",
+  ];
+  for (const value of invalidCompanionUrls) {
+    assert.throws(() => normalizeCompanionUrl(value), /companion/i, JSON.stringify(value));
+  }
+});
+
+test("companion URL recommendations use the selected loopback bind host", () => {
+  assert.equal(
+    recommendCompanionUrl({ publicOrigin: "https://wayang.example", host: "::1", port: 9000 }),
+    "https://wayang.example",
+  );
+
+  const loopbackHosts = [
+    ["::1", "http://[::1]:9000"],
+    ["[::1]", "http://[::1]:9000"],
+    ["localhost", "http://localhost:9000"],
+    ["127.42.3.4", "http://127.42.3.4:9000"],
+  ];
+  for (const [host, expected] of loopbackHosts) {
+    assert.equal(recommendCompanionUrl({ publicOrigin: "", host, port: 9000 }), expected, host);
+  }
+
+  for (const host of ["", "0.0.0.0", "::", "[::]", "192.0.2.1", "*", "127.0.0.999"]) {
+    assert.equal(
+      recommendCompanionUrl({ publicOrigin: "", host, port: 9000 }),
+      "http://127.0.0.1:9000",
+      host,
+    );
+  }
+});
+
+test("companion URL literal-syntax error names rejected characters", () => {
+  assert.throws(() => normalizeCompanionUrl("https://wayang.example\\"), {
+    message: "Companion tool backend URL must not contain credentials, a path, query, fragment, control characters, or backslashes",
+  });
+});
+
+test("companion prompt uses the public origin as its fallback", async () => {
+  let prompt;
+  const result = await promptForCompanionUrl({
+    publicOrigin: "https://wayang.example",
+    port: 8787,
+    existingValue: "",
+    ask: async (...args) => {
+      prompt = args;
+      return args[1];
+    },
+    notice: () => assert.fail("unexpected notice"),
+  });
+
+  assert.deepEqual(prompt, ["Companion pi-tool backend URL", "https://wayang.example"]);
+  assert.equal(result, "https://wayang.example");
+});
+
+test("companion prompt recommends loopback when no public origin is configured", async () => {
+  let prompt;
+  const result = await promptForCompanionUrl({
+    publicOrigin: "",
+    port: 9000,
+    existingValue: "",
+    ask: async (...args) => {
+      prompt = args;
+      return args[1];
+    },
+    notice: () => assert.fail("unexpected notice"),
+  });
+
+  assert.deepEqual(prompt, ["Companion pi-tool backend URL", "http://127.0.0.1:9000"]);
+  assert.equal(result, "http://127.0.0.1:9000");
+});
+
+test("companion prompt brackets an IPv6 loopback fallback", async () => {
+  let prompt;
+  const result = await promptForCompanionUrl({
+    publicOrigin: "",
+    host: "::1",
+    port: 9000,
+    existingValue: "",
+    ask: async (...args) => {
+      prompt = args;
+      return args[1];
+    },
+    notice: () => assert.fail("unexpected notice"),
+  });
+
+  assert.deepEqual(prompt, ["Companion pi-tool backend URL", "http://[::1]:9000"]);
+  assert.equal(result, "http://[::1]:9000");
+});
+
+test("companion prompt normalizes and preserves a valid explicit override", async () => {
+  let prompt;
+  const notices = [];
+  const result = await promptForCompanionUrl({
+    publicOrigin: "https://wayang.example",
+    port: 8787,
+    existingValue: "https://tools.example/",
+    ask: async (...args) => {
+      prompt = args;
+      return args[1];
+    },
+    notice: (message) => notices.push(message),
+  });
+
+  assert.deepEqual(prompt, ["Companion pi-tool backend URL", "https://tools.example"]);
+  assert.equal(result, "https://tools.example");
+  assert.equal(notices.length, 1);
+});
+
+test("companion prompt does not warn for an equivalent trailing-slash origin", async () => {
+  const notices = [];
+  await promptForCompanionUrl({
+    publicOrigin: "https://wayang.example",
+    port: 8787,
+    existingValue: "https://wayang.example/",
+    ask: async (_label, fallback) => fallback,
+    notice: (message) => notices.push(message),
+  });
+
+  assert.deepEqual(notices, []);
+});
+
+test("companion prompt mismatch notice contains only the safe recommendation", async () => {
+  const notices = [];
+  await promptForCompanionUrl({
+    publicOrigin: "https://wayang.example",
+    port: 8787,
+    existingValue: "https://tools.example",
+    ask: async (_label, fallback) => fallback,
+    notice: (message) => notices.push(message),
+  });
+
+  assert.deepEqual(notices, [
+    "The recommended companion pi-tool backend URL for this configuration is https://wayang.example.",
+  ]);
+  assert.doesNotMatch(notices[0], /tools\.example/);
+});
+
+test("companion prompt replaces invalid existing values without displaying them", async () => {
+  const invalidValues = [
+    "http://user:password@example.com",
+    "http://example.com\u001b[31m",
+  ];
+
+  for (const existingValue of invalidValues) {
+    let prompt;
+    const notices = [];
+    const result = await promptForCompanionUrl({
+      publicOrigin: "https://wayang.example",
+      port: 8787,
+      existingValue,
+      ask: async (...args) => {
+        prompt = args;
+        return args[1];
+      },
+      notice: (message) => notices.push(message),
+    });
+
+    assert.deepEqual(notices, [
+      "Existing WAYANG_URL is invalid and must be replaced; its value was not displayed.",
+    ]);
+    assert.deepEqual(prompt, ["Companion pi-tool backend URL", "https://wayang.example"]);
+    assert.equal(result, "https://wayang.example");
+    const displayed = [...notices, ...prompt].join("\n");
+    assert.equal(displayed.includes(existingValue), false);
+    assert.equal(displayed.includes("user"), false);
+    assert.equal(displayed.includes("password"), false);
+    assert.equal(displayed.includes("\u001b"), false);
+  }
+});
+
+test("companion prompt rejects an invalid user response", async () => {
+  let prompt;
+  await assert.rejects(
+    () => promptForCompanionUrl({
+      publicOrigin: "https://wayang.example",
+      port: 8787,
+      existingValue: "",
+      ask: async (...args) => {
+        prompt = args;
+        return "https://wayang.example/path";
+      },
+      notice: () => assert.fail("unexpected notice"),
+    }),
+    /Companion tool backend URL/,
+  );
+  assert.deepEqual(prompt, ["Companion pi-tool backend URL", "https://wayang.example"]);
 });
 
 test("configuration dry-run is non-interactive and secret-free", () => {
@@ -69,6 +301,7 @@ test("configuration dry-run is non-interactive and secret-free", () => {
     env: { PATH: process.env.PATH || "" },
   });
   assert.match(output, /writes nothing|not read or changed/i);
+  assert.match(output, /companion pi-tool backend URL: http:\/\/127\.0\.0\.1:8787/i);
   assert.doesNotMatch(output, /Wren host bash|Finance export/i);
   assert.doesNotMatch(output, /API_KEY=.*[^\s]/);
 });

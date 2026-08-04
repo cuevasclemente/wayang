@@ -12,7 +12,9 @@ Wayang's launcher parses `.env` as data; it never shell-sources it. Shell substi
 | `WAYANG_PORT` | `8787` | Backend HTTP/WebSocket port, 1–65535. |
 | `WAYANG_PUBLIC_ORIGIN` | none | Optional exact browser-facing `http(s)` origin for a reverse proxy or exposed bind. No path/query/fragment. Compiled loopback origins on `WAYANG_PORT` remain accepted for direct or SSH-tunneled administration. |
 | `WAYANG_DATA_DIR` | `~/.wayang` | Private Wayang metadata/search/session-auth directory. Use an absolute path in `.env`; `~` is not expanded. |
-| `WAYANG_URL` | `http://127.0.0.1:8787` | Optional companion pi-tool backend URL; core Wayang does not consume it. Keep it aligned with host/port if such tools are installed. |
+| `WAYANG_URL` | unset; `make configure` recommends the public origin or selected loopback bind host on `WAYANG_PORT` | Optional convention for a companion pi-tool backend URL. Core Wayang does not consume it, and external tools use it only when they explicitly support `WAYANG_URL`. |
+
+Companion tools are optional. The `make configure` wizard recommends the configured public origin or, when none exists, the selected loopback bind host on `WAYANG_PORT` (with IPv6 bracketed, such as `http://[::1]:8787`). An absent, unspecified, wildcard, invalid, or non-loopback host safely falls back to `http://127.0.0.1:<WAYANG_PORT>`. This is a wizard recommendation, not a core Wayang runtime fallback or a default shared by every external tool. An existing explicit `WAYANG_URL` remains the wizard prompt default even when it differs from the recommendation, so review it rather than expecting a silent rewrite. When built-in authentication is enabled, companion access requires an intentionally designed authenticated integration; do not copy browser credentials, shared passwords, or session cookies into companion configuration.
 
 Deprecated compatibility aliases `PI_WEB_UI_HOST`, `PI_WEB_UI_PORT`, and `PI_WEB_UI_DATA_DIR` are still read when the corresponding `WAYANG_*` variable is absent. New installations should not use them.
 
