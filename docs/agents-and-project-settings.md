@@ -12,15 +12,20 @@ Project paths are canonical and immutable. Project name, description, color, def
 
 Privileged authority belongs to a PIN-approved capability association between one immutable Project ID and one stable Agent Profile ID, not to a profile name, seeded identity, provider, or model. Provider/model are fluid runtime choices for that agent. Cloning creates a different Agent Profile ID and copies no associations; renaming or editing the associated stable profile preserves them.
 
-The current capabilities are:
+The current publicly listed and grantable capabilities are:
 
 - `wayang.standard-resources.v1` for a Standard Project-Agent pair. It permits Pi global instructions, skills, prompts, and reviewed extensions for any provider/model used by that agent in the project.
 - `wayang.host-execution.v1` for a Standard project/profile pair. It replaces sandboxed bash with direct execution as the Wayang OS user.
 - `wayang.protected-browser.v1` for a Protected project/profile pair. Protected projects remain browser-denied by default; assigning this exception gives the runtime broad control of its persistent authenticated browser.
+- `wayang.protected-automation.v1` for a Protected project/profile pair when the grantable build is deployed. It authorizes deterministic no-Pi automation for that exact pair.
+
+The Protected-automation implementation is complete through Milestone 5 with `activationAvailable: true`. A service restart is needed only to deploy new code, not to initialize attempt/cooldown state or record an approval. The flow reuses the command guard's existing identity PIN, and PIN entry is the normal human action for approving an exact reviewed Project–Agent pair. Startup automatically creates missing non-secret attempt/cooldown state under `WAYANG_DATA_DIR` with owner-only permissions and preserves it across reboots. Missing or unsafe PIN metadata and unsafe or malformed existing state fail approval closed without replacement. `make setup-capability-approval` is optional manual preflight/migration, not required setup. Only a fresh eligible interactive runtime after approval receives the production `protected_automation` tool. No environment flag or provider/model choice bypasses approval. This documentation update does not deploy code or approve an association.
+
+The source-session-bound tool operates only on its implicit immutable Project ID–Agent Profile ID and current association revision. It supports bounded reads; immutable source capture and compare-and-set update/tombstone/rebind; enable/pause; run-now/cancel; run history; and exact browser-profile preparation. The separate owner UI is status/attention plus denial-only emergency pause/cancel, preparation attachment, and PIN-approved purge of an already tombstoned, fully stopped job. It does not offer ordinary owner create/edit/enable/run controls.
 
 “Broad control” means navigation, page inspection, clicks, typing, downloads, and consequential site actions; it is not a read-only or vendor-specific export adapter. Login, MFA, CAPTCHA, payment, and other secret-bearing steps remain human-only. Do not grant this capability merely because a project handles sensitive data.
 
-Choose the Project privacy mode and allowed-agent list first, then review and associate only the intended capability and Project-Agent pair. Provider/model defaults remain runtime preferences, not authority. On a fresh installation, the human must first provision the existing command-guard identity PIN outside Wayang and run `make setup-capability-approval`; this initializes only private attempt/cooldown state and grants nothing. Explicit revocation, exact-profile allowlist exclusion, incompatible privacy, or subject deletion tombstones the association. Profile definition edits, project instructions/defaults, and provider/model changes preserve it; stale runtime objects are still destroyed and rebuilt. Revocation terminates affected direct-host command process groups with bounded TERM/KILL, but cannot undo host commands, browser actions, downloads, disclosures, or remote side effects already completed.
+Choose the Project privacy mode and allowed-agent list first, then review and associate only the intended capability and Project-Agent pair. Provider/model defaults remain runtime preferences, not authority. Capability associations persist in the service store; the normal human approval action is entering the existing command-guard identity PIN for the exact reviewed association. Explicit revocation, exact-profile allowlist exclusion, incompatible privacy, or subject deletion tombstones the association. Profile definition edits, project instructions/defaults, and provider/model changes preserve it; stale runtime objects are still destroyed and rebuilt. Revocation terminates affected direct-host command and Protected-automation process groups with bounded TERM/KILL, but cannot undo host commands, Project writes, browser actions, downloads, disclosures, or remote side effects already completed.
 
 ## Memory modes
 
@@ -101,9 +106,19 @@ Non-null allowlists are also enforced for Standard projects. The source profile 
 
 Protection is prospective. It cannot erase information that Dream, search, an agent, or another process derived before the project was protected.
 
+### Deterministic Protected automation
+
+When the grantable build is deployed and an exact eligible pair receives human PIN approval, Protected automation runs immutable Node snapshots through a Linux-only, shell-free direct-Bubblewrap runtime. Wayang creates no Pi/model/provider/session/transcript for a run. The child has no generic TCP/UDP/Unix-socket network, shell, general executable view, raw CDP, profile mount, credential API, or arbitrary environment. Sandbox-runtime is a recorded NO-GO for this boundary, macOS has no available runtime, and there is no weaker fallback.
+
+The runtime mounts the immutable code at `/snapshot`, the **whole authorized Project writable** at `/workspace`, and bounded run/state roots. This supports deterministic import and atomic-replace designs but is broad Project write authority. It is not hostile-code containment or same-UID isolation; cancellation/revocation cannot undo completed/racing Project writes or authenticated-site effects.
+
+Browser-enabled jobs use a persistent exact Project/Profile/Job realm through bounded framed backend RPC. Exact HTTPS origins apply to top-level documents and completed download sources. Wayang intercepts/attests top-level document requests and denies cross-origin redirects, but iframe and subresource traffic is continued and is not destination-allowlisted. Login, MFA, CAPTCHA, passkeys, and credential filling remain human-only in the exact preparation viewer/guarded broker. Deterministic code reports `needs_user` and exits without automatic retry.
+
 ## Scheduler, Dream, and Agent Teams
 
-Scheduled jobs store an optional agent profile and are retained—but visibly blocked—when their project becomes Protected. Backend policy is checked during create/update, manual run, timer fire, and immediately before Pi runtime creation.
+Scheduled Agent Jobs store an optional agent profile and are retained—but visibly blocked—when their project becomes Protected. Backend policy is checked during create/update, manual run, timer fire, and immediately before Pi runtime creation. Protected Automation Jobs are a separate deterministic domain and do not weaken or reuse this model-driven scheduled-agent path. Capability revocation, profile disable, allowlist exclusion, incompatible project privacy, or source revision change durably blocks affected automation work and terminates active runs/leases; regrant requires explicit `rebind_job` and a separate enable and never adopts or resumes an old run.
+
+Protected automation uses a Wayang-owned host-local five-field-cron scheduler. It persists a cursor and local wall-minute occurrence key, deduplicates the repeated DST fall-back minute, skips nonexistent spring-forward minutes, atomically pairs cursor advancement with a queued scheduled claim, and implements explicit `skip | run_once` downtime behavior. Startup dispatches recovered queued claims once, marks recovered running claims `interrupted` without retry, and then evaluates missed work. Overlap is skipped; no automatic retry/backoff is performed.
 
 Dream uses a private, atomic Wayang policy projection and an authorization runner. Missing, stale, malformed, unknown, protected, or changing policy fails closed before transcript bytes are returned.
 
@@ -150,7 +165,11 @@ Use a separate OS account, container, or VM when those actors must be mutually i
 
 ## Data and rollback
 
-Project/profile/session policy is stored in private `WAYANG_DATA_DIR/store.json`. The first schema migration creates a mode-`0600` backup and aborts rather than overwriting malformed or unsupported data.
+Project/profile/session policy, capability associations, Protected-automation jobs, and their schedules are stored persistently in private `WAYANG_DATA_DIR/store.json` and survive service restarts and host reboots. Store schema 3 adds `protectedAutomationJobs` and `protectedAutomationRuns`; fresh and migrated stores initialize both as empty and create no capability authority. Rows support queued/running and terminal completed/failed/skipped/cancelled/needs-user/interrupted/denied lifecycle states. Owner-bound immutable snapshots, bounded private runtime state/diagnostics, and persistent exact-job browser realms live beneath `WAYANG_DATA_DIR/protected-automation/`; public projections expose metadata, hashes, counts, fixed outcomes, and attention—not source, stdout/stderr, page, profile, credential, or downloaded-file contents. The first schema migration creates a mode-`0600` backup and aborts rather than overwriting malformed or unsupported data.
+
+Compiled bounds include 4,096 jobs globally and 500 run rows per job. Job listing defaults to and is capped at 50 rows, with an exact-owner `after_job_id` cursor; run listing defaults to 100 and is capped at 500. A snapshot is capped at 1,024 files, 512 directories, 4 MiB per file, 32 MiB total, depth 32, and 1,024 bytes per relative path. Snapshot storage is capped at 32 revisions per job, 64 MiB per exact Project–Agent pair, and 256 MiB globally. Published state is capped at 256 files/16 MiB; stdout and stderr at 1 MiB each; private runtime storage at 64 MiB/job, 128 MiB/pair, and 512 MiB/global. Downloads are capped at 32 observed files/lease and 32 MiB/file, with materialized incoming data capped at 32 files/64 MiB/run.
+
+The deterministic Node child can write anywhere in the whole authorized Project; those ordinary Project outputs are not covered by the private runtime quotas and cannot be rolled back on revoke/cancel. Persistent Chromium profile data is also not byte-quota-bounded and can grow between runs. A one-use identity-PIN purge is available only for a tombstoned, fully stopped job; it removes job/run metadata, snapshots, private runtime state/diagnostics, and the browser realm while preserving Project outputs. Binary rollback still requires stopping Wayang and restoring the pre-schema private store backup before starting an older binary.
 
 New chat uploads use private per-session directories:
 

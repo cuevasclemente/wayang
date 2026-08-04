@@ -370,17 +370,117 @@ function writePinAttemptState(filePath: string, state: DurablePinAttemptState): 
   if (!ownerOnlyPrivateDirectory(parent) || !ownerOnlyRegularFile(filePath)) return false;
   const temp = path.join(parent, `.pin-attempt-${process.pid}-${randomUUID()}.tmp`);
   try {
-    const fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+    const noFollow = fs.constants.O_NOFOLLOW;
+    if (typeof noFollow !== "number") return false;
+    const fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | noFollow, 0o600);
     try {
       fs.writeFileSync(fd, `${JSON.stringify(state)}\n`, "utf8");
-      fs.fsyncSync(fd);
       fs.fchmodSync(fd, 0o600);
+      fs.fsyncSync(fd);
     } finally { fs.closeSync(fd); }
     fs.renameSync(temp, filePath);
+    const directoryDescriptor = fs.openSync(parent,
+      fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | noFollow);
+    try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
     return true;
   } catch {
     try { fs.unlinkSync(temp); } catch { /* best effort */ }
     return false;
+  }
+}
+
+export type PinAttemptStateProvisionResult =
+  | { status: "ready"; created: boolean }
+  | { status: "unavailable"; reason: "pin_metadata" | "state_parent" | "state_existing" | "state_create" };
+
+/**
+ * Initialize only the non-secret durable attempt/cooldown state used by the
+ * deployed service. The existing command-guard PIN is checked by metadata
+ * only and is never opened here. Valid state is preserved byte-for-byte;
+ * unsafe or malformed existing authority is never repaired or replaced.
+ */
+export function provisionPinAttemptStateForService(filePath: string): PinAttemptStateProvisionResult {
+  const resolved = path.resolve(filePath);
+  if (!path.isAbsolute(filePath) || resolved !== filePath || !ownerOnlyRegularFile(commandGuardIdentityPinPath())) {
+    return { status: "unavailable", reason: "pin_metadata" };
+  }
+  try {
+    const existing = fs.lstatSync(resolved);
+    if (existing) return readPinAttemptState(resolved)
+      ? { status: "ready", created: false }
+      : { status: "unavailable", reason: "state_existing" };
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") return { status: "unavailable", reason: "state_existing" };
+  }
+
+  const parent = path.dirname(resolved);
+  const dataRoot = path.dirname(parent);
+  if (!ownerOnlyPrivateDirectory(dataRoot)) return { status: "unavailable", reason: "state_parent" };
+  let parentCreated = false;
+  try {
+    fs.mkdirSync(parent, { mode: 0o700 });
+    parentCreated = true;
+  } catch (error: any) {
+    if (error?.code !== "EEXIST") return { status: "unavailable", reason: "state_parent" };
+  }
+  const noFollow = fs.constants.O_NOFOLLOW;
+  if (typeof noFollow !== "number") return { status: "unavailable", reason: "state_create" };
+  if (parentCreated) {
+    try {
+      const rootDescriptor = fs.openSync(dataRoot,
+        fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | noFollow);
+      try { fs.fsyncSync(rootDescriptor); } finally { fs.closeSync(rootDescriptor); }
+    } catch { return { status: "unavailable", reason: "state_parent" }; }
+  }
+  const parentBefore = ownerOnlyPrivateDirectory(parent);
+  if (!parentBefore) return { status: "unavailable", reason: "state_parent" };
+
+  const initial: DurablePinAttemptState = {
+    version: PIN_ATTEMPT_STATE_VERSION,
+    attemptCount: 0,
+    lastAttemptAtMs: 0,
+    reservation: null,
+  };
+  const temp = path.join(parent, `.pin-attempt-bootstrap-${process.pid}-${randomUUID()}.tmp`);
+  let descriptor: number | null = null;
+  try {
+    descriptor = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | noFollow, 0o600);
+    fs.writeFileSync(descriptor, `${JSON.stringify(initial)}\n`, "utf8");
+    fs.fchmodSync(descriptor, 0o600);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    // Revalidate the canonical parent immediately before pathname-based
+    // publication. Node has no openat/linkat surface, so this is the strongest
+    // portable fail-closed check within Wayang's cooperative same-UID model.
+    const parentAtPublish = ownerOnlyPrivateDirectory(parent);
+    if (!parentAtPublish || parentAtPublish.dev !== parentBefore.dev || parentAtPublish.ino !== parentBefore.ino) {
+      return { status: "unavailable", reason: "state_parent" };
+    }
+    // Same-directory hard-link publication is no-overwrite: a concurrent
+    // service can win, but neither process may replace live cooldown state.
+    fs.linkSync(temp, resolved);
+    // Drop the temporary hard link before validating the canonical file's
+    // required single-link invariant.
+    fs.unlinkSync(temp);
+    const directoryDescriptor = fs.openSync(parent,
+      fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | noFollow);
+    try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
+    const parentAfter = ownerOnlyPrivateDirectory(parent);
+    if (!parentAfter || parentAfter.dev !== parentBefore.dev || parentAfter.ino !== parentBefore.ino) {
+      return { status: "unavailable", reason: "state_parent" };
+    }
+    return readPinAttemptState(resolved)
+      ? { status: "ready", created: true }
+      : { status: "unavailable", reason: "state_create" };
+  } catch (error: any) {
+    if (error?.code === "EEXIST" && readPinAttemptState(resolved)) {
+      return { status: "ready", created: false };
+    }
+    return { status: "unavailable", reason: "state_create" };
+  } finally {
+    if (descriptor !== null) try { fs.closeSync(descriptor); } catch { /* best effort */ }
+    try { fs.unlinkSync(temp); } catch { /* absent or already cleaned */ }
   }
 }
 
@@ -411,7 +511,10 @@ function verifyIdentityPinOpaque(candidate: string): "verified" | "wrong_pin" | 
 export class HardenedSettingsPinAttemptAdapter implements SettingsPinAttemptPort {
   private readonly statePath: string;
 
-  constructor(statePath = path.join(getConfig().dataDir, "workspace-capability-approval", "pin-attempt-state.json")) {
+  constructor(
+    statePath = path.join(getConfig().dataDir, "workspace-capability-approval", "pin-attempt-state.json"),
+    private readonly initializationReady = true,
+  ) {
     this.statePath = path.resolve(statePath);
   }
 
@@ -422,6 +525,7 @@ export class HardenedSettingsPinAttemptAdapter implements SettingsPinAttemptPort
     operationDigest: string;
     expiresAt: number;
   }): Promise<ReservePinAttemptResult> {
+    if (!this.initializationReady) return { status: "unavailable" };
     if (typeof input.realm !== "string" || input.realm.length < 1 || input.realm.length > 256
       || typeof input.reservationId !== "string" || input.reservationId.length < 1 || input.reservationId.length > 256
       || typeof input.requestId !== "string" || input.requestId.length < 1 || input.requestId.length > 256
@@ -443,6 +547,7 @@ export class HardenedSettingsPinAttemptAdapter implements SettingsPinAttemptPort
   }
 
   async verifyAndConsume(input: { realm: string; reservationId: string; requestId: string; pin: string; now: number }): Promise<VerifyPinAttemptResult> {
+    if (!this.initializationReady) return { status: "unavailable" };
     const state = readPinAttemptState(this.statePath);
     const reservation = state?.reservation;
     if (!state || !reservation || reservation.realm !== input.realm || reservation.reservationId !== input.reservationId || reservation.requestId !== input.requestId) {
@@ -465,6 +570,7 @@ export class HardenedSettingsPinAttemptAdapter implements SettingsPinAttemptPort
     reason: "cancelled" | "authentication_lost" | "expired" | "conflict" | "backend_failure";
     now: number;
   }): Promise<void> {
+    if (!this.initializationReady) throw new Error("Settings PIN attempt state is unavailable");
     const state = readPinAttemptState(this.statePath);
     const reservation = state?.reservation;
     if (!state || !reservation || reservation.realm !== input.realm || reservation.reservationId !== input.reservationId || reservation.requestId !== input.requestId) {
@@ -478,13 +584,14 @@ export class HardenedSettingsPinAttemptAdapter implements SettingsPinAttemptPort
 export function createWorkspaceCapabilityApprovalIntegration(options: {
   denial: WorkspaceCapabilityRuntimeDenialPort;
   pinAttemptStatePath?: string;
+  pinAttemptReady?: boolean;
 }): {
   integration: WorkspaceCapabilityIntegration;
   service: WorkspaceCapabilityApprovalService;
   pinAttempts: HardenedSettingsPinAttemptAdapter;
 } {
   const integration = new WorkspaceCapabilityIntegration(options.denial);
-  const pinAttempts = new HardenedSettingsPinAttemptAdapter(options.pinAttemptStatePath);
+  const pinAttempts = new HardenedSettingsPinAttemptAdapter(options.pinAttemptStatePath, options.pinAttemptReady ?? true);
   const service = new WorkspaceCapabilityApprovalService({ workspace: integration, pinAttempts, cleanup: integration });
   return { integration, service, pinAttempts };
 }

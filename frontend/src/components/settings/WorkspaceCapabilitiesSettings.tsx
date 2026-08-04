@@ -31,6 +31,8 @@ const CAPABILITY_RISK_DETAILS: Record<WorkspaceCapabilityId, string> = {
     "Host execution runs as the Wayang OS user outside the filesystem sandbox. It can affect same-UID files, processes, credentials, network services, and existing privilege mechanisms. A person authenticated to a remotely exposed Wayang instance can trigger those host effects.",
   "wayang.protected-browser.v1":
     "The agent may navigate, click, type non-secret text, download, and cause remote mutations. Existing authenticated cookies may permit purchases, deletion, exports, account-setting changes, logout, or browser-mediated passkey flows; human login handoff does not make later actions read-only.",
+  "wayang.protected-automation.v1":
+    "Deterministic scheduled Node code runs without a shell and can read or persist writes throughout its exact Protected project; completed or racing writes cannot be rolled back. The child has no generic TCP, UDP, or Unix-socket network access, but backend-owned browser RPC can use authenticated state at agent-configured HTTPS origins to disclose data or cause consequential account changes. Passwords, MFA, CAPTCHA, payments, recovery, and other secret-bearing steps remain human-only. This is not isolation from same-UID processes or trusted in-process code.",
 };
 
 function errorMessage(error: unknown): string {

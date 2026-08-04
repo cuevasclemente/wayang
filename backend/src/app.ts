@@ -18,6 +18,10 @@ import { router as ttsRouter } from "./routes/tts.js";
 import { router as browserRouter } from "./routes/browser.js";
 import { createBrowserCredentialsRouter } from "./routes/browser-credentials.js";
 import {
+  attachProtectedAutomationWs,
+  createProtectedAutomationsRouter,
+} from "./routes/protected-automations.js";
+import {
   createProtectedBrowserRouter,
   createProtectedBrowserSelectionMiddleware,
   type ProtectedBrowserIntegration,
@@ -53,20 +57,26 @@ import {
   type ProtectedBrowserOwnerPort,
   type ProtectedBrowserProductionBootstrap,
 } from "./browser/protected-production.js";
+import {
+  bootstrapProtectedAutomationProduction,
+  type ProtectedAutomationProductionBootstrap,
+  type ProtectedAutomationProductionIntegration,
+} from "./protected-automation/production.js";
 
 const serverCredentialBrokers = new WeakMap<http.Server, CredentialBroker>();
-const serverProductionBootstraps = new WeakMap<http.Server, readonly [
-  ProductionWorkspaceCapabilityBootstrap,
-  ProtectedBrowserProductionBootstrap,
-]>();
+const serverProtectedAutomationWsClosers = new WeakMap<http.Server, () => void>();
+const serverProductionBootstraps = new WeakMap<http.Server, readonly {
+  close(): Promise<void>;
+}[]>();
 const serverProductionCleanup = new WeakMap<http.Server, Promise<void>>();
 
 function bindProductionBootstraps(
   server: http.Server,
   workspaceCapabilities: ProductionWorkspaceCapabilityBootstrap,
   protectedBrowser: ProtectedBrowserProductionBootstrap,
+  protectedAutomation: ProtectedAutomationProductionBootstrap,
 ): void {
-  serverProductionBootstraps.set(server, [workspaceCapabilities, protectedBrowser]);
+  serverProductionBootstraps.set(server, [workspaceCapabilities, protectedBrowser, protectedAutomation]);
   server.once("close", () => { void closeProductionBootstraps(server); });
 }
 
@@ -101,6 +111,8 @@ export interface CreateAppOptions {
   protectedBrowser?: ProtectedBrowserIntegration;
   /** Exact authenticated Settings owner plus workspace/PIN service. Missing means the Settings capability API fails closed. */
   workspaceCapabilities?: WorkspaceCapabilitiesRouterOptions;
+  /** App-owned deterministic automation metadata/preparation/purge integration. Missing means these routes fail closed. */
+  protectedAutomation?: ProtectedAutomationProductionIntegration;
 }
 
 export function createApp(options: CreateAppOptions = {}) {
@@ -134,6 +146,15 @@ export function createApp(options: CreateAppOptions = {}) {
     };
     app.use("/api/workspace-capabilities", unavailableSettingsCapabilities);
     app.use("/api/workspace-capability-associations", unavailableSettingsCapabilities);
+  }
+
+  if (options.protectedAutomation) {
+    app.use("/api", createProtectedAutomationsRouter(auth, options.protectedAutomation));
+  } else {
+    app.use("/api/protected-automations", (_req, res) => {
+      res.setHeader("Cache-Control", "no-store");
+      res.status(503).json({ error: "Protected automation production integration is unavailable" });
+    });
   }
 
   // Durable Protected/capability selection runs before generic agent-token,
@@ -204,9 +225,16 @@ export function createApp(options: CreateAppOptions = {}) {
   // All WebSocket transports use the same authentication/origin decision.
   attachWs(server, auth);
   attachBrowserWs(server, auth, options.protectedBrowser);
+  if (options.protectedAutomation) {
+    serverProtectedAutomationWsClosers.set(
+      server,
+      attachProtectedAutomationWs(server, auth, options.protectedAutomation),
+    );
+  }
 
   serverCredentialBrokers.set(server, credentialBroker);
   server.on("close", () => {
+    serverProtectedAutomationWsClosers.get(server)?.();
     unregisterCredentialStopHook();
     void credentialBroker.shutdown().catch(() => undefined);
   });
@@ -215,6 +243,9 @@ export function createApp(options: CreateAppOptions = {}) {
 }
 
 export async function closeWayangServer(server: http.Server): Promise<void> {
+  // Upgraded preparation sockets are not closed by http.Server.close().
+  // Terminate them before waiting for the HTTP close callback.
+  serverProtectedAutomationWsClosers.get(server)?.();
   const serverClose = server.listening
     ? new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
     : Promise.resolve();
@@ -255,6 +286,11 @@ export function start() {
     owner,
     credentialBroker,
   });
+  const protectedAutomation = bootstrapProtectedAutomationProduction({
+    dataDir: config.dataDir,
+    credentialBroker,
+    pinAttempts: workspaceCapabilities.pinAttempts,
+  });
 
   if (!config.auth.enabled && !isLoopbackHost(config.host)) {
     console.warn("[wayang] WARNING: built-in authentication is disabled on a non-loopback bind; protect every HTTP and WebSocket path with a trusted network or authenticated reverse proxy.");
@@ -265,9 +301,11 @@ export function start() {
     authService,
     workspaceCapabilities: workspaceCapabilities.routerOptions,
     protectedBrowser: protectedBrowser.integration,
+    protectedAutomation: protectedAutomation.integration,
     credentialBroker,
   });
-  bindProductionBootstraps(server, workspaceCapabilities, protectedBrowser);
+  bindProductionBootstraps(server, workspaceCapabilities, protectedBrowser, protectedAutomation);
+  protectedAutomation.start();
 
   // Durable submissions survive a backend restart. Delivery failures stay in
   // the store and are retried again when their session's WebSocket attaches.
@@ -322,7 +360,7 @@ export function start() {
     clearAppsAgentToken();
   };
   // src/index.ts owns SIGINT/SIGTERM and awaits closeWayangServer(), which in
-  // turn awaits both production bootstraps. The close event handles direct
+  // turn awaits all production bootstraps. The close event handles direct
   // server closure without installing a second, racing signal path here.
   server.once("close", shutdownServices);
 

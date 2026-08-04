@@ -289,6 +289,292 @@ export interface ScheduledJob {
   lastRun: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// Protected Automations
+// ---------------------------------------------------------------------------
+
+export interface ProtectedAutomationStatus {
+  milestone: number;
+  activationAvailable: boolean;
+  production_services: boolean;
+}
+
+export type ProtectedAutomationRunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "cancelled"
+  | "needs_user"
+  | "interrupted"
+  | "denied";
+
+export type ProtectedAutomationAttentionReason =
+  | "login_required"
+  | "mfa_required"
+  | "captcha_required"
+  | "payment_confirmation_required"
+  | "human_review_required";
+
+export interface ProtectedAutomationAttention {
+  required: true;
+  reason: ProtectedAutomationAttentionReason;
+}
+
+/** Exact owner-safe projection returned by publicJob(). */
+export interface ProtectedAutomationJob {
+  id: string;
+  project_id: string;
+  agent_profile_id: string;
+  capability_revision: number;
+  revision: number;
+  source_revision: number;
+  name: string;
+  source_manifest_sha256: string;
+  entrypoint: string;
+  argv_count: number;
+  uses_browser_profile: boolean;
+  allowed_https_origins: string[];
+  cron_expr: string;
+  timeout_ms: number;
+  missed_run_policy: "skip" | "run_once";
+  enabled: boolean;
+  blocked_reason: string | null;
+  deleted_at: number | null;
+  created_at: number;
+  updated_at: number;
+  last_run_at: number | null;
+  next_run_at: number | null;
+  attention: ProtectedAutomationAttention | null;
+  activationAvailable: boolean;
+}
+
+/** Exact owner-safe projection returned by publicRun(). */
+export interface ProtectedAutomationRun {
+  id: string;
+  job_id: string;
+  project_id: string;
+  agent_profile_id: string;
+  job_revision: number;
+  capability_revision: number;
+  trigger: "schedule" | "manual";
+  scheduled_for: number | null;
+  started_at: number;
+  finished_at: number | null;
+  status: ProtectedAutomationRunStatus;
+  outcome_code: string | null;
+  exit_code: number | null;
+  attention: ProtectedAutomationAttention | null;
+}
+
+export interface ProtectedAutomationPreparationSelection {
+  sourceSessionId: string;
+  jobId: string;
+  preparationId: string;
+}
+
+export interface ProtectedAutomationPreparation {
+  preparation_id: string;
+  source_session_id: string;
+  job_id: string;
+  job_revision: number;
+  state: "waiting_for_owner" | "ready" | "closed";
+  websocket_path: string;
+  project_id: string;
+  agent_profile_id: string;
+  capability_revision: number;
+  source_revision: number;
+  allowed_https_origins: string[];
+  credential_broker: { supported: boolean; guarded: true };
+}
+
+export interface ProtectedAutomationPurgeChallenge {
+  request_id: string;
+  job_id: string;
+  expected_revision: number;
+  operation_digest: string;
+  expires_at: number;
+  summary: string;
+}
+
+export interface ProtectedAutomationPurgeResult {
+  purged_job_id: string;
+  purged_run_ids: string[];
+}
+
+export interface ProtectedAutomationCatalog {
+  status: ProtectedAutomationStatus;
+  jobs: ProtectedAutomationJob[];
+}
+
+export interface ProtectedAutomationDetail {
+  status: ProtectedAutomationStatus;
+  job: ProtectedAutomationJob;
+  runs: ProtectedAutomationRun[];
+}
+
+export function fetchProtectedAutomationStatus(): Promise<ProtectedAutomationStatus> {
+  return request<ProtectedAutomationStatus>("GET", "/api/protected-automations", undefined, undefined, true, "no-store");
+}
+
+export async function listProtectedAutomationJobs(): Promise<{ jobs: ProtectedAutomationJob[] }> {
+  const payload = await request<{ jobs?: unknown }>("GET", "/api/protected-automations/jobs", undefined, undefined, true, "no-store");
+  const rows = Array.isArray(payload?.jobs) ? payload.jobs : [];
+  return {
+    jobs: rows.filter((value): value is ProtectedAutomationJob => Boolean(
+      value && typeof value === "object" && typeof (value as { id?: unknown }).id === "string",
+    )),
+  };
+}
+
+export async function listProtectedAutomations(): Promise<ProtectedAutomationCatalog> {
+  const [status, result] = await Promise.all([
+    fetchProtectedAutomationStatus(),
+    listProtectedAutomationJobs(),
+  ]);
+  return { status, jobs: result.jobs };
+}
+
+export async function getProtectedAutomationJob(id: string): Promise<{ job: ProtectedAutomationJob }> {
+  const payload = await request<{ job?: unknown }>(
+    "GET",
+    `/api/protected-automations/jobs/${encodeURIComponent(id)}`,
+    undefined,
+    undefined,
+    true,
+    "no-store",
+  );
+  if (!payload?.job || typeof payload.job !== "object" || typeof (payload.job as { id?: unknown }).id !== "string") {
+    throw new Error("Protected automation backend returned an invalid job projection");
+  }
+  return { job: payload.job as ProtectedAutomationJob };
+}
+
+export async function listProtectedAutomationRuns(id: string): Promise<{ runs: ProtectedAutomationRun[] }> {
+  const payload = await request<{ runs?: unknown }>(
+    "GET",
+    `/api/protected-automations/jobs/${encodeURIComponent(id)}/runs`,
+    undefined,
+    undefined,
+    true,
+    "no-store",
+  );
+  const rows = Array.isArray(payload?.runs) ? payload.runs : [];
+  return {
+    runs: rows.filter((value): value is ProtectedAutomationRun => Boolean(
+      value && typeof value === "object" && typeof (value as { id?: unknown }).id === "string",
+    )),
+  };
+}
+
+export async function getProtectedAutomation(id: string): Promise<ProtectedAutomationDetail> {
+  const [status, jobResult, runResult] = await Promise.all([
+    fetchProtectedAutomationStatus(),
+    getProtectedAutomationJob(id),
+    listProtectedAutomationRuns(id),
+  ]);
+  return { status, job: jobResult.job, runs: runResult.runs };
+}
+
+export function pauseProtectedAutomation(id: string, expectedRevision: number): Promise<{ job: ProtectedAutomationJob }> {
+  return request<{ job: ProtectedAutomationJob }>(
+    "POST",
+    `/api/protected-automations/jobs/${encodeURIComponent(id)}/pause`,
+    { expectedRevision },
+    undefined,
+    true,
+    "no-store",
+  );
+}
+
+export function cancelProtectedAutomationRun(jobId: string, runId: string): Promise<{ run: ProtectedAutomationRun }> {
+  return request<{ run: ProtectedAutomationRun }>(
+    "POST",
+    `/api/protected-automations/jobs/${encodeURIComponent(jobId)}/runs/${encodeURIComponent(runId)}/cancel`,
+    {},
+    undefined,
+    true,
+    "no-store",
+  );
+}
+
+function protectedAutomationPreparationBase(selection: ProtectedAutomationPreparationSelection): string {
+  return `/api/protected-automations/sources/${encodeURIComponent(selection.sourceSessionId)}`
+    + `/jobs/${encodeURIComponent(selection.jobId)}/preparations/${encodeURIComponent(selection.preparationId)}`;
+}
+
+export async function getProtectedAutomationPreparation(
+  selection: ProtectedAutomationPreparationSelection,
+): Promise<ProtectedAutomationPreparation> {
+  const preparation = await request<ProtectedAutomationPreparation>(
+    "GET",
+    protectedAutomationPreparationBase(selection),
+    undefined,
+    undefined,
+    true,
+    "no-store",
+  );
+  if (preparation?.source_session_id !== selection.sourceSessionId
+    || preparation?.job_id !== selection.jobId
+    || preparation?.preparation_id !== selection.preparationId
+    || typeof preparation.websocket_path !== "string") {
+    throw new Error("Protected automation backend returned a mismatched preparation projection");
+  }
+  return preparation;
+}
+
+export function closeProtectedAutomationPreparation(selection: ProtectedAutomationPreparationSelection): Promise<null> {
+  return request<null>("POST", `${protectedAutomationPreparationBase(selection)}/close`, {}, undefined, true, "no-store");
+}
+
+export function navigateProtectedAutomationPreparation(
+  selection: ProtectedAutomationPreparationSelection,
+  url: string,
+): Promise<ProtectedAutomationPreparation> {
+  return request<ProtectedAutomationPreparation>("POST", `${protectedAutomationPreparationBase(selection)}/navigate`, { url }, undefined, true, "no-store");
+}
+
+export function requestProtectedAutomationPurge(
+  jobId: string,
+  expectedRevision: number,
+): Promise<ProtectedAutomationPurgeChallenge> {
+  return request<ProtectedAutomationPurgeChallenge>(
+    "POST",
+    `/api/protected-automations/jobs/${encodeURIComponent(jobId)}/purge-requests`,
+    { expectedRevision },
+    undefined,
+    false,
+    "no-store",
+  );
+}
+
+export function commitProtectedAutomationPurge(
+  jobId: string,
+  requestId: string,
+  pin: string,
+): Promise<ProtectedAutomationPurgeResult> {
+  return request<ProtectedAutomationPurgeResult>(
+    "POST",
+    `/api/protected-automations/jobs/${encodeURIComponent(jobId)}/purge-requests/${encodeURIComponent(requestId)}/commit`,
+    { pin },
+    undefined,
+    false,
+    "no-store",
+  );
+}
+
+export function cancelProtectedAutomationPurge(jobId: string, requestId: string): Promise<null> {
+  return request<null>(
+    "DELETE",
+    `/api/protected-automations/jobs/${encodeURIComponent(jobId)}/purge-requests/${encodeURIComponent(requestId)}`,
+    undefined,
+    undefined,
+    false,
+    "no-store",
+  );
+}
+
 export type ScheduledAgentRunStatus = "running" | "completed" | "failed" | "skipped";
 export type ScheduledAgentCommandGuardMode = "default" | "off" | "balanced" | "audit" | "strict";
 
@@ -353,6 +639,7 @@ export const WORKSPACE_CAPABILITY_IDS = [
   "wayang.standard-resources.v1",
   "wayang.host-execution.v1",
   "wayang.protected-browser.v1",
+  "wayang.protected-automation.v1",
 ] as const;
 
 export type WorkspaceCapabilityId = typeof WORKSPACE_CAPABILITY_IDS[number];
@@ -1033,6 +1320,89 @@ export async function lockBrowserCredentials(
     browserBody(sessionId, projectCwd),
   ));
   if (raw.locked !== true) throw new Error("Credential vault did not confirm it was locked");
+  return { locked: true };
+}
+
+function protectedAutomationCredentialPath(
+  selection: ProtectedAutomationPreparationSelection,
+  operation: string,
+): string {
+  return `${protectedAutomationPreparationBase(selection)}/credentials/${operation}`;
+}
+
+export async function fetchProtectedAutomationCredentialStatus(
+  selection: ProtectedAutomationPreparationSelection,
+): Promise<BrowserCredentialStatus> {
+  const raw = asRecord(await apiPost<unknown>(protectedAutomationCredentialPath(selection, "status")));
+  if (typeof raw.available !== "boolean" || typeof raw.unlocked !== "boolean") {
+    throw new Error("Automation credential broker returned an invalid status");
+  }
+  return {
+    availability: !raw.available ? "unavailable" : raw.unlocked ? "unlocked" : "locked",
+    exactOrigin: exactOrigin(raw.origin),
+    ...(typeof raw.unlockExpiresAt === "number" ? { unlockExpiresAt: raw.unlockExpiresAt } : {}),
+  };
+}
+
+export async function fetchProtectedAutomationCredentialMatches(
+  selection: ProtectedAutomationPreparationSelection,
+): Promise<BrowserCredentialMatches> {
+  let raw: Record<string, unknown>;
+  try {
+    raw = asRecord(await apiPost<unknown>(protectedAutomationCredentialPath(selection, "matches")));
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 503) return { availability: "unavailable", exactOrigin: null, choices: [] };
+    if (error instanceof ApiError && error.status === 409) return { availability: "locked", exactOrigin: null, choices: [] };
+    throw error;
+  }
+  const rawChoices = Array.isArray(raw.choices) ? raw.choices : [];
+  return {
+    availability: "unlocked",
+    exactOrigin: exactOrigin(raw.origin),
+    choices: rawChoices.flatMap((value): BrowserCredentialChoice[] => {
+      const choice = asRecord(value);
+      const choiceToken = typeof choice.choiceToken === "string"
+        ? choice.choiceToken
+        : typeof choice.token === "string" ? choice.token : "";
+      if (!choiceToken) return [];
+      return [{
+        choiceToken,
+        label: typeof choice.label === "string" && choice.label ? choice.label : "Saved login",
+        maskedIdentifier: typeof choice.maskedIdentifier === "string" && choice.maskedIdentifier
+          ? choice.maskedIdentifier : "Identifier hidden",
+        hasTotp: choice.hasTotp === true || choice.totpAvailable === true,
+        matchWarning: typeof choice.matchWarning === "string" ? choice.matchWarning
+          : typeof choice.warning === "string" ? choice.warning : undefined,
+      }];
+    }),
+  };
+}
+
+export async function fillProtectedAutomationCredentialLogin(
+  selection: ProtectedAutomationPreparationSelection,
+  choiceToken: string,
+): Promise<BrowserCredentialFillResult> {
+  return normalizeCredentialFill(await apiPost<unknown>(
+    protectedAutomationCredentialPath(selection, "fill"),
+    { choiceToken },
+  ));
+}
+
+export async function fillProtectedAutomationCredentialTotp(
+  selection: ProtectedAutomationPreparationSelection,
+  choiceToken: string,
+): Promise<BrowserCredentialFillResult> {
+  return normalizeCredentialFill(await apiPost<unknown>(
+    protectedAutomationCredentialPath(selection, "fill-totp"),
+    { choiceToken },
+  ));
+}
+
+export async function lockProtectedAutomationCredentials(
+  selection: ProtectedAutomationPreparationSelection,
+): Promise<{ locked: true }> {
+  const raw = asRecord(await apiPost<unknown>(protectedAutomationCredentialPath(selection, "lock")));
+  if (raw.locked !== true) throw new Error("Automation credential vault did not confirm it was locked");
   return { locked: true };
 }
 

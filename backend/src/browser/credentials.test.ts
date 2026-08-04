@@ -8,6 +8,7 @@ import type { BrowserCredentialsConfig } from "../config.js";
 import { BwCliAdapter, CredentialBroker, buildBwChildEnvironment, isValidBitwardenItemId, maskCredentialIdentifier, type BitwardenAdapter } from "./credentials.js";
 import type { BrowserCredentialContext } from "./manager.js";
 import type { ProtectedBrowserBinding } from "./types.js";
+import type { ProtectedAutomationBrowserLeaseBinding } from "../protected-automation/browser-realm.js";
 
 const USER_CANARY = "synthetic-user-canary@example.test";
 const PASSWORD_CANARY = "SYNTHETIC_PASSWORD_CANARY_9f2a";
@@ -147,6 +148,39 @@ test("protected choices bind the exact capability, target, document, runtime/con
     const revoked = (await broker.matches(exactContext)).choices[0];
     broker.revokeChoicesForProtectedBinding(protectedBinding({ controlGeneration: 99 }));
     await assert.rejects(() => broker.fill(revoked.choiceToken, "login", exactContext, async () => []), /already used|expired/i);
+  } finally {
+    await broker.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("automation credential choices bind one exact job preparation and cannot cross generations", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-automation-credential-binding-"));
+  const broker = new CredentialBroker(config(root), new FakeAdapter());
+  const binding: ProtectedAutomationBrowserLeaseBinding = {
+    projectId: "automation-project", projectCwd: "/synthetic/automation-project", agentProfileId: "automation-profile",
+    jobId: "automation-job", capabilityRevision: 2, jobRevision: 7, sourceRevision: 3,
+    sourceManifestSha256: "a".repeat(64), kind: "prepare", ownerId: "preparation-id", generation: "generation-a",
+  };
+  const exact = context({ runtimeKey: "automation-preparation", automationPreparationBinding: binding });
+  try {
+    broker.acceptUnlockKey(SESSION_CANARY);
+    for (const changed of [
+      { jobId: "other-job" }, { jobRevision: 8 }, { sourceRevision: 4 },
+      { ownerId: "other-preparation" }, { generation: "generation-b" },
+    ]) {
+      const choice = (await broker.matches(exact)).choices[0];
+      await assert.rejects(
+        broker.fill(choice.choiceToken, "login", context({
+          ...exact,
+          automationPreparationBinding: { ...binding, ...changed },
+        }), async () => []),
+        /no longer valid/i,
+      );
+    }
+    const revoked = (await broker.matches(exact)).choices[0];
+    broker.revokeChoicesForAutomationPreparation(binding);
+    await assert.rejects(broker.fill(revoked.choiceToken, "login", exact, async () => []), /already used|expired/i);
   } finally {
     await broker.shutdown();
     fs.rmSync(root, { recursive: true, force: true });

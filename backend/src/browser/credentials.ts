@@ -8,6 +8,14 @@ import type { BrowserCredentialsConfig } from "../config.js";
 import type { BrowserCredentialContext } from "./manager.js";
 import { exactProtectedBrowserBindingEqual } from "./protected-browser.js";
 import type { ProtectedBrowserBinding } from "./types.js";
+import type { ProtectedAutomationBrowserLeaseBinding } from "../protected-automation/browser-realm.js";
+
+declare module "./manager.js" {
+  interface BrowserCredentialContext {
+    /** Present only for one exact Protected-automation preparation lease. */
+    automationPreparationBinding?: ProtectedAutomationBrowserLeaseBinding;
+  }
+}
 
 const MAX_UNLOCK_KEY_BYTES = 4096;
 const MAX_LABEL_LENGTH = 160;
@@ -38,6 +46,7 @@ interface PendingChoice {
   documentIdentity: string;
   origin: string;
   capabilityBinding?: ProtectedBrowserBinding;
+  automationPreparationBinding?: ProtectedAutomationBrowserLeaseBinding;
   operation: "login" | "totp" | "login-or-totp";
   expiresAt: number;
 }
@@ -256,15 +265,31 @@ export function maskCredentialIdentifier(value: unknown): string {
   return maskPart(identifier);
 }
 
+function exactAutomationPreparationBindingEqual(
+  left: Readonly<ProtectedAutomationBrowserLeaseBinding>,
+  right: Readonly<ProtectedAutomationBrowserLeaseBinding>,
+): boolean {
+  return left.projectId === right.projectId && left.projectCwd === right.projectCwd
+    && left.agentProfileId === right.agentProfileId && left.jobId === right.jobId
+    && left.capabilityRevision === right.capabilityRevision && left.jobRevision === right.jobRevision
+    && left.sourceRevision === right.sourceRevision && left.sourceManifestSha256 === right.sourceManifestSha256
+    && left.kind === "prepare" && right.kind === "prepare" && left.ownerId === right.ownerId
+    && left.generation === right.generation;
+}
+
 function sameContext(choice: PendingChoice, context: BrowserCredentialContext): boolean {
   const choiceBinding = choice.capabilityBinding;
   const contextBinding = context.capabilityBinding;
+  const choicePreparation = choice.automationPreparationBinding;
+  const contextPreparation = context.automationPreparationBinding;
   return choice.runtimeKey === context.runtimeKey
     && choice.targetId === context.targetId
     && choice.documentIdentity === context.documentIdentity
     && choice.origin === context.origin
     && Boolean(choiceBinding) === Boolean(contextBinding)
-    && (!choiceBinding || !contextBinding || exactProtectedBrowserBindingEqual(choiceBinding, contextBinding));
+    && (!choiceBinding || !contextBinding || exactProtectedBrowserBindingEqual(choiceBinding, contextBinding))
+    && Boolean(choicePreparation) === Boolean(contextPreparation)
+    && (!choicePreparation || !contextPreparation || exactAutomationPreparationBindingEqual(choicePreparation, contextPreparation));
 }
 
 function sameProtectedRuntimeLease(left: Readonly<ProtectedBrowserBinding>, right: Readonly<ProtectedBrowserBinding>): boolean {
@@ -365,6 +390,14 @@ export class CredentialBroker {
     }
   }
 
+  /** Revoke every outstanding choice for one exact automation preparation generation. */
+  revokeChoicesForAutomationPreparation(binding: Readonly<ProtectedAutomationBrowserLeaseBinding>): void {
+    for (const [token, choice] of this.choices) {
+      if (choice.automationPreparationBinding
+        && exactAutomationPreparationBindingEqual(choice.automationPreparationBinding, binding)) this.choices.delete(token);
+    }
+  }
+
   async lock(): Promise<void> {
     const wasUnlocked = this.sessionKey !== null;
     this.sessionKey = null;
@@ -438,6 +471,8 @@ export class CredentialBroker {
       documentIdentity: context.documentIdentity,
       origin: context.origin,
       ...(context.capabilityBinding ? { capabilityBinding: { ...context.capabilityBinding } } : {}),
+      ...(context.automationPreparationBinding
+        ? { automationPreparationBinding: { ...context.automationPreparationBinding } } : {}),
       operation: "login-or-totp",
       expiresAt: this.now() + this.config.choiceTtlMs,
     });

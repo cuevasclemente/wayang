@@ -186,8 +186,8 @@ function writeInitialStateNoReplace(statePath) {
   try {
     descriptor = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
     writeFileSync(descriptor, `${JSON.stringify(INITIAL_STATE)}\n`, "utf8");
-    fsyncSync(descriptor);
     fchmodSync(descriptor, 0o600);
+    fsyncSync(descriptor);
     closeSync(descriptor);
     descriptor = null;
     // link(2) publishes the complete file atomically and refuses an existing

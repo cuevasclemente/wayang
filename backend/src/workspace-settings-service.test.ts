@@ -653,6 +653,8 @@ test("project registration deletion checks every central reference class and nev
       sessions: ["archived-ref"],
       scheduled_jobs: ["job-ref"],
       scheduled_runs: ["run-ref"],
+      protected_automation_jobs: [],
+      protected_automation_runs: [],
       apps: ["app-ref"],
       app_states: ["state-ref"],
       app_events: ["event-ref"],

@@ -27,6 +27,7 @@ import { ChatPanel } from "./panels/ChatPanel";
 import { NewSessionPanel } from "./panels/NewSessionPanel";
 import { RightPanel } from "./panels/RightPanel";
 import { ScheduledJobsPanel } from "./panels/ScheduledJobsPanel";
+import { ProtectedAutomationsPanel } from "./panels/ProtectedAutomationsPanel";
 import { isCurrentSessionPath, parseSessionPath, sessionPath } from "./routing/sessionRoute";
 import { SettingsDialog, type SettingsTab } from "./components/settings/SettingsDialog";
 
@@ -101,6 +102,8 @@ function App({ authEnabled, onLogout }: AppProps) {
   const [showNewSession, setShowNewSession] = useState(false);
   const [activeScheduledJobId, setActiveScheduledJobId] = useState<string | null>(null);
   const [showScheduledJobs, setShowScheduledJobs] = useState(false);
+  const [activeProtectedAutomationJobId, setActiveProtectedAutomationJobId] = useState<string | null>(null);
+  const [showProtectedAutomations, setShowProtectedAutomations] = useState(false);
   const [settingsRequest, setSettingsRequest] = useState<{ tab: SettingsTab; projectCwd: string | null } | null>(null);
   const [routeResolution, setRouteResolution] = useState<RouteResolution>(initialRouteResolution);
   const routeRequestGenerationRef = useRef(0);
@@ -122,6 +125,7 @@ function App({ authEnabled, onLogout }: AppProps) {
       setActiveProjectCwd(session.cwd.replace(/\/+$/, "") || "/");
       setShowNewSession(false);
       setShowScheduledJobs(false);
+      setShowProtectedAutomations(false);
       setScrollToMessageId(messageId);
       if (!isCurrentSessionPath(session.id)) {
         window.history.pushState(window.history.state, "", sessionPath(session.id));
@@ -159,6 +163,7 @@ function App({ authEnabled, onLogout }: AppProps) {
       handleSessionChange();
       setShowNewSession(false);
       setShowScheduledJobs(false);
+      setShowProtectedAutomations(false);
     },
     [handleSelectSession, handleSessionChange],
   );
@@ -192,6 +197,7 @@ function App({ authEnabled, onLogout }: AppProps) {
 
     setShowNewSession(false);
     setShowScheduledJobs(false);
+    setShowProtectedAutomations(false);
     setScrollToMessageId(null);
 
     if (route.kind === "root") {
@@ -270,6 +276,18 @@ function App({ authEnabled, onLogout }: AppProps) {
     (jobId: string | null) => {
       setActiveScheduledJobId(jobId);
       setShowScheduledJobs(true);
+      setShowProtectedAutomations(false);
+      setShowNewSession(false);
+      if (isMobile) setMobileTab("chat");
+    },
+    [isMobile],
+  );
+
+  const handleSelectProtectedAutomation = useCallback(
+    (jobId: string | null) => {
+      setActiveProtectedAutomationJobId(jobId);
+      setShowProtectedAutomations(true);
+      setShowScheduledJobs(false);
       setShowNewSession(false);
       if (isMobile) setMobileTab("chat");
     },
@@ -324,17 +342,20 @@ function App({ authEnabled, onLogout }: AppProps) {
       active={!isMobile || mobileTab === "sessions"}
       activeProjectCwd={activeProjectCwd}
       activeScheduledJobId={showScheduledJobs ? activeScheduledJobId : null}
+      activeProtectedAutomationJobId={showProtectedAutomations ? activeProtectedAutomationJobId : null}
       onSelect={handleSelectSession}
       onSelectSearchResult={handleSelectSearchResult}
       onSelectProject={handleSelectProject}
       onNewSessionForProject={handleCreateSessionForProject}
       onOpenProjectSettings={(cwd) => setSettingsRequest({ tab: "projects", projectCwd: cwd })}
       onSelectScheduledJob={handleSelectScheduledJob}
+      onSelectProtectedAutomation={handleSelectProtectedAutomation}
       onArchiveActive={handleRemovedActiveSession}
       refreshTrigger={sessionChangeTrigger}
       onNewSession={() => {
         setShowNewSession(true);
         setShowScheduledJobs(false);
+        setShowProtectedAutomations(false);
         if (isMobile) setMobileTab("chat");
       }}
     />
@@ -349,7 +370,7 @@ function App({ authEnabled, onLogout }: AppProps) {
       {/* Keep ChatPanel mounted so its browser-level WebSocket survives local
           navigation between center-pane tools. Session changes still use the
           existing switch_session message instead of constructing a new socket. */}
-      <div className={`h-full ${showNewSession || showScheduledJobs || hasRouteNotice ? "hidden" : ""}`}>
+      <div className={`h-full ${showNewSession || showScheduledJobs || showProtectedAutomations || hasRouteNotice ? "hidden" : ""}`}>
         <ChatPanel
           activeSession={activeSession}
           onSessionChange={handleSessionChange}
@@ -387,6 +408,17 @@ function App({ authEnabled, onLogout }: AppProps) {
             onOpenSession={handleOpenScheduledSession}
             onChanged={handleSessionChange}
             onClose={() => setShowScheduledJobs(false)}
+          />
+        </div>
+      )}
+      {showProtectedAutomations && (
+        <div className="absolute inset-0 bg-neutral-950">
+          <ProtectedAutomationsPanel
+            selectedJobId={activeProtectedAutomationJobId}
+            sourceSessionId={activeSessionId}
+            onSelectJob={handleSelectProtectedAutomation}
+            onChanged={handleSessionChange}
+            onClose={() => setShowProtectedAutomations(false)}
           />
         </div>
       )}

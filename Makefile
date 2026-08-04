@@ -23,7 +23,7 @@ install: ## Deterministically install backend, frontend, and E2E dependencies
 configure: ## Run the interactive, secret-safe configuration wizard
 	@node scripts/configure.mjs
 
-setup-capability-approval: ## Provision private capability-approval cooldown state for an existing identity PIN
+setup-capability-approval: ## Optional manual preflight; service startup initializes missing cooldown state automatically
 	@node scripts/run-with-env.mjs -- node scripts/setup-capability-approval.mjs
 
 pi-login: ## Start the checkout's pi CLI for an interactive /login

@@ -101,7 +101,7 @@ const INTENT = {
   agentProfileId: "profile",
 };
 
-test("request API accepts exactly three IDs and rejects provider/model extras", async (t) => {
+test("request API accepts compiled IDs and rejects provider/model extras", async (t) => {
   const { base } = await start(t);
   const stale = await fetch(`${base}/workspace-capabilities/requests`, {
     method: "POST",

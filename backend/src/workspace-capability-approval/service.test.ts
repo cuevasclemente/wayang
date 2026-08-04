@@ -28,7 +28,7 @@ function preview(intent = INTENT): CapabilityActivationPreview {
     projectLabel: "Renamed Project",
     projectCwd: "/synthetic/project",
     agentProfileLabel: "Not A Built-in Identity",
-    privacyMode: "standard",
+    privacyMode: intent.capabilityId.startsWith("wayang.protected-") ? "protected" : "standard",
     profileAllowed: true,
     profileEnabled: true,
     associationBefore: null,
@@ -148,7 +148,7 @@ test("revocation uses exact triple and expected revision, denial before cleanup"
   assert.deepEqual(events, ["deny-first", "cleanup"]);
 });
 
-test("activation accepts exactly three IDs and rejects tuple-era or unknown fields", async () => {
+test("activation accepts only the exact triple shape and rejects tuple-era or unknown fields", async () => {
   const events: string[] = [];
   const service = new WorkspaceCapabilityApprovalService({ workspace: workspacePort(events), pinAttempts: new AcceptingPinPort() });
   await assert.rejects(service.requestActivation(OWNER, { ...INTENT, provider: "old", model: "tuple" }), code("invalid_request"));
@@ -156,6 +156,28 @@ test("activation accepts exactly three IDs and rejects tuple-era or unknown fiel
   await assert.rejects(service.requestActivation(OWNER, { ...INTENT, capabilityId: "Wren" }), code("invalid_request"));
   await assert.rejects(service.revoke(OWNER, { ...INTENT, expectedRevision: 1, id: "old-event" }), code("invalid_request"));
   assert.deepEqual(events, []);
+});
+
+test("protected automation activation uses the reviewed preview and PIN reservation flow", async () => {
+  const events: string[] = [];
+  let reservations = 0;
+  const service = new WorkspaceCapabilityApprovalService({
+    workspace: workspacePort(events),
+    pinAttempts: {
+      async reserve() { reservations += 1; return { status: "reserved" as const }; },
+      async verifyAndConsume() { return { status: "verified" as const }; },
+      async cancelAndConsume() {},
+    },
+  });
+
+  const challenge = await service.requestActivation(OWNER, {
+    capabilityId: "wayang.protected-automation.v1",
+    projectId: "protected-project",
+    agentProfileId: "automation-owner",
+  });
+  assert.equal(challenge.capabilityId, "wayang.protected-automation.v1");
+  assert.deepEqual(events, ["preview"]);
+  assert.equal(reservations, 1);
 });
 
 test("history saturation rejects before consuming a PIN reservation", async () => {
@@ -189,6 +211,7 @@ test("status separates current associations from PIN approval events", async () 
     "wayang.standard-resources.v1",
     "wayang.host-execution.v1",
     "wayang.protected-browser.v1",
+    "wayang.protected-automation.v1",
   ]);
   assert.deepEqual(status.associations, []);
   assert.deepEqual(status.approvalEvents, []);

@@ -36,7 +36,7 @@ sh scripts/bootstrap.sh --dry-run
 node scripts/configure.mjs --dry-run
 ```
 
-The bootstrap performs this sequence (optional capability approval state is deliberately not provisioned automatically):
+The bootstrap performs this sequence. Capability-approval attempt/cooldown state is runtime data, not setup or build-time configuration; the deployed service creates it automatically with owner-only permissions when missing:
 
 1. verifies Linux/macOS, Node, npm, Git, Make, and native-build readiness;
 2. runs `npm ci` in `backend/`, `frontend/`, and `e2e/` using committed lockfiles;
@@ -65,16 +65,18 @@ Choose pi authentication:
 
 The checkout's pinned pi CLI is used; a globally installed `pi` is not required.
 
-### Optional privileged capability approval setup
+### Optional privileged capability approval preflight
 
-Ordinary sandboxed Wayang use needs no capability approval setup. If this installation will activate a reviewed privileged workspace capability, first provision the command-guard identity PIN using its supported human-local flow outside Wayang. Then initialize only Wayang's private attempt/cooldown state:
+Ordinary sandboxed Wayang use needs no capability approval setup. Capability approval reuses the command guard's existing identity PIN; entering it in the approval flow is the normal human action. On startup, the deployed service automatically creates missing non-secret attempt/cooldown state under `WAYANG_DATA_DIR` with owner-only permissions and preserves it across reboots. Capability associations, deterministic jobs, and schedules persist in the service store. No setup command or restart is required before approval or activation; restart only when deploying new code.
+
+For a manual preflight or migration check, the human may run:
 
 ```sh
 make setup-capability-approval
 make doctor
 ```
 
-The initializer never reads or creates the PIN and accepts no PIN argument. It validates the existing PIN authority by filesystem metadata, uses owner-only no-follow/no-overwrite creation, and safely leaves valid existing cooldown state unchanged. Missing, unsafe, symlinked, hard-linked, incorrectly permissioned, or malformed authority is refused rather than repaired or replaced. This command does not assign or activate a capability, configure a project/profile tuple, launch Wayang, or restart anything. `make doctor` checks metadata only; see [Configuration](configuration.md#provision-capability-approval-cooldown-state) for the exact contract.
+The optional initializer never reads or creates the PIN and accepts no PIN argument. It validates PIN authority by filesystem metadata, uses owner-only no-follow/no-overwrite creation when state is absent, and leaves valid existing cooldown state—including attempts or a live reservation—unchanged. Missing or unsafe PIN metadata and unsafe, symlinked, hard-linked, incorrectly permissioned, malformed, or unsupported existing state fail closed rather than being repaired or replaced. This command does not assign or activate a capability, configure a project/profile tuple, launch Wayang, or restart anything. `make doctor` checks metadata only; see [Configuration](configuration.md#capability-approval-cooldown-state) for the exact contract.
 
 Pi 0.80.6 requires explicit trust before a Wayang SDK session loads executable or configuration-bearing project `.pi` resources. After reviewing a project, save trust from a local terminal:
 

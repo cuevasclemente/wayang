@@ -10,7 +10,7 @@ The installing agent must:
 - run `make doctor` before changing the checkout;
 - never read or display `.env`, `.env.backup`, pi `auth.json`, secret stores, provider credentials, cookies, private keys, browser profiles, or real transcripts;
 - never request secrets in chat or put them in command arguments, logs, commits, screenshots, test fixtures, or tool calls;
-- pause for a human-local terminal handoff for `/login`, `/trust`, API-key entry, the Wayang shared password, command-guard PIN provisioning/capability cooldown initialization, MFA, and account selection;
+- pause for a human-local handoff for `/login`, `/trust`, API-key entry, the Wayang shared password, normal command-guard PIN entry when approving a capability, MFA, and account selection;
 - keep `WAYANG_HOST=127.0.0.1` unless the human explicitly requests a networking/security discussion;
 - use `npm ci` through the repository commands, with no global packages, `sudo`, service installation, or system-package mutation;
 - use synthetic HOME/pi/Wayang directories and fake credentials for tests;
@@ -59,15 +59,9 @@ make pi-login
 
 The human types `/login`, selects the provider, completes browser/device authorization, then types `/quit`. For a reviewed project that needs project-local `.pi` resources, the human separately starts the pinned CLI from that project, runs `/trust`, exits, and creates a new Wayang session. The agent must not auto-approve repositories or watch, scrape, summarize, or copy secret-bearing interactions. A user may configure OAuth and then rerun `make configure` for server/password settings.
 
-If the human intends to use reviewed privileged workspace capabilities, they must provision their existing command-guard identity PIN through its supported local convention and then run:
+If the human uses reviewed privileged workspace capabilities, Wayang reuses the command guard's existing identity PIN; normal PIN entry in the approval UI is the human authorization action. The deployed service automatically creates missing non-secret attempt/cooldown state under `WAYANG_DATA_DIR` with owner-only permissions on startup and preserves it across reboots. Capability associations, deterministic jobs, and schedules persist in the service store; restart is needed only when deploying new code. `make setup-capability-approval` is an optional human-run preflight/migration, not installation or activation setup. The agent must not create a PIN, inspect either file, or substitute ad-hoc shell redirection for the supported command.
 
-```sh
-make setup-capability-approval
-```
-
-This initializer accepts no PIN input and checks the opaque existing PIN by metadata only. It provisions only owner-private attempt/cooldown state, refuses unsafe or malformed existing authority, and does not assign/activate a capability or start/restart anything. The agent must not create a default PIN, inspect either file, or substitute ad-hoc shell redirection for this command.
-
-After handoff, the agent may check only metadata with `make doctor`. A successful configuration file should exist with mode `0600`; when capability approval was initialized, doctor should also report safe owner-only PIN and cooldown metadata. Their contents remain off limits.
+After handoff, the agent may check only metadata with `make doctor`. A successful configuration file should exist with mode `0600`. Doctor may report PIN and cooldown metadata readiness, but missing or unsafe PIN metadata and unsafe or malformed existing cooldown state must remain fail-closed and must not be replaced. Their contents remain off limits.
 
 ### 4. Validate
 
@@ -135,5 +129,5 @@ Do not delete dependencies, configuration, transcripts, databases, profiles, or 
 ## Copy/paste prompt for an installing agent
 
 ```text
-Install this Wayang source checkout by following docs/agent-install.md exactly. Inspect first and run make doctor. You may perform only non-secret dependency installation, builds, script tests, and isolated smoke checks. Never read .env, .env.backup, pi auth.json, command-guard PIN/cooldown state, secret stores, browser profiles, or real transcripts. Never create a default PIN or ask me to paste a password/API key/PIN into chat or put secrets in argv, logs, commits, screenshots, or tool calls. Keep the loopback bind. Pause and hand the local terminal to me for pi /login, API-key entry, the optional Wayang password, optional `make setup-capability-approval` after I provision my existing PIN, MFA, and any account choice. Do not use sudo, install global packages/services, change networking, activate capabilities, or delete user data. At the end, report commands/results and the human validation still required.
+Install this Wayang source checkout by following docs/agent-install.md exactly. Inspect first and run make doctor. You may perform only non-secret dependency installation, builds, script tests, and isolated smoke checks. Never read .env, .env.backup, pi auth.json, command-guard PIN/cooldown state, secret stores, browser profiles, or real transcripts. Never create a default PIN or ask me to paste a password/API key/PIN into chat or put secrets in argv, logs, commits, screenshots, or tool calls. Keep the loopback bind. Pause and hand control to me for pi /login, API-key entry, the optional Wayang password, normal entry of my existing command-guard PIN when I approve a capability, optional `make setup-capability-approval` preflight/migration, MFA, and any account choice. Do not use sudo, install global packages/services, change networking, activate capabilities, or delete user data. At the end, report commands/results and the human validation still required.
 ```

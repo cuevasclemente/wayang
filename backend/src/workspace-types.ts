@@ -1,4 +1,4 @@
-export const STORE_SCHEMA_VERSION = 2;
+export const STORE_SCHEMA_VERSION = 3;
 
 /**
  * Legacy stable IDs retained so schema-1 stores keep their references. Names
@@ -13,6 +13,7 @@ export const WORKSPACE_CAPABILITY_IDS = [
   "wayang.standard-resources.v1",
   "wayang.host-execution.v1",
   "wayang.protected-browser.v1",
+  "wayang.protected-automation.v1",
 ] as const;
 
 export type WorkspaceCapabilityId = typeof WORKSPACE_CAPABILITY_IDS[number];

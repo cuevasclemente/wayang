@@ -5,13 +5,24 @@ import type { Request } from "express";
 import type { CdpConnection, ChromeTarget } from "./cdp.js";
 import {
   ManagedChromiumRuntime,
-  redactKnownCredentialValues,
   type BrowserCredentialContext,
   type ManagedChromiumDownloadProgress,
   type ManagedChromiumDownloadWillBegin,
   type ManagedChromiumRuntimeOptions,
 } from "./manager.js";
 import type { CredentialBroker } from "./credentials.js";
+import {
+  boundedElementLimit,
+  compileGuardedDomOperation,
+  evaluateGuardedPage as evaluate,
+  guardedSend,
+  ProtectedCredentialProtection,
+  settledTopLevelDocument as settledDocument,
+} from "./guarded-page.js";
+export {
+  ProtectedCredentialProtection,
+  type ProtectedCredentialInspectionMode,
+} from "./guarded-page.js";
 import {
   CapabilityBoundProtectedBrowser,
   assertProtectedBrowserBinding,
@@ -49,8 +60,6 @@ import { onPolicyChanged } from "../policy-generation.js";
 
 const SETTLE_TIMEOUT_MS = 10_000;
 const SETTLE_INTERVAL_MS = 50;
-const MAX_TEXT_BYTES = 50_000;
-const MAX_ELEMENTS = 500;
 
 type MaybePromise<T> = T | Promise<T>;
 type CdpPort = Pick<CdpConnection, "send" | "on" | "close">;
@@ -90,25 +99,6 @@ export interface ProtectedBrowserProductionBootstrap {
   close(): Promise<void>;
 }
 
-interface SettledDocument {
-  targetId: string;
-  frameId: string;
-  loaderId: string;
-  documentIdentity: string;
-  topLevelUrl: string;
-  title: string;
-  readyState: string;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function boundedLimit(value: number | undefined, fallback: number): number {
-  if (!Number.isFinite(value)) return fallback;
-  return Math.max(1, Math.min(MAX_ELEMENTS, Math.floor(Number(value))));
-}
-
 function sameProtectedBrowserLeaseIdentity(
   left: Readonly<ProtectedBrowserBinding>,
   right: Readonly<ProtectedBrowserBinding>,
@@ -143,159 +133,6 @@ function createAuthorityPort(
   };
 }
 
-async function guardedSend<T>(
-  cdp: CdpPort,
-  guard: () => Promise<void>,
-  method: string,
-  parameters: Record<string, unknown> = {},
-): Promise<T> {
-  await guard();
-  return cdp.send<T>(method, parameters);
-}
-
-async function attestOnce(cdp: CdpPort, target: ChromeTarget, guard: () => Promise<void>): Promise<SettledDocument> {
-  const tree = await guardedSend<any>(cdp, guard, "Page.getFrameTree");
-  const frame = tree?.frameTree?.frame;
-  const frameId = typeof frame?.id === "string" ? frame.id : "";
-  const loaderId = typeof frame?.loaderId === "string" ? frame.loaderId : "";
-  if (!frameId || !loaderId) throw new Error("Protected browser top-level document identity is unavailable");
-  const evaluated = await guardedSend<any>(cdp, guard, "Runtime.evaluate", {
-    expression: "({ url: location.href, title: document.title, readyState: document.readyState })",
-    returnByValue: true,
-  });
-  const value = evaluated?.result?.value ?? {};
-  const topLevelUrl = String(value.url ?? target.url ?? "");
-  return {
-    targetId: target.id,
-    frameId,
-    loaderId,
-    documentIdentity: `${target.id}:${frameId}:${loaderId}`,
-    topLevelUrl,
-    title: String(value.title ?? ""),
-    readyState: String(value.readyState ?? ""),
-  };
-}
-
-async function settledDocument(
-  cdp: CdpPort,
-  target: ChromeTarget,
-  guard: () => Promise<void>,
-  timeoutMs: number,
-  intervalMs: number,
-): Promise<SettledDocument> {
-  const deadline = Date.now() + timeoutMs;
-  let prior: SettledDocument | undefined;
-  do {
-    const current = await attestOnce(cdp, target, guard);
-    if (prior && current.documentIdentity === prior.documentIdentity && current.topLevelUrl === prior.topLevelUrl
-      && current.readyState !== "loading") return current;
-    prior = current;
-    if (Date.now() >= deadline) break;
-    await sleep(intervalMs);
-  } while (true);
-  throw new Error("Protected browser top-level document did not settle");
-}
-
-const PAGE_HELPERS = String.raw`
-function __wayangSensitive(el) {
-  const type = String(el?.getAttribute?.("type") || "").toLowerCase();
-  const autocomplete = String(el?.getAttribute?.("autocomplete") || "");
-  const identity = [el?.id, el?.getAttribute?.("name"), el?.getAttribute?.("placeholder"), el?.getAttribute?.("aria-label")].filter(Boolean).join(" ");
-  return type === "password" || /(?:current-password|new-password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(autocomplete)
-    || /(?:pass(?:word|code)?|otp|totp|verification|recovery|secret|card(?:[ _-]?(?:number|no))?|cvc|cvv|security[ _-]?code|pin)/i.test(identity);
-}
-function __wayangSecrets() {
-  return Array.from(document.querySelectorAll("input,textarea,select,[contenteditable='true']"))
-    .filter(__wayangSensitive).map((el) => String(el.value || el.textContent || "")).filter(Boolean);
-}
-function __wayangRedact(value) {
-  let text = String(value == null ? "" : value);
-  for (const secret of __wayangSecrets()) text = text.split(secret).join("[REDACTED]");
-  return text;
-}
-function __wayangInfo(el, index) {
-  const rect = el.getBoundingClientRect();
-  return { index, tag: el.localName, role: el.getAttribute("role") || undefined,
-    type: el.getAttribute("type") || undefined, name: __wayangRedact(el.getAttribute("aria-label") || el.getAttribute("name") || el.textContent || "").slice(0, 500),
-    text: __wayangSensitive(el) ? "[REDACTED]" : __wayangRedact(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 500),
-    value: "value" in el ? (__wayangSensitive(el) && el.value ? "[REDACTED]" : __wayangRedact(el.value).slice(0, 500)) : undefined,
-    href: el.href ? __wayangRedact(el.href) : undefined,
-    disabled: "disabled" in el ? Boolean(el.disabled) : undefined,
-    rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) } };
-}
-`;
-
-async function evaluate<T>(cdp: CdpPort, guard: () => Promise<void>, body: string): Promise<T> {
-  const result = await guardedSend<any>(cdp, guard, "Runtime.evaluate", {
-    expression: `(() => { ${PAGE_HELPERS}\n${body}\n})()`,
-    returnByValue: true,
-    awaitPromise: true,
-  });
-  if (result?.exceptionDetails) throw new Error("Protected browser page evaluation failed");
-  return result?.result?.value as T;
-}
-
-export type ProtectedCredentialInspectionMode = "none" | "blocked" | "text-allowed";
-
-const PROTECTED_CREDENTIAL_MUTATIONS = new Set<ProtectedBrowserOperation["kind"]>([
-  "navigate", "click", "click_selector", "fill_selector", "type_public",
-]);
-
-/** Process-memory-only protection for values filled into one exact CDP document. */
-export class ProtectedCredentialProtection {
-  private modeValue: ProtectedCredentialInspectionMode = "none";
-  private documentIdentity?: string;
-  private values: string[] = [];
-  private allowUsed = false;
-
-  get mode(): ProtectedCredentialInspectionMode { return this.modeValue; }
-
-  recordFill(documentIdentity: string, values: { username?: string; password?: string; totp?: string }): void {
-    const sameDocument = this.documentIdentity === documentIdentity;
-    const next = [values.username, values.password, values.totp]
-      .filter((value): value is string => typeof value === "string" && value.length > 0);
-    this.values = [...new Set([...(sameDocument ? this.values : []), ...next])];
-    this.documentIdentity = documentIdentity;
-    this.modeValue = "blocked";
-    this.allowUsed = false;
-  }
-
-  reconcile(currentDocumentIdentity: string): void {
-    if (this.modeValue !== "none" && this.documentIdentity !== currentDocumentIdentity) this.reset();
-  }
-
-  allowInspection(currentDocumentIdentity: string): void {
-    this.reconcile(currentDocumentIdentity);
-    if (this.modeValue !== "blocked" || this.allowUsed) throw Object.assign(new Error("Credential inspection authorization is unavailable or already used"), { statusCode: 409 });
-    this.modeValue = "text-allowed";
-    this.allowUsed = true;
-  }
-
-  assertOperation(operation: Readonly<ProtectedBrowserOperation>, currentDocumentIdentity: string): void {
-    this.reconcile(currentDocumentIdentity);
-    if (this.modeValue === "blocked") throw Object.assign(new Error("Credential inspection requires explicit UI authorization"), { statusCode: 409 });
-    if (this.modeValue === "text-allowed" && operation.kind === "snapshot" && operation.mode === "screenshot") {
-      throw Object.assign(new Error("Agent screenshots remain blocked after credential fill"), { statusCode: 409 });
-    }
-    if (this.modeValue === "text-allowed" && PROTECTED_CREDENTIAL_MUTATIONS.has(operation.kind)) {
-      throw Object.assign(new Error("Agent mutations remain blocked after credential fill until document replacement"), { statusCode: 409 });
-    }
-  }
-
-  assertLifecycleMutation(): void {
-    if (this.modeValue !== "none") throw Object.assign(new Error("Agent lifecycle mutations remain blocked after credential fill until document replacement"), { statusCode: 409 });
-  }
-
-  redact<T>(value: T): T { return redactKnownCredentialValues(value, this.values); }
-
-  reset(): void {
-    this.modeValue = "none";
-    this.documentIdentity = undefined;
-    this.values = [];
-    this.allowUsed = false;
-  }
-}
-
 async function executePageOperation(
   operation: Readonly<ProtectedBrowserOperation>,
   context: ProtectedBrowserBackendContext,
@@ -324,8 +161,11 @@ async function executePageOperation(
         break;
       }
       case "snapshot": {
-        const page = await evaluate<{ url: string; title: string; text: string }>(cdp, guard,
-          `return { url: __wayangRedact(location.href), title: __wayangRedact(document.title), text: document.body ? __wayangRedact(document.body.innerText || "").slice(0, ${MAX_TEXT_BYTES}) : "" };`);
+        const page = await evaluate<{ url: string; title: string; text: string }>(
+          cdp,
+          guard,
+          compileGuardedDomOperation({ kind: "snapshot" }),
+        );
         if (operation.mode === "screenshot") {
           const shot = await guardedSend<any>(cdp, guard, "Page.captureScreenshot", { format: "jpeg", quality: 80, fromSurface: true });
           value = { url: page.url, title: page.title, screenshot: shot?.data ? `data:image/jpeg;base64,${shot.data}` : undefined };
@@ -333,18 +173,20 @@ async function executePageOperation(
         break;
       }
       case "dom_snapshot": {
-        const limit = boundedLimit(operation.limit, 80);
-        value = await evaluate(cdp, guard, `const nodes = Array.from(document.querySelectorAll("a,button,input,textarea,select,[role],[contenteditable='true'],summary,label,h1,h2,h3,h4,h5,h6")).slice(0, ${limit}); return { url: __wayangRedact(location.href), title: __wayangRedact(document.title), text: ${Boolean(operation.includeText)} && document.body ? __wayangRedact(document.body.innerText || "").slice(0, ${MAX_TEXT_BYTES}) : undefined, elements: nodes.map(__wayangInfo) };`);
+        value = await evaluate(cdp, guard, compileGuardedDomOperation({
+          kind: "dom_snapshot",
+          includeText: operation.includeText,
+          limit: operation.limit,
+        }));
         break;
       }
       case "links": {
-        const limit = boundedLimit(operation.limit, 100);
-        value = await evaluate(cdp, guard, `return { url: __wayangRedact(location.href), title: __wayangRedact(document.title), links: Array.from(document.querySelectorAll("a[href]")).slice(0, ${limit}).map((el, index) => ({ index, text: __wayangRedact(el.innerText || el.textContent || "").slice(0, 500), href: __wayangRedact(el.href), selector: el.id ? "#" + CSS.escape(el.id) : el.localName, visible: Boolean(el.getClientRects().length) })) };`);
+        value = await evaluate(cdp, guard, compileGuardedDomOperation({ kind: "links", limit: operation.limit }));
         break;
       }
       case "accessibility": {
-        const limit = boundedLimit(operation.limit, 120);
-        const secrets = await evaluate<string[]>(cdp, guard, "return __wayangSecrets();");
+        const limit = boundedElementLimit(operation.limit, 120);
+        const secrets = await evaluate<string[]>(cdp, guard, compileGuardedDomOperation({ kind: "secrets" }));
         await guardedSend(cdp, guard, "Accessibility.enable");
         const tree = await guardedSend<any>(cdp, guard, "Accessibility.getFullAXTree");
         const redact = (input: unknown) => secrets.reduce((text, secret) => text.split(secret).join("[REDACTED]"), String(input ?? ""));
@@ -352,8 +194,11 @@ async function executePageOperation(
         break;
       }
       case "query_selector": {
-        const limit = boundedLimit(operation.limit, 25);
-        value = await evaluate(cdp, guard, `const selector = ${JSON.stringify(operation.selector)}; return { url: __wayangRedact(location.href), title: __wayangRedact(document.title), selector, elements: Array.from(document.querySelectorAll(selector)).slice(0, ${limit}).map(__wayangInfo) };`);
+        value = await evaluate(cdp, guard, compileGuardedDomOperation({
+          kind: "query_selector",
+          selector: operation.selector,
+          limit: operation.limit,
+        }));
         break;
       }
       case "click":
@@ -362,17 +207,26 @@ async function executePageOperation(
         value = { clicked: true };
         break;
       case "click_selector": {
-        const point = await evaluate<{ x: number; y: number }>(cdp, guard, `const el = Array.from(document.querySelectorAll(${JSON.stringify(operation.selector)}))[${Math.floor(operation.index ?? 0)}]; if (!el) throw new Error("missing selector"); el.scrollIntoView({ block: "center", inline: "center" }); const rect = el.getBoundingClientRect(); return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };`);
+        const point = await evaluate<{ x: number; y: number }>(cdp, guard, compileGuardedDomOperation({
+          kind: "selector_point",
+          selector: operation.selector,
+          index: operation.index,
+        }));
         await guardedSend(cdp, guard, "Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1 });
         await guardedSend(cdp, guard, "Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1 });
         value = { clicked: true };
         break;
       }
       case "fill_selector":
-        value = await evaluate(cdp, guard, `const el = Array.from(document.querySelectorAll(${JSON.stringify(operation.selector)}))[${Math.floor(operation.index ?? 0)}]; if (!el || __wayangSensitive(el) || el.disabled || el.readOnly || !(el.isContentEditable || "value" in el)) throw new Error("unsafe public fill target"); const text = ${JSON.stringify(operation.text)}; if (el.isContentEditable) el.textContent = text; else el.value = text; el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true })); return { filled: true };`);
+        value = await evaluate(cdp, guard, compileGuardedDomOperation({
+          kind: "fill_selector",
+          selector: operation.selector,
+          index: operation.index,
+          text: operation.text,
+        }));
         break;
       case "type_public":
-        await evaluate(cdp, guard, "const el = document.activeElement; if (!el || __wayangSensitive(el) || el.disabled || el.readOnly || !(el.isContentEditable || 'value' in el)) throw new Error('unsafe public type target'); return true;");
+        await evaluate(cdp, guard, compileGuardedDomOperation({ kind: "public_active_target" }));
         await guardedSend(cdp, guard, "Input.insertText", { text: operation.text });
         value = { typed: true };
         break;

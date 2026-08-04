@@ -14,6 +14,25 @@ import { getConfig } from "./config.js";
 import type { AppEvent, AppManifest } from "./apps/types.js";
 import type { ScheduledJobRow, ScheduledRunRow } from "./scheduler/types.js";
 import type { FileFingerprint } from "./session-metadata.js";
+import { validateCronExpression } from "./scheduler/cron.js";
+import {
+  MAX_PROTECTED_AUTOMATION_ARGV_BYTES,
+  MAX_PROTECTED_AUTOMATION_ARGV_ITEMS,
+  MAX_PROTECTED_AUTOMATION_ARG_BYTES,
+  MAX_PROTECTED_AUTOMATION_CRON_BYTES,
+  MAX_PROTECTED_AUTOMATION_ENTRYPOINT_BYTES,
+  MAX_PROTECTED_AUTOMATION_HTTPS_ORIGINS,
+  MAX_PROTECTED_AUTOMATION_JOBS,
+  MAX_PROTECTED_AUTOMATION_NAME_BYTES,
+  MAX_PROTECTED_AUTOMATION_ORIGIN_BYTES,
+  MAX_PROTECTED_AUTOMATION_OUTCOME_CODE_BYTES,
+  MAX_PROTECTED_AUTOMATION_RUNS_PER_JOB,
+  MAX_PROTECTED_AUTOMATION_TIMEOUT_MS,
+  MIN_PROTECTED_AUTOMATION_TIMEOUT_MS,
+  PROTECTED_AUTOMATION_CAPABILITY_ID,
+  type ProtectedAutomationJobRow,
+  type ProtectedAutomationRunRow,
+} from "./protected-automation/types.js";
 import {
   WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL,
   WAYANG_WEBSOCKET_SUBMISSION_CHANNEL,
@@ -172,12 +191,15 @@ export interface StoreData {
   appEvents: AppEventRow[];
   scheduledJobs: StoredScheduledJobRow[];
   scheduledRuns: ScheduledRunRow[];
+  protectedAutomationJobs: ProtectedAutomationJobRow[];
+  protectedAutomationRuns: ProtectedAutomationRunRow[];
   interviews: InterviewRecord[];
 }
 
 const ARRAY_KEYS = [
   "workspaceCapabilityAssociations", "workspaceCapabilityApprovalEvents", "sessions", "projects", "agentProfiles",
-  "agentTeams", "teamMembers", "goals", "apps", "appStates", "appEvents", "scheduledJobs", "scheduledRuns", "interviews",
+  "agentTeams", "teamMembers", "goals", "apps", "appStates", "appEvents", "scheduledJobs", "scheduledRuns",
+  "protectedAutomationJobs", "protectedAutomationRuns", "interviews",
 ] as const;
 
 const STORE_LOCK_FILENAME = "store.json.lock";
@@ -502,6 +524,8 @@ function emptyStore(now = Date.now()): StoreData {
     appEvents: [],
     scheduledJobs: [],
     scheduledRuns: [],
+    protectedAutomationJobs: [],
+    protectedAutomationRuns: [],
     interviews: [],
   };
 }
@@ -545,7 +569,216 @@ function validPositiveRevision(value: unknown): value is number {
 }
 
 function capabilityPrivacyMode(capabilityId: WorkspaceCapabilityAssociationRow["capability_id"]): "standard" | "protected" {
-  return capabilityId === "wayang.protected-browser.v1" ? "protected" : "standard";
+  return capabilityId === "wayang.protected-browser.v1" || capabilityId === PROTECTED_AUTOMATION_CAPABILITY_ID
+    ? "protected"
+    : "standard";
+}
+
+function exactObjectKeys(value: object, keys: readonly string[]): boolean {
+  return Object.keys(value).sort().join(",") === [...keys].sort().join(",");
+}
+
+function finiteTimestamp(value: unknown, nullable = false): boolean {
+  return (nullable && value === null) || (typeof value === "number" && Number.isFinite(value) && value >= 0);
+}
+
+function boundedNfcText(value: unknown, maxBytes: number, allowEmpty = false): value is string {
+  return typeof value === "string" && (allowEmpty || value.length > 0) && value === value.normalize("NFC")
+    && !/[\u0000-\u001f\u007f]/u.test(value) && Buffer.byteLength(value, "utf8") <= maxBytes;
+}
+
+function validAutomationEntrypoint(value: unknown): value is string {
+  return boundedNfcText(value, MAX_PROTECTED_AUTOMATION_ENTRYPOINT_BYTES)
+    && !value.startsWith("/") && !value.includes("\\")
+    && value.split("/").every((part) => Boolean(part) && part !== "." && part !== "..");
+}
+
+function validAutomationArgv(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length > MAX_PROTECTED_AUTOMATION_ARGV_ITEMS) return false;
+  let bytes = 0;
+  for (const item of value) {
+    if (!boundedNfcText(item, MAX_PROTECTED_AUTOMATION_ARG_BYTES, true)) return false;
+    bytes += Buffer.byteLength(item, "utf8");
+  }
+  return bytes <= MAX_PROTECTED_AUTOMATION_ARGV_BYTES;
+}
+
+function validAutomationOrigins(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length > MAX_PROTECTED_AUTOMATION_HTTPS_ORIGINS) return false;
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string" || Buffer.byteLength(item, "utf8") > MAX_PROTECTED_AUTOMATION_ORIGIN_BYTES) return false;
+    let parsed: URL;
+    try { parsed = new URL(item); } catch { return false; }
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.pathname !== "/"
+      || parsed.search || parsed.hash || parsed.origin !== item || seen.has(item)) return false;
+    seen.add(item);
+  }
+  return true;
+}
+
+function validAutomationCron(value: unknown): value is string {
+  if (!boundedNfcText(value, MAX_PROTECTED_AUTOMATION_CRON_BYTES) || value.trim() !== value) return false;
+  try { validateCronExpression(value); return true; } catch { return false; }
+}
+
+function validLocalOccurrenceKey(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/u.exec(value);
+  if (!match) return false;
+  const [year, month, day, hour, minute] = match.slice(1).map(Number) as [number, number, number, number, number];
+  const roundTrip = new Date(Date.UTC(year, month - 1, day, hour, minute));
+  return year >= 1 && roundTrip.getUTCFullYear() === year && roundTrip.getUTCMonth() === month - 1
+    && roundTrip.getUTCDate() === day && roundTrip.getUTCHours() === hour && roundTrip.getUTCMinutes() === minute;
+}
+
+function protectedAutomationLocalOccurrenceKey(timestamp: number): string {
+  const date = new Date(timestamp);
+  const pad = (value: number, length = 2) => String(value).padStart(length, "0");
+  return `${pad(date.getFullYear(), 4)}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+    + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function validateProtectedAutomationRows(
+  raw: Record<string, unknown>,
+  projectIds: ReadonlySet<string>,
+  profileIds: ReadonlySet<string>,
+  associationsByKey: ReadonlyMap<string, WorkspaceCapabilityAssociationRow>,
+): void {
+  const jobs = raw.protectedAutomationJobs as unknown[];
+  const runs = raw.protectedAutomationRuns as unknown[];
+  if (jobs.length > MAX_PROTECTED_AUTOMATION_JOBS) throw new Error("Wayang protected automation job limit exceeded");
+  const jobIds = new Set<string>();
+  const jobsById = new Map<string, ProtectedAutomationJobRow>();
+  const jobKeys = [
+    "id", "project_id", "agent_profile_id", "capability_revision", "revision", "source_revision", "name", "source_manifest_sha256",
+    "entrypoint", "argv", "uses_browser_profile", "allowed_https_origins", "cron_expr", "timezone", "timeout_ms",
+    "overlap_policy", "missed_run_policy", "enabled", "blocked_reason", "deleted_at", "created_at", "updated_at",
+    "schedule_cursor_at", "last_occurrence_key", "last_run_at", "next_run_at",
+  ] as const;
+  for (const [index, candidate] of jobs.entries()) {
+    const value = candidate as Partial<ProtectedAutomationJobRow> | null;
+    if (!value || typeof value !== "object" || !exactObjectKeys(value, jobKeys)
+      || !validStableId(value.id) || !validStableId(value.project_id) || !validStableId(value.agent_profile_id)
+      || !validPositiveRevision(value.capability_revision) || !validPositiveRevision(value.revision)
+      || !validPositiveRevision(value.source_revision) || value.source_revision! > value.revision!
+      || !boundedNfcText(value.name, MAX_PROTECTED_AUTOMATION_NAME_BYTES)
+      || typeof value.source_manifest_sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(value.source_manifest_sha256)
+      || !validAutomationEntrypoint(value.entrypoint) || !validAutomationArgv(value.argv)
+      || typeof value.uses_browser_profile !== "boolean" || !validAutomationOrigins(value.allowed_https_origins)
+      || !validAutomationCron(value.cron_expr) || value.timezone !== "local"
+      || !Number.isSafeInteger(value.timeout_ms) || value.timeout_ms! < MIN_PROTECTED_AUTOMATION_TIMEOUT_MS
+      || value.timeout_ms! > MAX_PROTECTED_AUTOMATION_TIMEOUT_MS || value.overlap_policy !== "skip"
+      || !["skip", "run_once"].includes(value.missed_run_policy ?? "")
+      || typeof value.enabled !== "boolean"
+      || !(value.blocked_reason === null || boundedNfcText(value.blocked_reason, 256))
+      || (value.enabled ? value.blocked_reason !== null : value.blocked_reason === null)
+      || !finiteTimestamp(value.deleted_at, true) || !finiteTimestamp(value.created_at) || !finiteTimestamp(value.updated_at)
+      || value.updated_at! < value.created_at! || (value.deleted_at !== null && value.deleted_at! < value.created_at!)
+      || !finiteTimestamp(value.schedule_cursor_at) || value.schedule_cursor_at! < value.created_at!
+      || !(value.last_occurrence_key === null || validLocalOccurrenceKey(value.last_occurrence_key))
+      || !finiteTimestamp(value.last_run_at, true) || !finiteTimestamp(value.next_run_at, true)
+      || (!value.enabled && value.next_run_at !== null)
+      || (value.deleted_at !== null && (value.enabled || value.blocked_reason !== "tombstoned"))) {
+      throw new Error(`Wayang store contains a malformed protected automation job at index ${index}`);
+    }
+    if (jobIds.has(value.id)) throw new Error("Wayang store contains duplicate protected automation job ids");
+    jobIds.add(value.id);
+    const row = value as ProtectedAutomationJobRow;
+    jobsById.set(row.id, row);
+    if (row.deleted_at === null) {
+      if (!projectIds.has(row.project_id) || !profileIds.has(row.agent_profile_id)) {
+        throw new Error("Wayang store contains an orphan live protected automation job");
+      }
+      const association = associationsByKey.get(`${row.project_id}\u0000${row.agent_profile_id}\u0000${PROTECTED_AUTOMATION_CAPABILITY_ID}`);
+      if (!association || association.revision < row.capability_revision) {
+        throw new Error("Wayang store contains unattributed protected automation capability state");
+      }
+      if ((!association.active || association.revision !== row.capability_revision) && row.blocked_reason === null) {
+        throw new Error("Wayang store contains an unblocked stale protected automation job");
+      }
+    }
+  }
+
+  const runIds = new Set<string>();
+  const occurrenceClaims = new Set<string>();
+  const runCounts = new Map<string, number>();
+  const lastRunAtByJob = new Map<string, number>();
+  const latestCurrentOccurrenceByJob = new Map<string, { scheduledFor: number; id: string; occurrenceKey: string }>();
+  const runKeys = [
+    "id", "job_id", "project_id", "agent_profile_id", "job_revision", "capability_revision", "trigger",
+    "scheduled_for", "occurrence_key", "started_at", "finished_at", "status", "outcome_code", "exit_code",
+  ] as const;
+  for (const [index, candidate] of runs.entries()) {
+    const value = candidate as Partial<ProtectedAutomationRunRow> | null;
+    const job = value && typeof value === "object" && typeof value.job_id === "string" ? jobsById.get(value.job_id) : undefined;
+    if (!value || typeof value !== "object" || !exactObjectKeys(value, runKeys)
+      || !validStableId(value.id) || !validStableId(value.job_id) || !validStableId(value.project_id)
+      || !validStableId(value.agent_profile_id) || !validPositiveRevision(value.job_revision)
+      || !validPositiveRevision(value.capability_revision) || !["schedule", "manual"].includes(value.trigger ?? "")
+      || !finiteTimestamp(value.scheduled_for, true)
+      || !(value.occurrence_key === null || validLocalOccurrenceKey(value.occurrence_key))
+      // Historical wall-minute claims remain valid if the host timezone later changes.
+      // Exact timestamp/key matching is enforced transactionally when a claim is created.
+      || (value.trigger === "schedule" ? (value.scheduled_for === null || value.occurrence_key === null)
+        : (value.scheduled_for !== null || value.occurrence_key !== null))
+      || !finiteTimestamp(value.started_at) || !finiteTimestamp(value.finished_at, true)
+      || !["queued", "running", "completed", "failed", "skipped", "cancelled", "needs_user", "interrupted", "denied"].includes(value.status ?? "")
+      || (["queued", "running"].includes(value.status ?? "")
+        ? value.finished_at !== null || value.outcome_code !== null || value.exit_code !== null
+        : value.finished_at === null || value.finished_at! < value.started_at!
+          || !boundedNfcText(value.outcome_code, MAX_PROTECTED_AUTOMATION_OUTCOME_CODE_BYTES))
+      || !(value.exit_code === null || (Number.isSafeInteger(value.exit_code) && value.exit_code! >= 0 && value.exit_code! <= 255))
+      || (value.scheduled_for !== null && value.scheduled_for! > value.started_at!)
+      || !job || value.project_id !== job.project_id || value.agent_profile_id !== job.agent_profile_id
+      || value.started_at! < job.created_at || value.job_revision! > job.revision
+      || value.capability_revision! > job.capability_revision) {
+      throw new Error(`Wayang store contains a malformed protected automation run at index ${index}`);
+    }
+    if (runIds.has(value.id)) throw new Error("Wayang store contains duplicate protected automation run ids");
+    runIds.add(value.id);
+    if (value.occurrence_key !== null) {
+      const claim = `${value.job_id}\u0000${value.occurrence_key}`;
+      if (occurrenceClaims.has(claim)) throw new Error("Wayang store contains duplicate protected automation occurrence claims");
+      occurrenceClaims.add(claim);
+    }
+    const count = (runCounts.get(value.job_id) ?? 0) + 1;
+    if (count > MAX_PROTECTED_AUTOMATION_RUNS_PER_JOB) throw new Error("Wayang protected automation run history limit exceeded");
+    runCounts.set(value.job_id, count);
+    lastRunAtByJob.set(value.job_id, Math.max(lastRunAtByJob.get(value.job_id) ?? 0, value.started_at!));
+    if ((value.finished_at ?? value.started_at!) > job.updated_at) {
+      throw new Error("Wayang store contains a protected automation run newer than its job metadata");
+    }
+    if (typeof value.scheduled_for === "number" && value.scheduled_for > job.schedule_cursor_at) {
+      throw new Error("Wayang store contains a protected automation occurrence beyond its job cursor");
+    }
+    if (value.job_revision === job.revision && typeof value.scheduled_for === "number"
+      && typeof value.occurrence_key === "string") {
+      const prior = latestCurrentOccurrenceByJob.get(job.id);
+      if (!prior || value.scheduled_for > prior.scheduledFor
+        || (value.scheduled_for === prior.scheduledFor && value.id > prior.id)) {
+        latestCurrentOccurrenceByJob.set(job.id, {
+          scheduledFor: value.scheduled_for,
+          id: value.id,
+          occurrenceKey: value.occurrence_key,
+        });
+      }
+    }
+  }
+  for (const job of jobsById.values()) {
+    const expectedLastRunAt = lastRunAtByJob.get(job.id) ?? null;
+    if (job.last_run_at !== expectedLastRunAt) {
+      throw new Error("Wayang store contains incoherent protected automation last-run metadata");
+    }
+    const latestCurrentOccurrence = latestCurrentOccurrenceByJob.get(job.id);
+    if (latestCurrentOccurrence && job.last_occurrence_key !== latestCurrentOccurrence.occurrenceKey) {
+      throw new Error("Wayang store contains incoherent protected automation current occurrence metadata");
+    }
+    if (!latestCurrentOccurrence && job.last_occurrence_key !== null
+      && !occurrenceClaims.has(`${job.id}\u0000${job.last_occurrence_key}`)) {
+      throw new Error("Wayang store contains an unclaimed protected automation last occurrence");
+    }
+  }
 }
 
 function validateCurrentStore(raw: Record<string, unknown>): StoreData {
@@ -684,6 +917,7 @@ function validateCurrentStore(raw: Record<string, unknown>): StoreData {
       throw new Error("Wayang store contains rolled-back workspace capability association revision state");
     }
   }
+  validateProtectedAutomationRows(raw, projectIds, profileIds, associationsByKey);
   for (const session of raw.sessions as SessionRow[]) {
     if (session.agent_profile_id !== null && (typeof session.agent_profile_id !== "string" || !profileIds.has(session.agent_profile_id))) {
       throw new Error("Wayang session references an unknown agent profile");
@@ -729,7 +963,8 @@ function normalizeLegacyStore(raw: Record<string, unknown>): StoreData {
   data.workspaceSettings = { default_agent_profile_id: WREN_AGENT_PROFILE_ID };
   const legacyKeys = new Set<string>(ARRAY_KEYS.filter((key) =>
     key !== "workspaceCapabilityAssociations" && key !== "workspaceCapabilityApprovalEvents"
-    && key !== "projects" && key !== "agentProfiles"));
+    && key !== "projects" && key !== "agentProfiles"
+    && key !== "protectedAutomationJobs" && key !== "protectedAutomationRuns"));
   for (const key of Object.keys(raw)) {
     if (!legacyKeys.has(key)) throw new Error(`Legacy Wayang store contains unsupported field ${key}`);
   }
@@ -893,12 +1128,40 @@ function normalizeSchemaOneStore(raw: Record<string, unknown>): StoreData {
     appEvents: structuredClone(raw.appEvents) as AppEventRow[],
     scheduledJobs,
     scheduledRuns: structuredClone(raw.scheduledRuns) as ScheduledRunRow[],
+    protectedAutomationJobs: [],
+    protectedAutomationRuns: [],
     interviews: structuredClone(raw.interviews) as InterviewRecord[],
   };
   // Migration changes only schema-owned authority metadata. Existing display
   // names, descriptions, defaults, and ordinary runtime fields remain intact.
   for (const profile of data.agentProfiles) profile.updated_at = profile.updated_at ?? now;
   return validateCurrentStore(data as unknown as Record<string, unknown>);
+}
+
+function normalizeSchemaTwoStore(raw: Record<string, unknown>): StoreData {
+  const schemaTwoArrayKeys = ARRAY_KEYS.filter((key) => key !== "protectedAutomationJobs" && key !== "protectedAutomationRuns");
+  const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaTwoArrayKeys]);
+  for (const key of Object.keys(raw)) {
+    if (!allowedKeys.has(key)) throw new Error(`Schema-2 Wayang store contains unsupported field ${key}`);
+  }
+  for (const key of schemaTwoArrayKeys) {
+    if (!Array.isArray(raw[key])) throw new Error(`Schema-2 Wayang store field ${key} must be an array`);
+  }
+  for (const collection of [raw.workspaceCapabilityAssociations, raw.workspaceCapabilityApprovalEvents] as unknown[][]) {
+    if (collection.some((candidate) => candidate && typeof candidate === "object"
+      && (candidate as { capability_id?: unknown }).capability_id === PROTECTED_AUTOMATION_CAPABILITY_ID)) {
+      throw new Error("Schema-2 Wayang store cannot contain protected automation authority");
+    }
+  }
+  // Schema 2 had no automation domain. Migration deliberately creates no
+  // authority, job, run, timer cursor, browser realm, or execution request.
+  const migrated = {
+    ...structuredClone(raw),
+    schema_version: STORE_SCHEMA_VERSION,
+    protectedAutomationJobs: [],
+    protectedAutomationRuns: [],
+  } as unknown as StoreData;
+  return validateCurrentStore(migrated as unknown as Record<string, unknown>);
 }
 
 function isPlausibleInterviewRecord(record: unknown): record is InterviewRecord {
@@ -1089,9 +1352,18 @@ function saveStoreAtPath(data: StoreData, storePath: string): void {
     fs.closeSync(fd);
     fd = null;
     fs.renameSync(tempPath, storePath);
-    // The canonical store bytes are committed at rename. Mode was already set
-    // on the temp inode; post-rename reinforcement/projection work must not
-    // make callers believe the durable transaction failed.
+    // A scheduled occurrence claim and its cursor advance share this rename.
+    // Persist the directory entry before reporting the transaction committed,
+    // so a power loss cannot retain the old cursor after external effects.
+    const directoryFd = fs.openSync(dataDir, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0));
+    try {
+      fs.fsyncSync(directoryFd);
+    } finally {
+      fs.closeSync(directoryFd);
+    }
+    // The canonical store bytes and directory entry are committed. Mode was
+    // already set on the temp inode; post-publication reinforcement/projection
+    // work must not make callers believe the durable transaction failed.
     try { fs.chmodSync(storePath, 0o600); } catch {
       console.warn("[db] Store mode reinforcement failed after durable publication");
     }
@@ -1138,7 +1410,11 @@ function loadStore(storePath: string): StoreData {
   // Never normalize or replace an old store until its exact bytes have a
   // durable private backup. Any backup error aborts startup.
   createPrivateBackup(storePath, contents, version);
-  const migrated = version === 1 ? normalizeSchemaOneStore(raw) : normalizeLegacyStore(raw);
+  let migrated: StoreData;
+  if (version === 2) migrated = normalizeSchemaTwoStore(raw);
+  else if (version === 1) migrated = normalizeSchemaOneStore(raw);
+  else if (version === 0) migrated = normalizeLegacyStore(raw);
+  else throw new Error(`Wayang store schema ${version} has no supported migration path`);
   saveStoreAtPath(migrated, storePath);
   return migrated;
 }

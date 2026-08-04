@@ -191,12 +191,28 @@ function profileReferences(id: string): unknown {
       .filter((job) => job.agent_profile_id === id)
       .map((job) => structuredClone(job))
       .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    protected_automation_jobs: store.protectedAutomationJobs
+      .filter((job) => job.agent_profile_id === id)
+      .map((job) => structuredClone(job))
+      .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    protected_automation_runs: store.protectedAutomationRuns
+      .filter((run) => run.agent_profile_id === id)
+      .map((run) => structuredClone(run))
+      .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
   };
 }
 
 function profileIsInUse(id: string): boolean {
-  const refs = profileReferences(id) as { workspace_default: boolean; projects: unknown[]; sessions: unknown[]; scheduled_jobs: unknown[] };
-  return refs.workspace_default || refs.projects.length > 0 || refs.sessions.length > 0 || refs.scheduled_jobs.length > 0;
+  const refs = profileReferences(id) as {
+    workspace_default: boolean;
+    projects: unknown[];
+    sessions: unknown[];
+    scheduled_jobs: unknown[];
+    protected_automation_jobs: unknown[];
+    protected_automation_runs: unknown[];
+  };
+  return refs.workspace_default || refs.projects.length > 0 || refs.sessions.length > 0 || refs.scheduled_jobs.length > 0
+    || refs.protected_automation_jobs.length > 0 || refs.protected_automation_runs.length > 0;
 }
 
 function validateReplacement(replacementId: string | null, replacedId: string): void {
@@ -366,6 +382,13 @@ function prepareMutation(raw: unknown): PreparedMutation {
       if (getStore().sessions.some((session) => session.pending_agent_switch?.from_agent_profile_id === current.id || session.pending_agent_switch?.to_agent_profile_id === current.id)) {
         throw new WorkspaceStoreError("Agent profile cannot be deleted while an agent switch references it", 409);
       }
+      const references = profileReferences(current.id) as {
+        protected_automation_jobs: unknown[];
+        protected_automation_runs: unknown[];
+      };
+      if (references.protected_automation_jobs.length > 0 || references.protected_automation_runs.length > 0) {
+        throw new WorkspaceStoreError("Agent profile cannot be deleted while protected automation history references its exact stable ID", 409);
+      }
       if (profileIsInUse(current.id)) validateReplacement(canonical.mutation.replacement_agent_profile_id, current.id);
       return {
         canonical,
@@ -458,7 +481,10 @@ function plannedInvalidatedAssociationKeys(prepared: PreparedMutation): string[]
     const nextPolicy = mutation.updates.access_policy ?? project.access_policy;
     return store.workspaceCapabilityAssociations.filter((association) => {
       if (!association.active || association.project_id !== project.id) return false;
-      const compatibleMode = association.capability_id === "wayang.protected-browser.v1" ? "protected" : "standard";
+      const compatibleMode = association.capability_id === "wayang.protected-browser.v1"
+        || association.capability_id === "wayang.protected-automation.v1"
+        ? "protected"
+        : "standard";
       return compatibleMode !== nextPolicy.privacy_mode
         || (nextPolicy.allowed_agent_profile_ids !== null
           && !nextPolicy.allowed_agent_profile_ids.includes(association.agent_profile_id));

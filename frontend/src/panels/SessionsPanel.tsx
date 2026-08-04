@@ -4,6 +4,7 @@ import {
   ChevronDown,
   CalendarClock,
   ChevronRight,
+  ShieldCheck,
   Filter,
   Folder,
   FolderOpen,
@@ -23,6 +24,7 @@ import {
   canRetryAuthenticatedTransport,
   deleteSession,
   fetchProjects,
+  listProtectedAutomations,
   listScheduledAgentJobs,
   listSessions,
   joinSessionsIntoProjects,
@@ -30,6 +32,7 @@ import {
   stopSession,
   updateSessionTitle,
   type Project,
+  type ProtectedAutomationCatalog,
   type ScheduledAgentJob,
   type Session,
   type SessionSearchFilters,
@@ -47,6 +50,7 @@ interface SessionsPanelProps {
   active: boolean;
   activeProjectCwd: string | null;
   activeScheduledJobId?: string | null;
+  activeProtectedAutomationJobId?: string | null;
   onSelect: (session: Session) => void;
   /**
    * Same as `onSelect`, but also passes the pi `message_id` we matched on so
@@ -58,6 +62,7 @@ interface SessionsPanelProps {
   onNewSessionForProject?: (cwd: string) => Promise<void> | void;
   onOpenProjectSettings?: (cwd: string) => void;
   onSelectScheduledJob?: (jobId: string | null) => void;
+  onSelectProtectedAutomation?: (jobId: string | null) => void;
   onArchiveActive?: () => void;
   refreshTrigger?: number;
   onNewSession?: () => void;
@@ -123,12 +128,14 @@ export function SessionsPanel({
   active,
   activeProjectCwd,
   activeScheduledJobId,
+  activeProtectedAutomationJobId,
   onSelect,
   onSelectSearchResult,
   onSelectProject,
   onNewSessionForProject,
   onOpenProjectSettings,
   onSelectScheduledJob,
+  onSelectProtectedAutomation,
   onArchiveActive,
   refreshTrigger,
   onNewSession,
@@ -136,6 +143,12 @@ export function SessionsPanel({
   const [sessions, setSessions] = useState<Session[]>([]);
   const [durableProjects, setDurableProjects] = useState<WorkspaceProject[]>([]);
   const [scheduledJobs, setScheduledJobs] = useState<ScheduledAgentJob[]>([]);
+  const [protectedAutomations, setProtectedAutomations] = useState<ProtectedAutomationCatalog>({
+    status: { milestone: 0, activationAvailable: false, production_services: false },
+    jobs: [],
+  });
+  const [protectedAutomationsLoading, setProtectedAutomationsLoading] = useState(true);
+  const [protectedAutomationsUnavailable, setProtectedAutomationsUnavailable] = useState(false);
   const [loadState, setLoadState] = useState<LoadState>("loading");
   const [errorMsg, setErrorMsg] = useState("");
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
@@ -246,21 +259,41 @@ export function SessionsPanel({
     }
   }, []);
 
+  const automationsRefreshInFlightRef = useRef(false);
+  const refreshProtectedAutomations = useCallback(async () => {
+    if (!activeRef.current || document.visibilityState === "hidden" || automationsRefreshInFlightRef.current) return;
+    automationsRefreshInFlightRef.current = true;
+    try {
+      setProtectedAutomations(await listProtectedAutomations());
+      setProtectedAutomationsUnavailable(false);
+    } catch {
+      setProtectedAutomations((previous) => ({ ...previous, jobs: [] }));
+      setProtectedAutomationsUnavailable(true);
+    } finally {
+      setProtectedAutomationsLoading(false);
+      automationsRefreshInFlightRef.current = false;
+    }
+  }, []);
+
   useEffect(() => {
     if (active) {
       void refresh();
       void refreshJobs();
+      void refreshProtectedAutomations();
     } else {
       refreshAbortRef.current?.abort();
     }
-  }, [active, refresh, refreshJobs]);
+  }, [active, refresh, refreshJobs, refreshProtectedAutomations]);
 
   useEffect(() => {
     if (refreshTrigger !== undefined && refreshTrigger > 0) {
       refreshPendingRef.current = true;
-      if (active) void refresh();
+      if (active) {
+        void refresh();
+        void refreshProtectedAutomations();
+      }
     }
-  }, [active, refreshTrigger, refresh]);
+  }, [active, refreshTrigger, refresh, refreshProtectedAutomations]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -276,6 +309,7 @@ export function SessionsPanel({
       if (active && document.visibilityState === "visible") {
         void refresh();
         void refreshJobs();
+        void refreshProtectedAutomations();
       }
     };
     document.addEventListener("visibilitychange", onVisibility);
@@ -294,6 +328,7 @@ export function SessionsPanel({
       if (document.visibilityState === "visible") {
         void refresh();
         void refreshJobs();
+        void refreshProtectedAutomations();
       }
     }, 60_000);
     return () => {
@@ -301,7 +336,7 @@ export function SessionsPanel({
       events.close();
       window.clearInterval(id);
     };
-  }, [active, refresh, refreshJobs]);
+  }, [active, refresh, refreshJobs, refreshProtectedAutomations]);
 
   // ----- Debounced server-side search -----------------------------------
   const searchSeqRef = useRef(0);
@@ -697,6 +732,13 @@ export function SessionsPanel({
           activeJobId={activeScheduledJobId ?? null}
           onSelectJob={onSelectScheduledJob}
         />
+        <ProtectedAutomationsSection
+          catalog={protectedAutomations}
+          loading={protectedAutomationsLoading}
+          unavailable={protectedAutomationsUnavailable}
+          activeJobId={activeProtectedAutomationJobId ?? null}
+          onSelectJob={onSelectProtectedAutomation}
+        />
 
         {loadState === "loading" && (
           <div className="p-4 text-sm text-neutral-500">Loading…</div>
@@ -956,6 +998,73 @@ function SearchResultRow({
         </div>
       )}
     </button>
+  );
+}
+
+function ProtectedAutomationsSection({ catalog, loading, unavailable, activeJobId, onSelectJob }: {
+  catalog: ProtectedAutomationCatalog;
+  loading: boolean;
+  unavailable: boolean;
+  activeJobId: string | null;
+  onSelectJob?: (jobId: string | null) => void;
+}) {
+  const jobs = Array.isArray(catalog.jobs) ? catalog.jobs : [];
+  const productionAvailable = catalog.status?.production_services === true;
+  const held = catalog.status?.activationAvailable === false;
+  return (
+    <section data-testid="protected-automations-navigation" className="border-b border-neutral-900 py-2">
+      <button
+        type="button"
+        data-testid="protected-automations-open"
+        onClick={() => onSelectJob?.(null)}
+        className="flex w-full items-center justify-between gap-2 px-3 py-1 text-left hover:bg-neutral-900"
+      >
+        <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-violet-300">
+          <ShieldCheck size={13} /> Protected Automations
+        </span>
+        <span className={`text-[10px] ${loading ? "text-neutral-600" : unavailable || held ? "text-amber-400" : "text-emerald-500"}`}>
+          {loading ? "loading" : unavailable ? "unavailable" : held ? "held" : productionAvailable ? "available" : "unavailable"}
+        </span>
+      </button>
+      {!loading && (unavailable || held) && (
+        <button
+          type="button"
+          data-testid={unavailable ? "protected-automations-nav-unavailable" : "protected-automations-nav-held"}
+          onClick={() => onSelectJob?.(null)}
+          className="block w-full px-3 py-1.5 text-left text-xs leading-relaxed text-amber-300/70 hover:bg-neutral-900"
+        >
+          {unavailable ? "Production integration unavailable" : "Activation held · owner emergency controls only"}
+        </button>
+      )}
+      {!loading && !unavailable && jobs.length === 0 && (
+        <button type="button" onClick={() => onSelectJob?.(null)} className="block w-full px-3 py-1.5 text-left text-xs text-neutral-600 hover:bg-neutral-900 hover:text-neutral-400">
+          No captured jobs
+        </button>
+      )}
+      {!loading && !unavailable && jobs.length > 0 && (
+        <div className="mt-1">
+          {jobs.slice(0, 8).map((job) => (
+            <button
+              key={job.id}
+              type="button"
+              data-testid="protected-automation-nav-job"
+              data-job-id={job.id}
+              onClick={() => onSelectJob?.(job.id)}
+              className={`block w-full px-3 py-1.5 text-left transition-colors ${job.id === activeJobId ? "bg-neutral-800 text-neutral-100" : "text-neutral-300 hover:bg-neutral-900"}`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="truncate text-xs font-medium">{job.name}</span>
+                <span className={`shrink-0 text-[10px] ${job.attention ? "text-sky-300" : job.deleted_at !== null || job.blocked_reason ? "text-amber-400" : job.enabled ? "text-emerald-500" : "text-neutral-600"}`}>
+                  {job.deleted_at !== null ? "tombstoned" : job.attention ? "attention" : job.blocked_reason === "paused" ? "paused" : job.blocked_reason ? "blocked" : job.enabled ? "enabled" : "paused"}
+                </span>
+              </div>
+              <div className="truncate font-mono text-[10px] text-neutral-600">{job.cron_expr}</div>
+            </button>
+          ))}
+          {jobs.length > 8 && <div className="px-3 py-1 text-[10px] text-neutral-600">+{jobs.length - 8} more</div>}
+        </div>
+      )}
+    </section>
   );
 }
 

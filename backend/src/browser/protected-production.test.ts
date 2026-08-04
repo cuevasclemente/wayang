@@ -637,6 +637,14 @@ test("future Project-Agent pairs receive independent realms while same-pair sess
   }
 });
 
+test("protected production preserves its strict runtime export surface", async () => {
+  const runtime = await import("./protected-production.js");
+  assert.deepEqual(Object.keys(runtime).sort(), [
+    "ProtectedCredentialProtection",
+    "bootstrapProtectedBrowserProduction",
+  ]);
+});
+
 test("production selection never falls back from an exact runtime binding", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-protected-production-selection-"));
   let installed = 0;

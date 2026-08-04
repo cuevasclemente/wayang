@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { commitStoreMutation, getStore, type SessionRow, type StoreData, type StoredScheduledJobRow } from "./db.js";
 import { notifyPolicyChanged } from "./policy-generation.js";
+import { blockProtectedAutomationJobsDraft } from "./protected-automation/draft-lifecycle.js";
+import { PROTECTED_AUTOMATION_CAPABILITY_ID } from "./protected-automation/types.js";
 import {
   WORKSPACE_CAPABILITY_IDS,
   WorkspaceStoreError,
@@ -17,7 +19,7 @@ export const MAX_WORKSPACE_CAPABILITY_APPROVAL_EVENTS = 4_096;
 export interface WorkspaceCapabilityDefinition {
   id: WorkspaceCapabilityId;
   privacy_mode: WorkspacePrivacyMode;
-  risk: "global-resources" | "host-execution" | "authenticated-browser";
+  risk: "global-resources" | "host-execution" | "authenticated-browser" | "protected-automation";
 }
 
 export const WORKSPACE_CAPABILITY_REGISTRY: Readonly<Record<WorkspaceCapabilityId, WorkspaceCapabilityDefinition>> = Object.freeze({
@@ -35,6 +37,11 @@ export const WORKSPACE_CAPABILITY_REGISTRY: Readonly<Record<WorkspaceCapabilityI
     id: "wayang.protected-browser.v1",
     privacy_mode: "protected",
     risk: "authenticated-browser",
+  }),
+  "wayang.protected-automation.v1": Object.freeze({
+    id: "wayang.protected-automation.v1",
+    privacy_mode: "protected",
+    risk: "protected-automation",
   }),
 });
 
@@ -328,6 +335,15 @@ export function revokeWorkspaceCapabilityAssociation(
       throw new WorkspaceStoreError("Workspace capability association revision conflict", 409);
     }
     tombstoneWorkspaceCapabilityAssociationsDraft(draft, (candidate) => candidate === row, now);
+    if (row.capability_id === PROTECTED_AUTOMATION_CAPABILITY_ID) {
+      blockProtectedAutomationJobsDraft(
+        draft,
+        (job) => job.project_id === row.project_id && job.agent_profile_id === row.agent_profile_id,
+        "capability_revoked",
+        row.revoked_at!,
+        true,
+      );
+    }
     return { status: "revoked", association: { ...row } } as const;
   });
   if (result.status === "revoked") notifyPolicyChanged();

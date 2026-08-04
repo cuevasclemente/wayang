@@ -9,6 +9,8 @@ import type { WorkspaceCapabilitiesRouterOptions } from "./routes/workspace-capa
 import type { CapabilityAssociationRecord } from "./workspace-capability-approval/types.js";
 import {
   createWorkspaceCapabilityApprovalIntegration,
+  provisionPinAttemptStateForService,
+  type HardenedSettingsPinAttemptAdapter,
   type WorkspaceCapabilityRuntimeDenialPort,
 } from "./workspace-capability-integration.js";
 import { workspaceSettingsService } from "./workspace-settings-service.js";
@@ -16,6 +18,8 @@ import { workspaceSettingsService } from "./workspace-settings-service.js";
 export interface ProductionWorkspaceCapabilityBootstrap {
   /** Pass directly as createApp({ workspaceCapabilities: routerOptions }). */
   routerOptions: WorkspaceCapabilitiesRouterOptions;
+  /** Shared durable PIN-attempt authority for other owner/Origin-bound Settings confirmations. */
+  pinAttempts: HardenedSettingsPinAttemptAdapter;
   /** Best-effort completion of runtime/browser cleanup begun by denial latches. */
   close(): Promise<void>;
 }
@@ -47,22 +51,32 @@ class ProductionCapabilityRuntimeDenial implements WorkspaceCapabilityRuntimeDen
 
 /**
  * Compose the production Settings capability ports without activating anything.
- * PIN and cooldown authority must already exist as owner-only regular files;
- * this bootstrap never creates either authority or reads identity/name flags.
+ * The existing command-guard PIN remains external and is checked by metadata
+ * only. Missing non-secret cooldown state is initialized owner-privately and
+ * then persists across restarts; unsafe existing authority is never repaired.
  */
 export function createProductionWorkspaceCapabilityBootstrap(
   auth: AuthService,
   configOrDataDir: Pick<Config, "dataDir"> | string,
 ): ProductionWorkspaceCapabilityBootstrap {
   const configuredDataDir = typeof configOrDataDir === "string" ? configOrDataDir : configOrDataDir.dataDir;
-  if (typeof configuredDataDir !== "string" || configuredDataDir.length === 0) {
-    throw new Error("Workspace capability bootstrap requires a data directory");
+  if (typeof configuredDataDir !== "string" || configuredDataDir.length === 0 || !path.isAbsolute(configuredDataDir)) {
+    throw new Error("Workspace capability bootstrap requires an absolute data directory");
   }
   const dataDir = path.resolve(configuredDataDir);
+  const pinAttemptStatePath = path.join(dataDir, "workspace-capability-approval", "pin-attempt-state.json");
+  const provisioned = provisionPinAttemptStateForService(pinAttemptStatePath);
+  if (provisioned.status === "unavailable") {
+    console.warn(`[workspace-capabilities] PIN approval remains unavailable (${provisioned.reason})`);
+  }
   const denial = new ProductionCapabilityRuntimeDenial();
-  const { integration, service } = createWorkspaceCapabilityApprovalIntegration({
+  const { integration, service, pinAttempts } = createWorkspaceCapabilityApprovalIntegration({
     denial,
-    pinAttemptStatePath: path.join(dataDir, "workspace-capability-approval", "pin-attempt-state.json"),
+    pinAttemptStatePath,
+    // A failed initialization stays unavailable for this process even if a
+    // partial publication happens to look valid afterward. Restart performs a
+    // fresh full validation; no request may bypass the startup decision.
+    pinAttemptReady: provisioned.status === "ready",
   });
 
   // Ordinary Settings mutations and dedicated revocation now share the exact
@@ -75,6 +89,7 @@ export function createProductionWorkspaceCapabilityBootstrap(
       service,
       owners: { resolve: (request) => auth.resolveSettingsOwner(request) },
     },
+    pinAttempts,
     close: () => denial.close(),
   };
 }

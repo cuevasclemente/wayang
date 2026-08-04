@@ -332,6 +332,8 @@ test("schema-1 migration creates zero positive authority and removes subject aut
   delete initial.workspaceSettings;
   delete initial.workspaceCapabilityAssociations;
   delete initial.workspaceCapabilityApprovalEvents;
+  delete initial.protectedAutomationJobs;
+  delete initial.protectedAutomationRuns;
   initial.schema_version = 1;
   initial.agentProfiles = (initial.agentProfiles as Array<Record<string, unknown>>).map((profile) => ({
     ...profile, name: "Finance", capability_grants: [{ provider: "legacy", model: "legacy", active: true }], authorization_revision: 99,
@@ -350,9 +352,11 @@ test("schema-1 migration creates zero positive authority and removes subject aut
 
   init();
   const migrated = getStore();
-  assert.equal(migrated.schema_version, 2);
+  assert.equal(migrated.schema_version, 3);
   assert.deepEqual(migrated.workspaceCapabilityAssociations, []);
   assert.deepEqual(migrated.workspaceCapabilityApprovalEvents, []);
+  assert.deepEqual(migrated.protectedAutomationJobs, []);
+  assert.deepEqual(migrated.protectedAutomationRuns, []);
   assert.ok(migrated.agentProfiles.every((profile) => !("capability_grants" in profile) && !("authorization_revision" in profile)));
   assert.ok(migrated.projects.every((project) => !("capability_grants" in project) && !("authorization_revision" in project)));
   assert.equal(migrated.sessions[0]!.legacy_private_session_quarantine, true);

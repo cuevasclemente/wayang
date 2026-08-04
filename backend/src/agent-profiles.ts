@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { commitStoreMutation, getStore, type SessionRow, type StoreData, type StoredScheduledJobRow } from "./db.js";
 import { notifyPolicyChanged } from "./policy-generation.js";
+import { blockProtectedAutomationJobsDraft } from "./protected-automation/draft-lifecycle.js";
 import { tombstoneWorkspaceCapabilityAssociationsDraft } from "./workspace-capabilities.js";
 import {
   WorkspaceStoreError,
@@ -108,7 +109,15 @@ function isInUse(id: string): boolean {
   return store.workspaceSettings.default_agent_profile_id === id
     || store.projects.some((project) => project.default_agent_profile_id === id || project.access_policy.allowed_agent_profile_ids?.includes(id))
     || store.sessions.some((session: SessionRow) => session.agent_profile_id === id)
-    || store.scheduledJobs.some((job: StoredScheduledJobRow) => job.agent_profile_id === id);
+    || store.scheduledJobs.some((job: StoredScheduledJobRow) => job.agent_profile_id === id)
+    || store.protectedAutomationJobs.some((job) => job.agent_profile_id === id)
+    || store.protectedAutomationRuns.some((run) => run.agent_profile_id === id);
+}
+
+function hasProtectedAutomationReferences(id: string): boolean {
+  const store = getStore();
+  return store.protectedAutomationJobs.some((job) => job.agent_profile_id === id)
+    || store.protectedAutomationRuns.some((run) => run.agent_profile_id === id);
 }
 
 function isDefaultInUse(id: string): boolean {
@@ -265,7 +274,16 @@ export function updateAgentProfile(id: string, input: AgentProfileUpdateInput, r
     if (!target) throw new WorkspaceStoreError("Agent profile not found", 404);
     Object.assign(target, next);
     // Disable and every profile-definition edit preserve the stable-ID
-    // associations. Runtime denial/rebuild is owned by the impact layer.
+    // associations. Disable persistently pauses exact-pair automation; a
+    // replacement profile never receives ownership or capability attribution.
+    if (!target.enabled) {
+      blockProtectedAutomationJobsDraft(
+        draft,
+        (job) => job.agent_profile_id === id,
+        "agent_profile_disabled",
+        next.updated_at,
+      );
+    }
     return cloneProfile(target);
   });
   if (runtimeDefinitionChanged) notifyPolicyChanged();
@@ -277,6 +295,9 @@ export function deleteAgentProfile(id: string, replacementAgentProfileId?: strin
   const index = store.agentProfiles.findIndex((candidate) => candidate.id === id);
   if (index < 0) throw new WorkspaceStoreError("Agent profile not found", 404);
   rejectPendingSwitchReference(id);
+  if (hasProtectedAutomationReferences(id)) {
+    throw new WorkspaceStoreError("Agent profile cannot be deleted while protected automation history references its exact stable ID", 409);
+  }
   const replacement = isInUse(id) ? requireEnabledReplacement(replacementAgentProfileId, id) : null;
   commitStoreMutation((draft) => {
     const draftIndex = draft.agentProfiles.findIndex((candidate) => candidate.id === id);

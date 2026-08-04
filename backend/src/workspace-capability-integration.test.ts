@@ -158,6 +158,26 @@ test("missing or unsafe PIN/cooldown authority fails closed without creating def
   assert.equal(fs.existsSync(statePath), false);
 });
 
+test("failed startup initialization latches an otherwise valid state unavailable for the process", async () => {
+  const pinDirectory = path.join(root, "config", "pi");
+  const stateDirectory = path.join(root, "approval-latched");
+  fs.mkdirSync(pinDirectory, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(stateDirectory, { mode: 0o700 });
+  fs.writeFileSync(path.join(pinDirectory, "command-guard-identity-pin"), "12345678\n", { mode: 0o600 });
+  const statePath = path.join(stateDirectory, "pin-attempt-state.json");
+  const initial = `${JSON.stringify({ version: 1, attemptCount: 0, lastAttemptAtMs: 0, reservation: null })}\n`;
+  fs.writeFileSync(statePath, initial, { mode: 0o600 });
+  const pins = new HardenedSettingsPinAttemptAdapter(statePath, false);
+  assert.deepEqual(await pins.reserve({
+    realm: "wayang.workspace-capabilities.v1",
+    reservationId: "reservation",
+    requestId: "request",
+    operationDigest: "f".repeat(64),
+    expiresAt: Date.now() + 60_000,
+  }), { status: "unavailable" });
+  assert.equal(fs.readFileSync(statePath, "utf8"), initial);
+});
+
 test("owner-only PIN state reserves the preallocated attempt and verifies opaquely once", async () => {
   const pinDirectory = path.join(root, "config", "pi");
   const stateDirectory = path.join(root, "approval");

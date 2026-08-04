@@ -5,9 +5,10 @@ const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
   console.log(`Usage: make setup-capability-approval
 
-Provision private workspace capability approval cooldown state beside an existing
-command-guard identity PIN authority. The PIN is checked by filesystem metadata
-only and is never read. No PIN, capability grant, activation, service, or runtime
+Optional manual preflight for the private workspace capability approval cooldown
+state. Normal service startup initializes missing state automatically beside the
+existing command-guard identity PIN authority. This command checks PIN metadata
+only and never reads it. No PIN, capability grant, activation, service, or runtime
 is created or changed.`);
   process.exit(0);
 }

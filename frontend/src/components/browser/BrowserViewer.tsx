@@ -35,7 +35,30 @@ interface PresentableFrame extends FrameEnvelope {
 
 export function BrowserViewer(props: BrowserViewerProps) {
   if (props.transport === "vnc") return <VncBrowserViewer {...props} />;
-  return <CdpBrowserViewer {...props} />;
+  const websocketUrl = props.running && (props.sessionId || props.projectCwd)
+    ? browserWsUrl(props.sessionId, props.projectCwd)
+    : null;
+  return (
+    <CdpScreencastViewer
+      websocketUrl={websocketUrl}
+      running={props.running}
+      onStatus={props.onStatus}
+      onPageChange={props.onPageChange}
+      onPasteText={props.onPasteText}
+    />
+  );
+}
+
+export interface CdpScreencastViewerProps {
+  /** Backend-issued URL. This low-level viewer never constructs an authority endpoint. */
+  websocketUrl: string | null;
+  running: boolean;
+  onStatus?: () => void;
+  onPageChange?: (page: { url?: string; title?: string }) => void;
+  onPasteText?: (text: string) => void;
+  connectionLabel?: string;
+  imageAlt?: string;
+  testId?: string;
 }
 
 function directPaste(event: React.ClipboardEvent, onPasteText?: (text: string) => void) {
@@ -112,7 +135,16 @@ function VncBrowserViewer({ sessionId, projectCwd, running, onPasteText }: Brows
   );
 }
 
-function CdpBrowserViewer({ sessionId, projectCwd, running, onStatus, onPageChange, onPasteText }: BrowserViewerProps) {
+export function CdpScreencastViewer({
+  websocketUrl,
+  running,
+  onStatus,
+  onPageChange,
+  onPasteText,
+  connectionLabel = "Fast page",
+  imageAlt = "Chromium fast page",
+  testId,
+}: CdpScreencastViewerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -173,9 +205,9 @@ function CdpBrowserViewer({ sessionId, projectCwd, running, onStatus, onPageChan
   }, [send]);
 
   useEffect(() => {
-    if (!running || (!sessionId && !projectCwd)) return;
+    if (!running || !websocketUrl) return;
     const image = imgRef.current;
-    const ws = new WebSocket(browserWsUrl(sessionId, projectCwd));
+    const ws = new WebSocket(websocketUrl);
     ws.binaryType = "blob";
     wsRef.current = ws;
     setError(null);
@@ -187,7 +219,7 @@ function CdpBrowserViewer({ sessionId, projectCwd, running, onStatus, onPageChan
       setConnected(false);
       void canRetryAuthenticatedTransport();
     };
-    ws.onerror = () => setError("Fast page viewer websocket error");
+    ws.onerror = () => setError(`${connectionLabel} websocket error`);
     ws.onmessage = (event) => {
       if (typeof event.data !== "string") {
         const blob = event.data instanceof Blob ? event.data : new Blob([event.data], { type: "image/jpeg" });
@@ -248,7 +280,7 @@ function CdpBrowserViewer({ sessionId, projectCwd, running, onStatus, onPageChan
       }
       presentingRef.current = false;
     };
-  }, [sessionId, projectCwd, running, onStatus, onPageChange, presentFrame]);
+  }, [websocketUrl, running, onStatus, onPageChange, presentFrame, connectionLabel]);
 
   useEffect(() => () => {
     if (moveAnimationRef.current !== null) window.cancelAnimationFrame(moveAnimationRef.current);
@@ -373,10 +405,10 @@ function CdpBrowserViewer({ sessionId, projectCwd, running, onStatus, onPageChan
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-black">
+    <div data-testid={testId} className="flex h-full min-h-0 flex-col bg-black">
       <div className="flex shrink-0 items-center justify-between gap-3 border-b border-neutral-800 px-3 py-1.5 text-[11px] text-neutral-400">
-        <span>{connected ? "Fast page connected" : "Fast page connecting…"}</span>
-        <span className="hidden truncate sm:block">Fast CDP page view. Click inside to focus.</span>
+        <span>{connected ? `${connectionLabel} connected` : `${connectionLabel} connecting…`}</span>
+        <span className="hidden truncate sm:block">Interactive CDP page view. Click inside to focus.</span>
       </div>
       {error && <div className="shrink-0 border-b border-red-900/50 bg-red-950/40 px-3 py-2 text-xs text-red-200">{error}</div>}
       <div
@@ -394,7 +426,7 @@ function CdpBrowserViewer({ sessionId, projectCwd, running, onStatus, onPageChan
       >
         <img
           ref={imgRef}
-          alt="Chromium fast page"
+          alt={imageAlt}
           draggable={false}
           className={`mx-auto block max-h-full max-w-full select-none ${hasFrame ? "opacity-100" : "opacity-0"}`}
         />

@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { commitStoreMutation, getStore, type StoreData } from "./db.js";
 import { getAgentProfile } from "./agent-profiles.js";
 import { notifyPolicyChanged } from "./policy-generation.js";
+import { blockProtectedAutomationJobsDraft } from "./protected-automation/draft-lifecycle.js";
 import {
   isWorkspaceCapabilityCompatible,
   tombstoneWorkspaceCapabilityAssociationsDraft,
@@ -47,6 +48,8 @@ export interface ProjectRegistrationReferences {
   sessions: string[];
   scheduled_jobs: string[];
   scheduled_runs: string[];
+  protected_automation_jobs: string[];
+  protected_automation_runs: string[];
   apps: string[];
   app_states: string[];
   app_events: string[];
@@ -263,6 +266,10 @@ export function getProjectRegistrationReferences(id: string): ProjectRegistratio
       // until central metadata is repaired rather than orphaning ambiguity.
       return !allJobIds.has(run.job_id) && (run.session_id === null || !allSessionIds.has(run.session_id));
     }).map((run) => run.id).sort(),
+    protected_automation_jobs: store.protectedAutomationJobs
+      .filter((job) => job.project_id === project.id).map((job) => job.id).sort(),
+    protected_automation_runs: store.protectedAutomationRuns
+      .filter((run) => run.project_id === project.id).map((run) => run.id).sort(),
     apps: store.apps.filter((app) => app.project_cwd === project.cwd).map((app) => app.id).sort(),
     app_states: store.appStates.filter((state) => state.project_cwd === project.cwd).map((state) => state.app_id).sort(),
     app_events: store.appEvents.filter((event) => event.projectCwd === project.cwd).map((event) => event.id).sort(),
@@ -333,6 +340,15 @@ export function updateProject(id: string, input: ProjectUpdateInput): ProjectRow
           || target.access_policy.allowed_agent_profile_ids.includes(association.agent_profile_id)
         )
       ),
+      next.updated_at,
+    );
+    blockProtectedAutomationJobsDraft(
+      draft,
+      (job) => job.project_id === id && (
+        target.access_policy.privacy_mode !== "protected"
+        || !target.access_policy.allowed_agent_profile_ids?.includes(job.agent_profile_id)
+      ),
+      "project_policy_incompatible",
       next.updated_at,
     );
     return cloneProject(target);

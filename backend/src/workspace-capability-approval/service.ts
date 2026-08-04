@@ -1,5 +1,5 @@
 import { CapabilityApprovalAuthority } from "./authority.js";
-import { capabilityCatalog, isWorkspaceCapabilityId } from "./catalog.js";
+import { capabilityCatalog, compiledCapability, isWorkspaceCapabilityId } from "./catalog.js";
 import { CapabilityApprovalError } from "./errors.js";
 import { boundedHistoryLimit } from "./history-policy.js";
 import type {
@@ -74,6 +74,9 @@ export class WorkspaceCapabilityApprovalService {
 
   async requestActivation(owner: SettingsRequestOwner, input: unknown): Promise<RenderedCapabilityChallenge> {
     const intent = parseActivationIntent(input);
+    if (!compiledCapability(intent.capabilityId).activationAvailable) {
+      throw new CapabilityApprovalError("denied", "Capability activation is not available", 403);
+    }
     const result = await this.workspace.previewActivation(intent);
     if (result.status === "conflict") throw new CapabilityApprovalError("state_conflict", "Workspace state changed; retry the preview", 409);
     if (result.status === "denied" && result.reason === "activation_history_full") {

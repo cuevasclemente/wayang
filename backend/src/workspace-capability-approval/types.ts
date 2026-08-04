@@ -2,6 +2,7 @@ export const WORKSPACE_CAPABILITY_IDS = [
   "wayang.standard-resources.v1",
   "wayang.host-execution.v1",
   "wayang.protected-browser.v1",
+  "wayang.protected-automation.v1",
 ] as const;
 
 export type WorkspaceCapabilityId = typeof WORKSPACE_CAPABILITY_IDS[number];

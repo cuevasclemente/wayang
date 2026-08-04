@@ -70,6 +70,15 @@ import type { ProtectedBrowserAuthoritySnapshot, ProtectedBrowserBinding } from 
 import { PROTECTED_BROWSER_TOOL_NAME, type ProtectedBrowserToolRuntime } from "./browser/protected-tools.js";
 import { exactProtectedBrowserBindingEqual } from "./browser/protected-browser.js";
 import {
+  exactProtectedAutomationBindingEqual,
+  type ProtectedAutomationBinding,
+} from "./protected-automation/authority.js";
+import {
+  createProtectedAutomationToolRuntime,
+  PROTECTED_AUTOMATION_TOOL_NAME,
+  type ProtectedAutomationToolRuntime,
+} from "./protected-automation/tool.js";
+import {
   createRestrictedMcpRuntime,
   includeRestrictedMcpActiveTool,
   type RestrictedMcpLiveContext,
@@ -105,6 +114,8 @@ export interface PiSessionHandle {
   restrictedMcpRuntime?: RestrictedMcpRuntime;
   protectedBrowserRuntime?: ProtectedBrowserToolRuntime;
   protectedBrowserFactory?: CreatePiSessionRuntimeOptions["protectedBrowserFactory"];
+  protectedAutomationRuntime?: ProtectedAutomationToolRuntime;
+  protectedAutomationFactory?: CreatePiSessionRuntimeOptions["protectedAutomationFactory"];
   activeInteractiveTurn?: BrowserTurnProvenance | null;
   /** Permanent process-local denial latch; only a fresh handle may regain authority. */
   capabilityAuthorityDenied?: boolean;
@@ -1563,12 +1574,17 @@ export interface AgentSwitchResult {
 }
 
 export type ProtectedBrowserFactory = (binding: ProtectedBrowserBinding) => ProtectedBrowserToolRuntime | Promise<ProtectedBrowserToolRuntime>;
+export type ProtectedAutomationFactory = (options: {
+  binding: ProtectedAutomationBinding;
+  isRuntimeCurrent(): boolean;
+}) => ProtectedAutomationToolRuntime | Promise<ProtectedAutomationToolRuntime>;
 
 export type PiSessionCreationPrivilegedEffect =
   | "extension_provider_load"
   | "resource_loader"
   | "restricted_mcp_runtime"
   | "protected_browser_runtime"
+  | "protected_automation_runtime"
   | "agent_session"
   | "extension_lifecycle"
   | "handle_publication";
@@ -1580,6 +1596,8 @@ export interface CreatePiSessionRuntimeOptions {
   /** Synthetic/internal override. Interactive production sessions normally use
    * the factory installed once during application bootstrap. */
   protectedBrowserFactory?: ProtectedBrowserFactory;
+  /** Synthetic/internal exact-return factory seam. Production uses the inert built-in factory. */
+  protectedAutomationFactory?: ProtectedAutomationFactory;
   /** Deterministic regression seam. Production callers must leave this unset. */
   testHooks?: {
     afterStandardResourcesResolution?: (authorized: boolean) => Promise<void>;
@@ -1626,13 +1644,18 @@ async function closeUnpublishedAgentSession(session: AgentSession | undefined): 
 }
 
 export function piSessionHandleRequiresFreshRuntime(
-  handle: Pick<PiSessionHandle, "capabilityAuthorityDenied" | "protectedBrowserRuntime">,
+  handle: Pick<PiSessionHandle, "capabilityAuthorityDenied" | "protectedBrowserRuntime" | "protectedAutomationRuntime">,
 ): boolean {
   if (handle.capabilityAuthorityDenied) return true;
-  const runtime = handle.protectedBrowserRuntime;
-  if (!runtime) return false;
-  if (runtime.browser.isRevoked) return true;
-  try { return !runtime.preflight().allowed; }
+  const browser = handle.protectedBrowserRuntime;
+  if (browser) {
+    if (browser.browser.isRevoked) return true;
+    try { if (!browser.preflight().allowed) return true; }
+    catch { return true; }
+  }
+  const automation = handle.protectedAutomationRuntime;
+  if (!automation) return false;
+  try { return !automation.preflight().allowed; }
   catch { return true; }
 }
 
@@ -1665,6 +1688,7 @@ export async function createPiSession(
   const creationStartedAt = performance.now();
   let pendingRestrictedMcpRuntime: RestrictedMcpRuntime | undefined;
   let pendingProtectedBrowserRuntime: ProtectedBrowserToolRuntime | undefined;
+  let pendingProtectedAutomationRuntime: ProtectedAutomationToolRuntime | undefined;
   let pendingAgentSession: AgentSession | undefined;
   const creation = (async () => {
     assertCreationCurrent();
@@ -1768,6 +1792,8 @@ export async function createPiSession(
     // Generate a fresh process-local runtime epoch before composing privileged tools.
     const runtimeGeneration = randomUUID();
     let standardResourcesRuntimePublished = false;
+    let protectedAutomationRuntimePublished = false;
+    let protectedAutomationRuntimeForFence: ProtectedAutomationToolRuntime | undefined;
 
     const getRestrictedMcpLiveContext = (): RestrictedMcpLiveContext | null => {
       const currentRow = getSessionById(id);
@@ -1852,6 +1878,55 @@ export async function createPiSession(
           await pendingProtectedBrowserRuntime?.close().catch(() => undefined);
           pendingProtectedBrowserRuntime = undefined;
           throw new WorkspaceStoreError("Protected browser factory returned a non-exact runtime lease", 409);
+        }
+      }
+    }
+
+    const selectedProtectedAutomationFactory = runtimeOptions.protectedAutomationFactory ?? createProtectedAutomationToolRuntime;
+    if (isSessionCapabilityEligible(runtimeIdentity.row)
+      && runtimeIdentity.row.pending_agent_switch === null
+      && runtimeIdentity.row.scheduled_job_id === null && runtimeIdentity.row.scheduled_run_id === null) {
+      assertCreationCurrent();
+      const automationResolution = resolveWorkspaceCapability({
+        capability_id: "wayang.protected-automation.v1",
+        project_id: runtimeIdentity.project.id,
+        agent_profile_id: runtimeIdentity.agentProfile.id,
+      });
+      assertCreationCurrent();
+      if (automationResolution.authorized) {
+        const automationBinding: ProtectedAutomationBinding = {
+          capabilityId: "wayang.protected-automation.v1",
+          sourceSessionId: id,
+          projectId: runtimeIdentity.project.id,
+          projectCwd: runtimeIdentity.project.cwd,
+          agentProfileId: runtimeIdentity.agentProfile.id,
+          associationRevision: automationResolution.association.revision,
+          runtimeGeneration,
+          processBootNonce: PROCESS_BOOT_NONCE,
+        };
+        assertCreationCurrent();
+        runtimeOptions.testHooks?.onPrivilegedEffect?.("protected_automation_runtime");
+        assertCreationCurrent();
+        pendingProtectedAutomationRuntime = await selectedProtectedAutomationFactory({
+          binding: automationBinding,
+          isRuntimeCurrent: () => {
+            if (!protectedAutomationRuntimePublished) {
+              try { assertCreationCurrent(); } catch { return false; }
+              return pendingProtectedAutomationRuntime?.binding.runtimeGeneration === runtimeGeneration;
+            }
+            const active = sessions.get(id);
+            return Boolean(active && !active.capabilityAuthorityDenied
+              && active.runtimeGeneration === runtimeGeneration
+              && active.protectedAutomationRuntime === protectedAutomationRuntimeForFence);
+          },
+        });
+        protectedAutomationRuntimeForFence = pendingProtectedAutomationRuntime;
+        assertCreationCurrent();
+        if (!pendingProtectedAutomationRuntime
+          || !exactProtectedAutomationBindingEqual(pendingProtectedAutomationRuntime.binding, automationBinding)) {
+          await pendingProtectedAutomationRuntime?.close().catch(() => undefined);
+          pendingProtectedAutomationRuntime = undefined;
+          throw new WorkspaceStoreError("Protected automation factory returned a non-exact runtime lease", 409);
         }
       }
     }
@@ -1981,8 +2056,12 @@ export async function createPiSession(
       sessionManager,
       settingsManager,
       resourceLoader: runtimeResources.resourceLoader,
-      tools: pendingProtectedBrowserRuntime
-        ? [...(includeRestrictedMcpActiveTool(runtimeResources.tools, pendingRestrictedMcpRuntime) ?? []), PROTECTED_BROWSER_TOOL_NAME]
+      tools: pendingProtectedBrowserRuntime || pendingProtectedAutomationRuntime
+        ? [
+            ...(includeRestrictedMcpActiveTool(runtimeResources.tools, pendingRestrictedMcpRuntime) ?? []),
+            ...(pendingProtectedBrowserRuntime ? [PROTECTED_BROWSER_TOOL_NAME] : []),
+            ...(pendingProtectedAutomationRuntime ? [PROTECTED_AUTOMATION_TOOL_NAME] : []),
+          ]
         : includeRestrictedMcpActiveTool(runtimeResources.tools, pendingRestrictedMcpRuntime),
       excludeTools: excludeTools.length > 0 ? [...new Set(excludeTools)] : undefined,
       customTools: createWayangSessionCustomTools({
@@ -1999,6 +2078,7 @@ export async function createPiSession(
         }) ? createWorkspaceToolDefinitions({ sourceSessionId: id }) : []),
         ...(pendingRestrictedMcpRuntime ? [pendingRestrictedMcpRuntime.tool] : []),
         ...(pendingProtectedBrowserRuntime ? [pendingProtectedBrowserRuntime.tool] : []),
+        ...(pendingProtectedAutomationRuntime ? [pendingProtectedAutomationRuntime.tool] : []),
         ...(hostBashTool ? [hostBashTool] : []),
         ...(bashMode === "sandboxed" || bashMode === "sandboxed-wren"
           ? [createPolicySandboxedBashToolDefinition(cwd, id, bashMode)]
@@ -2062,6 +2142,7 @@ export async function createPiSession(
         },
       } : undefined,
       protectedBrowserRuntime: pendingProtectedBrowserRuntime,
+      protectedAutomationRuntime: pendingProtectedAutomationRuntime,
     });
     assertCreationCurrent();
     if (hostBashTool && hostCreationDecision.allowed) {
@@ -2108,6 +2189,10 @@ export async function createPiSession(
       ...(pendingRestrictedMcpRuntime ? { restrictedMcpRuntime: pendingRestrictedMcpRuntime } : {}),
       ...(pendingProtectedBrowserRuntime ? { protectedBrowserRuntime: pendingProtectedBrowserRuntime } : {}),
       ...(selectedProtectedBrowserFactory ? { protectedBrowserFactory: selectedProtectedBrowserFactory } : {}),
+      ...(pendingProtectedAutomationRuntime ? {
+        protectedAutomationRuntime: pendingProtectedAutomationRuntime,
+        protectedAutomationFactory: selectedProtectedAutomationFactory,
+      } : {}),
       activeInteractiveTurn: null,
     };
 
@@ -2117,9 +2202,11 @@ export async function createPiSession(
     assertCreationCurrent();
     sessions.set(id, handle);
     standardResourcesRuntimePublished = true;
+    protectedAutomationRuntimePublished = true;
     pendingAgentSession = undefined;
     pendingRestrictedMcpRuntime = undefined;
     pendingProtectedBrowserRuntime = undefined;
+    pendingProtectedAutomationRuntime = undefined;
     runtimeEvents.emit("event", {
       type: "runtime_state_changed",
       sessionId: id,
@@ -2141,6 +2228,8 @@ export async function createPiSession(
     pendingRestrictedMcpRuntime = undefined;
     await pendingProtectedBrowserRuntime?.close().catch(() => undefined);
     pendingProtectedBrowserRuntime = undefined;
+    await pendingProtectedAutomationRuntime?.close().catch(() => undefined);
+    pendingProtectedAutomationRuntime = undefined;
     throw error;
   }).finally(() => {
     recordLatencyMetric("lazy_session_create_ms", performance.now() - creationStartedAt);
@@ -2212,6 +2301,7 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
           skipPendingRecovery: true,
           forceInMemorySettings: true,
           protectedBrowserFactory: currentHandle?.protectedBrowserFactory,
+          protectedAutomationFactory: currentHandle?.protectedAutomationFactory,
         },
       );
       authorityLifecycle.provisionalTargetConstructed({
@@ -2250,7 +2340,12 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
         completed.provider,
         completed.model,
         completed.pi_session_file,
-        { profileOverride: target.profile, forceInMemorySettings: true, protectedBrowserFactory: currentHandle?.protectedBrowserFactory },
+        {
+          profileOverride: target.profile,
+          forceInMemorySettings: true,
+          protectedBrowserFactory: currentHandle?.protectedBrowserFactory,
+          protectedAutomationFactory: currentHandle?.protectedAutomationFactory,
+        },
       );
       const freshRow = getSessionById(id);
       authorityLifecycle.freshTargetConstructed({
@@ -2274,7 +2369,12 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
             recovered.provider,
             recovered.model,
             recovered.pi_session_file,
-            { profileOverride: restoredProfile, forceInMemorySettings: true, protectedBrowserFactory: currentHandle?.protectedBrowserFactory },
+            {
+              profileOverride: restoredProfile,
+              forceInMemorySettings: true,
+              protectedBrowserFactory: currentHandle?.protectedBrowserFactory,
+              protectedAutomationFactory: currentHandle?.protectedAutomationFactory,
+            },
           );
         } catch (restoreError) {
           console.warn(`[pi-bridge] Failed to restore runtime after agent switch ${pending.switch_id}:`, restoreError);
@@ -2301,6 +2401,25 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
 
 export function getPiSession(id: string): PiSessionHandle | undefined {
   return sessions.get(id);
+}
+
+/** Exact source/runtime registry access; durable pair metadata alone is never a live tool lease. */
+export function getLiveProtectedAutomationRuntime(
+  sourceSessionId: string,
+  expectedBinding?: Readonly<ProtectedAutomationBinding>,
+): ProtectedAutomationToolRuntime | undefined {
+  const handle = sessions.get(sourceSessionId);
+  const runtime = handle?.protectedAutomationRuntime;
+  if (!handle || handle.capabilityAuthorityDenied || !runtime) return undefined;
+  const current = runtime.binding;
+  if (current.sourceSessionId !== sourceSessionId
+    || current.runtimeGeneration !== handle.runtimeGeneration
+    || current.processBootNonce !== PROCESS_BOOT_NONCE
+    || current.agentProfileId !== handle.agentProfileId
+    || current.projectCwd !== handle.cwd
+    || (expectedBinding && !exactProtectedAutomationBindingEqual(current, expectedBinding))) return undefined;
+  try { return runtime.preflight().allowed ? runtime : undefined; }
+  catch { return undefined; }
 }
 
 /** Exact protected-runtime registry access for routes/composition. This never
@@ -2583,9 +2702,11 @@ function beginPiSessionAuthorityCleanup(handle: PiSessionHandle): Promise<void> 
   // agent/process/control denial; process, socket, and browser shutdown may finish later.
   const restricted = handle.restrictedMcpRuntime;
   const protectedBrowser = handle.protectedBrowserRuntime;
+  const protectedAutomation = handle.protectedAutomationRuntime;
   const hostBashTeardown = handle.hostBashTeardown;
   handle.restrictedMcpRuntime = undefined;
   handle.protectedBrowserRuntime = undefined;
+  handle.protectedAutomationRuntime = undefined;
   handle.hostBashTeardown = undefined;
   const invokeClose = (runtime: { close(): Promise<void> } | undefined): Promise<void> => {
     try { return runtime ? Promise.resolve(runtime.close()) : Promise.resolve(); }
@@ -2602,6 +2723,7 @@ function beginPiSessionAuthorityCleanup(handle: PiSessionHandle): Promise<void> 
     invokeAgentAbort(),
     invokeClose(restricted),
     invokeClose(protectedBrowser),
+    invokeClose(protectedAutomation),
   ]).then(() => undefined);
   capabilityAuthorityCleanup.set(handle, cleanup);
   return cleanup;
@@ -2646,8 +2768,10 @@ function latchPiSessionHandleCapabilityDenial(handle: PiSessionHandle): void {
     }
     session._toolRegistry?.delete?.("bash");
     session._toolRegistry?.delete?.(PROTECTED_BROWSER_TOOL_NAME);
+    session._toolRegistry?.delete?.(PROTECTED_AUTOMATION_TOOL_NAME);
     session._toolDefinitions?.delete?.("bash");
     session._toolDefinitions?.delete?.(PROTECTED_BROWSER_TOOL_NAME);
+    session._toolDefinitions?.delete?.(PROTECTED_AUTOMATION_TOOL_NAME);
   }
 
   // Calling these async closers starts their synchronous denial prefixes now.
