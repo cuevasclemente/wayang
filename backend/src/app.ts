@@ -6,6 +6,7 @@ import { getConfig, type Config } from "./config.js";
 import { AuthService } from "./auth/service.js";
 import { createAuthRouter } from "./auth/routes.js";
 import { init } from "./db.js";
+import { isLoopbackHost } from "./loopback.js";
 import { router as sessionsRouter } from "./routes/sessions.js";
 import { router as projectsRouter } from "./routes/projects.js";
 import { router as agentProfilesRouter } from "./routes/agent-profiles.js";
@@ -262,11 +263,6 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
   clearBrowserAgentToken();
   clearAppsAgentToken();
   if (serverCloseResult.status === "rejected") throw serverCloseResult.reason;
-}
-
-function isLoopbackHost(host: string): boolean {
-  const normalized = host.toLowerCase().replace(/^\[|\]$/g, "");
-  return normalized === "localhost" || normalized === "::1" || normalized.startsWith("127.");
 }
 
 export function start() {

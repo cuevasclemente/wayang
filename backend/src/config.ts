@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import * as os from "node:os";
 import { isPasswordHashRecord } from "./auth/password.js";
+import { isLoopbackHost } from "./loopback.js";
 
 export interface TtsConfig {
   /** Shared TTS broker base URL; preferred for streaming/job-based playback. */
@@ -168,9 +169,7 @@ export function validateAuthConfig(auth: AuthConfig): void {
     const hasRemoteHttpsOrigin = auth.allowedOrigins.some((origin) => {
       try {
         const parsed = new URL(origin);
-        const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/gu, "");
-        const loopback = host === "localhost" || host === "::1" || host.startsWith("127.") || host.startsWith("::ffff:127.");
-        return parsed.protocol === "https:" && !loopback;
+        return parsed.protocol === "https:" && !isLoopbackHost(parsed.hostname);
       } catch { return false; }
     });
     if (!hasRemoteHttpsOrigin) throw new Error("WAYANG_AUTH_PROXY_IDENTITY_HEADER requires an exact remote HTTPS WAYANG_PUBLIC_ORIGIN");

@@ -3,6 +3,7 @@ import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import type { Request, RequestHandler } from "express";
 import type { AuthConfig } from "../config.js";
+import { isLoopbackAddress, isLoopbackHost } from "../loopback.js";
 import { verifyPassword } from "./password.js";
 import { SessionStore } from "./session-store.js";
 
@@ -45,17 +46,9 @@ function firstHeader(value: string | string[] | undefined): string | undefined {
   return item?.split(",", 1)[0]?.trim();
 }
 
-function isLoopbackAddress(address: string | undefined): boolean {
-  if (!address) return false;
-  const normalized = address.toLowerCase().split("%", 1)[0].replace(/^\[|\]$/gu, "");
-  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "::ffff:127.0.0.1" ||
-    normalized.startsWith("127.") || normalized.startsWith("::ffff:127.");
-}
-
 function isLoopbackOrigin(origin: string): boolean {
   try {
-    const hostname = new URL(origin).hostname.toLowerCase();
-    return hostname === "localhost" || isLoopbackAddress(hostname);
+    return isLoopbackHost(new URL(origin).hostname);
   } catch {
     return false;
   }

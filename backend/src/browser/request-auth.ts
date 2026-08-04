@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import type { Request, RequestHandler } from "express";
+import { isLoopbackAddress } from "../loopback.js";
 import { authorizeProjectAction } from "../policy.js";
 import { getProjectByCwd } from "../projects.js";
 import { getSessionById, isLegacyPrivateSessionQuarantined } from "../sessions.js";
@@ -27,13 +28,6 @@ declare global {
   // exported through process.env, HTTP, logs, app children, or bash children.
   // eslint-disable-next-line no-var
   var __wayang_browser_agent_capabilities: BrowserAgentCapabilityBridge | undefined;
-}
-
-function isLoopbackAddress(address: string | undefined): boolean {
-  if (!address) return false;
-  const normalized = address.toLowerCase().split("%", 1)[0];
-  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "::ffff:127.0.0.1" ||
-    normalized.startsWith("127.") || normalized.startsWith("::ffff:127.");
 }
 
 function tokenForSourceSession(sourceSessionId: string): string {
