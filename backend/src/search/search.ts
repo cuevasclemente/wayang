@@ -4,7 +4,9 @@
  * v1: BM25 keyword only. M3 adds a hybrid path via reciprocal-rank fusion.
  */
 
+import { buildProjectPolicyProjection } from "../policy.js";
 import { getSearchDb } from "./db.js";
+import { listIndexableSessions } from "./policy-filter.js";
 import { getWatcherStatus } from "./watcher.js";
 import type {
   SearchFacets,
@@ -44,14 +46,34 @@ export function runSearch(query: string, filters: SearchFilters = {}): SearchRes
     return emptyResponse(trimmed, start);
   }
 
-  const db = getSearchDb();
   const ftsExpr = buildFtsExpression(trimmed);
   if (!ftsExpr) {
     return emptyResponse(trimmed, start);
   }
 
+  // Query-time filtering is independent of purge success. Only currently
+  // registered projects whose projection permits global indexing can
+  // contribute snippets, results, or facets.
+  const allowedCwds = buildProjectPolicyProjection().projects
+    .filter((project) => project.global_index)
+    .map((project) => project.cwd);
+  const allowedSessionIds = listIndexableSessions().map((session) => session.id);
+  if (allowedCwds.length === 0 || allowedSessionIds.length === 0) return emptyResponse(trimmed, start);
+
+  const db = getSearchDb();
   const where: string[] = ["chunks_fts MATCH @match"];
-  const params: Record<string, unknown> = { match: ftsExpr };
+  const params: Record<string, unknown> = {
+    match: ftsExpr,
+    policy_session_ids: JSON.stringify(allowedSessionIds),
+  };
+  // JSON1 avoids SQLite's host-parameter limit for larger session catalogs.
+  where.push("c.session_id IN (SELECT value FROM json_each(@policy_session_ids))");
+  const policyPlaceholders = allowedCwds.map((cwd, index) => {
+    const key = `policy_cwd_${index}`;
+    params[key] = cwd;
+    return `@${key}`;
+  });
+  where.push(`c.cwd IN (${policyPlaceholders.join(", ")})`);
 
   // archived: false (default), true, any
   const archived = filters.archived ?? "false";

@@ -1,16 +1,25 @@
 import { Router, type Request, type Response } from "express";
-import { createSession, listSessions, syncPiSessionFiles, updateSessionTitle, archiveSession, deleteSession, getSessionById, updateGoal, updateSessionModel, getSessionCatalogGeneration, onSessionCatalogGeneration, type SessionRow } from "../sessions.js";
-import { getPiSession, getPiSessionRuntimeState, listModels, listSlashCommands, setSessionDefaultModel, setSessionModel, stopPiSession } from "../pi-bridge.js";
+import { createSession, listSessions, syncPiSessionFiles, updateSessionTitle, archiveSession, deleteSession, getSessionById, updateGoal, getSessionCatalogGeneration, onSessionCatalogGeneration, type SessionRow } from "../sessions.js";
+import { getPiSession, getPiSessionBashMode, getPiSessionBrowserMode, getPiSessionRuntimeState, listModels, listSlashCommands, previewSessionAgentSwitch, setSessionDefaultModel, setSessionModel, stopPiSession, switchSessionAgent } from "../pi-bridge.js";
 import { validateCommandGuardIdentityPin } from "../command-guard-pin.js";
 import { removeSession as removeSearchSession } from "../search/indexer.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
 
 export const router = Router();
 
-type SessionResponse = SessionRow & ReturnType<typeof getPiSessionRuntimeState>;
+type SessionResponse = SessionRow & ReturnType<typeof getPiSessionRuntimeState> & {
+  bash_mode: ReturnType<typeof getPiSessionBashMode>;
+  browser_mode: ReturnType<typeof getPiSessionBrowserMode>;
+};
 
-function serializeSession(session: SessionRow): SessionResponse {
-  return { ...session, ...getPiSessionRuntimeState(session.id) };
+/** @internal Exported for focused response-projection tests. */
+export function serializeSession(session: SessionRow): SessionResponse {
+  return {
+    ...session,
+    ...getPiSessionRuntimeState(session.id),
+    bash_mode: getPiSessionBashMode(session.id),
+    browser_mode: getPiSessionBrowserMode(session.id, session),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -79,7 +88,7 @@ router.post("/sessions/import", async (_req: Request, res: Response) => {
 
 router.post("/sessions", async (req: Request, res: Response) => {
   try {
-    const { cwd, title, model, provider } = req.body;
+    const { cwd, title, model, provider, agent_profile_id } = req.body;
     if (!cwd || typeof cwd !== "string") {
       res.status(400).json({ error: "cwd is required" });
       return;
@@ -88,11 +97,20 @@ router.post("/sessions", async (req: Request, res: Response) => {
     // Create only the lightweight DB record. Opening/selecting a session is
     // read-only; the live pi AgentSession is started lazily when the first
     // human/agent message is sent.
-    const session = createSession(cwd, title, model || undefined, undefined, provider || undefined);
+    if (agent_profile_id !== undefined && typeof agent_profile_id !== "string") {
+      res.status(400).json({ error: "agent_profile_id must be a string" });
+      return;
+    }
+    const session = createSession(cwd, {
+      title,
+      model: model || undefined,
+      provider: provider || undefined,
+      agentProfileId: agent_profile_id,
+    });
 
     res.status(201).json(serializeSession(session));
-  } catch (err) {
-    res.status(500).json({ error: String(err) });
+  } catch (err: any) {
+    res.status(err?.statusCode || 500).json({ error: err?.message || String(err) });
   }
 });
 
@@ -223,6 +241,41 @@ router.post("/sessions/:id/stop", async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
+// Preview/switch session agent
+// ---------------------------------------------------------------------------
+
+router.post("/sessions/:id/agent/preview", async (req: Request, res: Response) => {
+  try {
+    const agentProfileId = req.body?.agent_profile_id;
+    if (typeof agentProfileId !== "string" || !agentProfileId) {
+      res.status(400).json({ error: "agent_profile_id is required" });
+      return;
+    }
+    res.json(await previewSessionAgentSwitch(req.params.id, agentProfileId));
+  } catch (err: any) {
+    res.status(err?.statusCode || 500).json({ error: err?.message || String(err) });
+  }
+});
+
+router.put("/sessions/:id/agent", async (req: Request, res: Response) => {
+  try {
+    const agentProfileId = req.body?.agent_profile_id;
+    if (typeof agentProfileId !== "string" || !agentProfileId) {
+      res.status(400).json({ error: "agent_profile_id is required" });
+      return;
+    }
+    const result = await switchSessionAgent(req.params.id, agentProfileId);
+    res.json({
+      switch_id: result.switch_id,
+      preview: result.preview,
+      session: serializeSession(result.session),
+    });
+  } catch (err: any) {
+    res.status(err?.statusCode || 500).json({ error: err?.message || String(err) });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Update session model
 // ---------------------------------------------------------------------------
 
@@ -246,15 +299,13 @@ router.put("/sessions/:id/model", async (req: Request, res: Response) => {
 
     if (wantsDefault) {
       await setSessionDefaultModel(req.params.id);
-      updateSessionModel(req.params.id, null, null);
     } else {
-      const selected = await setSessionModel(req.params.id, provider, model);
-      updateSessionModel(req.params.id, selected.model, selected.provider);
+      await setSessionModel(req.params.id, provider, model);
     }
     const updated = getSessionById(req.params.id);
     res.json(updated ? serializeSession(updated) : null);
   } catch (err: any) {
-    res.status(500).json({ error: err?.message || String(err) });
+    res.status(err?.statusCode || 500).json({ error: err?.message || String(err) });
   }
 });
 

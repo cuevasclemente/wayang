@@ -39,7 +39,7 @@ Wayang contains adapters or UI affordances for the following extension-provided 
 | Optional capability | Behavior when a compatible extension is installed | Behavior when absent |
 |---|---|---|
 | Interview/questionnaire tools | A bridge renders structured questions as inline web forms and returns responses to the tool. | No interview tools are offered to the model; normal chat continues. |
-| App companion tools | An agent can register, start, stop, list, and update app state through Wayang's HTTP API. | Apps remain manually discoverable and controllable in the Apps pane. |
+| App companion tools | A source-session-attributed agent can register, stop, list, and update app state through Wayang's HTTP API. Start/restart is available only when no project is protected; otherwise the reviewed manual Apps-pane action is required because app commands are unsandboxed. | Apps remain manually discoverable and controllable in the Apps pane. |
 | Browser companion tools | An agent can use the Wayang-managed browser through reviewed tool wrappers. | The Browser pane and human controls remain usable. |
 | TODO tool | Wayang recognizes compatible TODO state and tool results. | The TODO-specific state is empty; chat and sessions are unaffected. |
 | Agent teams, subagents, and shared goals | Compatible tools and commands appear through normal extension discovery. | Team/goal actions are not offered; single-agent sessions remain available. |

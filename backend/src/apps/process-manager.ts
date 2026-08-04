@@ -1,7 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as net from "node:net";
 import type { RegisteredApp } from "./types.js";
+import { stripInternalCapabilityEnv } from "../child-env.js";
 import { refreshManifest, resolveAppWorkingDirectory, updateAppRuntime } from "./registry.js";
+import { assertAgentAppLaunchSandboxAvailable } from "./request-auth.js";
 
 const MAX_LOG_LINES = 500;
 const STARTUP_TIMEOUT_MS = 20_000;
@@ -84,7 +86,18 @@ export function isAppRunning(app: RegisteredApp): boolean {
   return Boolean(handle && !handle.child.killed && handle.child.exitCode === null);
 }
 
-export async function startApp(app: RegisteredApp): Promise<RegisteredApp> {
+export function buildManagedAppChildEnvironment(
+  source: NodeJS.ProcessEnv,
+  values: Record<string, string>,
+): NodeJS.ProcessEnv {
+  return { ...stripInternalCapabilityEnv(source), ...stripInternalCapabilityEnv(values) };
+}
+
+export async function startApp(
+  app: RegisteredApp,
+  options: { agentInitiated?: boolean } = {},
+): Promise<RegisteredApp> {
+  assertAgentAppLaunchSandboxAvailable(options.agentInitiated === true);
   const existing = getHandle(app);
   if (existing && isAppRunning(existing.app)) return existing.app;
 
@@ -99,19 +112,21 @@ export async function startApp(app: RegisteredApp): Promise<RegisteredApp> {
   const appBasePath = latest.sessionId
     ? `/api/apps/${encodeURIComponent(latest.id)}/proxy/${encodeURIComponent(latest.sessionId)}/`
     : `/api/apps/${encodeURIComponent(latest.id)}/proxy/`;
+  // No await may occur between this live policy check and spawn. This closes
+  // the route-check/port-allocation race if a project becomes protected.
+  assertAgentAppLaunchSandboxAvailable(options.agentInitiated === true);
   const child = spawn(latest.manifest.entry.devCommand, {
     cwd,
     shell: true,
     detached: process.platform !== "win32",
-    env: {
-      ...process.env,
+    env: buildManagedAppChildEnvironment(process.env, {
       PORT: String(port),
       PI_APP_PORT: String(port),
       PI_APP_ID: latest.id,
       PI_APP_PROJECT_CWD: latest.projectCwd,
       PI_APP_MANIFEST_PATH: latest.manifestPath,
       PI_APP_BASE_PATH: appBasePath,
-    },
+    }),
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -191,9 +206,12 @@ export async function stopApp(app: RegisteredApp): Promise<RegisteredApp> {
   return updateAppRuntime(app.id, app.projectCwd, { status: "stopped", url: undefined, port: undefined, lastError: undefined });
 }
 
-export async function restartApp(app: RegisteredApp): Promise<RegisteredApp> {
+export async function restartApp(
+  app: RegisteredApp,
+  options: { agentInitiated?: boolean } = {},
+): Promise<RegisteredApp> {
   await stopApp(app);
-  return startApp(app);
+  return startApp(app, options);
 }
 
 export function getAppLogs(app: RegisteredApp): string[] {

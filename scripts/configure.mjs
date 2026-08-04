@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { stdin, stdout } from "node:process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createPasswordHash, isLoopbackHost, normalizePublicOrigin, parseEnv, updateEnv, writePrivateAtomic } from "./lib/config.mjs";
+import { createPasswordHash, isLoopbackHost, normalizePublicOrigin, parseEnv, promptForCompanionUrl, updateEnv, writePrivateAtomic } from "./lib/config.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const envPath = resolve(root, ".env");
@@ -90,6 +90,7 @@ async function main() {
   if (dryRun) {
     console.log(`[dry-run] Would update ${envPath} atomically with mode 0600.`);
     console.log("[dry-run] Defaults: configure pi later; built-in auth disabled; 127.0.0.1:8787.");
+    console.log("[dry-run] Default companion pi-tool backend URL: http://127.0.0.1:8787.");
     console.log("[dry-run] Existing files and secret stores are not read or changed.");
     return;
   }
@@ -165,17 +166,45 @@ async function main() {
   updates.WAYANG_PORT = String(portNumber);
 
   const currentPublicOrigin = existing.get("WAYANG_PUBLIC_ORIGIN") || "";
+  let publicOrigin;
   if (isLoopbackHost(host)) {
     const configurePublicOrigin = await confirm(
       "Configure an exact public browser origin for an HTTPS reverse proxy?",
       Boolean(currentPublicOrigin),
     );
-    updates.WAYANG_PUBLIC_ORIGIN = configurePublicOrigin
+    publicOrigin = configurePublicOrigin
       ? normalizePublicOrigin(await ask("Public browser origin", currentPublicOrigin || undefined))
-      : undefined;
+      : "";
   } else {
     console.log("\nAn exposed bind requires the exact browser-facing origin (for example, https://wayang.example).");
-    updates.WAYANG_PUBLIC_ORIGIN = normalizePublicOrigin(await ask("Public browser origin", currentPublicOrigin || undefined));
+    publicOrigin = normalizePublicOrigin(await ask("Public browser origin", currentPublicOrigin || undefined));
+  }
+  updates.WAYANG_PUBLIC_ORIGIN = publicOrigin || undefined;
+
+  updates.WAYANG_URL = await promptForCompanionUrl({
+    publicOrigin,
+    host,
+    port: portNumber,
+    existingValue: existing.get("WAYANG_URL") || "",
+    ask,
+    notice: console.log,
+  });
+
+  const currentProxyIdentityHeader = existing.get("WAYANG_AUTH_PROXY_IDENTITY_HEADER") || "";
+  const canUseProxyOwner = !enableAuth && Boolean(updates.WAYANG_PUBLIC_ORIGIN);
+  if (canUseProxyOwner && await confirm(
+    "Trust an authenticated loopback reverse proxy as the Settings/browser owner?",
+    Boolean(currentProxyIdentityHeader),
+  )) {
+    console.log("\nThe proxy must authenticate every Wayang path, connect from loopback, preserve the exact public Host,");
+    console.log("replace X-Forwarded-* metadata, strip the identity header supplied by clients, and inject it only after authentication.");
+    const acknowledgement = await ask('Type "I UNDERSTAND" to trust the proxy identity boundary');
+    if (acknowledgement !== "I UNDERSTAND") throw new Error("Reverse-proxy identity trust was not acknowledged");
+    const header = await ask("Proxy-injected stable identity header", currentProxyIdentityHeader || "X-Authentik-UID");
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u.test(header)) throw new Error("Proxy identity header must be one valid HTTP header name");
+    updates.WAYANG_AUTH_PROXY_IDENTITY_HEADER = header.toLowerCase();
+  } else {
+    updates.WAYANG_AUTH_PROXY_IDENTITY_HEADER = undefined;
   }
 
   if (!isLoopbackHost(host) && !enableAuth) {

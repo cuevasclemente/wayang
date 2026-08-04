@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  ApiError,
   type BrowserControlMode,
   type BrowserSessionState,
+  type BrowserViewerTransport,
   fetchBrowserStatus,
   navigateBrowser,
   pasteTextBrowser,
@@ -11,35 +13,61 @@ import {
   startBrowser,
   stopBrowser,
 } from "../api/client";
+import { BrowserCredentialsDrawer } from "../components/browser/BrowserCredentialsDrawer";
 import { BrowserToolbar } from "../components/browser/BrowserToolbar";
 import { BrowserViewer } from "../components/browser/BrowserViewer";
 
 interface BrowserPanelProps {
   sessionId: string | null;
   sessionCwd: string | null;
+  browserMode: "standard" | "protected";
 }
 
-export function BrowserPanel({ sessionId, sessionCwd }: BrowserPanelProps) {
+export function BrowserPanel({ sessionId, sessionCwd, browserMode }: BrowserPanelProps) {
   const [state, setState] = useState<BrowserSessionState | null>(null);
+  const [viewerTransport, setViewerTransport] = useState<BrowserViewerTransport>("cdp-screencast");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [clipboardCaptureOpen, setClipboardCaptureOpen] = useState(false);
-  const [clipboardText, setClipboardText] = useState("");
+  const [credentialsOpen, setCredentialsOpen] = useState(false);
   const clipboardCaptureRef = useRef<HTMLTextAreaElement | null>(null);
+  const viewerChosenRef = useRef(false);
+
+  const applyState = useCallback((next: BrowserSessionState) => {
+    setState(next);
+    setViewerTransport((current) => {
+      // CDP is the default for this release. A user may still select a
+      // backend-advertised generic VNC viewer, but Protected always remains CDP.
+      if (!viewerChosenRef.current) return "cdp-screencast";
+      if (next.profile.persistence === "protected") return "cdp-screencast";
+      if (current === "vnc" && next.vncReady === false && next.cdpReady) return "cdp-screencast";
+      if (current === "cdp-screencast" && next.cdpReady === false && next.vncReady) return "vnc";
+      return current;
+    });
+  }, []);
 
   const refresh = useCallback(async () => {
     if (!sessionId && !sessionCwd) return;
     try {
       setError(null);
-      setState(await fetchBrowserStatus(sessionId, sessionCwd));
+      const next = await fetchBrowserStatus(sessionId, sessionCwd);
+      applyState(next);
     } catch (err: any) {
+      if (browserMode === "protected") {
+        setState(null);
+        setCredentialsOpen(false);
+      }
       setError(err?.message || String(err));
     }
-  }, [sessionId, sessionCwd]);
+  }, [sessionId, sessionCwd, browserMode, applyState]);
 
   useEffect(() => {
-    refresh();
+    viewerChosenRef.current = false;
+    setState(null);
+    setCredentialsOpen(false);
+    setClipboardCaptureOpen(false);
+    void refresh();
     const interval = window.setInterval(refresh, 4_000);
     return () => window.clearInterval(interval);
   }, [refresh]);
@@ -50,12 +78,16 @@ export function BrowserPanel({ sessionId, sessionCwd }: BrowserPanelProps) {
     return () => window.clearTimeout(timeout);
   }, [clipboardCaptureOpen]);
 
-  const runAction = async (action: () => Promise<BrowserSessionState>) => {
+  const runAction = async (action: () => Promise<unknown>) => {
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      setState(await action());
+      await action();
+      // Standard and capability-bound browser operations have different
+      // internal result shapes. The common backend status projection is the
+      // only state this generic panel renders.
+      applyState(await fetchBrowserStatus(sessionId, sessionCwd));
     } catch (err: any) {
       setError(err?.message || String(err));
     } finally {
@@ -64,27 +96,99 @@ export function BrowserPanel({ sessionId, sessionCwd }: BrowserPanelProps) {
   };
 
   const handleResetProfile = () => {
+    const profileKind = state?.profile.persistence === "protected" ? "protected capability browser" : "backend-selected browser";
     const ok = window.confirm(
-      "Reset this browser profile? Wayang will stop Chromium and move the profile directory into .pi/browser-workbench/profile-trash so cookies/login state are no longer active.",
+      `Reset the ${profileKind} profile? Wayang will stop Chromium and move the profile to a private recovery directory. Saved browser login state will no longer be active.`,
     );
     if (!ok) return;
-    runAction(() => resetBrowserProfile(sessionId, sessionCwd));
+    void runAction(() => resetBrowserProfile(sessionId, sessionCwd));
   };
 
-  const handleControlMode = (mode: BrowserControlMode, reason?: string) => {
-    runAction(() => setBrowserControlMode(sessionId, sessionCwd, mode, reason));
-  };
-
-  const handlePasteClipboard = () => {
+  const handleControlMode = async (mode: BrowserControlMode, reason?: string) => {
+    setBusy(true);
     setError(null);
-    setNotice("Middle-click the capture box for Linux mouse-selection paste, or Ctrl+V / Read system clipboard, then paste it into the focused browser field.");
-    setClipboardText("");
+    setNotice(null);
+    try {
+      await setBrowserControlMode(
+        sessionId,
+        sessionCwd,
+        mode,
+        state?.profile.persistence === "protected" ? undefined : reason,
+      );
+      applyState(await fetchBrowserStatus(sessionId, sessionCwd));
+    } catch (err: any) {
+      if (
+        mode === "agent"
+        && err instanceof ApiError
+        && err.status === 409
+        && /credential inspection/i.test(err.message)
+      ) {
+        setCredentialsOpen(true);
+        setError("Generic Resume cannot bypass credential-fill protection. Credentials has been reopened; review the page and choose Allow agent read-only redacted inspection.");
+      } else {
+        setError(err?.message || String(err));
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleViewerTransport = (transport: BrowserViewerTransport) => {
+    viewerChosenRef.current = true;
+    setViewerTransport(transport);
+    setNotice(transport === "vnc"
+      ? "Full browser selected: browser chrome and extensions are visible."
+      : "CDP screencast selected: page-only low-latency view is active.");
+  };
+
+  const ensureProtectedHumanControl = async (): Promise<boolean> => {
+    if (state?.profile.persistence !== "protected" || state.controlMode !== "agent") return true;
+    setBusy(true);
+    try {
+      // Protected paste is an owner-only human action. Establish the
+      // handoff/baseline before accepting any clipboard text.
+      await setBrowserControlMode(sessionId, sessionCwd, "user");
+      applyState(await fetchBrowserStatus(sessionId, sessionCwd));
+      return true;
+    } catch (err: any) {
+      setError(err?.message || String(err));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handlePasteClipboard = async () => {
+    setError(null);
+    if (!await ensureProtectedHumanControl()) return;
+    setNotice("Paste into the capture target. Text is forwarded immediately to the focused page and is not retained in React state or agent tool parameters.");
     setClipboardCaptureOpen(true);
+  };
+
+  const handleViewerPasteText = async (text: string) => {
+    setError(null);
+    if (!await ensureProtectedHumanControl()) return;
+    await handleDirectPasteText(text);
+  };
+
+  const handleDirectPasteText = async (text: string) => {
+    if (!text) return;
+    setBusy(true);
+    setError(null);
+    setClipboardCaptureOpen(false);
+    try {
+      applyState(await pasteTextBrowser(sessionId, sessionCwd, text));
+      setNotice("Clipboard text pasted into the focused browser field.");
+    } catch (err: any) {
+      setError(err?.message || String(err));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const handleReadSystemClipboard = async () => {
     if (!navigator.clipboard?.readText) {
-      setError("This browser cannot read the system clipboard directly. Use Ctrl+V or middle-click in the capture box instead.");
+      setError("This browser cannot read the system clipboard directly. Use Ctrl+V or middle-click in the capture target instead.");
       return;
     }
     setBusy(true);
@@ -92,138 +196,225 @@ export function BrowserPanel({ sessionId, sessionCwd }: BrowserPanelProps) {
     try {
       const text = await navigator.clipboard.readText();
       if (!text) throw new Error("System clipboard is empty or does not contain text");
-      setClipboardText(text);
-      setNotice("System clipboard text captured locally. Review the destination field, then press Paste captured text.");
+      await handleDirectPasteText(text);
     } catch (err: any) {
       setError(err?.message || String(err));
-    } finally {
       setBusy(false);
     }
   };
 
-  const handlePasteCapturedText = async () => {
-    if (!clipboardText) {
-      setError("Capture text first with middle-click, Ctrl+V, or Read system clipboard.");
+  const handleCredentialToggle = async () => {
+    if (credentialsOpen) {
+      setCredentialsOpen(false);
       return;
     }
-    setBusy(true);
-    setError(null);
-    try {
-      setState(await pasteTextBrowser(sessionId, sessionCwd, clipboardText));
-      setNotice("Pasted captured text into the focused browser page.");
-      setClipboardCaptureOpen(false);
-      setClipboardText("");
-    } catch (err: any) {
-      setError(err?.message || String(err));
-    } finally {
-      setBusy(false);
+    const protectedRuntime = state?.profile.persistence === "protected";
+    if (protectedRuntime && state?.credentialBroker?.supported !== true) {
+      setError("The backend did not advertise guarded credential support for this protected runtime.");
+      return;
     }
+    setClipboardCaptureOpen(false);
+    setNotice("Credentials mode opened. The agent stays paused; after filling, review the page before explicitly allowing read-only redacted text and DOM inspection.");
+    // Establish the exact backend control generation before the drawer can
+    // request document-bound choices. Publishing the drawer first creates a
+    // race in which matches are minted against the old agent-control epoch.
+    if (state?.controlMode === "agent") {
+      await runAction(() => setBrowserControlMode(
+        sessionId,
+        sessionCwd,
+        "user",
+        protectedRuntime ? undefined : "Private credential picker opened; explicit credential review required",
+      ));
+    }
+    setCredentialsOpen(true);
+  };
+
+  const handleInspectionAllowed = (nextState: BrowserSessionState) => {
+    applyState(nextState);
+    setCredentialsOpen(false);
+    setError(null);
   };
 
   const handlePageChange = useCallback((page: { url?: string; title?: string }) => {
-    setState((prev) => prev
-      ? { ...prev, activeUrl: page.url ?? prev.activeUrl, activeTitle: page.title ?? prev.activeTitle }
-      : prev,
+    setState((previous) => previous
+      // Page notifications update display metadata only. credentialInspection
+      // remains backend-owned and changes only when a public state arrives.
+      ? { ...previous, activeUrl: page.url ?? previous.activeUrl, activeTitle: page.title ?? previous.activeTitle }
+      : previous,
     );
   }, []);
 
   const running = state?.status === "running";
-  const providerLabel = state ? "Active session model/provider applies" : "No browser session yet";
+  const cooperative = state?.controlMode === "agent";
+  const credentialInspection = state?.credentialInspection;
+  const protectedRuntime = browserMode === "protected";
+  // Standard support is the existing generic backend contract. Protected
+  // support is positive metadata from the exact runtime and is never inferred
+  // from a project/profile label or from Protected styling alone.
+  const credentialsSupported = browserMode === "standard" || state?.credentialBroker?.supported === true;
+  const profileLabel = state?.profile.persistence === "shared"
+    ? "Wayang shared"
+    : state?.profile.persistence === "session"
+      ? "Session isolated"
+      : protectedRuntime
+        ? "Protected capability"
+        : "Project persistent";
 
   if (!sessionId && !sessionCwd) {
     return <div className="p-4 text-sm text-neutral-500">Select or create a session before opening the Browser workbench.</div>;
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-neutral-950 text-neutral-100">
+    <div className="relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-neutral-950 text-neutral-100">
       <BrowserToolbar
         state={state}
         busy={busy}
-        onStart={() => runAction(() => startBrowser(sessionId, sessionCwd))}
-        onStop={() => runAction(() => stopBrowser(sessionId, sessionCwd))}
-        onRestart={() => runAction(() => restartBrowser(sessionId, sessionCwd))}
+        viewerTransport={viewerTransport}
+        credentialsOpen={credentialsOpen}
+        credentialsSupported={credentialsSupported}
+        onStart={() => void runAction(() => startBrowser(sessionId, sessionCwd))}
+        onStop={() => void runAction(() => stopBrowser(sessionId, sessionCwd))}
+        onRestart={() => void runAction(() => restartBrowser(sessionId, sessionCwd))}
         onResetProfile={handleResetProfile}
         onControlMode={handleControlMode}
-        onNavigate={(url) => runAction(() => navigateBrowser(sessionId, sessionCwd, url))}
-        onPasteClipboard={handlePasteClipboard}
+        onViewerTransport={handleViewerTransport}
+        onCredentials={() => void handleCredentialToggle()}
+        onNavigate={(url) => void runAction(() => navigateBrowser(sessionId, sessionCwd, url))}
+        onPasteClipboard={() => void handlePasteClipboard()}
       />
 
-      <div className="border-b border-amber-900/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-100">
-        The agent may see page text/screenshots when browser tools are used. Type passwords, MFA, CAPTCHA, and payment details only directly in this browser surface, and only with a model/provider you trust for the active page.
+      {protectedRuntime && (
+        <div data-testid="protected-downloads" className="shrink-0 border-b border-neutral-900 bg-neutral-950 px-3 py-1.5 text-xs text-neutral-500">
+          Downloads save directly to <code className="text-neutral-300">.wayang/browser-downloads/</code>.
+          {state?.download && (
+            <span className="ml-2" data-testid="protected-download-status">
+              Latest: <span className="text-neutral-300">{state.download.status}</span>
+              {state.download.bytes !== undefined && <> · {formatBytes(state.download.bytes)}</>}
+            </span>
+          )}
+        </div>
+      )}
+
+      <div className={`shrink-0 border-b px-3 py-2 text-xs ${
+        credentialInspection === "text-allowed"
+          ? "border-sky-900/60 bg-sky-950/35 text-sky-100"
+          : cooperative
+            ? "border-emerald-900/50 bg-emerald-950/25 text-emerald-100"
+            : "border-amber-800/60 bg-amber-950/35 text-amber-100"
+      }`}>
+        {credentialInspection === "blocked"
+          ? "Credential fill protection: the agent remains paused. Reopen Credentials to allow read-only redacted text and DOM inspection after reviewing the page."
+          : credentialInspection === "text-allowed"
+            ? "Agent read-only inspection: redacted text and DOM only. Agent screenshots and all agent navigation, click, type, and mutations remain blocked until the backend confirms a new top-level document."
+            : protectedRuntime && cooperative
+              ? "Protected agent control is active. Choose Human control before login, MFA, CAPTCHA, payment, or other secret-bearing steps."
+              : protectedRuntime
+                ? "Protected human control: use the viewer or owner-only Paste. Resume is allowed only after the browser reaches a fresh, safe top-level document."
+                : cooperative
+                  ? "Shared control: you and the agent may act in this browser at the same time. Pause the agent before sensitive or irreversible steps."
+                  : "Agent paused: your viewer input remains active, but agent browser inspection and actions are blocked until Resume agent."}
       </div>
 
-      {notice && <div className="border-b border-sky-900/50 bg-sky-950/30 px-3 py-2 text-xs text-sky-100">{notice}</div>}
+      <details className="shrink-0 border-b border-neutral-900 bg-neutral-950 text-xs text-neutral-400">
+        <summary className="cursor-pointer px-3 py-1.5 text-neutral-500 hover:text-neutral-300">
+          {protectedRuntime ? "Safety, privacy, and browser details" : "Privacy and browser details"}
+        </summary>
+        <div className="border-t border-neutral-900 px-3 py-2" role={protectedRuntime ? "note" : undefined}>
+          {protectedRuntime
+            ? "Protected browser capability: the agent can inspect authenticated pages, click, type non-secret text, download, and cause remote effects. Existing cookies may permit purchases, deletions, exports, account changes, logout, or passkey flows; human-only login and payment do not make later agent actions read-only."
+            : "The agent may see page content and cause browser-mediated remote effects when browser tools are used."}
+          {" "}Handle login, MFA, CAPTCHA, payment, booking, account changes, and other sensitive or irreversible steps with the agent paused. An authenticated remote Wayang controller has the same browser UI authority as a local controller.
+        </div>
+        {protectedRuntime && !cooperative && (
+          <div data-testid="protected-human-handoff" className="border-t border-amber-900/50 bg-amber-950/20 px-3 py-2 text-amber-100">
+            Enter passwords, MFA codes, CAPTCHA answers, passkeys, payment details, and other secrets only in the human-controlled viewer. {credentialsSupported ? "Guarded saved-login fill sends values only from the backend broker to this exact CDP document." : "Guarded saved-login support is unavailable."} Owner-only Direct Paste uses an authenticated route and is never exposed as an agent operation. Navigate to a fresh safe page before resuming the agent.
+          </div>
+        )}
+        <div className="grid grid-cols-2 gap-x-3 gap-y-2 border-t border-neutral-900 px-3 py-2 sm:grid-cols-4">
+          <StatusItem label="Browser" value={state?.status || "unknown"} />
+          <StatusItem
+            label="Control"
+            value={credentialInspection === "text-allowed" ? "agent read-only" : cooperative ? "shared / cooperative" : "agent paused"}
+          />
+          <StatusItem
+            label="Inspection"
+            value={credentialInspection === "blocked"
+              ? "credential-blocked"
+              : credentialInspection === "text-allowed"
+                ? "read-only redacted text / DOM"
+                : "standard"}
+          />
+          <StatusItem label="Viewer" value={viewerTransport === "vnc" ? "Full browser" : "CDP screencast"} />
+          <StatusItem label="Profile" value={profileLabel} />
+          <StatusItem label="Title" value={state?.activeTitle || "—"} wide />
+          <StatusItem label="URL" value={state?.activeUrl || "about:blank"} wide />
+        </div>
+      </details>
+
+      {notice && <div className="shrink-0 border-b border-sky-900/50 bg-sky-950/30 px-3 py-2 text-xs text-sky-100">{notice}</div>}
       {clipboardCaptureOpen && (
-        <form
-          className="border-b border-neutral-800 bg-neutral-950 px-3 py-3 text-xs text-neutral-300"
-          onSubmit={(event) => {
-            event.preventDefault();
-            handlePasteCapturedText();
-          }}
-        >
+        <div className="shrink-0 border-b border-neutral-800 bg-neutral-950 px-3 py-3 text-xs text-neutral-300">
           <label className="mb-2 block font-medium text-neutral-200" htmlFor="browser-clipboard-capture">
-            Clipboard / mouse-selection capture
+            Direct paste target
           </label>
           <textarea
             id="browser-clipboard-capture"
             ref={clipboardCaptureRef}
-            value={clipboardText}
-            onChange={(event) => setClipboardText(event.currentTarget.value)}
-            placeholder="Middle-click here for Linux mouse selection, or Ctrl+V to capture clipboard text. Contents stay local to Wayang and are sent only to the browser paste endpoint."
-            className="mb-2 h-20 w-full resize-y rounded border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-sky-500 focus:outline-none"
+            defaultValue=""
+            onPaste={(event) => {
+              const text = event.clipboardData.getData("text/plain");
+              if (!text) return;
+              event.preventDefault();
+              event.currentTarget.value = "";
+              void handleDirectPasteText(text);
+            }}
+            onInput={(event) => {
+              // Linux PRIMARY/middle-click paste may arrive only as an input
+              // event. Read the uncontrolled DOM value once, clear it
+              // immediately, and never copy it into React state.
+              const text = event.currentTarget.value;
+              event.currentTarget.value = "";
+              if (text) void handleDirectPasteText(text);
+            }}
+            placeholder="Ctrl+V or middle-click here. Text is sent immediately and not displayed or retained."
+            className="mb-2 h-16 w-full resize-none rounded border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-sky-500 focus:outline-none"
           />
           <div className="flex flex-wrap items-center gap-2">
             <button
-              type="submit"
-              disabled={busy || !clipboardText}
-              className="rounded border border-sky-600 bg-sky-600/20 px-3 py-1.5 text-xs font-semibold text-sky-100 hover:bg-sky-600/30 disabled:cursor-not-allowed disabled:opacity-40"
+              type="button"
+              disabled={busy}
+              onClick={() => void handleReadSystemClipboard()}
+              className="rounded border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-xs font-medium text-neutral-200 hover:bg-neutral-800 disabled:opacity-40"
             >
-              Paste captured text
+              Read and paste system clipboard
             </button>
             <button
               type="button"
               disabled={busy}
-              onClick={handleReadSystemClipboard}
-              className="rounded border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-xs font-medium text-neutral-200 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Read system clipboard
-            </button>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => {
-                setClipboardCaptureOpen(false);
-                setClipboardText("");
-              }}
-              className="rounded border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-xs font-medium text-neutral-200 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40"
+              onClick={() => setClipboardCaptureOpen(false)}
+              className="rounded border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-xs font-medium text-neutral-200 hover:bg-neutral-800 disabled:opacity-40"
             >
               Cancel
             </button>
           </div>
-        </form>
+        </div>
       )}
-      {error && <div className="border-b border-red-900/50 bg-red-950/40 px-3 py-2 text-sm text-red-200">{error}</div>}
-      {state?.lastError && <div className="border-b border-red-900/50 bg-red-950/30 px-3 py-2 text-xs text-red-200">{state.lastError}</div>}
+      {error && <div className="shrink-0 border-b border-red-900/50 bg-red-950/40 px-3 py-2 text-sm text-red-200">{error}</div>}
+      {state?.lastError && <div className="shrink-0 border-b border-red-900/50 bg-red-950/30 px-3 py-2 text-xs text-red-200">{state.lastError}</div>}
 
-      <div className="grid grid-cols-2 gap-2 border-b border-neutral-900 px-3 py-2 text-xs text-neutral-400 md:grid-cols-4">
-        <StatusItem label="Status" value={state?.status || "unknown"} />
-        <StatusItem label="Control" value={state?.controlMode || "agent"} />
-        <StatusItem label="Viewer" value={state?.viewerTransport === "vnc" ? "VNC/noVNC" : "CDP screencast"} />
-        <StatusItem label="Profile" value={state?.profile.persistence === "session" ? "session" : "project-persistent"} />
-        <StatusItem label="Model" value={providerLabel} />
-        <StatusItem label="Title" value={state?.activeTitle || "—"} wide />
-        <StatusItem label="URL" value={state?.activeUrl || "about:blank"} wide />
-      </div>
-
-      {state?.needsUser && (
-        <div className="flex items-center justify-between gap-3 border-b border-sky-900/60 bg-sky-950/40 px-3 py-2 text-sm text-sky-100">
-          <span>{state.needsUserReason || "Agent is waiting for user action."}</span>
+      {state?.needsUser && !cooperative && (
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-sky-900/60 bg-sky-950/40 px-3 py-2 text-sm text-sky-100">
+          <span>{credentialInspection === "blocked"
+            ? "Credentials were filled. Generic Resume is blocked; reopen Credentials to review the page and explicitly allow read-only redacted text and DOM inspection."
+            : protectedRuntime
+              ? "Human control is active. Finish the sensitive step and navigate to a fresh safe document before resuming the agent."
+              : state.needsUserReason || "Agent is waiting while you handle this browser step."}</span>
           <button
             type="button"
             className="rounded border border-sky-500 bg-sky-500/20 px-3 py-1 text-xs font-semibold text-sky-100 hover:bg-sky-500/30"
             onClick={() => handleControlMode("agent")}
           >
-            I handled it — resume agent
+            Resume agent
           </button>
         </div>
       )}
@@ -233,22 +424,44 @@ export function BrowserPanel({ sessionId, sessionCwd }: BrowserPanelProps) {
           <BrowserViewer
             sessionId={sessionId}
             projectCwd={sessionCwd}
-            running={running}
-            transport={state?.viewerTransport}
+            running
+            transport={viewerTransport}
             onStatus={refresh}
             onPageChange={handlePageChange}
+            onPasteText={(text) => void handleViewerPasteText(text)}
           />
         ) : (
           <div className="flex h-full items-center justify-center p-6 text-center text-sm text-neutral-500">
             <div>
               <div className="mb-2 text-base text-neutral-300">Browser workbench is stopped</div>
-              <div>Start Chromium to create a persistent project browser profile under <code className="text-neutral-400">.pi/browser-workbench/</code>.</div>
+              <div>{protectedRuntime ? "Start the backend-issued protected browser runtime." : "Start Chromium to use the backend-selected browser runtime."}</div>
             </div>
           </div>
         )}
       </div>
+
+      {credentialsSupported && (
+        <BrowserCredentialsDrawer
+          open={credentialsOpen}
+          sessionId={sessionId}
+          projectCwd={sessionCwd}
+          pageIdentity={state?.activeUrl}
+          credentialInspection={credentialInspection}
+          onClose={() => setCredentialsOpen(false)}
+          onCredentialFilled={refresh}
+          onInspectionAllowed={handleInspectionAllowed}
+          onNotice={setNotice}
+          onError={setError}
+        />
+      )}
     </div>
   );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function StatusItem({ label, value, wide }: { label: string; value: string; wide?: boolean }) {

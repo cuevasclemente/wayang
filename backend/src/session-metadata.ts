@@ -35,10 +35,9 @@ interface WorkerReply {
 // Kept self-contained so both `tsx src/index.ts` and compiled `dist/index.js`
 // execute the exact same worker code without runtime TypeScript loaders or a
 // copied worker asset. Transcript bytes and parsed entries never return to the
-// main thread; only bounded catalog metadata does.
+// main thread after authorization; only bounded catalog metadata returns.
 const WORKER_SOURCE = String.raw`
 const { parentPort } = require("node:worker_threads");
-const fs = require("node:fs/promises");
 
 function textContent(message) {
   const content = message && message.content;
@@ -71,8 +70,8 @@ function activeBranch(entries) {
   return path;
 }
 
-async function parseFile(filePath, fingerprint) {
-  const content = await fs.readFile(filePath, "utf8");
+function parseFile(filePath, fingerprint, contentBytes) {
+  const content = Buffer.from(contentBytes.buffer, contentBytes.byteOffset, contentBytes.byteLength).toString("utf8");
   const entries = [];
   for (const line of content.split("\n")) {
     if (!line.trim()) continue;
@@ -125,9 +124,9 @@ async function parseFile(filePath, fingerprint) {
   };
 }
 
-parentPort.on("message", async ({ taskId, filePath, fingerprint }) => {
+parentPort.on("message", ({ taskId, filePath, fingerprint, contentBytes }) => {
   try {
-    parentPort.postMessage({ taskId, metadata: await parseFile(filePath, fingerprint) });
+    parentPort.postMessage({ taskId, metadata: parseFile(filePath, fingerprint, contentBytes) });
   } catch (error) {
     parentPort.postMessage({ taskId, error: error && error.message ? error.message : String(error) });
   }
@@ -141,7 +140,7 @@ export function fingerprintsEqual(a: FileFingerprint | null | undefined, b: File
 export class SessionMetadataWorkerPool {
   private readonly workers: Worker[] = [];
   private readonly idle: Worker[] = [];
-  private readonly queue: Array<{ taskId: number; filePath: string; fingerprint: FileFingerprint }> = [];
+  private readonly queue: Array<{ taskId: number; filePath: string; fingerprint: FileFingerprint; contentBytes: Uint8Array }> = [];
   private readonly pending = new Map<number, PendingTask>();
   private nextTaskId = 1;
   private closed = false;
@@ -150,13 +149,15 @@ export class SessionMetadataWorkerPool {
     for (let index = 0; index < size; index++) this.addWorker();
   }
 
-  parse(filePath: string, fingerprint: FileFingerprint): Promise<SessionFileMetadata | null> {
+  parseAuthorizedContent(filePath: string, fingerprint: FileFingerprint, content: Uint8Array): Promise<SessionFileMetadata | null> {
     if (this.closed) return Promise.reject(new Error("Session metadata worker pool is closed"));
     const taskId = this.nextTaskId++;
     const promise = new Promise<SessionFileMetadata | null>((resolve, reject) => {
       this.pending.set(taskId, { resolve, reject });
     });
-    this.queue.push({ taskId, filePath, fingerprint });
+    // Catalog allocates a normal ArrayBuffer specifically so ownership can be
+    // transferred without cloning large authorized transcripts.
+    this.queue.push({ taskId, filePath, fingerprint, contentBytes: content });
     this.dispatch();
     return promise;
   }
@@ -200,7 +201,13 @@ export class SessionMetadataWorkerPool {
     while (this.idle.length > 0 && this.queue.length > 0) {
       const worker = this.idle.pop()!;
       const task = this.queue.shift()!;
-      worker.postMessage(task);
+      try {
+        worker.postMessage(task, [task.contentBytes.buffer as ArrayBuffer]);
+      } catch (error) {
+        this.pending.get(task.taskId)?.reject(error);
+        this.pending.delete(task.taskId);
+        this.idle.push(worker);
+      }
     }
   }
 }

@@ -1,21 +1,29 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   canRetryAuthenticatedTransport,
   chatWsUrl,
+  fetchAgentProfiles,
   fetchModels,
+  fetchProjects,
   fetchSlashCommands,
+  previewSessionAgentSwitch,
   refreshSessionTitle,
+  switchSessionAgent,
   synthesizeTts,
   updateSessionGoal,
   updateSessionModel as updateSessionModelRequest,
+  type AgentProfileSummary,
+  type BashMode,
   type DefaultModelOption,
   type ModelOption,
   type Session,
+  type SessionAgentSwitchPreview,
   type SlashArgumentSuggestion,
   type SlashCommandOption,
   type TtsChunkManifest,
+  type WorkspaceProject,
 } from "../api/client";
 import {
   InterviewForm,
@@ -23,6 +31,7 @@ import {
   type InterviewAnswer,
   type InterviewSubmissionState,
 } from "../components/InterviewForm";
+import { BashModeStatus } from "../components/BashModeStatus";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -67,10 +76,14 @@ interface ToolActivityResultItem {
 
 type ToolActivityItem = ToolActivityUseItem | ToolActivityResultItem;
 
+type StreamingContentBlock =
+  | { type: "thinking"; thinking: string }
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id?: string; name: string; input: unknown }
+  | { type: "tool_result"; id?: string; name?: string; content: unknown; is_error?: boolean };
+
 interface StreamingBlocks {
-  thinking: string;
-  text: string;
-  toolActivities: ToolActivityItem[];
+  content: StreamingContentBlock[];
 }
 
 interface QueuedAttachment {
@@ -125,6 +138,10 @@ interface RuntimeErrorState {
 }
 
 type WsStatus = "connecting" | "connected" | "disconnected";
+
+function isBashMode(value: unknown): value is BashMode {
+  return value === "host" || value === "sandboxed" || value === "sandboxed-wren" || value === "unavailable";
+}
 
 type InterviewSubmission = {
   answers: InterviewAnswer[];
@@ -907,41 +924,34 @@ function buildDisplayAssistantMessage(parts: ChatMessage[]): ChatMessage | null 
     .reverse()
     .map((part) => assistantErrorMessage(part.message))
     .find((error): error is string => Boolean(error));
-  const thinkingParts: string[] = [];
-  const textParts: string[] = [];
-  const toolBlocks: any[] = [];
+  const content: any[] = [];
 
   for (const part of parts) {
     if (part.type === "assistant") {
       for (const block of messageContentAsBlocks(part.message?.content)) {
         if (typeof block === "string") {
-          textParts.push(block);
+          content.push({ type: "text", text: block });
           continue;
         }
         const toolBlock = normalizeToolBlockForDisplay(block);
         if (toolBlock) {
-          toolBlocks.push(toolBlock);
+          content.push(toolBlock);
           continue;
         }
         if (block?.type === "thinking" && typeof block.thinking === "string" && block.thinking.length > 0) {
-          thinkingParts.push(block.thinking);
+          content.push({ type: "thinking", thinking: block.thinking });
           continue;
         }
         if (block?.type === "text" && typeof block.text === "string" && block.text.length > 0) {
-          textParts.push(block.text);
+          content.push({ type: "text", text: block.text });
         }
       }
       continue;
     }
 
     const toolResultBlock = toolResultMessageToBlock(part.message);
-    if (toolResultBlock) toolBlocks.push(toolResultBlock);
+    if (toolResultBlock) content.push(toolResultBlock);
   }
-
-  const content: any[] = [];
-  if (thinkingParts.length > 0) content.push({ type: "thinking", thinking: thinkingParts.join("\n\n") });
-  if (textParts.length > 0) content.push({ type: "text", text: textParts.join("\n\n") });
-  content.push(...toolBlocks);
 
   if (content.length === 0) {
     if (assistantError) return { type: "error", error: assistantError };
@@ -1034,7 +1044,15 @@ function normalizeTtsPlaybackUrl(url: string | null | undefined): string {
   return url;
 }
 
-function AssistantMessage({ msg, sessionId }: { msg: ChatMessage; sessionId?: string | null }) {
+function AssistantMessage({
+  msg,
+  sessionId,
+  ttsAllowed = true,
+}: {
+  msg: ChatMessage;
+  sessionId?: string | null;
+  ttsAllowed?: boolean;
+}) {
   const message = msg.message;
   const messageId = typeof msg.id === "string" ? msg.id : null;
   const [ttsStage, setTtsStage] = useState<TtsStage>("idle");
@@ -1070,6 +1088,17 @@ function AssistantMessage({ msg, sessionId }: { msg: ChatMessage; sessionId?: st
   }, []);
 
   useEffect(() => closeTtsEvents, [closeTtsEvents]);
+
+  useEffect(() => {
+    if (ttsAllowed) return;
+    closeTtsEvents();
+    audioRef.current?.pause();
+    setTtsStage("idle");
+    setTtsChunks([]);
+    setTtsFinalUrl(null);
+    setCurrentChunkIndex(null);
+    setTtsError("");
+  }, [closeTtsEvents, ttsAllowed]);
 
   useEffect(() => {
     if (!currentAudioUrl || !["playing", "buffering_next_chunk", "ready"].includes(ttsStage)) return;
@@ -1175,7 +1204,7 @@ function AssistantMessage({ msg, sessionId }: { msg: ChatMessage; sessionId?: st
   }, [closeTtsEvents, ttsStage, upsertChunk]);
 
   const handleReadAloud = useCallback(async () => {
-    if (!sessionId || !messageId || ttsLoading) return;
+    if (!ttsAllowed || !sessionId || !messageId || ttsLoading) return;
     closeTtsEvents();
     setTtsChunks([]);
     setTtsProgress({ completed: 0, total: 0 });
@@ -1198,7 +1227,7 @@ function AssistantMessage({ msg, sessionId }: { msg: ChatMessage; sessionId?: st
       setTtsError(err instanceof Error ? err.message : "TTS failed");
       setTtsStage("error");
     }
-  }, [closeTtsEvents, sessionId, messageId, subscribeToTtsJob, ttsLoading]);
+  }, [closeTtsEvents, sessionId, messageId, subscribeToTtsJob, ttsAllowed, ttsLoading]);
   if (!message) return null;
 
   const content = Array.isArray(message.content) ? message.content : [];
@@ -1222,7 +1251,7 @@ function AssistantMessage({ msg, sessionId }: { msg: ChatMessage; sessionId?: st
           )}
         </div>
         <div className="flex items-center gap-2">
-          {sessionId && messageId && ttsStage === "idle" && (
+          {ttsAllowed && sessionId && messageId && ttsStage === "idle" && (
             <button
               type="button"
               onClick={handleReadAloud}
@@ -1365,32 +1394,51 @@ function userMessagesMatch(a: ChatMessage, b: ChatMessage): boolean {
   return aHasImages && bHasImages && (aText === "" || bText === "" || userContentMatches(aText, bText));
 }
 
-function streamingBlocksToAssistantMessage(blocks: StreamingBlocks): ChatMessage | null {
-  const content: any[] = [];
-  if (blocks.thinking) content.push({ type: "thinking", thinking: blocks.thinking });
-  if (blocks.text) content.push({ type: "text", text: blocks.text });
-  for (const activity of blocks.toolActivities) {
-    if (activity.kind === "use") {
-      content.push({
-        type: "tool_use",
-        name: activity.name,
-        input: activity.input,
-      });
-    } else {
-      content.push({
-        type: "tool_result",
-        name: activity.name,
-        content: activity.content,
-        is_error: activity.isError,
-      });
-    }
+function appendStreamingDelta(
+  blocks: StreamingBlocks,
+  type: "thinking" | "text",
+  delta: string,
+): StreamingBlocks {
+  if (!delta) return blocks;
+  const last = blocks.content[blocks.content.length - 1];
+  if (type === "thinking" && last?.type === "thinking") {
+    return {
+      content: [
+        ...blocks.content.slice(0, -1),
+        { ...last, thinking: last.thinking + delta },
+      ],
+    };
   }
-  if (content.length === 0) return null;
+  if (type === "text" && last?.type === "text") {
+    return {
+      content: [
+        ...blocks.content.slice(0, -1),
+        { ...last, text: last.text + delta },
+      ],
+    };
+  }
+  return {
+    content: [
+      ...blocks.content,
+      type === "thinking" ? { type, thinking: delta } : { type, text: delta },
+    ],
+  };
+}
+
+function appendStreamingBlock(
+  blocks: StreamingBlocks,
+  block: StreamingContentBlock,
+): StreamingBlocks {
+  return { content: [...blocks.content, block] };
+}
+
+function streamingBlocksToAssistantMessage(blocks: StreamingBlocks): ChatMessage | null {
+  if (blocks.content.length === 0) return null;
   return {
     type: "assistant",
     message: {
       role: "assistant",
-      content,
+      content: [...blocks.content],
     },
   };
 }
@@ -1623,6 +1671,29 @@ function CustomMessage({ msg }: { msg: ChatMessage }) {
   const customType = message.customType || "custom";
   const isInterviewSubmission = customType === "wayang-interview-submission";
   const content = message.content;
+
+  if (customType === "wayang-agent-change") {
+    const details = message.details && typeof message.details === "object"
+      ? message.details as { provider?: unknown; model?: unknown }
+      : null;
+    const provider = typeof details?.provider === "string" ? details.provider : null;
+    const model = typeof details?.model === "string" ? details.model : null;
+    return (
+      <div
+        data-testid="chat-message"
+        data-role="custom"
+        data-custom-type="wayang-agent-change"
+        className="flex items-center gap-3 px-4 py-2 text-[11px] text-neutral-500"
+      >
+        <span className="h-px flex-1 bg-neutral-800" aria-hidden="true" />
+        <span className="shrink-0 font-medium text-neutral-400">
+          Agent changed{provider && model ? ` · ${provider}/${model}` : ""}
+        </span>
+        <MessageTimestamp msg={msg} className="shrink-0 text-neutral-600" />
+        <span className="h-px flex-1 bg-neutral-800" aria-hidden="true" />
+      </div>
+    );
+  }
   const text =
     typeof content === "string"
       ? content
@@ -1966,11 +2037,12 @@ function renderMessage(
     resendingMessageId?: string | null;
     onResendUserMessage?: (msg: ChatMessage) => void;
     sessionId?: string | null;
+    ttsAllowed?: boolean;
   } = {},
 ) {
   switch (msg.type) {
     case "assistant":
-      return <AssistantMessage key={index} msg={msg} sessionId={options.sessionId} />;
+      return <AssistantMessage key={index} msg={msg} sessionId={options.sessionId} ttsAllowed={options.ttsAllowed} />;
     case "user":
       return (
         <UserMessage
@@ -2010,12 +2082,14 @@ const MemoizedMessageRow = memo(function MemoizedMessageRow({
   resendingMessageId,
   onResendUserMessage,
   sessionId,
+  ttsAllowed,
 }: {
   msg: ChatMessage;
   canResendUserMessage: boolean;
   resendingMessageId: string | null;
   onResendUserMessage: (msg: ChatMessage) => void;
   sessionId: string | null;
+  ttsAllowed: boolean;
 }) {
   const messageId = typeof msg.id === "string" ? msg.id : null;
   return (
@@ -2025,10 +2099,131 @@ const MemoizedMessageRow = memo(function MemoizedMessageRow({
         resendingMessageId,
         onResendUserMessage,
         sessionId,
+        ttsAllowed,
       })}
     </div>
   );
 });
+
+// ---------------------------------------------------------------------------
+// Agent switch confirmation
+// ---------------------------------------------------------------------------
+
+interface AgentSwitchDialogState {
+  sessionId: string;
+  targetProfileId: string;
+  targetName: string;
+  preview: SessionAgentSwitchPreview | null;
+  error: string;
+}
+
+function memoryAccessLabel(value: SessionAgentSwitchPreview["memory_access"]): string {
+  if (value === "read_write") return "Read and write";
+  if (value === "read") return "Read only";
+  return "None";
+}
+
+function providerModelLabel(provider: string | null, model: string | null): string {
+  return provider && model ? `${provider}/${model}` : "runtime default";
+}
+
+function AgentSwitchDialog({
+  state,
+  previewing,
+  switching,
+  onCancel,
+  onConfirm,
+}: {
+  state: AgentSwitchDialogState;
+  previewing: boolean;
+  switching: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => cancelRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  const preview = state.preview;
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 px-4 py-6"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="agent-switch-title"
+      onClick={() => { if (!switching) onCancel(); }}
+      onKeyDown={(event) => { if (event.key === "Escape" && !switching) onCancel(); }}
+    >
+      <div
+        className="w-full max-w-md overflow-hidden rounded-xl border border-neutral-700 bg-neutral-950 shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="border-b border-neutral-800 px-4 py-3">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-blue-400">Switch agent</div>
+          <h2 id="agent-switch-title" className="mt-1 text-base font-semibold text-neutral-100">
+            Switch to {preview?.to_agent_name ?? state.targetName}?
+          </h2>
+        </div>
+        <div className="space-y-4 px-4 py-4">
+          {previewing && (
+            <div className="flex items-center gap-2 text-sm text-neutral-400">
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-neutral-700 border-t-blue-400" />
+              Resolving agent policy and model…
+            </div>
+          )}
+          {state.error && (
+            <div role="alert" className="rounded border border-red-900/60 bg-red-950/30 px-3 py-2 text-sm text-red-200">
+              {state.error}
+            </div>
+          )}
+          {preview && (
+            <>
+              <dl className="grid grid-cols-[auto,1fr] gap-x-4 gap-y-2 rounded border border-neutral-800 bg-neutral-900/40 px-3 py-3 text-xs">
+                <dt className="text-neutral-500">Agent</dt>
+                <dd className="text-neutral-200">{preview.from_agent_name ?? "Project default"} → {preview.to_agent_name}</dd>
+                <dt className="text-neutral-500">Model</dt>
+                <dd className="break-all font-mono text-neutral-200">{providerModelLabel(preview.current_provider, preview.current_model)} → {preview.target_provider}/{preview.target_model}</dd>
+                <dt className="text-neutral-500">Memory</dt>
+                <dd className="text-neutral-200">{memoryAccessLabel(preview.memory_access)}</dd>
+              </dl>
+              <div className="rounded border border-amber-900/60 bg-amber-950/20 px-3 py-2 text-xs leading-relaxed text-amber-100/85">
+                {preview.warning}
+              </div>
+              {preview.transcript_retained && (
+                <p className="text-xs leading-relaxed text-neutral-400">
+                  Prior messages remain visible to the new agent. Your unsent composer draft stays in this browser.
+                </p>
+              )}
+            </>
+          )}
+        </div>
+        <div className="flex items-center justify-end gap-2 border-t border-neutral-800 px-4 py-3">
+          <button
+            ref={cancelRef}
+            type="button"
+            onClick={onCancel}
+            disabled={switching}
+            className="rounded px-3 py-2 text-xs font-medium text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100 disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={!preview || previewing || switching}
+            className="inline-flex items-center gap-2 rounded bg-blue-700 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-600 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {switching && <span className="h-3 w-3 animate-spin rounded-full border-2 border-blue-300 border-t-white" />}
+            {switching ? "Switching…" : "Switch agent"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // ChatPanel
@@ -2047,7 +2242,7 @@ export function ChatPanel({
   const [visibleMessageStart, setVisibleMessageStart] = useState(0);
   const [deferredUserMessages, setDeferredUserMessages] = useState<ChatMessage[]>([]);
   const [queuedUserMessages, setQueuedUserMessages] = useState<QueuedUserMessage[]>([]);
-  const [streamingBlocks, setStreamingBlocks] = useState<StreamingBlocks>({ thinking: "", text: "", toolActivities: [] });
+  const [streamingBlocks, setStreamingBlocks] = useState<StreamingBlocks>({ content: [] });
   const [inputText, setInputText] = useState("");
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState("");
@@ -2056,6 +2251,7 @@ export function ChatPanel({
   const [slashAutocompleteIndex, setSlashAutocompleteIndex] = useState(0);
   const [isStreaming, setIsStreaming] = useState(false);
   const [wsStatus, setWsStatus] = useState<WsStatus>("disconnected");
+  const [bashMode, setBashMode] = useState<BashMode>("unavailable");
   const [isSessionHistoryLoading, setIsSessionHistoryLoading] = useState(false);
   const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
   const [defaultModel, setDefaultModel] = useState<DefaultModelOption | null>(null);
@@ -2064,6 +2260,13 @@ export function ChatPanel({
   const [isModelSaving, setIsModelSaving] = useState(false);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
   const [modelQuery, setModelQuery] = useState("");
+  const [agentProfiles, setAgentProfiles] = useState<AgentProfileSummary[]>([]);
+  const [activeProject, setActiveProject] = useState<WorkspaceProject | null>(null);
+  const [isAgentPickerOpen, setIsAgentPickerOpen] = useState(false);
+  const [agentError, setAgentError] = useState("");
+  const [agentSwitchDialog, setAgentSwitchDialog] = useState<AgentSwitchDialogState | null>(null);
+  const [isAgentPreviewing, setIsAgentPreviewing] = useState(false);
+  const [isAgentSwitching, setIsAgentSwitching] = useState(false);
   const [goalInput, setGoalInput] = useState("");
   const [showGoalInput, setShowGoalInput] = useState(false);
   const [interviewQueue, setInterviewQueue] = useState<QueuedInterview[]>([]);
@@ -2094,6 +2297,7 @@ export function ChatPanel({
     contextWindow: number;
     percent: number | null;
   } | null>(null);
+  const [isCompacting, setIsCompacting] = useState(false);
   const [commandGuardState, setCommandGuardState] = useState<CommandGuardState | null>(null);
   const [commandGuardSaving, setCommandGuardSaving] = useState(false);
   const [runtimeError, setRuntimeError] = useState<RuntimeErrorState | null>(null);
@@ -2103,6 +2307,7 @@ export function ChatPanel({
 
   const currentGoal = activeSession?.goal ?? null;
   const currentGoalStatus = activeSession?.goal_status ?? null;
+  const effectiveAgentProfileId = activeSession?.agent_profile_id ?? activeProject?.default_agent_profile_id ?? null;
   const transcriptOwnedBySelection = Boolean(activeSessionId && messagesOwnerSessionId === activeSessionId);
   const normalizedOwnedMessages = useMemo(
     () => transcriptOwnedBySelection ? normalizeMessagesForDisplay(messages) : [],
@@ -2147,6 +2352,36 @@ export function ChatPanel({
   }, [activeSession]);
 
   useEffect(() => {
+    if (!activeSessionId || !activeSession?.cwd) {
+      setActiveProject(null);
+      setAgentSwitchDialog(null);
+      setIsAgentPickerOpen(false);
+      return;
+    }
+    let cancelled = false;
+    setAgentError("");
+    // Keep an already-resolved same-workspace context while refreshing the
+    // agent picker. A different selected cwd cannot reuse it because the
+    // owner-cwd check below keeps TTS hidden until the new join resolves.
+    void Promise.all([fetchAgentProfiles(), fetchProjects()]).then(([profiles, projects]) => {
+      if (cancelled) return;
+      setAgentProfiles(profiles);
+      const cwd = activeSession.cwd.replace(/\/+$/, "") || "/";
+      setActiveProject(projects.find((project) => (project.cwd.replace(/\/+$/, "") || "/") === cwd) ?? null);
+    }).catch((error: unknown) => {
+      if (!cancelled) setAgentError(error instanceof Error ? error.message : String(error));
+    });
+    return () => { cancelled = true; };
+  }, [activeSession?.cwd, activeSessionId, isAgentPickerOpen]);
+
+  useEffect(() => {
+    setAgentSwitchDialog(null);
+    setIsAgentPickerOpen(false);
+    setIsAgentPreviewing(false);
+    setIsAgentSwitching(false);
+  }, [activeSessionId]);
+
+  useEffect(() => {
     if (!activeSessionId) {
       setSlashCommands(FALLBACK_SLASH_COMMANDS);
       return;
@@ -2177,7 +2412,9 @@ export function ChatPanel({
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptRef = useRef<number>(0);
   const activeSessionIdRef = useRef<string | null>(null);
+  const selectedSessionIdRef = useRef<string | null>(activeSessionId);
   const selectionIdRef = useRef<string | null>(null);
+  const selectionGenerationRef = useRef(0);
   const selectionStartedAtRef = useRef(0);
   const scrollAnchorRef = useRef<HTMLDivElement | null>(null);
   const activeTurnUserMessageRef = useRef<HTMLDivElement | null>(null);
@@ -2188,6 +2425,7 @@ export function ChatPanel({
   const connectingSessionIdRef = useRef<string | null>(null);
   const connectRef = useRef<() => void>(() => {});
   const wsAttemptIdRef = useRef(0);
+  const transportGenerationRef = useRef(0);
   const activeSessionErrorRef = useRef<string | null>(null);
   const activeSessionRuntimeStreamingRef = useRef(false);
   const isStreamingRef = useRef(false);
@@ -2195,11 +2433,16 @@ export function ChatPanel({
   const lastProgrammaticScrollAtRef = useRef(0);
   const queuedUserMessagesRef = useRef<QueuedUserMessage[]>([]);
   const deferredUserMessagesRef = useRef<ChatMessage[]>([]);
-  const streamingBlocksRef = useRef<StreamingBlocks>({ thinking: "", text: "", toolActivities: [] });
+  const streamingBlocksRef = useRef<StreamingBlocks>({ content: [] });
   const interviewQueueRef = useRef<QueuedInterview[]>([]);
   const isRestoringDraftRef = useRef(false);
   activeSessionErrorRef.current = activeSession?.error ?? null;
   activeSessionRuntimeStreamingRef.current = Boolean(activeSession?.runtime_is_streaming);
+
+  useLayoutEffect(() => {
+    selectedSessionIdRef.current = activeSessionId;
+    selectionGenerationRef.current += 1;
+  }, [activeSessionId]);
 
   useEffect(() => {
     isRestoringDraftRef.current = true;
@@ -2243,7 +2486,7 @@ export function ChatPanel({
 
   const hasActiveAssistantOutput = useCallback(() => {
     const blocks = streamingBlocksRef.current;
-    return isStreamingRef.current || Boolean(blocks.thinking || blocks.text || blocks.toolActivities.length > 0);
+    return isStreamingRef.current || blocks.content.length > 0;
   }, []);
 
   const insertAcceptedUsersAfterActiveStreaming = useCallback((userMessages: ChatMessage[]) => {
@@ -2258,8 +2501,8 @@ export function ChatPanel({
     });
     // Keep the agent running flag intact, but start a fresh live accumulator so
     // post-steering thinking/text/tool deltas render below the accepted user
-    // message instead of continuing the pre-message thinking block above it.
-    setStreamingBlocksSynced({ thinking: "", text: "", toolActivities: [] });
+    // message instead of continuing the pre-message content above it.
+    setStreamingBlocksSynced({ content: [] });
   }, [setStreamingBlocksSynced]);
 
   const appendRuntimeError = useCallback((message: string) => {
@@ -2458,6 +2701,7 @@ export function ChatPanel({
       }
 
       const attemptId = ++wsAttemptIdRef.current;
+      const transportGeneration = ++transportGenerationRef.current;
       const connectStart = performance.now();
       chatWsProfile("connect_start", { sessionId, selectionId: selectionIdRef.current, attemptId });
 
@@ -2516,6 +2760,19 @@ export function ChatPanel({
           return;
         }
 
+        if (msg.type === "session_runtime_state") {
+          if (
+            msg.session_id === selectedSessionIdRef.current
+            && msg.session_id === activeSessionIdRef.current
+            && msg.selection_id === selectionIdRef.current
+            && ws === wsRef.current
+            && transportGeneration === transportGenerationRef.current
+          ) {
+            setBashMode(isBashMode(msg.bash_mode) ? msg.bash_mode : "unavailable");
+          }
+          return;
+        }
+
         if (msg.type === "session_loading") {
           chatWsProfile("message_session_loading", {
             sessionId: msg.session_id,
@@ -2523,6 +2780,7 @@ export function ChatPanel({
             elapsedMs: Math.round(performance.now() - connectStart),
           });
           if (msg.session_id === activeSessionIdRef.current && msg.selection_id === selectionIdRef.current) {
+            setBashMode("unavailable");
             setWsStatus("connecting");
             setIsSessionHistoryLoading(true);
           }
@@ -2558,6 +2816,7 @@ export function ChatPanel({
             elapsedMs: Math.round(performance.now() - connectStart),
           });
           if (msg.session_id === activeSessionIdRef.current && msg.selection_id === selectionIdRef.current) {
+            setBashMode("unavailable");
             setWsStatus("disconnected");
             setIsSessionHistoryLoading(false);
             appendRuntimeError(String(msg.error || "Failed to load session"));
@@ -2570,6 +2829,12 @@ export function ChatPanel({
           if (msg.session_id !== activeSessionIdRef.current || msg.selection_id !== selectionIdRef.current) {
             chatWsProfile("stale_history_ignored", { sessionId: msg.session_id, selectionId: msg.selection_id });
             return;
+          }
+          if (msg.reason === "agent_settled_reconciliation") {
+            // Keep reconnect-era partial output visible until its authoritative
+            // settled snapshot is actually available, then replace it atomically
+            // with durable history rather than briefly rendering both copies.
+            setStreamingBlocksSynced({ content: [] });
           }
           const historyMessages: ChatMessage[] = Array.isArray(msg.messages)
             ? msg.messages
@@ -2640,49 +2905,33 @@ export function ChatPanel({
 
         // Handle streaming deltas
         if (msg.type === "text_delta") {
-          setStreamingBlocksSynced((prev) => ({
-            ...prev,
-            text: prev.text + (msg.delta || ""),
-          }));
+          setStreamingBlocksSynced((prev) => appendStreamingDelta(prev, "text", msg.delta || ""));
           return;
         }
 
         if (msg.type === "thinking_delta") {
-          setStreamingBlocksSynced((prev) => ({
-            ...prev,
-            thinking: prev.thinking + (msg.delta || ""),
-          }));
+          setStreamingBlocksSynced((prev) => appendStreamingDelta(prev, "thinking", msg.delta || ""));
           return;
         }
 
         // Tool execution
         if (msg.type === "tool_execution_start") {
-          setStreamingBlocksSynced((prev) => ({
-            ...prev,
-            toolActivities: [
-              ...prev.toolActivities,
-              {
-                kind: "use",
-                name: msg.tool_name || "unknown",
-                input: msg.input || {},
-              },
-            ],
+          setStreamingBlocksSynced((prev) => appendStreamingBlock(prev, {
+            type: "tool_use",
+            id: typeof msg.tool_call_id === "string" ? msg.tool_call_id : undefined,
+            name: msg.tool_name || "unknown",
+            input: msg.input || {},
           }));
           return;
         }
 
         if (msg.type === "tool_execution_end") {
-          setStreamingBlocksSynced((prev) => ({
-            ...prev,
-            toolActivities: [
-              ...prev.toolActivities,
-              {
-                kind: "result",
-                name: typeof msg.tool_name === "string" ? msg.tool_name : undefined,
-                content: msg.result,
-                isError: Boolean(msg.is_error),
-              },
-            ],
+          setStreamingBlocksSynced((prev) => appendStreamingBlock(prev, {
+            type: "tool_result",
+            id: typeof msg.tool_call_id === "string" ? msg.tool_call_id : undefined,
+            name: typeof msg.tool_name === "string" ? msg.tool_name : undefined,
+            content: msg.result,
+            is_error: Boolean(msg.is_error),
           }));
           return;
         }
@@ -2693,11 +2942,7 @@ export function ChatPanel({
           setResendingMessageId(null);
           isStreamingRef.current = true;
           setIsStreaming(true);
-          setStreamingBlocksSynced({
-            thinking: "",
-            text: "",
-            toolActivities: [],
-          });
+          setStreamingBlocksSynced({ content: [] });
           return;
         }
 
@@ -2726,7 +2971,29 @@ export function ChatPanel({
             setRuntimeError({ message: turnError, timestamp: Date.now() });
           }
 
-          setStreamingBlocksSynced({ thinking: "", text: "", toolActivities: [] });
+          setStreamingBlocksSynced({ content: [] });
+          // Pi can retry or compact after agent_end. Keep the top-level run
+          // active until agent_settled so a prompt sent in that interval stays
+          // queued instead of being inserted ahead of continuation output.
+          onSessionChange?.();
+          return;
+        }
+
+        if (msg.type === "compaction_start") {
+          setIsCompacting(true);
+          return;
+        }
+
+        if (msg.type === "compaction_end") {
+          setIsCompacting(false);
+          if (typeof msg.error === "string" && msg.error.trim()) {
+            appendRuntimeError(msg.error);
+          }
+          return;
+        }
+
+        if (msg.type === "agent_settled") {
+          setIsCompacting(false);
           isStreamingRef.current = false;
           pinActiveTurnScrollRef.current = false;
           setActiveTurnScrollAnchorText(null);
@@ -2952,9 +3219,11 @@ export function ChatPanel({
           reason: ev.reason,
           elapsedMs: Math.round(performance.now() - connectStart),
         });
+        const closedCurrentTransport = wsRef.current === ws;
         wsRef.current = null;
         wsConnectedRef.current = false;
         connectingSessionIdRef.current = null;
+        if (closedCurrentTransport) setBashMode("unavailable");
         setWsStatus("disconnected");
         setInterviewQueueSynced((current) => current.map((item) => (
           item.submission && item.submission.state === "submitting"
@@ -2975,6 +3244,7 @@ export function ChatPanel({
       };
 
       ws.onerror = () => {
+        if (wsRef.current === ws) setBashMode("unavailable");
         chatWsProfile("socket_error", {
           sessionId,
           attemptId,
@@ -2991,7 +3261,6 @@ export function ChatPanel({
         reconnectTimerRef.current = null;
       }
       reconnectAttemptRef.current = 0;
-
       const ws = wsRef.current;
       wsRef.current = null;
       wsConnectedRef.current = false;
@@ -3014,16 +3283,18 @@ export function ChatPanel({
   // On session change
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
+    const selectionGeneration = selectionGenerationRef.current;
     const selectionId = activeSessionId ? createSelectionId() : null;
     selectionIdRef.current = selectionId;
     selectionStartedAtRef.current = performance.now();
-    chatWsProfile("selection_started", { activeSessionId, selectionId });
+    chatWsProfile("selection_started", { activeSessionId, selectionId, selectionGeneration });
     chatWsProfile("active_session_effect", {
       activeSessionId,
       hasSocket: Boolean(wsRef.current),
       socketReadyState: wsRef.current?.readyState,
       wsConnected: wsConnectedRef.current,
     });
+    setBashMode("unavailable");
     if (!activeSessionId) {
       setMessagesOwnerSessionId(null);
       setMessages([]);
@@ -3066,13 +3337,10 @@ export function ChatPanel({
     setTodoState({ todos: [], source: "none" });
     setIsTodoPanelOpen(false);
     setContextUsage(null);
+    setIsCompacting(false);
     setCommandGuardState(null);
     setCommandGuardSaving(false);
-    setStreamingBlocksSynced({
-      thinking: "",
-      text: "",
-      toolActivities: [],
-    });
+    setStreamingBlocksSynced({ content: [] });
 
     if (hasOpenSocket) {
       chatWsProfile("send_switch_session", {
@@ -3155,6 +3423,66 @@ export function ChatPanel({
     [activeSessionId, onSessionChange, onSessionUpdate, selectedModelValue, sendWs],
   );
 
+  const handleAgentPreview = useCallback(async (profile: AgentProfileSummary) => {
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId || profile.id === effectiveAgentProfileId) {
+      setIsAgentPickerOpen(false);
+      return;
+    }
+    setIsAgentPickerOpen(false);
+    setIsModelPickerOpen(false);
+    setAgentError("");
+    setIsAgentPreviewing(true);
+    setAgentSwitchDialog({
+      sessionId,
+      targetProfileId: profile.id,
+      targetName: profile.name,
+      preview: null,
+      error: "",
+    });
+    try {
+      const preview = await previewSessionAgentSwitch(sessionId, profile.id);
+      if (activeSessionIdRef.current !== sessionId) return;
+      setAgentSwitchDialog((current) => current?.sessionId === sessionId && current.targetProfileId === profile.id
+        ? { ...current, preview, error: "" }
+        : current);
+    } catch (error) {
+      if (activeSessionIdRef.current !== sessionId) return;
+      const message = error instanceof Error ? error.message : String(error);
+      setAgentSwitchDialog((current) => current?.sessionId === sessionId && current.targetProfileId === profile.id
+        ? { ...current, error: message }
+        : current);
+    } finally {
+      if (activeSessionIdRef.current === sessionId) setIsAgentPreviewing(false);
+    }
+  }, [effectiveAgentProfileId]);
+
+  const handleAgentSwitchConfirm = useCallback(async () => {
+    const pending = agentSwitchDialog;
+    if (!pending?.preview || isAgentSwitching) return;
+    setIsAgentSwitching(true);
+    setAgentSwitchDialog((current) => current ? { ...current, error: "" } : current);
+    try {
+      const result = await switchSessionAgent(pending.sessionId, pending.targetProfileId);
+      if (activeSessionIdRef.current === pending.sessionId) {
+        // The backend's agent_switched runtime event reattaches this durable
+        // WebSocket and sends fresh history with the same selection id. Keep
+        // composer, attachment, and browser draft state untouched here.
+        onSessionUpdate?.(result.session);
+      }
+      onSessionChange?.();
+      setAgentSwitchDialog(null);
+      setAgentError("");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setAgentSwitchDialog((current) => current?.sessionId === pending.sessionId
+        ? { ...current, error: message }
+        : current);
+    } finally {
+      setIsAgentSwitching(false);
+    }
+  }, [agentSwitchDialog, isAgentSwitching, onSessionChange, onSessionUpdate]);
+
   const addAttachmentFiles = useCallback(async (files: File[] | FileList) => {
     const incomingFiles = Array.from(files);
     if (incomingFiles.length === 0) return;
@@ -3227,7 +3555,7 @@ export function ChatPanel({
   const handleSend = useCallback(async () => {
     const trimmed = inputText.trim();
     const attachments = pendingAttachments;
-    if ((!trimmed && attachments.length === 0) || wsStatus !== "connected" || !activeSessionId) return;
+    if (isCompacting || (!trimmed && attachments.length === 0) || wsStatus !== "connected" || !activeSessionId) return;
 
     clearRuntimeError();
     const isFirstMessage = messages.length === 0;
@@ -3287,6 +3615,7 @@ export function ChatPanel({
   }, [
     inputText,
     pendingAttachments,
+    isCompacting,
     wsStatus,
     sendWs,
     activeSessionId,
@@ -3303,7 +3632,7 @@ export function ChatPanel({
 
     clearRuntimeError();
     clearQueuedAndDeferredUserMessages();
-    setStreamingBlocksSynced({ thinking: "", text: "", toolActivities: [] });
+    setStreamingBlocksSynced({ content: [] });
     isStreamingRef.current = false;
     setIsStreaming(false);
     pinActiveTurnScrollRef.current = false;
@@ -3603,6 +3932,16 @@ export function ChatPanel({
     }
   })();
 
+  const allowedAgentIds = activeProject?.access_policy.allowed_agent_profile_ids ?? null;
+  const availableAgentProfiles = agentProfiles.filter((profile) => (
+    profile.enabled && (!allowedAgentIds || allowedAgentIds.includes(profile.id))
+  ));
+  const currentAgentProfile = agentProfiles.find((profile) => profile.id === effectiveAgentProfileId) ?? null;
+  const currentAgentLabel = currentAgentProfile?.name ?? (effectiveAgentProfileId ? "Unknown agent" : "Project default");
+  // TTS authorization is backend-owned. Display names and profile labels never
+  // determine whether a runtime may use it; rejected calls surface normally.
+  const ttsAllowed = true;
+
   const selectedModelKnown =
     !selectedModelValue ||
     modelOptions.some(
@@ -3640,14 +3979,9 @@ export function ChatPanel({
       : `Command guard: ${commandGuardMode}${commandGuardState?.source ? ` (${commandGuardState.source})` : ""}${commandGuardRoute}`);
 
   // Streaming content for live rendering
-  const hasStreamingContent = Boolean(
-    streamingBlocks.thinking ||
-    streamingBlocks.text ||
-    streamingBlocks.toolActivities.length > 0,
-  );
-  const isAgentRunning = isStreaming || hasStreamingContent;
+  const hasStreamingContent = streamingBlocks.content.length > 0;
+  const isAgentRunning = isStreaming || hasStreamingContent || isCompacting;
   const isTranscriptLoading = !transcriptOwnedBySelection || isSessionHistoryLoading || wsStatus === "connecting";
-
   // ------------------------------------------------------------------
   // Render
   // ------------------------------------------------------------------
@@ -3696,7 +4030,55 @@ export function ChatPanel({
           </button>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => {
+                if (isAgentRunning || isAgentSwitching) return;
+                setIsModelPickerOpen(false);
+                setIsAgentPickerOpen((open) => !open);
+              }}
+              disabled={isAgentRunning || isAgentSwitching || availableAgentProfiles.length === 0}
+              aria-haspopup="listbox"
+              aria-expanded={isAgentPickerOpen}
+              title={agentError || "Agent identity and runtime policy for future turns"}
+              className={`max-w-28 truncate rounded-full border bg-neutral-900 px-2 py-0.5 text-left text-xs outline-none hover:border-neutral-600 focus:border-blue-600 disabled:cursor-not-allowed disabled:opacity-60 sm:max-w-44 ${agentError ? "border-red-900/70 text-red-300" : "border-neutral-700 text-neutral-200"}`}
+            >
+              {activeProject?.access_policy.privacy_mode === "protected" ? "🔒 " : ""}{currentAgentLabel}
+            </button>
+            {isAgentPickerOpen && (
+              <div className="absolute right-0 top-7 z-50 w-72 max-w-[calc(100vw-2rem)] overflow-hidden rounded-lg border border-neutral-700 bg-neutral-950 shadow-2xl">
+                <div className="border-b border-neutral-800 px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-neutral-500">
+                  Switch agent
+                </div>
+                <div role="listbox" aria-label="Allowed agent profiles" className="max-h-72 overflow-y-auto p-1">
+                  {availableAgentProfiles.map((profile) => {
+                    const selected = profile.id === effectiveAgentProfileId;
+                    return (
+                      <button
+                        key={profile.id}
+                        type="button"
+                        role="option"
+                        aria-selected={selected}
+                        disabled={selected}
+                        onClick={() => void handleAgentPreview(profile)}
+                        className={`block w-full rounded px-2 py-2 text-left disabled:cursor-default ${selected ? "bg-blue-950/60 text-blue-200" : "text-neutral-200 hover:bg-neutral-800"}`}
+                      >
+                        <span className="block truncate text-xs font-medium">{profile.name}{selected ? " — current" : ""}</span>
+                        <span className="block truncate text-[10px] text-neutral-500">
+                          Memory: {profile.memory_access === "read_write" ? "read/write" : profile.memory_access === "read" ? "read only" : "none"}
+                        </span>
+                      </button>
+                    );
+                  })}
+                  {availableAgentProfiles.length <= 1 && (
+                    <p className="px-2 py-3 text-xs leading-relaxed text-neutral-500">No other enabled agent is allowed for this project.</p>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
           <button
             type="button"
             onClick={handleCommandGuardToggle}
@@ -3730,6 +4112,7 @@ export function ChatPanel({
                 type="button"
                 onClick={() => {
                   if (isAgentRunning || isModelSaving) return;
+                  setIsAgentPickerOpen(false);
                   setModelQuery("");
                   setIsModelPickerOpen((open) => !open);
                 }}
@@ -3868,10 +4251,11 @@ export function ChatPanel({
           )}
           <div className="flex items-center gap-1.5 text-xs text-neutral-500">
             <div className={`w-2 h-2 rounded-full ${statusDot}`} />
-            <span className="font-mono">{wsStatus}</span>
+            <span className="font-mono">{isCompacting ? "compacting" : wsStatus}</span>
           </div>
         </div>
         </div>
+        <BashModeStatus mode={bashMode} />
         {visibleTodos.length > 0 && (
           <div className="flex min-w-0 items-center gap-2 pl-0 sm:pl-0">
             <TodoStatusPanel
@@ -3980,6 +4364,7 @@ export function ChatPanel({
                   resendingMessageId,
                   onResendUserMessage: handleResendMessage,
                   sessionId: activeSessionId,
+                  ttsAllowed,
                 })}
               </div>
             );
@@ -3992,6 +4377,7 @@ export function ChatPanel({
               resendingMessageId={resendingMessageId}
               onResendUserMessage={handleResendMessage}
               sessionId={activeSessionId}
+              ttsAllowed={ttsAllowed}
             />
           );
         })}
@@ -4003,15 +4389,7 @@ export function ChatPanel({
               Streaming...
             </div>
             <div className="space-y-2">
-              {streamingBlocks.thinking && (
-                renderThinkingBlock(streamingBlocks.thinking)
-              )}
-              {streamingBlocks.text && (
-                renderTextBlock(streamingBlocks.text)
-              )}
-              {streamingBlocks.toolActivities.length > 0 && (
-                renderToolActivityGroup(streamingBlocks.toolActivities)
-              )}
+              {renderAssistantContentBlocks(streamingBlocks.content)}
             </div>
           </div>
         )}
@@ -4250,13 +4628,26 @@ export function ChatPanel({
                 ? "bg-amber-700 hover:bg-amber-600"
                 : "bg-blue-700 hover:bg-blue-600"
             }`}
-            disabled={(!inputText.trim() && pendingAttachments.length === 0) || wsStatus !== "connected"}
+            disabled={isCompacting || (!inputText.trim() && pendingAttachments.length === 0) || wsStatus !== "connected"}
             onClick={handleSend}
           >
             {isAgentRunning ? "Queue" : "Send"}
           </button>
         </div>
       </div>
+
+      {agentSwitchDialog && (
+        <AgentSwitchDialog
+          state={agentSwitchDialog}
+          previewing={isAgentPreviewing}
+          switching={isAgentSwitching}
+          onCancel={() => {
+            if (!isAgentSwitching) setAgentSwitchDialog(null);
+          }}
+          onConfirm={() => void handleAgentSwitchConfirm()}
+        />
+      )}
+
     </section>
   );
 }

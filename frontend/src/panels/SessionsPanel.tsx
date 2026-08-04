@@ -4,12 +4,15 @@ import {
   ChevronDown,
   CalendarClock,
   ChevronRight,
+  ShieldCheck,
   Filter,
   Folder,
   FolderOpen,
   Loader2,
+  Lock,
   Plus,
   Search,
+  Settings,
   Square,
   Trash2,
   X,
@@ -20,18 +23,22 @@ import {
   archiveSession,
   canRetryAuthenticatedTransport,
   deleteSession,
+  fetchProjects,
+  listProtectedAutomations,
   listScheduledAgentJobs,
   listSessions,
-  groupSessionsIntoProjects,
+  joinSessionsIntoProjects,
   searchSessions,
   stopSession,
   updateSessionTitle,
   type Project,
+  type ProtectedAutomationCatalog,
   type ScheduledAgentJob,
   type Session,
   type SessionSearchFilters,
   type SessionSearchResponse,
   type SessionSearchResult,
+  type WorkspaceProject,
 } from "../api/client";
 import { formatRelativeTime } from "../utils/time";
 import { SessionResultSnippet } from "../components/SessionResultSnippet";
@@ -43,6 +50,7 @@ interface SessionsPanelProps {
   active: boolean;
   activeProjectCwd: string | null;
   activeScheduledJobId?: string | null;
+  activeProtectedAutomationJobId?: string | null;
   onSelect: (session: Session) => void;
   /**
    * Same as `onSelect`, but also passes the pi `message_id` we matched on so
@@ -52,7 +60,9 @@ interface SessionsPanelProps {
   onSelectSearchResult?: (session: Session, messageId: string | null) => void;
   onSelectProject: (cwd: string) => void;
   onNewSessionForProject?: (cwd: string) => Promise<void> | void;
+  onOpenProjectSettings?: (cwd: string) => void;
   onSelectScheduledJob?: (jobId: string | null) => void;
+  onSelectProtectedAutomation?: (jobId: string | null) => void;
   onArchiveActive?: () => void;
   refreshTrigger?: number;
   onNewSession?: () => void;
@@ -84,11 +94,14 @@ function sessionListsEqual(a: Session[], b: Session[]): boolean {
       left.id !== right.id || left.title !== right.title || left.cwd !== right.cwd
       || left.last_active !== right.last_active || left.archived !== right.archived
       || left.model !== right.model || left.provider !== right.provider
+      || left.agent_profile_id !== right.agent_profile_id
+      || left.pending_agent_switch?.switch_id !== right.pending_agent_switch?.switch_id
       || left.goal !== right.goal || left.goal_status !== right.goal_status
       || left.error !== right.error || left.runtime_status !== right.runtime_status
       || left.runtime_is_streaming !== right.runtime_is_streaming
       || left.runtime_subscriber_count !== right.runtime_subscriber_count
       || left.runtime_last_activity_at !== right.runtime_last_activity_at
+      || left.bash_mode !== right.bash_mode
     ) return false;
   }
   return true;
@@ -115,17 +128,27 @@ export function SessionsPanel({
   active,
   activeProjectCwd,
   activeScheduledJobId,
+  activeProtectedAutomationJobId,
   onSelect,
   onSelectSearchResult,
   onSelectProject,
   onNewSessionForProject,
+  onOpenProjectSettings,
   onSelectScheduledJob,
+  onSelectProtectedAutomation,
   onArchiveActive,
   refreshTrigger,
   onNewSession,
 }: SessionsPanelProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [durableProjects, setDurableProjects] = useState<WorkspaceProject[]>([]);
   const [scheduledJobs, setScheduledJobs] = useState<ScheduledAgentJob[]>([]);
+  const [protectedAutomations, setProtectedAutomations] = useState<ProtectedAutomationCatalog>({
+    status: { milestone: 0, activationAvailable: false, production_services: false },
+    jobs: [],
+  });
+  const [protectedAutomationsLoading, setProtectedAutomationsLoading] = useState(true);
+  const [protectedAutomationsUnavailable, setProtectedAutomationsUnavailable] = useState(false);
   const [loadState, setLoadState] = useState<LoadState>("loading");
   const [errorMsg, setErrorMsg] = useState("");
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(
@@ -159,7 +182,10 @@ export function SessionsPanel({
     () => (showScheduledProjectRuns ? sessions : sessions.filter((s) => !isScheduledRunSession(s))),
     [sessions, showScheduledProjectRuns],
   );
-  const projects = useMemo(() => groupSessionsIntoProjects(projectListSessions), [projectListSessions]);
+  const projects = useMemo(
+    () => joinSessionsIntoProjects(projectListSessions, durableProjects),
+    [durableProjects, projectListSessions],
+  );
   const hiddenScheduledProjectRuns = sessions.length - projectListSessions.length;
   const hiddenScheduledRunsByCwd = useMemo(() => {
     const counts = new Map<string, number>();
@@ -201,6 +227,11 @@ export function SessionsPanel({
           const normalized = Array.isArray(list) ? list : [];
           setSessions((previous) => sessionListsEqual(previous, normalized) ? previous : normalized);
           setLoadState("ready");
+          // Project metadata is independent from the session catalog. A
+          // transient settings failure must not blank session navigation.
+          void fetchProjects().then((rows) => {
+            if (!controller.signal.aborted) setDurableProjects(rows);
+          }).catch(() => {});
         } catch (err) {
           if (controller.signal.aborted) return;
           setLoadState((prev) => (prev === "ready" ? prev : "error"));
@@ -228,21 +259,41 @@ export function SessionsPanel({
     }
   }, []);
 
+  const automationsRefreshInFlightRef = useRef(false);
+  const refreshProtectedAutomations = useCallback(async () => {
+    if (!activeRef.current || document.visibilityState === "hidden" || automationsRefreshInFlightRef.current) return;
+    automationsRefreshInFlightRef.current = true;
+    try {
+      setProtectedAutomations(await listProtectedAutomations());
+      setProtectedAutomationsUnavailable(false);
+    } catch {
+      setProtectedAutomations((previous) => ({ ...previous, jobs: [] }));
+      setProtectedAutomationsUnavailable(true);
+    } finally {
+      setProtectedAutomationsLoading(false);
+      automationsRefreshInFlightRef.current = false;
+    }
+  }, []);
+
   useEffect(() => {
     if (active) {
       void refresh();
       void refreshJobs();
+      void refreshProtectedAutomations();
     } else {
       refreshAbortRef.current?.abort();
     }
-  }, [active, refresh, refreshJobs]);
+  }, [active, refresh, refreshJobs, refreshProtectedAutomations]);
 
   useEffect(() => {
     if (refreshTrigger !== undefined && refreshTrigger > 0) {
       refreshPendingRef.current = true;
-      if (active) void refresh();
+      if (active) {
+        void refresh();
+        void refreshProtectedAutomations();
+      }
     }
-  }, [active, refreshTrigger, refresh]);
+  }, [active, refreshTrigger, refresh, refreshProtectedAutomations]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -258,6 +309,7 @@ export function SessionsPanel({
       if (active && document.visibilityState === "visible") {
         void refresh();
         void refreshJobs();
+        void refreshProtectedAutomations();
       }
     };
     document.addEventListener("visibilitychange", onVisibility);
@@ -276,6 +328,7 @@ export function SessionsPanel({
       if (document.visibilityState === "visible") {
         void refresh();
         void refreshJobs();
+        void refreshProtectedAutomations();
       }
     }, 60_000);
     return () => {
@@ -283,7 +336,7 @@ export function SessionsPanel({
       events.close();
       window.clearInterval(id);
     };
-  }, [active, refresh, refreshJobs]);
+  }, [active, refresh, refreshJobs, refreshProtectedAutomations]);
 
   // ----- Debounced server-side search -----------------------------------
   const searchSeqRef = useRef(0);
@@ -368,6 +421,8 @@ export function SessionsPanel({
         cwd: result.cwd,
         provider: null,
         model: result.model,
+        agent_profile_id: null,
+        pending_agent_switch: null,
         created_at: result.last_active,
         last_active: result.last_active,
         archived: result.archived ? 1 : 0,
@@ -380,6 +435,8 @@ export function SessionsPanel({
         runtime_is_streaming: false,
         runtime_subscriber_count: 0,
         runtime_last_activity_at: null,
+        bash_mode: "unavailable",
+        browser_mode: "unavailable",
       };
       if (onSelectSearchResult) {
         onSelectSearchResult(placeholder, result.best_message_id ?? null);
@@ -671,8 +728,16 @@ export function SessionsPanel({
       <div className="flex-1 overflow-y-auto">
         <ScheduledJobsSection
           jobs={scheduledJobs}
+          projects={durableProjects}
           activeJobId={activeScheduledJobId ?? null}
           onSelectJob={onSelectScheduledJob}
+        />
+        <ProtectedAutomationsSection
+          catalog={protectedAutomations}
+          loading={protectedAutomationsLoading}
+          unavailable={protectedAutomationsUnavailable}
+          activeJobId={activeProtectedAutomationJobId ?? null}
+          onSelectJob={onSelectProtectedAutomation}
         />
 
         {loadState === "loading" && (
@@ -749,6 +814,9 @@ export function SessionsPanel({
                         ? () => void handleCreateSessionForProject(project.cwd)
                         : undefined
                     }
+                    onSettings={project.id && onOpenProjectSettings
+                      ? () => onOpenProjectSettings(project.cwd)
+                      : undefined}
                   />
 
                   {isExpanded &&
@@ -896,6 +964,8 @@ function SearchResultRow({
       type="button"
       onClick={() => onSelect(result)}
       data-testid="session-search-result"
+      data-session-id={result.session_id}
+      aria-current={active ? "page" : undefined}
       className={
         "group relative block w-full pl-8 pr-4 py-1.5 text-left transition-colors " +
         (active
@@ -931,8 +1001,76 @@ function SearchResultRow({
   );
 }
 
-function ScheduledJobsSection({ jobs, activeJobId, onSelectJob }: {
+function ProtectedAutomationsSection({ catalog, loading, unavailable, activeJobId, onSelectJob }: {
+  catalog: ProtectedAutomationCatalog;
+  loading: boolean;
+  unavailable: boolean;
+  activeJobId: string | null;
+  onSelectJob?: (jobId: string | null) => void;
+}) {
+  const jobs = Array.isArray(catalog.jobs) ? catalog.jobs : [];
+  const productionAvailable = catalog.status?.production_services === true;
+  const held = catalog.status?.activationAvailable === false;
+  return (
+    <section data-testid="protected-automations-navigation" className="border-b border-neutral-900 py-2">
+      <button
+        type="button"
+        data-testid="protected-automations-open"
+        onClick={() => onSelectJob?.(null)}
+        className="flex w-full items-center justify-between gap-2 px-3 py-1 text-left hover:bg-neutral-900"
+      >
+        <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-violet-300">
+          <ShieldCheck size={13} /> Protected Automations
+        </span>
+        <span className={`text-[10px] ${loading ? "text-neutral-600" : unavailable || held ? "text-amber-400" : "text-emerald-500"}`}>
+          {loading ? "loading" : unavailable ? "unavailable" : held ? "held" : productionAvailable ? "available" : "unavailable"}
+        </span>
+      </button>
+      {!loading && (unavailable || held) && (
+        <button
+          type="button"
+          data-testid={unavailable ? "protected-automations-nav-unavailable" : "protected-automations-nav-held"}
+          onClick={() => onSelectJob?.(null)}
+          className="block w-full px-3 py-1.5 text-left text-xs leading-relaxed text-amber-300/70 hover:bg-neutral-900"
+        >
+          {unavailable ? "Production integration unavailable" : "Activation held · owner emergency controls only"}
+        </button>
+      )}
+      {!loading && !unavailable && jobs.length === 0 && (
+        <button type="button" onClick={() => onSelectJob?.(null)} className="block w-full px-3 py-1.5 text-left text-xs text-neutral-600 hover:bg-neutral-900 hover:text-neutral-400">
+          No captured jobs
+        </button>
+      )}
+      {!loading && !unavailable && jobs.length > 0 && (
+        <div className="mt-1">
+          {jobs.slice(0, 8).map((job) => (
+            <button
+              key={job.id}
+              type="button"
+              data-testid="protected-automation-nav-job"
+              data-job-id={job.id}
+              onClick={() => onSelectJob?.(job.id)}
+              className={`block w-full px-3 py-1.5 text-left transition-colors ${job.id === activeJobId ? "bg-neutral-800 text-neutral-100" : "text-neutral-300 hover:bg-neutral-900"}`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="truncate text-xs font-medium">{job.name}</span>
+                <span className={`shrink-0 text-[10px] ${job.attention ? "text-sky-300" : job.deleted_at !== null || job.blocked_reason ? "text-amber-400" : job.enabled ? "text-emerald-500" : "text-neutral-600"}`}>
+                  {job.deleted_at !== null ? "tombstoned" : job.attention ? "attention" : job.blocked_reason === "paused" ? "paused" : job.blocked_reason ? "blocked" : job.enabled ? "enabled" : "paused"}
+                </span>
+              </div>
+              <div className="truncate font-mono text-[10px] text-neutral-600">{job.cron_expr}</div>
+            </button>
+          ))}
+          {jobs.length > 8 && <div className="px-3 py-1 text-[10px] text-neutral-600">+{jobs.length - 8} more</div>}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ScheduledJobsSection({ jobs, projects, activeJobId, onSelectJob }: {
   jobs: ScheduledAgentJob[];
+  projects: WorkspaceProject[];
   activeJobId: string | null;
   onSelectJob?: (jobId: string | null) => void;
 }) {
@@ -962,26 +1100,33 @@ function ScheduledJobsSection({ jobs, activeJobId, onSelectJob }: {
         </button>
       ) : (
         <div className="mt-1">
-          {safeJobs.slice(0, 8).map((job) => (
-            <button
-              key={job.id}
-              type="button"
-              onClick={() => onSelectJob?.(job.id)}
-              className={
-                "block w-full px-3 py-1.5 text-left transition-colors " +
-                (job.id === activeJobId ? "bg-neutral-800 text-neutral-100" : "text-neutral-300 hover:bg-neutral-900")
-              }
-              title={`${job.cron_expr} · ${job.cwd}`}
-            >
-              <div className="flex items-center justify-between gap-2">
-                <span className="truncate text-xs font-medium">{job.name}</span>
-                <span className={job.enabled ? "text-[10px] text-emerald-500" : "text-[10px] text-neutral-600"}>
-                  {job.enabled ? "on" : "off"}
-                </span>
-              </div>
-              <div className="truncate font-mono text-[10px] text-neutral-600">{job.cron_expr}</div>
-            </button>
-          ))}
+          {safeJobs.slice(0, 8).map((job) => {
+            const cwd = job.cwd.replace(/\/+$/, "") || "/";
+            const blocked = projects.some((project) => (
+              (project.cwd.replace(/\/+$/, "") || "/") === cwd
+              && project.access_policy.privacy_mode === "protected"
+            ));
+            return (
+              <button
+                key={job.id}
+                type="button"
+                onClick={() => onSelectJob?.(job.id)}
+                className={
+                  "block w-full px-3 py-1.5 text-left transition-colors " +
+                  (job.id === activeJobId ? "bg-neutral-800 text-neutral-100" : "text-neutral-300 hover:bg-neutral-900")
+                }
+                title={blocked ? "Retained job; cannot run while its project is Protected" : `${job.cron_expr} · ${job.cwd}`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate text-xs font-medium">{job.name}</span>
+                  <span className={blocked ? "inline-flex items-center gap-0.5 text-[10px] text-amber-400" : job.enabled ? "text-[10px] text-emerald-500" : "text-[10px] text-neutral-600"}>
+                    {blocked && <Lock size={9} />}{blocked ? "blocked" : job.enabled ? "on" : "off"}
+                  </span>
+                </div>
+                <div className="truncate font-mono text-[10px] text-neutral-600">{job.cron_expr}</div>
+              </button>
+            );
+          })}
           {safeJobs.length > 8 && <div className="px-3 py-1 text-[10px] text-neutral-600">+{safeJobs.length - 8} more</div>}
         </div>
       )}
@@ -998,6 +1143,7 @@ interface ProjectHeaderProps {
   onShowScheduledRuns?: () => void;
   onToggle: () => void;
   onNewSession?: () => void;
+  onSettings?: () => void;
 }
 
 function ProjectHeader({
@@ -1009,6 +1155,7 @@ function ProjectHeader({
   onShowScheduledRuns,
   onToggle,
   onNewSession,
+  onSettings,
 }: ProjectHeaderProps) {
   const Chevron = expanded ? ChevronDown : ChevronRight;
   const FolderIcon = expanded ? FolderOpen : Folder;
@@ -1025,10 +1172,18 @@ function ProjectHeader({
       title={project.cwd}
     >
       <Chevron size={12} className="shrink-0 text-neutral-500" />
+      <span
+        className="h-2 w-2 shrink-0 rounded-full border border-white/10"
+        style={{ backgroundColor: project.color ?? "#525252" }}
+        aria-hidden="true"
+      />
       <FolderIcon size={14} className="shrink-0 text-neutral-400" />
       <div className="min-w-0 flex-1">
-        <span className="truncate text-sm font-medium block">
-          {project.name}
+        <span className="flex items-center gap-1 truncate text-sm font-medium">
+          <span className="truncate">{project.name}</span>
+          {project.access_policy.privacy_mode === "protected" && (
+            <Lock size={11} className="shrink-0 text-amber-400" aria-label="Protected project" />
+          )}
         </span>
       </div>
       <span className="text-[10px] text-neutral-600 shrink-0">
@@ -1047,6 +1202,20 @@ function ProjectHeader({
         >
           <CalendarClock size={10} />
           {hiddenScheduledCount}
+        </button>
+      )}
+      {onSettings && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onSettings();
+          }}
+          className="rounded p-1 text-neutral-500 opacity-70 transition-colors hover:bg-neutral-800 hover:text-neutral-100 focus:opacity-100 focus:outline-none focus:ring-1 focus:ring-neutral-600 group-hover:opacity-100"
+          title={`Settings for ${project.name}`}
+          aria-label={`Settings for ${project.name}`}
+        >
+          <Settings size={13} />
         </button>
       )}
       {onNewSession && (
@@ -1122,6 +1291,7 @@ function DeleteSessionDialog({
             Command guard identity PIN
             <input
               type="password"
+              data-testid="delete-session-pin"
               inputMode="numeric"
               pattern="[0-9]{8}"
               maxLength={8}
@@ -1146,6 +1316,7 @@ function DeleteSessionDialog({
           </button>
           <button
             type="submit"
+            data-testid="delete-session-confirm"
             disabled={submitting || pin.length !== 8}
             className="inline-flex items-center gap-2 rounded bg-red-700 px-3 py-2 text-xs font-semibold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -1213,6 +1384,9 @@ function SessionRow({
 
   return (
     <div
+      data-testid="session-row"
+      data-session-id={session.id}
+      aria-current={active ? "page" : undefined}
       className={
         "group relative flex items-start gap-2 pl-8 pr-4 py-1.5 cursor-pointer transition-colors " +
         (active

@@ -9,12 +9,15 @@ import {
   createOpenInterview,
   getInterviewForSession,
   listOpenInterviews,
-  markDelivered,
   type CreateOpenInterviewInput,
   type InterviewAnswer,
   type InterviewQuestion,
   type InterviewRecord,
 } from "./interviews.js";
+import {
+  WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL,
+  WAYANG_WEBSOCKET_SUBMISSION_CHANNEL,
+} from "./interview-provenance.js";
 
 export type { InterviewAnswer, InterviewQuestion } from "./interviews.js";
 
@@ -26,7 +29,12 @@ export interface InterviewRequest {
 }
 
 export type InterviewWaitOutcome =
-  | { status: "submitted"; request: InterviewRequest; answers: InterviewAnswer[] }
+  | {
+    status: "submitted";
+    request: InterviewRequest;
+    submission: { submissionId: string };
+    answers: InterviewAnswer[];
+  }
   | { status: "pending"; request: InterviewRequest }
   | { status: "cancelled"; request: InterviewRequest };
 
@@ -46,6 +54,14 @@ interface PendingInterview {
 
 type RequestCallback = (req: InterviewRequest) => void;
 
+interface InterviewBridgeStore {
+  getInterviewForSession: typeof getInterviewForSession;
+}
+
+const DEFAULT_INTERVIEW_BRIDGE_STORE: InterviewBridgeStore = {
+  getInterviewForSession,
+};
+
 function requestFrom(record: InterviewRecord): InterviewRequest {
   return {
     requestId: record.request_id,
@@ -58,6 +74,9 @@ function requestFrom(record: InterviewRecord): InterviewRequest {
 export class PiInterviewBridge {
   private pending = new Map<string, PendingInterview>();
   private listeners = new Set<RequestCallback>();
+  private toolResultHandoffs = new Map<string, string>();
+
+  constructor(private readonly store: InterviewBridgeStore = DEFAULT_INTERVIEW_BRIDGE_STORE) {}
 
   /**
    * Durable request API for updated extensions. On grace expiry the request
@@ -107,12 +126,39 @@ export class PiInterviewBridge {
   /** Resolve exactly the live waiter for a durably accepted submission. */
   resolveSubmitted(record: InterviewRecord): boolean {
     const pending = this.pending.get(record.request_id);
-    if (!pending || pending.request.sessionId !== record.session_id || !record.answers) return false;
+    if (!pending || pending.request.sessionId !== record.session_id || !record.submission_id) return false;
+
+    const authoritative = this.store.getInterviewForSession(pending.request.sessionId, pending.request.requestId);
+    if (
+      !authoritative
+      || authoritative.status !== "submitted"
+      || authoritative.submission_id !== record.submission_id
+      || authoritative.submission_channel !== WAYANG_WEBSOCKET_SUBMISSION_CHANNEL
+      || authoritative.authenticated_principal !== WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL
+      || !authoritative.answers
+    ) return false;
+
+    // Keep the record submitted until the exact matching Pi tool-result entry
+    // is visible in the persisted branch. A crash before then remains
+    // recoverable through delayed custom-message delivery.
+    this.toolResultHandoffs.set(authoritative.request_id, authoritative.session_id);
     clearTimeout(pending.timer);
-    this.pending.delete(record.request_id);
-    markDelivered(record.request_id, "tool_result");
-    pending.resolve({ status: "submitted", request: pending.request, answers: record.answers });
+    this.pending.delete(authoritative.request_id);
+    pending.resolve({
+      status: "submitted",
+      request: pending.request,
+      submission: { submissionId: authoritative.submission_id },
+      answers: authoritative.answers,
+    });
     return true;
+  }
+
+  hasToolResultHandoff(sessionId: string, requestId: string): boolean {
+    return this.toolResultHandoffs.get(requestId) === sessionId;
+  }
+
+  completeToolResultHandoff(sessionId: string, requestId: string): void {
+    if (this.toolResultHandoffs.get(requestId) === sessionId) this.toolResultHandoffs.delete(requestId);
   }
 
   /** Explicit cancellation is terminal only while the original waiter is live. */
@@ -133,6 +179,9 @@ export class PiInterviewBridge {
       this.pending.delete(id);
       pending.resolve({ status: "cancelled", request: pending.request });
     }
+    for (const [requestId, ownerSessionId] of this.toolResultHandoffs) {
+      if (ownerSessionId === sessionId) this.toolResultHandoffs.delete(requestId);
+    }
   }
 
   onRequest(callback: RequestCallback): () => void {
@@ -146,7 +195,7 @@ export class PiInterviewBridge {
   }
 
   getRequest(sessionId: string, requestId: string): InterviewRequest | undefined {
-    const record = getInterviewForSession(sessionId, requestId);
+    const record = this.store.getInterviewForSession(sessionId, requestId);
     return record ? requestFrom(record) : undefined;
   }
 }

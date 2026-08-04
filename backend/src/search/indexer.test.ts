@@ -16,10 +16,14 @@ process.env.WAYANG_DATA_DIR = tmpRoot;
 
 // Import after env is set so getConfig() reads the temp dir.
 const dbMod = await import("../db.js");
-const sessionsMod = await import("../sessions.js");
+const projectsMod = await import("../projects.js");
+const agentProfilesMod = await import("../agent-profiles.js");
+const searchRouteMod = await import("../routes/search.js");
 const searchDbMod = await import("./db.js");
 const indexerMod = await import("./indexer.js");
+const policyFilterMod = await import("./policy-filter.js");
 const searchMod = await import("./search.js");
+const watcherMod = await import("./watcher.js");
 
 dbMod.init();
 
@@ -54,16 +58,22 @@ function seedSession(opts: {
 }): string {
   const store = dbMod.getStore();
   const id = `sess-${store.sessions.length + 1}`;
-  const cwd = `/tmp/proj-${id}`;
-  const file = writeFixture(id, cwd, opts.transcript);
+  const cwd = path.join(tmpRoot, `proj-${id}`);
+  fs.mkdirSync(cwd, { recursive: true });
+  const { project } = projectsMod.ensureProjectForCwd(cwd);
+  const file = writeFixture(id, project.cwd, opts.transcript);
   const now = Date.now();
   store.sessions.push({
     id,
     pi_session_file: file,
     title: opts.title,
-    cwd,
+    cwd: project.cwd,
     provider: "openrouter",
     model: "test-model",
+    agent_profile_id: project.default_agent_profile_id,
+    pending_agent_switch: null,
+    legacy_private_session_quarantine: false,
+    legacy_capability_ineligible: false,
     created_at: now,
     last_active: now,
     archived: opts.archived ? 1 : 0,
@@ -186,6 +196,118 @@ test("force reindex picks up file changes even with same mtime", async () => {
   await indexerMod.indexSession(id, { force: true });
   const after = searchMod.runSearch("zulu");
   assert.ok(after.results.some((r) => r.session_id === id));
+});
+
+test("legacy private quarantine excludes stale chunks and blocks indexing despite project drift", async () => {
+  const id = seedSession({
+    title: "Legacy private quarantine canary",
+    transcript: [{ role: "user", text: "synthetic sticky capybara canary" }],
+  });
+  await indexerMod.indexSession(id);
+  assert.ok(searchMod.runSearch("capybara canary").results.some((result) => result.session_id === id));
+
+  const row = dbMod.getStore().sessions.find((session) => session.id === id)!;
+  row.legacy_private_session_quarantine = true;
+  row.legacy_capability_ineligible = true;
+  dbMod.flush();
+  const project = projectsMod.getProjectByCwd(row.cwd)!;
+  assert.equal(project.access_policy.privacy_mode, "standard", "current project is deliberately generic Standard");
+  assert.equal(policyFilterMod.getIndexableSessionIds().has(id), false);
+  assert.equal(searchMod.runSearch("capybara canary", { archived: "any" }).results.some((result) => result.session_id === id), false);
+
+  const denied = await indexerMod.indexSession(id, { force: true });
+  assert.equal(denied.policySkipped, true);
+  const db = searchDbMod.getSearchDb();
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?").get(id) as { n: number }).n, 0);
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM session_index_state WHERE session_id = ?").get(id) as { n: number }).n, 0);
+});
+
+test("standard allowlist live-filters stale profile chunks from query, facets, and health, then watcher purges", async () => {
+  const id = seedSession({
+    title: "Standard allowlist stale canary",
+    transcript: [{ role: "user", text: "synthetic quokka allowlist canary" }],
+  });
+  await indexerMod.indexSession(id);
+  assert.ok(searchMod.runSearch("quokka allowlist").results.some((result) => result.session_id === id));
+
+  const row = dbMod.getStore().sessions.find((session) => session.id === id)!;
+  const originalProfileId = row.agent_profile_id;
+  assert.ok(originalProfileId);
+  assert.ok(dbMod.getStore().agentProfiles.some((profile) => profile.id === originalProfileId));
+  const project = projectsMod.getProjectByCwd(row.cwd)!;
+  const alternateProfile = agentProfilesMod.createAgentProfile({ name: `Alternate standard search profile ${id}` });
+  projectsMod.updateProject(project.id, {
+    default_agent_profile_id: alternateProfile.id,
+    access_policy: {
+      privacy_mode: "standard",
+      allowed_agent_profile_ids: [alternateProfile.id],
+    },
+  });
+
+  // The watcher is intentionally stopped, simulating purge failure/delay while
+  // stale transcript chunks and index state remain durable.
+  const db = searchDbMod.getSearchDb();
+  assert.ok((db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?").get(id) as { n: number }).n > 0);
+  assert.ok(db.prepare("SELECT session_id FROM session_index_state WHERE session_id = ?").get(id));
+  const hidden = searchMod.runSearch("quokka allowlist");
+  assert.equal(hidden.results.some((result) => result.session_id === id), false);
+  assert.equal(hidden.facets.cwds.some((facet) => facet.value === row.cwd), false);
+  assert.equal(policyFilterMod.getIndexableSessionIds().has(id), false);
+
+  const health = searchRouteMod.getSearchHealthSnapshot();
+  const authorizedIds = policyFilterMod.getIndexableSessionIds();
+  const states = db.prepare("SELECT session_id FROM session_index_state").all() as Array<{ session_id: string }>;
+  assert.equal(health.total_sessions, authorizedIds.size);
+  assert.equal(health.indexed_sessions, states.filter((state) => authorizedIds.has(state.session_id)).length);
+  assert.ok(states.some((state) => state.session_id === id), "stale denied state must exist for the health filter assertion");
+
+  // Restore access, start the watcher, then tighten again. The central policy
+  // notification must synchronously purge the now-disallowed standard session.
+  projectsMod.updateProject(project.id, {
+    default_agent_profile_id: originalProfileId,
+    access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: null },
+  });
+  assert.ok(searchMod.runSearch("quokka allowlist").results.some((result) => result.session_id === id));
+  watcherMod.startWatcher();
+  try {
+    projectsMod.updateProject(project.id, {
+      default_agent_profile_id: alternateProfile.id,
+      access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [alternateProfile.id] },
+    });
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?").get(id) as { n: number }).n, 0);
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM session_index_state WHERE session_id = ?").get(id) as { n: number }).n, 0);
+  } finally {
+    watcherMod.stopWatcher();
+  }
+});
+
+test("protected policy live-filters stale results and indexing denial purges chunks and state", async () => {
+  const id = seedSession({
+    title: "Protected stale canary",
+    transcript: [{ role: "user", text: "confidential synthetic narwhal canary" }],
+  });
+  await indexerMod.indexSession(id);
+  assert.ok(searchMod.runSearch("narwhal canary").results.some((result) => result.session_id === id));
+
+  const row = dbMod.getStore().sessions.find((session) => session.id === id)!;
+  const project = projectsMod.getProjectByCwd(row.cwd)!;
+  projectsMod.updateProject(project.id, {
+    access_policy: {
+      privacy_mode: "protected",
+      allowed_agent_profile_ids: [project.default_agent_profile_id],
+    },
+  });
+
+  // Query-time policy is independent of purge completion.
+  const db = searchDbMod.getSearchDb();
+  assert.ok((db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?").get(id) as { n: number }).n > 0);
+  assert.equal(searchMod.runSearch("narwhal canary").results.some((result) => result.session_id === id), false);
+  assert.equal(searchMod.runSearch("narwhal canary").facets.cwds.some((facet) => facet.value === row.cwd), false);
+
+  const denied = await indexerMod.indexSession(id);
+  assert.equal(denied.policySkipped, true);
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?").get(id) as { n: number }).n, 0);
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM session_index_state WHERE session_id = ?").get(id) as { n: number }).n, 0);
 });
 
 test("search returns empty for short queries without throwing", () => {

@@ -5,6 +5,7 @@
 .pi/
 
 # Dependencies and build output
+.worktrees/
 **/node_modules/
 **/dist/
 *.tsbuildinfo

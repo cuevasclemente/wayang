@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import * as os from "node:os";
 import { isPasswordHashRecord } from "./auth/password.js";
+import { isLoopbackHost } from "./loopback.js";
 
 export interface TtsConfig {
   /** Shared TTS broker base URL; preferred for streaming/job-based playback. */
@@ -21,8 +22,24 @@ export interface AuthConfig {
   sessionDays: number;
   sessionStorePath: string;
   trustProxy: "loopback" | false;
+  /** Lowercase proxy-injected identity header trusted only from a loopback proxy. */
+  proxyIdentityHeader: string;
   cookieSecure: "auto" | "always" | "never";
   allowedOrigins: string[];
+}
+
+export interface BrowserCredentialsConfig {
+  bwPath: string;
+  unlockSocketPath: string;
+  idleTimeoutMs: number;
+  choiceTtlMs: number;
+  maxCliOutputBytes: number;
+  cliTimeoutMs: number;
+}
+
+export interface BrowserConfig {
+  transport: "auto" | "vnc" | "cdp";
+  credentials: BrowserCredentialsConfig;
 }
 
 export interface Config {
@@ -36,6 +53,7 @@ export interface Config {
   maxReadSize: number;
   tts: TtsConfig;
   auth: AuthConfig;
+  browser: BrowserConfig;
 }
 
 function getDataDir(): string {
@@ -53,6 +71,27 @@ function getEnvInt(name: string, fallback: number, legacyName?: string): number 
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function getPositiveEnvInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (!/^[0-9]+$/.test(raw)) throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  return value;
+}
+
+function browserTransport(): BrowserConfig["transport"] {
+  const raw = process.env.WAYANG_BROWSER_TRANSPORT || "auto";
+  if (raw === "auto" || raw === "vnc" || raw === "cdp") return raw;
+  throw new Error("WAYANG_BROWSER_TRANSPORT must be auto, vnc, or cdp");
+}
+
+function bitwardenCliPath(): string {
+  const configured = process.env.WAYANG_BITWARDEN_CLI_PATH?.trim() || "";
+  if (configured && !path.isAbsolute(configured)) throw new Error("WAYANG_BITWARDEN_CLI_PATH must be an absolute path");
+  return configured;
+}
+
 function getAuthSessionDays(): number {
   const raw = process.env.WAYANG_AUTH_SESSION_DAYS;
   if (raw === undefined) return 30;
@@ -60,10 +99,14 @@ function getAuthSessionDays(): number {
   return Number(raw);
 }
 
-function authEnabled(): boolean {
-  const raw = process.env.WAYANG_AUTH_ENABLED ?? "0";
-  if (raw !== "0" && raw !== "1") throw new Error("WAYANG_AUTH_ENABLED must be 0 or 1");
+function envFlag(name: string, fallback = "0"): boolean {
+  const raw = process.env[name] ?? fallback;
+  if (raw !== "0" && raw !== "1") throw new Error(`${name} must be 0 or 1`);
   return raw === "1";
+}
+
+function authEnabled(): boolean {
+  return envFlag("WAYANG_AUTH_ENABLED");
 }
 
 function trustProxy(): "loopback" | false {
@@ -71,6 +114,15 @@ function trustProxy(): "loopback" | false {
   if (raw === "loopback") return "loopback";
   if (raw === "0") return false;
   throw new Error("WAYANG_TRUST_PROXY must be loopback or 0");
+}
+
+function proxyIdentityHeader(): string {
+  const raw = process.env.WAYANG_AUTH_PROXY_IDENTITY_HEADER?.trim() || "";
+  if (!raw) return "";
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u.test(raw)) {
+    throw new Error("WAYANG_AUTH_PROXY_IDENTITY_HEADER must be one valid HTTP header name");
+  }
+  return raw.toLowerCase();
 }
 
 function cookieSecure(): AuthConfig["cookieSecure"] {
@@ -82,14 +134,13 @@ function cookieSecure(): AuthConfig["cookieSecure"] {
 }
 
 function allowedOrigins(port: number): string[] {
+  const loopback = [
+    `http://127.0.0.1:${port}`,
+    `http://localhost:${port}`,
+    `http://[::1]:${port}`,
+  ];
   const configured = process.env.WAYANG_PUBLIC_ORIGIN?.trim();
-  if (!configured) {
-    return [
-      `http://127.0.0.1:${port}`,
-      `http://localhost:${port}`,
-      `http://[::1]:${port}`,
-    ];
-  }
+  if (!configured) return loopback;
   let parsed: URL;
   try {
     parsed = new URL(configured);
@@ -99,7 +150,10 @@ function allowedOrigins(port: number): string[] {
   if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
     throw new Error("WAYANG_PUBLIC_ORIGIN must be an absolute http(s) origin without credentials, path, query, or fragment");
   }
-  return [parsed.origin];
+  // Keep direct/SSH-tunneled loopback administration available even when the
+  // normal browser-facing origin is a remote HTTPS reverse proxy. Settings
+  // still requires a loopback socket+Origin when built-in auth is disabled.
+  return [...new Set([parsed.origin, ...loopback])];
 }
 
 export function validateAuthConfig(auth: AuthConfig): void {
@@ -108,6 +162,17 @@ export function validateAuthConfig(auth: AuthConfig): void {
   }
   if (!Number.isInteger(auth.sessionDays) || auth.sessionDays < 1 || auth.sessionDays > 365) {
     throw new Error("WAYANG_AUTH_SESSION_DAYS must be an integer between 1 and 365");
+  }
+  if (auth.proxyIdentityHeader) {
+    if (auth.enabled) throw new Error("WAYANG_AUTH_PROXY_IDENTITY_HEADER and built-in authentication are mutually exclusive");
+    if (auth.trustProxy !== "loopback") throw new Error("WAYANG_AUTH_PROXY_IDENTITY_HEADER requires WAYANG_TRUST_PROXY=loopback");
+    const hasRemoteHttpsOrigin = auth.allowedOrigins.some((origin) => {
+      try {
+        const parsed = new URL(origin);
+        return parsed.protocol === "https:" && !isLoopbackHost(parsed.hostname);
+      } catch { return false; }
+    });
+    if (!hasRemoteHttpsOrigin) throw new Error("WAYANG_AUTH_PROXY_IDENTITY_HEADER requires an exact remote HTTPS WAYANG_PUBLIC_ORIGIN");
   }
   if (!auth.enabled) return;
   if (!isPasswordHashRecord(auth.passwordHash)) {
@@ -144,8 +209,20 @@ export function getConfig(overrides?: Partial<Config>): Config {
       sessionDays: getAuthSessionDays(),
       sessionStorePath: path.join(dataDir, "auth-sessions.json"),
       trustProxy: trustProxy(),
+      proxyIdentityHeader: proxyIdentityHeader(),
       cookieSecure: cookieSecure(),
       allowedOrigins: allowedOrigins(port),
+    },
+    browser: {
+      transport: browserTransport(),
+      credentials: {
+        bwPath: bitwardenCliPath(),
+        unlockSocketPath: path.join(dataDir, "browser-credentials", "unlock.sock"),
+        idleTimeoutMs: getPositiveEnvInt("WAYANG_BROWSER_CREDENTIALS_IDLE_MINUTES", 15, 1, 1440) * 60_000,
+        choiceTtlMs: 30_000,
+        maxCliOutputBytes: 4 * 1024 * 1024,
+        cliTimeoutMs: 15_000,
+      },
     },
     ...overrides,
   };

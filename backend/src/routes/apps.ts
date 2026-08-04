@@ -3,11 +3,18 @@ import { Router, type Request, type Response } from "express";
 import { addAppEvent, getAppState, listAppEvents, setAppState } from "../apps/bridge.js";
 import { getRegisteredApp, listAppsForProject, listAppsForSession, registerApp, AppRegistryError } from "../apps/registry.js";
 import { getAppLogs, restartApp, startApp, stopApp } from "../apps/process-manager.js";
+import { assertAppsAgentLaunchAllowed, authorizeAppsAgentTarget, isAppsAgentRequest } from "../apps/request-auth.js";
+import { canonicalizeProjectCwd } from "../projects.js";
+import { getSessionById } from "../sessions.js";
 
 export const router = Router();
 
 function statusForError(err: unknown): number {
-  return err instanceof AppRegistryError ? err.statusCode : 500;
+  if (err instanceof AppRegistryError) return err.statusCode;
+  const explicit = err && typeof err === "object" && "statusCode" in err
+    ? Number((err as { statusCode?: unknown }).statusCode)
+    : NaN;
+  return Number.isInteger(explicit) && explicit >= 400 && explicit <= 599 ? explicit : 500;
 }
 
 function errorMessage(err: unknown): string {
@@ -30,6 +37,11 @@ const APP_PROXY_BLOCKED_REQUEST_HEADERS = new Set([
   "x-forwarded-for",
   "x-forwarded-host",
   "x-forwarded-proto",
+  "x-wayang-apps-actor",
+  "x-wayang-apps-agent-token",
+  "x-wayang-browser-actor",
+  "x-wayang-browser-agent-token",
+  "x-wayang-source-session-id",
 ]);
 
 const APP_PROXY_BLOCKED_RESPONSE_HEADERS = new Set([
@@ -48,7 +60,7 @@ export function shouldForwardAppProxyResponseHeader(name: string): boolean {
   return !APP_PROXY_BLOCKED_RESPONSE_HEADERS.has(name.toLowerCase());
 }
 
-function appFromRequest(req: Request) {
+function requestTarget(req: Request): { sessionId?: string; projectCwd?: string } {
   const sessionId = typeof req.query.session_id === "string"
     ? req.query.session_id
     : typeof req.body?.sessionId === "string"
@@ -59,7 +71,28 @@ function appFromRequest(req: Request) {
     : typeof req.body?.projectCwd === "string"
       ? req.body.projectCwd
       : undefined;
-  return getRegisteredApp(req.params.appId, { sessionId, projectCwd });
+  return { sessionId, projectCwd };
+}
+
+function authorizeRequestedTarget(req: Request): string {
+  const { sessionId, projectCwd } = requestTarget(req);
+  const session = sessionId ? getSessionById(sessionId) : undefined;
+  if (sessionId && !session) throw new AppRegistryError("Session not found", 404);
+  if (session && projectCwd && canonicalizeProjectCwd(projectCwd) !== canonicalizeProjectCwd(session.cwd)) {
+    throw new AppRegistryError("sessionId cwd does not match projectCwd", 400);
+  }
+  if (isAppsAgentRequest(req) && !session && !projectCwd) {
+    throw new AppRegistryError("Agent Apps requests require sessionId or projectCwd", 400);
+  }
+  const targetCwd = projectCwd || session?.cwd || process.cwd();
+  authorizeAppsAgentTarget(req, targetCwd);
+  return targetCwd;
+}
+
+function appFromRequest(req: Request) {
+  const app = getRegisteredApp(req.params.appId, requestTarget(req));
+  authorizeAppsAgentTarget(req, app.projectCwd);
+  return app;
 }
 
 router.get("/apps", (req: Request, res: Response) => {
@@ -67,6 +100,7 @@ router.get("/apps", (req: Request, res: Response) => {
     const sessionId = typeof req.query.session_id === "string" ? req.query.session_id : undefined;
     const projectCwd = typeof req.query.project_cwd === "string" ? req.query.project_cwd : undefined;
     const scan = req.query.scan !== "0";
+    authorizeRequestedTarget(req);
     if (sessionId) {
       res.json(listAppsForSession(sessionId, scan));
       return;
@@ -84,6 +118,7 @@ router.get("/apps", (req: Request, res: Response) => {
 router.post("/apps/register", (req: Request, res: Response) => {
   try {
     const { sessionId, projectCwd, manifestPath } = req.body ?? {};
+    authorizeRequestedTarget(req);
     if (typeof manifestPath !== "string") {
       res.status(400).json({ error: "manifestPath is required" });
       return;
@@ -107,6 +142,7 @@ router.use("/apps/:appId/proxy/:sessionId", async (req: Request, res: Response) 
     }
 
     const app = getRegisteredApp(req.params.appId, { sessionId: req.params.sessionId });
+    authorizeAppsAgentTarget(req, app.projectCwd);
     if (!app.url) {
       res.status(409).json({ error: "App is not running" });
       return;
@@ -157,7 +193,9 @@ router.get("/apps/:appId", (req: Request, res: Response) => {
 
 router.post("/apps/:appId/start", async (req: Request, res: Response) => {
   try {
-    res.json(await startApp(appFromRequest(req)));
+    const app = appFromRequest(req);
+    assertAppsAgentLaunchAllowed(req);
+    res.json(await startApp(app, { agentInitiated: isAppsAgentRequest(req) }));
   } catch (err) {
     sendError(res, err);
   }
@@ -173,7 +211,9 @@ router.post("/apps/:appId/stop", async (req: Request, res: Response) => {
 
 router.post("/apps/:appId/restart", async (req: Request, res: Response) => {
   try {
-    res.json(await restartApp(appFromRequest(req)));
+    const app = appFromRequest(req);
+    assertAppsAgentLaunchAllowed(req);
+    res.json(await restartApp(app, { agentInitiated: isAppsAgentRequest(req) }));
   } catch (err) {
     sendError(res, err);
   }

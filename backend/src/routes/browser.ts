@@ -1,4 +1,4 @@
-import { Router, type Request, type Response } from "express";
+import { Router, type Request, type RequestHandler, type Response } from "express";
 import {
   browserAccessibilitySnapshot,
   browserDomSnapshot,
@@ -7,19 +7,23 @@ import {
   clickBrowserSelector,
   extractBrowserLinks,
   fillBrowserSelector,
-  getBrowserStatus,
-  listBrowserSessions,
+  assertBrowserAgentControl,
+  getPublicBrowserStatus,
+  listPublicBrowserSessions,
   navigateBrowser,
   pasteTextBrowser,
   queryBrowserSelector,
+  refreshBrowserNavigationState,
   resetBrowserProfile,
   restartBrowser,
+  sanitizeBrowserErrorMessage,
   setBrowserControlMode,
   startBrowser,
   stopBrowser,
   typePublicBrowser,
 } from "../browser/manager.js";
 import type { BrowserControlMode, BrowserSessionLookup } from "../browser/types.js";
+import { assertGenericBrowserTargetAllowed, authorizeBrowserAgentTarget, isBrowserAgentRequest } from "../browser/request-auth.js";
 
 export const router = Router();
 
@@ -29,8 +33,11 @@ function errorMessage(err: unknown): string {
 
 function sendError(res: Response, err: unknown): void {
   const message = errorMessage(err);
-  const status = /not found/i.test(message) ? 404 : /required|invalid/i.test(message) ? 400 : 500;
-  res.status(status).json({ error: message });
+  const explicit = err && typeof err === "object" && "statusCode" in err ? Number((err as { statusCode?: unknown }).statusCode) : NaN;
+  const status = Number.isInteger(explicit) && explicit >= 400 && explicit <= 599
+    ? explicit
+    : /not found/i.test(message) ? 404 : /required|invalid/i.test(message) ? 400 : 500;
+  res.status(status).json({ error: status >= 500 ? sanitizeBrowserErrorMessage(err) : message });
 }
 
 function lookupFromRequest(req: Request): BrowserSessionLookup {
@@ -49,21 +56,68 @@ function lookupFromRequest(req: Request): BrowserSessionLookup {
       : typeof body.project_cwd === "string"
         ? body.project_cwd
         : undefined;
-  const persistence = body.persistence === "session" || req.query.persistence === "session" ? "session" : "project";
+  const requestedPersistence = body.persistence ?? req.query.persistence;
+  const persistence = requestedPersistence === "session" ? "session" : requestedPersistence === "project" ? "project" : "shared";
   return { sessionId, projectCwd, persistence };
 }
+
+function requireAgentControl(req: Request, lookup: BrowserSessionLookup): number | undefined {
+  return isBrowserAgentRequest(req) ? assertBrowserAgentControl(lookup) : undefined;
+}
+
+function publicActor(req: Request): "ui" | "agent" {
+  return isBrowserAgentRequest(req) ? "agent" : "ui";
+}
+
+function sendState(req: Request, res: Response, lookup: BrowserSessionLookup): void {
+  res.json(getPublicBrowserStatus(lookup, publicActor(req)));
+}
+
+export function createGenericBrowserProtectedIsolation(
+  assertTarget: (lookup: BrowserSessionLookup) => void = assertGenericBrowserTargetAllowed,
+): RequestHandler {
+  return (req, res, next) => {
+    try {
+      assertTarget(lookupFromRequest(req));
+      next();
+    } catch {
+      res.setHeader("Cache-Control", "no-store");
+      res.status(403).json({ error: "Protected targets require capability-bound browser routes" });
+    }
+  };
+}
+
 
 function normalizeControlMode(value: unknown): BrowserControlMode | null {
   return value === "agent" || value === "user" || value === "paused" ? value : null;
 }
 
-router.get("/browser/sessions", (_req: Request, res: Response) => {
-  res.json({ sessions: listBrowserSessions() });
+// Durable Protected classification precedes agent authorization and every
+// generic browser manager/registry lookup.
+router.use("/browser/:operation", createGenericBrowserProtectedIsolation());
+
+router.use("/browser/:operation", (req: Request, res: Response, next) => {
+  try {
+    if (isBrowserAgentRequest(req)) {
+      const lookup = lookupFromRequest(req);
+      authorizeBrowserAgentTarget(req, lookup);
+      if (!["status", "sessions", "control-mode"].includes(req.params.operation)) {
+        requireAgentControl(req, lookup);
+      }
+    }
+    next();
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+router.get("/browser/sessions", (req: Request, res: Response) => {
+  res.json({ sessions: listPublicBrowserSessions(publicActor(req)) });
 });
 
 router.get("/browser/status", (req: Request, res: Response) => {
   try {
-    res.json(getBrowserStatus(lookupFromRequest(req)));
+    res.json(getPublicBrowserStatus(lookupFromRequest(req), publicActor(req)));
   } catch (err) {
     sendError(res, err);
   }
@@ -71,7 +125,9 @@ router.get("/browser/status", (req: Request, res: Response) => {
 
 router.post("/browser/start", async (req: Request, res: Response) => {
   try {
-    res.json(await startBrowser(lookupFromRequest(req)));
+    const lookup = lookupFromRequest(req);
+    await startBrowser(lookup, requireAgentControl(req, lookup));
+    sendState(req, res, lookup);
   } catch (err) {
     sendError(res, err);
   }
@@ -79,7 +135,9 @@ router.post("/browser/start", async (req: Request, res: Response) => {
 
 router.post("/browser/stop", async (req: Request, res: Response) => {
   try {
-    res.json(await stopBrowser(lookupFromRequest(req)));
+    const lookup = lookupFromRequest(req);
+    await stopBrowser(lookup, requireAgentControl(req, lookup));
+    sendState(req, res, lookup);
   } catch (err) {
     sendError(res, err);
   }
@@ -87,7 +145,9 @@ router.post("/browser/stop", async (req: Request, res: Response) => {
 
 router.post("/browser/restart", async (req: Request, res: Response) => {
   try {
-    res.json(await restartBrowser(lookupFromRequest(req)));
+    const lookup = lookupFromRequest(req);
+    await restartBrowser(lookup, requireAgentControl(req, lookup));
+    sendState(req, res, lookup);
   } catch (err) {
     sendError(res, err);
   }
@@ -95,18 +155,24 @@ router.post("/browser/restart", async (req: Request, res: Response) => {
 
 router.post("/browser/reset-profile", async (req: Request, res: Response) => {
   try {
-    res.json(await resetBrowserProfile(lookupFromRequest(req)));
+    const lookup = lookupFromRequest(req);
+    await resetBrowserProfile(lookup, requireAgentControl(req, lookup));
+    sendState(req, res, lookup);
   } catch (err) {
     sendError(res, err);
   }
 });
 
-router.post("/browser/control-mode", (req: Request, res: Response) => {
+router.post("/browser/control-mode", async (req: Request, res: Response) => {
   try {
     const mode = normalizeControlMode(req.body?.mode);
     if (!mode) throw new Error("Invalid control mode");
     const reason = typeof req.body?.reason === "string" ? req.body.reason : undefined;
-    res.json(setBrowserControlMode(lookupFromRequest(req), mode, reason));
+    const lookup = lookupFromRequest(req);
+    if (isBrowserAgentRequest(req) && mode === "agent") requireAgentControl(req, lookup);
+    if (!isBrowserAgentRequest(req) && mode === "agent") await refreshBrowserNavigationState(lookup);
+    setBrowserControlMode(lookup, mode, reason);
+    sendState(req, res, lookup);
   } catch (err) {
     sendError(res, err);
   }
@@ -116,7 +182,10 @@ router.post("/browser/navigate", async (req: Request, res: Response) => {
   try {
     const url = typeof req.body?.url === "string" ? req.body.url.trim() : "";
     if (!url) throw new Error("url is required");
-    res.json(await navigateBrowser(lookupFromRequest(req), url));
+    const lookup = lookupFromRequest(req);
+    const generation = requireAgentControl(req, lookup);
+    await navigateBrowser(lookup, url, generation);
+    sendState(req, res, lookup);
   } catch (err) {
     sendError(res, err);
   }
@@ -125,7 +194,8 @@ router.post("/browser/navigate", async (req: Request, res: Response) => {
 router.post("/browser/snapshot", async (req: Request, res: Response) => {
   try {
     const mode = req.body?.mode === "screenshot" ? "screenshot" : "text";
-    res.json(await browserSnapshot(lookupFromRequest(req), mode));
+    const lookup = lookupFromRequest(req);
+    res.json(await browserSnapshot(lookup, mode, requireAgentControl(req, lookup)));
   } catch (err) {
     sendError(res, err);
   }
@@ -134,7 +204,8 @@ router.post("/browser/snapshot", async (req: Request, res: Response) => {
 router.post("/browser/dom-snapshot", async (req: Request, res: Response) => {
   try {
     const limit = req.body?.limit === undefined ? undefined : Number(req.body.limit);
-    res.json(await browserDomSnapshot(lookupFromRequest(req), { includeText: Boolean(req.body?.includeText), limit }));
+    const lookup = lookupFromRequest(req);
+    res.json(await browserDomSnapshot(lookup, { includeText: Boolean(req.body?.includeText), limit }, requireAgentControl(req, lookup)));
   } catch (err) {
     sendError(res, err);
   }
@@ -145,7 +216,8 @@ router.post("/browser/query-selector", async (req: Request, res: Response) => {
     const selector = typeof req.body?.selector === "string" ? req.body.selector.trim() : "";
     if (!selector) throw new Error("selector is required");
     const limit = req.body?.limit === undefined ? undefined : Number(req.body.limit);
-    res.json(await queryBrowserSelector(lookupFromRequest(req), selector, { limit }));
+    const lookup = lookupFromRequest(req);
+    res.json(await queryBrowserSelector(lookup, selector, { limit }, requireAgentControl(req, lookup)));
   } catch (err) {
     sendError(res, err);
   }
@@ -157,7 +229,9 @@ router.post("/browser/click-selector", async (req: Request, res: Response) => {
     if (!selector) throw new Error("selector is required");
     const index = req.body?.index === undefined ? 0 : Number(req.body.index);
     if (!Number.isFinite(index) || index < 0) throw new Error("index must be a non-negative number");
-    res.json(await clickBrowserSelector(lookupFromRequest(req), selector, index));
+    const lookup = lookupFromRequest(req);
+    await clickBrowserSelector(lookup, selector, index, requireAgentControl(req, lookup));
+    sendState(req, res, lookup);
   } catch (err) {
     sendError(res, err);
   }
@@ -170,7 +244,9 @@ router.post("/browser/fill-selector", async (req: Request, res: Response) => {
     const text = typeof req.body?.text === "string" ? req.body.text : "";
     const index = req.body?.index === undefined ? 0 : Number(req.body.index);
     if (!Number.isFinite(index) || index < 0) throw new Error("index must be a non-negative number");
-    res.json(await fillBrowserSelector(lookupFromRequest(req), selector, text, index));
+    const lookup = lookupFromRequest(req);
+    await fillBrowserSelector(lookup, selector, text, index, requireAgentControl(req, lookup));
+    sendState(req, res, lookup);
   } catch (err) {
     sendError(res, err);
   }
@@ -179,7 +255,8 @@ router.post("/browser/fill-selector", async (req: Request, res: Response) => {
 router.post("/browser/links", async (req: Request, res: Response) => {
   try {
     const limit = req.body?.limit === undefined ? undefined : Number(req.body.limit);
-    res.json(await extractBrowserLinks(lookupFromRequest(req), { limit }));
+    const lookup = lookupFromRequest(req);
+    res.json(await extractBrowserLinks(lookup, { limit }, requireAgentControl(req, lookup)));
   } catch (err) {
     sendError(res, err);
   }
@@ -188,7 +265,8 @@ router.post("/browser/links", async (req: Request, res: Response) => {
 router.post("/browser/accessibility", async (req: Request, res: Response) => {
   try {
     const limit = req.body?.limit === undefined ? undefined : Number(req.body.limit);
-    res.json(await browserAccessibilitySnapshot(lookupFromRequest(req), { limit }));
+    const lookup = lookupFromRequest(req);
+    res.json(await browserAccessibilitySnapshot(lookup, { limit }, requireAgentControl(req, lookup)));
   } catch (err) {
     sendError(res, err);
   }
@@ -199,7 +277,9 @@ router.post("/browser/click", async (req: Request, res: Response) => {
     const x = Number(req.body?.x);
     const y = Number(req.body?.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error("x and y are required numeric coordinates");
-    res.json(await clickBrowser(lookupFromRequest(req), x, y));
+    const lookup = lookupFromRequest(req);
+    await clickBrowser(lookup, x, y, requireAgentControl(req, lookup));
+    sendState(req, res, lookup);
   } catch (err) {
     sendError(res, err);
   }
@@ -209,7 +289,9 @@ router.post("/browser/type-public", async (req: Request, res: Response) => {
   try {
     const text = typeof req.body?.text === "string" ? req.body.text : "";
     if (!text) throw new Error("text is required");
-    res.json(await typePublicBrowser(lookupFromRequest(req), text));
+    const lookup = lookupFromRequest(req);
+    await typePublicBrowser(lookup, text, requireAgentControl(req, lookup));
+    sendState(req, res, lookup);
   } catch (err) {
     sendError(res, err);
   }
@@ -219,7 +301,9 @@ router.post("/browser/paste-text", async (req: Request, res: Response) => {
   try {
     const text = typeof req.body?.text === "string" ? req.body.text : "";
     if (!text) throw new Error("text is required");
-    res.json(await pasteTextBrowser(lookupFromRequest(req), text));
+    const lookup = lookupFromRequest(req);
+    await pasteTextBrowser(lookup, text, requireAgentControl(req, lookup));
+    sendState(req, res, lookup);
   } catch (err) {
     sendError(res, err);
   }

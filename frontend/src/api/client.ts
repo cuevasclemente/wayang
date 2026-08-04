@@ -7,6 +7,19 @@
 // ---------------------------------------------------------------------------
 
 export type SessionRuntimeStatus = "active" | "starting" | "stopped";
+export type BashMode = "host" | "sandboxed" | "sandboxed-wren" | "unavailable";
+export type BrowserSurfaceMode = "standard" | "protected" | "unavailable";
+
+export interface PendingAgentSwitch {
+  switch_id: string;
+  from_agent_profile_id: string | null;
+  from_provider: string | null;
+  from_model: string | null;
+  to_agent_profile_id: string;
+  target_provider: string;
+  target_model: string;
+  changed_at: number;
+}
 
 export interface Session {
   id: string;
@@ -15,6 +28,8 @@ export interface Session {
   cwd: string;
   provider: string | null;
   model: string | null;
+  agent_profile_id: string | null;
+  pending_agent_switch: PendingAgentSwitch | null;
   created_at: number;
   last_active: number;
   archived: number;
@@ -27,6 +42,8 @@ export interface Session {
   runtime_is_streaming: boolean;
   runtime_subscriber_count: number;
   runtime_last_activity_at: number | null;
+  bash_mode: BashMode;
+  browser_mode: BrowserSurfaceMode;
 }
 
 export interface Me {
@@ -131,11 +148,13 @@ async function request<T>(
   body?: unknown,
   signal?: AbortSignal,
   notifyOnUnauthorized = true,
+  cache?: RequestCache,
 ): Promise<T> {
   const init: RequestInit = {
     method,
     credentials: "include",
     redirect: "manual",
+    cache,
     headers:
       body !== undefined ? { "Content-Type": "application/json" } : undefined,
     body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -149,7 +168,11 @@ async function request<T>(
   }
   if (!res.ok) {
     const parsed = await parseBody(res);
-    if (res.status === 401 && notifyOnUnauthorized) reportUnauthorized();
+    if (
+      res.status === 401
+      && notifyOnUnauthorized
+      && res.headers.get("x-wayang-authentication-required") === "1"
+    ) reportUnauthorized();
     const message =
       parsed && typeof parsed === "object" && "error" in parsed && typeof parsed.error === "string"
         ? parsed.error
@@ -266,6 +289,292 @@ export interface ScheduledJob {
   lastRun: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// Protected Automations
+// ---------------------------------------------------------------------------
+
+export interface ProtectedAutomationStatus {
+  milestone: number;
+  activationAvailable: boolean;
+  production_services: boolean;
+}
+
+export type ProtectedAutomationRunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "cancelled"
+  | "needs_user"
+  | "interrupted"
+  | "denied";
+
+export type ProtectedAutomationAttentionReason =
+  | "login_required"
+  | "mfa_required"
+  | "captcha_required"
+  | "payment_confirmation_required"
+  | "human_review_required";
+
+export interface ProtectedAutomationAttention {
+  required: true;
+  reason: ProtectedAutomationAttentionReason;
+}
+
+/** Exact owner-safe projection returned by publicJob(). */
+export interface ProtectedAutomationJob {
+  id: string;
+  project_id: string;
+  agent_profile_id: string;
+  capability_revision: number;
+  revision: number;
+  source_revision: number;
+  name: string;
+  source_manifest_sha256: string;
+  entrypoint: string;
+  argv_count: number;
+  uses_browser_profile: boolean;
+  allowed_https_origins: string[];
+  cron_expr: string;
+  timeout_ms: number;
+  missed_run_policy: "skip" | "run_once";
+  enabled: boolean;
+  blocked_reason: string | null;
+  deleted_at: number | null;
+  created_at: number;
+  updated_at: number;
+  last_run_at: number | null;
+  next_run_at: number | null;
+  attention: ProtectedAutomationAttention | null;
+  activationAvailable: boolean;
+}
+
+/** Exact owner-safe projection returned by publicRun(). */
+export interface ProtectedAutomationRun {
+  id: string;
+  job_id: string;
+  project_id: string;
+  agent_profile_id: string;
+  job_revision: number;
+  capability_revision: number;
+  trigger: "schedule" | "manual";
+  scheduled_for: number | null;
+  started_at: number;
+  finished_at: number | null;
+  status: ProtectedAutomationRunStatus;
+  outcome_code: string | null;
+  exit_code: number | null;
+  attention: ProtectedAutomationAttention | null;
+}
+
+export interface ProtectedAutomationPreparationSelection {
+  sourceSessionId: string;
+  jobId: string;
+  preparationId: string;
+}
+
+export interface ProtectedAutomationPreparation {
+  preparation_id: string;
+  source_session_id: string;
+  job_id: string;
+  job_revision: number;
+  state: "waiting_for_owner" | "ready" | "closed";
+  websocket_path: string;
+  project_id: string;
+  agent_profile_id: string;
+  capability_revision: number;
+  source_revision: number;
+  allowed_https_origins: string[];
+  credential_broker: { supported: boolean; guarded: true };
+}
+
+export interface ProtectedAutomationPurgeChallenge {
+  request_id: string;
+  job_id: string;
+  expected_revision: number;
+  operation_digest: string;
+  expires_at: number;
+  summary: string;
+}
+
+export interface ProtectedAutomationPurgeResult {
+  purged_job_id: string;
+  purged_run_ids: string[];
+}
+
+export interface ProtectedAutomationCatalog {
+  status: ProtectedAutomationStatus;
+  jobs: ProtectedAutomationJob[];
+}
+
+export interface ProtectedAutomationDetail {
+  status: ProtectedAutomationStatus;
+  job: ProtectedAutomationJob;
+  runs: ProtectedAutomationRun[];
+}
+
+export function fetchProtectedAutomationStatus(): Promise<ProtectedAutomationStatus> {
+  return request<ProtectedAutomationStatus>("GET", "/api/protected-automations", undefined, undefined, true, "no-store");
+}
+
+export async function listProtectedAutomationJobs(): Promise<{ jobs: ProtectedAutomationJob[] }> {
+  const payload = await request<{ jobs?: unknown }>("GET", "/api/protected-automations/jobs", undefined, undefined, true, "no-store");
+  const rows = Array.isArray(payload?.jobs) ? payload.jobs : [];
+  return {
+    jobs: rows.filter((value): value is ProtectedAutomationJob => Boolean(
+      value && typeof value === "object" && typeof (value as { id?: unknown }).id === "string",
+    )),
+  };
+}
+
+export async function listProtectedAutomations(): Promise<ProtectedAutomationCatalog> {
+  const [status, result] = await Promise.all([
+    fetchProtectedAutomationStatus(),
+    listProtectedAutomationJobs(),
+  ]);
+  return { status, jobs: result.jobs };
+}
+
+export async function getProtectedAutomationJob(id: string): Promise<{ job: ProtectedAutomationJob }> {
+  const payload = await request<{ job?: unknown }>(
+    "GET",
+    `/api/protected-automations/jobs/${encodeURIComponent(id)}`,
+    undefined,
+    undefined,
+    true,
+    "no-store",
+  );
+  if (!payload?.job || typeof payload.job !== "object" || typeof (payload.job as { id?: unknown }).id !== "string") {
+    throw new Error("Protected automation backend returned an invalid job projection");
+  }
+  return { job: payload.job as ProtectedAutomationJob };
+}
+
+export async function listProtectedAutomationRuns(id: string): Promise<{ runs: ProtectedAutomationRun[] }> {
+  const payload = await request<{ runs?: unknown }>(
+    "GET",
+    `/api/protected-automations/jobs/${encodeURIComponent(id)}/runs`,
+    undefined,
+    undefined,
+    true,
+    "no-store",
+  );
+  const rows = Array.isArray(payload?.runs) ? payload.runs : [];
+  return {
+    runs: rows.filter((value): value is ProtectedAutomationRun => Boolean(
+      value && typeof value === "object" && typeof (value as { id?: unknown }).id === "string",
+    )),
+  };
+}
+
+export async function getProtectedAutomation(id: string): Promise<ProtectedAutomationDetail> {
+  const [status, jobResult, runResult] = await Promise.all([
+    fetchProtectedAutomationStatus(),
+    getProtectedAutomationJob(id),
+    listProtectedAutomationRuns(id),
+  ]);
+  return { status, job: jobResult.job, runs: runResult.runs };
+}
+
+export function pauseProtectedAutomation(id: string, expectedRevision: number): Promise<{ job: ProtectedAutomationJob }> {
+  return request<{ job: ProtectedAutomationJob }>(
+    "POST",
+    `/api/protected-automations/jobs/${encodeURIComponent(id)}/pause`,
+    { expectedRevision },
+    undefined,
+    true,
+    "no-store",
+  );
+}
+
+export function cancelProtectedAutomationRun(jobId: string, runId: string): Promise<{ run: ProtectedAutomationRun }> {
+  return request<{ run: ProtectedAutomationRun }>(
+    "POST",
+    `/api/protected-automations/jobs/${encodeURIComponent(jobId)}/runs/${encodeURIComponent(runId)}/cancel`,
+    {},
+    undefined,
+    true,
+    "no-store",
+  );
+}
+
+function protectedAutomationPreparationBase(selection: ProtectedAutomationPreparationSelection): string {
+  return `/api/protected-automations/sources/${encodeURIComponent(selection.sourceSessionId)}`
+    + `/jobs/${encodeURIComponent(selection.jobId)}/preparations/${encodeURIComponent(selection.preparationId)}`;
+}
+
+export async function getProtectedAutomationPreparation(
+  selection: ProtectedAutomationPreparationSelection,
+): Promise<ProtectedAutomationPreparation> {
+  const preparation = await request<ProtectedAutomationPreparation>(
+    "GET",
+    protectedAutomationPreparationBase(selection),
+    undefined,
+    undefined,
+    true,
+    "no-store",
+  );
+  if (preparation?.source_session_id !== selection.sourceSessionId
+    || preparation?.job_id !== selection.jobId
+    || preparation?.preparation_id !== selection.preparationId
+    || typeof preparation.websocket_path !== "string") {
+    throw new Error("Protected automation backend returned a mismatched preparation projection");
+  }
+  return preparation;
+}
+
+export function closeProtectedAutomationPreparation(selection: ProtectedAutomationPreparationSelection): Promise<null> {
+  return request<null>("POST", `${protectedAutomationPreparationBase(selection)}/close`, {}, undefined, true, "no-store");
+}
+
+export function navigateProtectedAutomationPreparation(
+  selection: ProtectedAutomationPreparationSelection,
+  url: string,
+): Promise<ProtectedAutomationPreparation> {
+  return request<ProtectedAutomationPreparation>("POST", `${protectedAutomationPreparationBase(selection)}/navigate`, { url }, undefined, true, "no-store");
+}
+
+export function requestProtectedAutomationPurge(
+  jobId: string,
+  expectedRevision: number,
+): Promise<ProtectedAutomationPurgeChallenge> {
+  return request<ProtectedAutomationPurgeChallenge>(
+    "POST",
+    `/api/protected-automations/jobs/${encodeURIComponent(jobId)}/purge-requests`,
+    { expectedRevision },
+    undefined,
+    false,
+    "no-store",
+  );
+}
+
+export function commitProtectedAutomationPurge(
+  jobId: string,
+  requestId: string,
+  pin: string,
+): Promise<ProtectedAutomationPurgeResult> {
+  return request<ProtectedAutomationPurgeResult>(
+    "POST",
+    `/api/protected-automations/jobs/${encodeURIComponent(jobId)}/purge-requests/${encodeURIComponent(requestId)}/commit`,
+    { pin },
+    undefined,
+    false,
+    "no-store",
+  );
+}
+
+export function cancelProtectedAutomationPurge(jobId: string, requestId: string): Promise<null> {
+  return request<null>(
+    "DELETE",
+    `/api/protected-automations/jobs/${encodeURIComponent(jobId)}/purge-requests/${encodeURIComponent(requestId)}`,
+    undefined,
+    undefined,
+    false,
+    "no-store",
+  );
+}
+
 export type ScheduledAgentRunStatus = "running" | "completed" | "failed" | "skipped";
 export type ScheduledAgentCommandGuardMode = "default" | "off" | "balanced" | "audit" | "strict";
 
@@ -279,6 +588,7 @@ export interface ScheduledAgentJob {
   cwd: string;
   provider: string | null;
   model: string | null;
+  agent_profile_id: string | null;
   permission_mode: string;
   command_guard_mode: ScheduledAgentCommandGuardMode;
   timeout_ms: number;
@@ -312,6 +622,7 @@ export interface ScheduledAgentJobInput {
   cwd?: string;
   provider?: string | null;
   model?: string | null;
+  agent_profile_id?: string | null;
   permission_mode?: string;
   command_guard_mode?: ScheduledAgentCommandGuardMode;
   timeout_ms?: number;
@@ -322,6 +633,152 @@ export interface ScheduledAgentJobInput {
 export function fetchCapabilities(cwd?: string | null): Promise<{ cwd: string | null; capabilities: Capability[] }> {
   const params = cwd ? `?${new URLSearchParams({ cwd }).toString()}` : "";
   return apiGet<{ cwd: string | null; capabilities: Capability[] }>(`/api/capabilities${params}`);
+}
+
+export const WORKSPACE_CAPABILITY_IDS = [
+  "wayang.standard-resources.v1",
+  "wayang.host-execution.v1",
+  "wayang.protected-browser.v1",
+  "wayang.protected-automation.v1",
+] as const;
+
+export type WorkspaceCapabilityId = typeof WORKSPACE_CAPABILITY_IDS[number];
+export type WorkspacePrivacyMode = "standard" | "protected";
+
+export interface WorkspaceCapabilityCatalogItem {
+  id: WorkspaceCapabilityId;
+  compatiblePrivacyMode: WorkspacePrivacyMode;
+  title: string;
+  riskSummary: string;
+}
+
+export interface WorkspaceCapabilityAssociation {
+  capabilityId: WorkspaceCapabilityId;
+  projectId: string;
+  agentProfileId: string;
+  revision: number;
+  active: boolean;
+  approvedAt: number;
+  revokedAt: number | null;
+  updatedAt: number;
+}
+
+export interface WorkspaceCapabilityApprovalEvent {
+  id: string;
+  capabilityId: WorkspaceCapabilityId;
+  projectId: string;
+  agentProfileId: string;
+  associationRevision: number;
+  operationDigest: string;
+  approvedAt: number;
+  revokedAt: number | null;
+}
+
+export interface WorkspaceCapabilityCatalogStatus {
+  capabilities: WorkspaceCapabilityCatalogItem[];
+  associations: WorkspaceCapabilityAssociation[];
+  approvalEvents: WorkspaceCapabilityApprovalEvent[];
+  history: { returned: number; limit: number; hasMore: boolean };
+}
+
+export interface WorkspaceCapabilityChallenge {
+  requestId: string;
+  operationDigest: string;
+  expiresAt: number;
+  capabilityId: WorkspaceCapabilityId;
+  projectId: string;
+  projectLabel: string;
+  projectCwd: string;
+  privacyMode: WorkspacePrivacyMode;
+  agentProfileId: string;
+  agentProfileLabel: string;
+  profileEnabled: boolean;
+  profileAllowed: boolean;
+  previewStateDigest: string;
+  association: {
+    before: { active: boolean; revision: number } | null;
+    after: { active: boolean; revision: number };
+  };
+  summary: string;
+  consequences: string[];
+  affectedRuntimes: Array<{
+    runtimeId: string;
+    status: "idle" | "streaming" | "queued" | "starting" | "mutation_locked";
+  }>;
+}
+
+export interface WorkspaceCapabilityAssociationIntent {
+  capabilityId: WorkspaceCapabilityId;
+  projectId: string;
+  agentProfileId: string;
+}
+
+export function fetchWorkspaceCapabilities(): Promise<WorkspaceCapabilityCatalogStatus> {
+  return request<WorkspaceCapabilityCatalogStatus>(
+    "GET",
+    "/api/workspace-capabilities",
+    undefined,
+    undefined,
+    false,
+    "no-store",
+  );
+}
+
+export function requestWorkspaceCapabilityActivation(
+  intent: WorkspaceCapabilityAssociationIntent,
+): Promise<WorkspaceCapabilityChallenge> {
+  return request<WorkspaceCapabilityChallenge>(
+    "POST",
+    "/api/workspace-capabilities/requests",
+    intent,
+    undefined,
+    false,
+    "no-store",
+  );
+}
+
+/** One non-retrying, no-store submission of the transient PIN. */
+export function commitWorkspaceCapabilityActivation(
+  requestId: string,
+  pin: string,
+): Promise<{ association: WorkspaceCapabilityAssociation }> {
+  return request<{ association: WorkspaceCapabilityAssociation }>(
+    "POST",
+    `/api/workspace-capabilities/requests/${encodeURIComponent(requestId)}/commit`,
+    { pin },
+    undefined,
+    false,
+    "no-store",
+  );
+}
+
+export function cancelWorkspaceCapabilityActivation(requestId: string): Promise<null> {
+  return request<null>(
+    "DELETE",
+    `/api/workspace-capabilities/requests/${encodeURIComponent(requestId)}`,
+    undefined,
+    undefined,
+    false,
+    "no-store",
+  );
+}
+
+export function revokeWorkspaceCapabilityAssociation(
+  association: Pick<WorkspaceCapabilityAssociation, "capabilityId" | "projectId" | "agentProfileId" | "revision">,
+): Promise<{ association: WorkspaceCapabilityAssociation }> {
+  return request<{ association: WorkspaceCapabilityAssociation }>(
+    "POST",
+    "/api/workspace-capability-associations/revoke",
+    {
+      capabilityId: association.capabilityId,
+      projectId: association.projectId,
+      agentProfileId: association.agentProfileId,
+      expectedRevision: association.revision,
+    },
+    undefined,
+    false,
+    "no-store",
+  );
 }
 
 export function fetchScheduledJobs(): Promise<{ jobs: ScheduledJob[] }> {
@@ -365,8 +822,56 @@ export function createSession(
   title?: string,
   model?: string,
   provider?: string,
+  agentProfileId?: string,
 ): Promise<Session> {
-  return apiPost<Session>("/api/sessions", { cwd, title: title ?? "", model, provider });
+  return apiPost<Session>("/api/sessions", {
+    cwd,
+    title: title ?? "",
+    model,
+    provider,
+    agent_profile_id: agentProfileId,
+  });
+}
+
+export interface SessionAgentSwitchPreview {
+  session_id: string;
+  from_agent_profile_id: string | null;
+  from_agent_name: string | null;
+  to_agent_profile_id: string;
+  to_agent_name: string;
+  current_provider: string | null;
+  current_model: string | null;
+  target_provider: string;
+  target_model: string;
+  memory_access: MemoryAccess;
+  transcript_retained: true;
+  warning: string;
+}
+
+export interface SessionAgentSwitchResult {
+  switch_id: string;
+  preview: SessionAgentSwitchPreview;
+  session: Session;
+}
+
+export function previewSessionAgentSwitch(
+  sessionId: string,
+  agentProfileId: string,
+): Promise<SessionAgentSwitchPreview> {
+  return apiPost<SessionAgentSwitchPreview>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/agent/preview`,
+    { agent_profile_id: agentProfileId },
+  );
+}
+
+export function switchSessionAgent(
+  sessionId: string,
+  agentProfileId: string,
+): Promise<SessionAgentSwitchResult> {
+  return apiPut<SessionAgentSwitchResult>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/agent`,
+    { agent_profile_id: agentProfileId },
+  );
 }
 
 export function getSession(id: string): Promise<Session> {
@@ -536,21 +1041,23 @@ export type BrowserLifecycleStatus = "stopped" | "starting" | "running" | "error
 export type BrowserControlMode = "agent" | "user" | "paused";
 export type BrowserViewerTransport = "vnc" | "cdp-screencast";
 
+/** Public profile metadata deliberately excludes private runtime and filesystem paths. */
 export interface BrowserProfileMetadata {
-  key: string;
-  projectCwd: string;
-  rootDir: string;
-  profileDir: string;
-  downloadsDir: string;
-  artifactsDir: string;
-  runtimePath: string;
-  persistence: "project" | "session";
+  persistence: "shared" | "project" | "session" | "protected";
+}
+
+/** Exact public state returned by browser HTTP routes and status messages. */
+export interface ProtectedDownloadStatus {
+  status: "downloading" | "completed" | "canceled";
+  suggestedFilename: string;
+  relativePath?: string;
+  bytes?: number;
+  updatedAt: number;
 }
 
 export interface BrowserSessionState {
   sessionId: string | null;
   projectCwd: string;
-  key: string;
   status: BrowserLifecycleStatus;
   controlMode: BrowserControlMode;
   secretTainted: boolean;
@@ -560,19 +1067,18 @@ export interface BrowserSessionState {
   lastResumeAt?: number;
   activeUrl?: string;
   activeTitle?: string;
-  cdpPort?: number;
   cdpReady: boolean;
   viewerTransport: BrowserViewerTransport;
   viewerWsPath?: string;
   cdpScreencastWsPath?: string;
   vncReady: boolean;
-  vncPort?: number;
-  display?: string;
   profile: BrowserProfileMetadata;
   startedAt?: number;
   updatedAt: number;
   lastError?: string;
-  logs: string[];
+  credentialInspection?: "blocked" | "text-allowed";
+  credentialBroker?: { supported: boolean; guarded: true };
+  download?: ProtectedDownloadStatus;
 }
 
 export interface BrowserSnapshot {
@@ -597,24 +1103,28 @@ function browserQuery(sessionId: string | null, projectCwd: string | null): stri
   return params.toString();
 }
 
+function browserApiPath(operation: string, sessionId: string | null, projectCwd: string | null): string {
+  return `/api/browser/${operation}?${browserQuery(sessionId, projectCwd)}`;
+}
+
 export function fetchBrowserStatus(sessionId: string | null, projectCwd: string | null): Promise<BrowserSessionState> {
   return apiGet<BrowserSessionState>(`/api/browser/status?${browserQuery(sessionId, projectCwd)}`);
 }
 
 export function startBrowser(sessionId: string | null, projectCwd: string | null): Promise<BrowserSessionState> {
-  return apiPost<BrowserSessionState>("/api/browser/start", browserBody(sessionId, projectCwd));
+  return apiPost<BrowserSessionState>(browserApiPath("start", sessionId, projectCwd), browserBody(sessionId, projectCwd));
 }
 
 export function stopBrowser(sessionId: string | null, projectCwd: string | null): Promise<BrowserSessionState> {
-  return apiPost<BrowserSessionState>("/api/browser/stop", browserBody(sessionId, projectCwd));
+  return apiPost<BrowserSessionState>(browserApiPath("stop", sessionId, projectCwd), browserBody(sessionId, projectCwd));
 }
 
 export function restartBrowser(sessionId: string | null, projectCwd: string | null): Promise<BrowserSessionState> {
-  return apiPost<BrowserSessionState>("/api/browser/restart", browserBody(sessionId, projectCwd));
+  return apiPost<BrowserSessionState>(browserApiPath("restart", sessionId, projectCwd), browserBody(sessionId, projectCwd));
 }
 
 export function resetBrowserProfile(sessionId: string | null, projectCwd: string | null): Promise<BrowserSessionState> {
-  return apiPost<BrowserSessionState>("/api/browser/reset-profile", browserBody(sessionId, projectCwd));
+  return apiPost<BrowserSessionState>(browserApiPath("reset-profile", sessionId, projectCwd), browserBody(sessionId, projectCwd, { confirmed: true }));
 }
 
 export function setBrowserControlMode(
@@ -623,11 +1133,11 @@ export function setBrowserControlMode(
   mode: BrowserControlMode,
   reason?: string,
 ): Promise<BrowserSessionState> {
-  return apiPost<BrowserSessionState>("/api/browser/control-mode", browserBody(sessionId, projectCwd, { mode, reason }));
+  return apiPost<BrowserSessionState>(browserApiPath("control-mode", sessionId, projectCwd), browserBody(sessionId, projectCwd, { mode, reason }));
 }
 
 export function navigateBrowser(sessionId: string | null, projectCwd: string | null, url: string): Promise<BrowserSessionState> {
-  return apiPost<BrowserSessionState>("/api/browser/navigate", browserBody(sessionId, projectCwd, { url }));
+  return apiPost<BrowserSessionState>(browserApiPath("navigate", sessionId, projectCwd), browserBody(sessionId, projectCwd, { url }));
 }
 
 export function snapshotBrowser(
@@ -635,29 +1145,272 @@ export function snapshotBrowser(
   projectCwd: string | null,
   mode: "text" | "screenshot" = "text",
 ): Promise<BrowserSnapshot> {
-  return apiPost<BrowserSnapshot>("/api/browser/snapshot", browserBody(sessionId, projectCwd, { mode }));
+  return apiPost<BrowserSnapshot>(browserApiPath("snapshot", sessionId, projectCwd), browserBody(sessionId, projectCwd, { mode }));
 }
 
-export async function pasteTextBrowser(sessionId: string | null, projectCwd: string | null, text: string): Promise<BrowserSessionState> {
-  const body = browserBody(sessionId, projectCwd, { text });
+export function pasteTextBrowser(sessionId: string | null, projectCwd: string | null, text: string): Promise<BrowserSessionState> {
+  // This user-only route is intentionally not allowed to fall back to the
+  // agent's public-text route: a direct human paste may contain a credential.
+  return apiPost<BrowserSessionState>(browserApiPath("paste-text", sessionId, projectCwd), browserBody(sessionId, projectCwd, { text }));
+}
+
+export type BrowserCredentialAvailability = "unavailable" | "locked" | "unlocked";
+
+export interface BrowserCredentialStatus {
+  availability: BrowserCredentialAvailability;
+  exactOrigin: string | null;
+  unlockExpiresAt?: number;
+}
+
+export interface BrowserCredentialChoice {
+  choiceToken: string;
+  label: string;
+  maskedIdentifier: string;
+  hasTotp: boolean;
+  matchWarning?: string;
+}
+
+export interface BrowserCredentialMatches extends BrowserCredentialStatus {
+  choices: BrowserCredentialChoice[];
+}
+
+export interface BrowserCredentialFillResult {
+  filled: Array<"username" | "password" | "totp">;
+}
+
+export interface BrowserCredentialInspectionResult {
+  allowedInspection: "text-only";
+  screenshotsAllowed: false;
+  mutationsAllowed: false;
+  state: BrowserSessionState;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? value as Record<string, unknown> : {};
+}
+
+function exactOrigin(value: unknown): string | null {
+  if (typeof value !== "string" || !value) return null;
   try {
-    return await apiPost<BrowserSessionState>("/api/browser/paste-text", body);
-  } catch (err) {
-    // During rolling frontend/backend updates, an already-running backend may
-    // not have the user-paste endpoint yet. Fall back to the existing CDP text
-    // insertion route so the UI works immediately after the frontend build is
-    // served, without exposing clipboard text to chat or logs.
-    if (err instanceof ApiError && err.status === 404) {
-      return apiPost<BrowserSessionState>("/api/browser/type-public", body);
-    }
-    throw err;
+    const url = new URL(value);
+    return url.origin === "null" ? null : url.origin;
+  } catch {
+    return null;
   }
+}
+
+export async function fetchBrowserCredentialStatus(
+  sessionId: string | null,
+  projectCwd: string | null,
+): Promise<BrowserCredentialStatus> {
+  const raw = asRecord(await apiPost<unknown>(
+    browserApiPath("credentials/status", sessionId, projectCwd),
+    browserBody(sessionId, projectCwd),
+  ));
+  if (typeof raw.available !== "boolean" || typeof raw.unlocked !== "boolean") {
+    throw new Error("Credential broker returned an invalid status");
+  }
+  return {
+    availability: !raw.available ? "unavailable" : raw.unlocked ? "unlocked" : "locked",
+    exactOrigin: exactOrigin(raw.origin),
+    ...(typeof raw.unlockExpiresAt === "number" ? { unlockExpiresAt: raw.unlockExpiresAt } : {}),
+  };
+}
+
+export async function fetchBrowserCredentialMatches(
+  sessionId: string | null,
+  projectCwd: string | null,
+): Promise<BrowserCredentialMatches> {
+  let raw: Record<string, unknown>;
+  try {
+    raw = asRecord(await apiPost<unknown>(
+      browserApiPath("credentials/matches", sessionId, projectCwd),
+      browserBody(sessionId, projectCwd),
+    ));
+  } catch (error) {
+    // The finalized UI route pauses the agent before checking the broker. Its
+    // status is represented by bounded HTTP outcomes rather than secret-bearing
+    // response data: unavailable=503, locked/not-connected=409.
+    if (error instanceof ApiError && error.status === 503) {
+      return { availability: "unavailable", exactOrigin: null, choices: [] };
+    }
+    if (error instanceof ApiError && error.status === 409) {
+      return { availability: "locked", exactOrigin: null, choices: [] };
+    }
+    throw error;
+  }
+  const rawChoices = Array.isArray(raw.choices) ? raw.choices : [];
+  return {
+    availability: "unlocked",
+    exactOrigin: exactOrigin(raw.origin),
+    choices: rawChoices.flatMap((value): BrowserCredentialChoice[] => {
+      const choice = asRecord(value);
+      const choiceToken = typeof choice.choiceToken === "string"
+        ? choice.choiceToken
+        : typeof choice.token === "string"
+          ? choice.token
+          : "";
+      if (!choiceToken) return [];
+      return [{
+        choiceToken,
+        label: typeof choice.label === "string" && choice.label ? choice.label : "Saved login",
+        // Never fall back to a raw username/identifier field. The broker must
+        // explicitly return display-safe masked metadata.
+        maskedIdentifier: typeof choice.maskedIdentifier === "string" && choice.maskedIdentifier
+          ? choice.maskedIdentifier
+          : "Identifier hidden",
+        hasTotp: choice.hasTotp === true || choice.totpAvailable === true,
+        matchWarning: typeof choice.matchWarning === "string"
+          ? choice.matchWarning
+          : typeof choice.warning === "string"
+            ? choice.warning
+            : undefined,
+      }];
+    }),
+  };
+}
+
+function normalizeCredentialFill(value: unknown): BrowserCredentialFillResult {
+  const record = asRecord(value);
+  const values = Array.isArray(record.filled) ? record.filled : Array.isArray(record.fields) ? record.fields : [];
+  const allowed = new Set<BrowserCredentialFillResult["filled"][number]>(["username", "password", "totp"]);
+  return { filled: values.filter((field): field is BrowserCredentialFillResult["filled"][number] => allowed.has(field)) };
+}
+
+export async function fillBrowserCredentialLogin(
+  sessionId: string | null,
+  projectCwd: string | null,
+  choiceToken: string,
+): Promise<BrowserCredentialFillResult> {
+  const raw = await apiPost<unknown>(
+    browserApiPath("credentials/fill", sessionId, projectCwd),
+    browserBody(sessionId, projectCwd, { choiceToken }),
+  );
+  return normalizeCredentialFill(raw);
+}
+
+export async function fillBrowserCredentialTotp(
+  sessionId: string | null,
+  projectCwd: string | null,
+  choiceToken: string,
+): Promise<BrowserCredentialFillResult> {
+  const raw = await apiPost<unknown>(
+    browserApiPath("credentials/fill-totp", sessionId, projectCwd),
+    browserBody(sessionId, projectCwd, { choiceToken }),
+  );
+  return normalizeCredentialFill(raw);
+}
+
+export async function allowAgentBrowserCredentialInspection(
+  sessionId: string | null,
+  projectCwd: string | null,
+): Promise<BrowserCredentialInspectionResult> {
+  return apiPost<BrowserCredentialInspectionResult>(
+    browserApiPath("credentials/allow-agent-inspection", sessionId, projectCwd),
+    browserBody(sessionId, projectCwd),
+  );
+}
+
+export async function lockBrowserCredentials(
+  sessionId: string | null,
+  projectCwd: string | null,
+): Promise<{ locked: true }> {
+  const raw = asRecord(await apiPost<unknown>(
+    browserApiPath("credentials/lock", sessionId, projectCwd),
+    browserBody(sessionId, projectCwd),
+  ));
+  if (raw.locked !== true) throw new Error("Credential vault did not confirm it was locked");
+  return { locked: true };
+}
+
+function protectedAutomationCredentialPath(
+  selection: ProtectedAutomationPreparationSelection,
+  operation: string,
+): string {
+  return `${protectedAutomationPreparationBase(selection)}/credentials/${operation}`;
+}
+
+export async function fetchProtectedAutomationCredentialStatus(
+  selection: ProtectedAutomationPreparationSelection,
+): Promise<BrowserCredentialStatus> {
+  const raw = asRecord(await apiPost<unknown>(protectedAutomationCredentialPath(selection, "status")));
+  if (typeof raw.available !== "boolean" || typeof raw.unlocked !== "boolean") {
+    throw new Error("Automation credential broker returned an invalid status");
+  }
+  return {
+    availability: !raw.available ? "unavailable" : raw.unlocked ? "unlocked" : "locked",
+    exactOrigin: exactOrigin(raw.origin),
+    ...(typeof raw.unlockExpiresAt === "number" ? { unlockExpiresAt: raw.unlockExpiresAt } : {}),
+  };
+}
+
+export async function fetchProtectedAutomationCredentialMatches(
+  selection: ProtectedAutomationPreparationSelection,
+): Promise<BrowserCredentialMatches> {
+  let raw: Record<string, unknown>;
+  try {
+    raw = asRecord(await apiPost<unknown>(protectedAutomationCredentialPath(selection, "matches")));
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 503) return { availability: "unavailable", exactOrigin: null, choices: [] };
+    if (error instanceof ApiError && error.status === 409) return { availability: "locked", exactOrigin: null, choices: [] };
+    throw error;
+  }
+  const rawChoices = Array.isArray(raw.choices) ? raw.choices : [];
+  return {
+    availability: "unlocked",
+    exactOrigin: exactOrigin(raw.origin),
+    choices: rawChoices.flatMap((value): BrowserCredentialChoice[] => {
+      const choice = asRecord(value);
+      const choiceToken = typeof choice.choiceToken === "string"
+        ? choice.choiceToken
+        : typeof choice.token === "string" ? choice.token : "";
+      if (!choiceToken) return [];
+      return [{
+        choiceToken,
+        label: typeof choice.label === "string" && choice.label ? choice.label : "Saved login",
+        maskedIdentifier: typeof choice.maskedIdentifier === "string" && choice.maskedIdentifier
+          ? choice.maskedIdentifier : "Identifier hidden",
+        hasTotp: choice.hasTotp === true || choice.totpAvailable === true,
+        matchWarning: typeof choice.matchWarning === "string" ? choice.matchWarning
+          : typeof choice.warning === "string" ? choice.warning : undefined,
+      }];
+    }),
+  };
+}
+
+export async function fillProtectedAutomationCredentialLogin(
+  selection: ProtectedAutomationPreparationSelection,
+  choiceToken: string,
+): Promise<BrowserCredentialFillResult> {
+  return normalizeCredentialFill(await apiPost<unknown>(
+    protectedAutomationCredentialPath(selection, "fill"),
+    { choiceToken },
+  ));
+}
+
+export async function fillProtectedAutomationCredentialTotp(
+  selection: ProtectedAutomationPreparationSelection,
+  choiceToken: string,
+): Promise<BrowserCredentialFillResult> {
+  return normalizeCredentialFill(await apiPost<unknown>(
+    protectedAutomationCredentialPath(selection, "fill-totp"),
+    { choiceToken },
+  ));
+}
+
+export async function lockProtectedAutomationCredentials(
+  selection: ProtectedAutomationPreparationSelection,
+): Promise<{ locked: true }> {
+  const raw = asRecord(await apiPost<unknown>(protectedAutomationCredentialPath(selection, "lock")));
+  if (raw.locked !== true) throw new Error("Automation credential vault did not confirm it was locked");
+  return { locked: true };
 }
 
 export function browserWsUrl(sessionId: string | null, projectCwd: string | null): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const params = browserQuery(sessionId, projectCwd);
-  return `${proto}//${window.location.host}/ws/browser?${params}`;
+  const params = new URLSearchParams(browserQuery(sessionId, projectCwd));
+  params.set("frames", "binary");
+  return `${proto}//${window.location.host}/ws/browser?${params.toString()}`;
 }
 
 export function browserVncWsUrl(sessionId: string | null, projectCwd: string | null): string {
@@ -716,12 +1469,157 @@ export function synthesizeTts(
 }
 
 // ---------------------------------------------------------------------------
-// Projects — virtual grouping by cwd
+// Durable projects and agent profiles
+// ---------------------------------------------------------------------------
+
+export type MemoryAccess = "none" | "read" | "read_write";
+export type ResourceMode = "standard" | "project_only" | "custom";
+
+export interface ProjectAccessPolicy {
+  privacy_mode: "standard" | "protected";
+  allowed_agent_profile_ids: string[] | null;
+}
+
+export interface WorkspaceProject {
+  id: string;
+  cwd: string;
+  name: string;
+  description: string | null;
+  color: string | null;
+  default_agent_profile_id: string;
+  default_provider: string | null;
+  default_model: string | null;
+  access_policy: ProjectAccessPolicy;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AgentProfileSummary {
+  id: string;
+  name: string;
+  description: string | null;
+  enabled: boolean;
+  resource_mode: ResourceMode;
+  memory_access: MemoryAccess;
+  default_provider: string | null;
+  default_model: string | null;
+  allowed_tools: string[] | null;
+  allowed_extensions: string[] | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface AgentProfile extends AgentProfileSummary {
+  instructions: string | null;
+}
+
+export interface ProjectInstructions {
+  path: string;
+  exists: boolean;
+  text: string | null;
+  sha256: string | null;
+  git_tracked: boolean | null;
+  git_changed: boolean | null;
+}
+
+export interface ProjectInput {
+  cwd: string;
+  name?: string;
+  description?: string | null;
+  color?: string | null;
+  default_agent_profile_id?: string;
+  default_provider?: string | null;
+  default_model?: string | null;
+  access_policy?: ProjectAccessPolicy;
+}
+
+export type ProjectUpdate = Omit<ProjectInput, "cwd">;
+
+export interface AgentProfileInput {
+  name: string;
+  description?: string | null;
+  resource_mode?: ResourceMode;
+  instructions?: string | null;
+  memory_access?: MemoryAccess;
+  default_provider?: string | null;
+  default_model?: string | null;
+}
+
+export interface AgentProfileUpdate {
+  name?: string;
+  description?: string | null;
+  enabled?: boolean;
+  resource_mode?: ResourceMode;
+  instructions?: string | null;
+  memory_access?: MemoryAccess;
+  default_provider?: string | null;
+  default_model?: string | null;
+  replacement_agent_profile_id?: string;
+}
+
+export function fetchProjects(): Promise<WorkspaceProject[]> {
+  return apiGet<WorkspaceProject[]>("/api/projects");
+}
+
+export function createProject(input: ProjectInput): Promise<WorkspaceProject> {
+  return apiPost<WorkspaceProject>("/api/projects", input);
+}
+
+export function fetchProject(id: string): Promise<WorkspaceProject> {
+  return apiGet<WorkspaceProject>(`/api/projects/${encodeURIComponent(id)}`);
+}
+
+export function updateProject(id: string, input: ProjectUpdate): Promise<WorkspaceProject> {
+  return apiPut<WorkspaceProject>(`/api/projects/${encodeURIComponent(id)}`, input);
+}
+
+export function fetchProjectInstructions(id: string): Promise<ProjectInstructions> {
+  return apiGet<ProjectInstructions>(`/api/projects/${encodeURIComponent(id)}/instructions`);
+}
+
+export function updateProjectInstructions(
+  id: string,
+  input: { text: string; expected_sha256?: string | null; create_if_missing?: boolean },
+): Promise<ProjectInstructions> {
+  return apiPut<ProjectInstructions>(`/api/projects/${encodeURIComponent(id)}/instructions`, input);
+}
+
+export function fetchAgentProfiles(): Promise<AgentProfileSummary[]> {
+  return apiGet<AgentProfileSummary[]>("/api/agent-profiles");
+}
+
+export function createAgentProfile(input: AgentProfileInput): Promise<AgentProfile> {
+  return apiPost<AgentProfile>("/api/agent-profiles", input);
+}
+
+export function fetchAgentProfile(id: string): Promise<AgentProfile> {
+  return apiGet<AgentProfile>(`/api/agent-profiles/${encodeURIComponent(id)}`);
+}
+
+export function updateAgentProfile(id: string, input: AgentProfileUpdate): Promise<AgentProfile> {
+  return apiPut<AgentProfile>(`/api/agent-profiles/${encodeURIComponent(id)}`, input);
+}
+
+export function deleteAgentProfile(id: string, replacementAgentProfileId?: string): Promise<null> {
+  return request<null>("DELETE", `/api/agent-profiles/${encodeURIComponent(id)}`, replacementAgentProfileId
+    ? { replacement_agent_profile_id: replacementAgentProfileId }
+    : {});
+}
+
+// ---------------------------------------------------------------------------
+// Project/session joins (virtual fallback retained for catalog durability)
 // ---------------------------------------------------------------------------
 
 export interface Project {
+  id: string | null;
   cwd: string;
   name: string;
+  description: string | null;
+  color: string | null;
+  default_agent_profile_id: string | null;
+  default_provider: string | null;
+  default_model: string | null;
+  access_policy: ProjectAccessPolicy;
   sessions: Session[];
   lastActive: number;
 }
@@ -744,8 +1642,15 @@ export function groupSessionsIntoProjects(sessions: Session[]): Project[] {
     cwdSessions.sort((a, b) => b.last_active - a.last_active);
     const segments = cwd.split("/").filter(Boolean);
     projects.push({
+      id: null,
       cwd,
       name: segments[segments.length - 1] || "/",
+      description: null,
+      color: null,
+      default_agent_profile_id: null,
+      default_provider: null,
+      default_model: null,
+      access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: null },
       sessions: cwdSessions,
       lastActive: cwdSessions[0].last_active,
     });
@@ -753,6 +1658,34 @@ export function groupSessionsIntoProjects(sessions: Session[]): Project[] {
 
   projects.sort((a, b) => b.lastActive - a.lastActive);
   return projects;
+}
+
+export function joinSessionsIntoProjects(
+  sessions: Session[],
+  durableProjects: WorkspaceProject[],
+): Project[] {
+  const virtual = groupSessionsIntoProjects(sessions);
+  const byCwd = new Map(virtual.map((project) => [project.cwd, project]));
+
+  for (const record of durableProjects) {
+    const cwd = record.cwd.replace(/\/+$/, "") || "/";
+    const existing = byCwd.get(cwd);
+    byCwd.set(cwd, {
+      id: record.id,
+      cwd,
+      name: record.name,
+      description: record.description,
+      color: record.color,
+      default_agent_profile_id: record.default_agent_profile_id,
+      default_provider: record.default_provider,
+      default_model: record.default_model,
+      access_policy: record.access_policy,
+      sessions: existing?.sessions ?? [],
+      lastActive: existing?.lastActive ?? record.updated_at,
+    });
+  }
+
+  return [...byCwd.values()].sort((a, b) => b.lastActive - a.lastActive);
 }
 
 // ---------------------------------------------------------------------------

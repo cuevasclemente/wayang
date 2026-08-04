@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { flush, getStore } from "../db.js";
+import { getAgentProfile } from "../agent-profiles.js";
+import { commitStoreMutation, flush, getStore } from "../db.js";
+import { authorizeProjectAction } from "../policy.js";
+import { WorkspaceStoreError } from "../workspace-types.js";
 import { nextCronOccurrence, validateCronExpression } from "./cron.js";
 import type { ScheduledJobCommandGuardMode, ScheduledJobInput, ScheduledJobRow, ScheduledRunRow, ScheduledJobStatus, ScheduledJobTrigger } from "./types.js";
 
@@ -33,7 +36,9 @@ export function createScheduledJob(input: ScheduledJobInput): ScheduledJobRow {
   const cronExpr = requiredString(input.cron_expr, "cron_expr");
   const prompt = requiredString(input.prompt, "prompt");
   const cwd = requiredString(input.cwd, "cwd");
+  const agentProfileId = validateAgentProfileId(input.agent_profile_id);
   validateCronExpression(cronExpr);
+  requireScheduledAuthorization(cwd, agentProfileId);
 
   const store = getStore();
   const now = Date.now();
@@ -48,6 +53,7 @@ export function createScheduledJob(input: ScheduledJobInput): ScheduledJobRow {
     cwd,
     provider: normalizeNullableString(input.provider),
     model: normalizeNullableString(input.model),
+    agent_profile_id: agentProfileId,
     permission_mode: normalizeString(input.permission_mode) || "bypass",
     command_guard_mode: normalizeCommandGuardMode(input.command_guard_mode),
     timeout_ms: positiveInteger(input.timeout_ms, DEFAULT_TIMEOUT_MS, "timeout_ms"),
@@ -66,30 +72,44 @@ export function createScheduledJob(input: ScheduledJobInput): ScheduledJobRow {
 }
 
 export function updateScheduledJob(id: string, input: ScheduledJobInput): ScheduledJobRow | undefined {
-  const store = getStore();
-  const job = store.scheduledJobs.find((row) => row.id === id);
+  const job = getStore().scheduledJobs.find((row) => row.id === id);
   if (!job) return undefined;
 
-  if (input.name !== undefined) job.name = requiredString(input.name, "name");
+  // Build and validate a private candidate before publishing any fields. The
+  // attribution ID and its capability marker must always move together.
+  const candidate = { ...job };
+  if (input.name !== undefined) candidate.name = requiredString(input.name, "name");
   if (input.cron_expr !== undefined) {
     const cronExpr = requiredString(input.cron_expr, "cron_expr");
     validateCronExpression(cronExpr);
-    job.cron_expr = cronExpr;
+    candidate.cron_expr = cronExpr;
   }
-  if (input.prompt !== undefined) job.prompt = requiredString(input.prompt, "prompt");
-  if (input.cwd !== undefined) job.cwd = requiredString(input.cwd, "cwd");
-  if (input.provider !== undefined) job.provider = normalizeNullableString(input.provider);
-  if (input.model !== undefined) job.model = normalizeNullableString(input.model);
-  if (input.permission_mode !== undefined) job.permission_mode = normalizeString(input.permission_mode) || "bypass";
-  if (input.command_guard_mode !== undefined) job.command_guard_mode = normalizeCommandGuardMode(input.command_guard_mode);
-  if (input.timeout_ms !== undefined) job.timeout_ms = positiveInteger(input.timeout_ms, DEFAULT_TIMEOUT_MS, "timeout_ms");
-  if (input.prompt_timeout_ms !== undefined) job.prompt_timeout_ms = positiveInteger(input.prompt_timeout_ms, DEFAULT_PROMPT_TIMEOUT_MS, "prompt_timeout_ms");
-  if (input.enabled !== undefined) job.enabled = Boolean(input.enabled);
+  if (input.prompt !== undefined) candidate.prompt = requiredString(input.prompt, "prompt");
+  if (input.cwd !== undefined) candidate.cwd = requiredString(input.cwd, "cwd");
+  if (input.provider !== undefined) candidate.provider = normalizeNullableString(input.provider);
+  if (input.model !== undefined) candidate.model = normalizeNullableString(input.model);
+  if (input.agent_profile_id !== undefined) {
+    const agentProfileId = validateAgentProfileId(input.agent_profile_id);
+    candidate.agent_profile_id = agentProfileId;
+    candidate.legacy_capability_ineligible = agentProfileId === null;
+  }
+  if (input.permission_mode !== undefined) candidate.permission_mode = normalizeString(input.permission_mode) || "bypass";
+  if (input.command_guard_mode !== undefined) candidate.command_guard_mode = normalizeCommandGuardMode(input.command_guard_mode);
+  if (input.timeout_ms !== undefined) candidate.timeout_ms = positiveInteger(input.timeout_ms, DEFAULT_TIMEOUT_MS, "timeout_ms");
+  if (input.prompt_timeout_ms !== undefined) candidate.prompt_timeout_ms = positiveInteger(input.prompt_timeout_ms, DEFAULT_PROMPT_TIMEOUT_MS, "prompt_timeout_ms");
+  if (input.enabled !== undefined) candidate.enabled = Boolean(input.enabled);
 
-  job.updated_at = Date.now();
-  job.next_run_at = job.enabled ? nextCronOccurrence(job.cron_expr, Date.now()) : null;
-  flush();
-  return cloneJob(job);
+  requireScheduledAuthorization(candidate.cwd, candidate.agent_profile_id);
+  const now = Date.now();
+  candidate.updated_at = now;
+  candidate.next_run_at = candidate.enabled ? nextCronOccurrence(candidate.cron_expr, now) : null;
+
+  return commitStoreMutation((draft) => {
+    const target = draft.scheduledJobs.find((row) => row.id === id);
+    if (!target) return undefined;
+    Object.assign(target, candidate);
+    return cloneJob(target);
+  });
 }
 
 export function deleteScheduledJob(id: string): boolean {
@@ -186,6 +206,23 @@ function normalizeNullableString(value: unknown): string | null {
   return normalized ? normalized : null;
 }
 
+function requireScheduledAuthorization(cwd: string, agentProfileId: string | null): void {
+  const decision = authorizeProjectAction({ cwd, actor: "scheduled", agentProfileId });
+  if (!decision.allowed) throw new WorkspaceStoreError(decision.reason ?? "Scheduled project access denied", 403);
+}
+
+function validateAgentProfileId(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !value.trim()) {
+    throw new WorkspaceStoreError("agent_profile_id must be a nonempty string or null");
+  }
+  const id = value.trim();
+  const profile = getAgentProfile(id);
+  if (!profile) throw new WorkspaceStoreError("Agent profile not found", 404);
+  if (!profile.enabled) throw new WorkspaceStoreError("Agent profile must be enabled", 409);
+  return id;
+}
+
 function positiveInteger(value: unknown, fallback: number, field: string): number {
   if (value === undefined || value === null || value === "") return fallback;
   const num = Number(value);
@@ -213,7 +250,7 @@ function cloneJob(job: ScheduledJobRow): ScheduledJobRow {
   // Ignore unknown legacy metadata rather than exposing implementation-specific
   // migration provenance through the public API.
   const { migrated_from: _legacyMigration, ...publicJob } = job as ScheduledJobRow & { migrated_from?: unknown };
-  return { ...publicJob };
+  return { ...publicJob, agent_profile_id: publicJob.agent_profile_id ?? null };
 }
 
 function cloneRun(run: ScheduledRunRow): ScheduledRunRow {

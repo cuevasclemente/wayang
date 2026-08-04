@@ -9,7 +9,7 @@
  */
 
 import { Router, type Request, type Response } from "express";
-import { listSessions } from "../sessions.js";
+import { listIndexableSessions } from "../search/policy-filter.js";
 import {
   getSearchDb,
   getWatcherStatus,
@@ -96,42 +96,38 @@ router.get("/sessions/search", (req: Request, res: Response) => {
   }
 });
 
+export function getSearchHealthSnapshot() {
+  const db = getSearchDb();
+  const allowedSessionIds = new Set(listIndexableSessions().map((session) => session.id));
+  const states = db
+    .prepare("SELECT session_id, error, indexed_at_ms FROM session_index_state")
+    .all() as Array<{ session_id: string; error: string | null; indexed_at_ms: number }>;
+  const allowedStates = states.filter((state) => allowedSessionIds.has(state.session_id));
+  const total = allowedSessionIds.size;
+  const indexed = allowedStates.length;
+  const errors = allowedStates
+    .filter((state) => state.error)
+    .sort((a, b) => b.indexed_at_ms - a.indexed_at_ms);
+  const watcher = getWatcherStatus();
+  return {
+    total_sessions: total,
+    indexed_sessions: indexed,
+    pending: Math.max(0, total - indexed),
+    errored: errors.length,
+    last_error: errors[0]?.error ?? watcher.lastError ?? undefined,
+    schema_version: SCHEMA_VERSION,
+    embedder: "off" as const,
+    watcher: {
+      backfill_done: watcher.backfillDone,
+      backfill_running: watcher.backfillRunning,
+      last_tick_at: watcher.lastTickAt,
+    },
+  };
+}
+
 router.get("/sessions/search/health", (_req: Request, res: Response) => {
   try {
-    const db = getSearchDb();
-    const total = listSessions(true).length;
-    const indexed = (
-      db
-        .prepare("SELECT COUNT(*) AS n FROM session_index_state")
-        .get() as { n: number }
-    ).n;
-    const errored = (
-      db
-        .prepare(
-          "SELECT COUNT(*) AS n FROM session_index_state WHERE error IS NOT NULL AND error <> ''",
-        )
-        .get() as { n: number }
-    ).n;
-    const lastErrorRow = db
-      .prepare(
-        "SELECT error FROM session_index_state WHERE error IS NOT NULL AND error <> '' ORDER BY indexed_at_ms DESC LIMIT 1",
-      )
-      .get() as { error: string } | undefined;
-    const watcher = getWatcherStatus();
-    res.json({
-      total_sessions: total,
-      indexed_sessions: indexed,
-      pending: Math.max(0, total - indexed),
-      errored,
-      last_error: lastErrorRow?.error ?? watcher.lastError ?? undefined,
-      schema_version: SCHEMA_VERSION,
-      embedder: "off" as const,
-      watcher: {
-        backfill_done: watcher.backfillDone,
-        backfill_running: watcher.backfillRunning,
-        last_tick_at: watcher.lastTickAt,
-      },
-    });
+    res.json(getSearchHealthSnapshot());
   } catch (err: any) {
     res.status(500).json({ error: err?.message || String(err) });
   }

@@ -1,24 +1,52 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CdpConnection, type ChromeTarget } from "./cdp.js";
+import { CdpConnection, connectBrowserCdp, type ChromeTarget } from "./cdp.js";
 import type {
   BrowserAccessibilitySnapshot,
   BrowserControlMode,
   BrowserDomSnapshot,
   BrowserLinksResult,
   BrowserSelectorQueryResult,
+  BrowserPersistence,
+  BrowserPublicState,
   BrowserSessionLookup,
   BrowserSessionState,
   BrowserSnapshot,
 } from "./types.js";
-import { getSessionById, normalizeSessionCwd } from "../sessions.js";
+import { stripInternalCapabilityEnv } from "../child-env.js";
+import { resolveBrowserSessionLookup } from "./lookup.js";
+
+// Generic protected-browser coordination is re-exported here for runtime
+// composition while its workspace authority and Chromium backend stay injected.
+export {
+  CapabilityBoundProtectedBrowser,
+  ensureProtectedBrowserStorage,
+  exactProtectedBrowserBindingEqual,
+  isProtectedBrowserAllowedTopLevelUrl,
+  isProtectedBrowserHttpsUrl,
+  normalizeProtectedBrowserHttpsUrl,
+  type ProtectedBrowserAuthorityPort,
+  type ProtectedBrowserBackendPort,
+  type ProtectedBrowserCredentialPort,
+} from "./protected-browser.js";
 
 const STARTUP_TIMEOUT_MS = 20_000;
 const MAX_LOG_LINES = 300;
+
+type CredentialInspectionMode = "none" | "blocked" | "text-allowed";
+type AgentWorkKind = "inspection-text" | "inspection-screenshot" | "mutation";
+
+interface CredentialInspectionState {
+  mode: CredentialInspectionMode;
+  values: string[];
+  targetId?: string;
+  documentIdentity?: string;
+  allowUsed: boolean;
+}
 
 interface BrowserRuntime {
   state: BrowserSessionState;
@@ -26,9 +54,12 @@ interface BrowserRuntime {
   xvfbChild: ChildProcess | null;
   vncChild: ChildProcess | null;
   stopping: boolean;
+  mutationTail: Promise<void>;
+  credentialInspection: CredentialInspectionState;
 }
 
 const runtimes = new Map<string, BrowserRuntime>();
+const browserStopHooks = new Set<() => Promise<void>>();
 
 function now(): number {
   return Date.now();
@@ -53,13 +84,32 @@ function appendChunk(runtime: BrowserRuntime, chunk: Buffer | string): void {
   }
 }
 
+function executableOnPath(name: string): string | null {
+  if (name.includes(path.sep)) return null;
+  for (const directory of (process.env.PATH || "").split(path.delimiter)) {
+    if (!path.isAbsolute(directory)) continue;
+    const resolved = resolveChromiumExecutableCandidate(path.join(directory, name));
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
 function hasCommand(name: string): boolean {
-  const found = spawnSync("command", ["-v", name], { shell: true, encoding: "utf-8" });
-  return found.status === 0 && found.stdout.trim().length > 0;
+  return executableOnPath(name) !== null;
 }
 
 function canUseVncTransport(): boolean {
-  return process.env.WAYANG_BROWSER_TRANSPORT !== "cdp" && hasCommand("Xvfb") && hasCommand("x11vnc");
+  return process.platform === "linux" && hasCommand("Xvfb") && hasCommand("x11vnc");
+}
+
+function selectedViewerTransport(vncAvailable: boolean): "vnc" | "cdp-screencast" {
+  const configured = process.env.WAYANG_BROWSER_TRANSPORT || "auto";
+  if (configured === "vnc" && !vncAvailable) throw new Error("VNC transport requested but Xvfb/x11vnc are unavailable");
+  return configured === "cdp" || !vncAvailable ? "cdp-screencast" : "vnc";
+}
+
+function browserChildEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return { ...stripInternalCapabilityEnv(process.env), ...stripInternalCapabilityEnv(overrides) };
 }
 
 function allocatePort(): Promise<number> {
@@ -78,39 +128,149 @@ function allocatePort(): Promise<number> {
   });
 }
 
-function playwrightChromiumCandidates(): string[] {
-  const cacheDir = path.join(os.homedir(), ".cache", "ms-playwright");
+export function getPlaywrightCacheRoot(
+  platform: NodeJS.Platform = process.platform,
+  homeDir = os.homedir(),
+): string {
+  return platform === "darwin"
+    ? path.join(homeDir, "Library", "Caches", "ms-playwright")
+    : path.join(homeDir, ".cache", "ms-playwright");
+}
+
+export function getChromiumHostArchitecture(
+  platform: NodeJS.Platform = process.platform,
+  processArch: NodeJS.Architecture = process.arch,
+  cpuModels?: readonly string[],
+): NodeJS.Architecture {
+  if (platform !== "darwin") return processArch;
+  const detectedCpuModels = cpuModels ?? os.cpus().map((cpu) => cpu.model);
+  return detectedCpuModels.some((model) => model.includes("Apple")) ? "arm64" : processArch;
+}
+
+function playwrightEntryRevision(name: string): number {
+  return Number(name.match(/-(\d+)$/)?.[1] ?? 0);
+}
+
+function playwrightEntryProductOrder(name: string): number {
+  return name.startsWith("chromium-") ? 0 : 1;
+}
+
+export function getPlaywrightChromiumCandidates(
+  platform: NodeJS.Platform = process.platform,
+  hostArchitecture: NodeJS.Architecture = process.arch,
+  homeDir = os.homedir(),
+  cacheEntryNames?: readonly string[],
+): string[] {
+  const cacheDir = getPlaywrightCacheRoot(platform, homeDir);
+  let entries: readonly string[];
   try {
-    return fs.readdirSync(cacheDir)
-      .filter((name) => name.startsWith("chromium-"))
-      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
-      .flatMap((name) => [
-        path.join(cacheDir, name, "chrome-linux64", "chrome"),
-        path.join(cacheDir, name, "chrome-linux", "chrome"),
-      ]);
+    entries = cacheEntryNames ?? fs.readdirSync(cacheDir);
   } catch {
     return [];
   }
+
+  return entries
+    .filter((name) => /^(?:chromium|chromium_headless_shell)-\d+$/.test(name))
+    .sort((a, b) => (
+      playwrightEntryRevision(b) - playwrightEntryRevision(a)
+      || playwrightEntryProductOrder(a) - playwrightEntryProductOrder(b)
+    ))
+    .flatMap((name) => {
+      if (platform === "darwin") {
+        // Unknown macOS architectures conservatively probe both supported Playwright layouts.
+        const macArchitectures = hostArchitecture === "arm64" || hostArchitecture === "x64"
+          ? [hostArchitecture]
+          : ["arm64", "x64"];
+        if (name.startsWith("chromium_headless_shell-")) {
+          return macArchitectures.map((candidateArch) => path.join(
+            cacheDir,
+            name,
+            `chrome-headless-shell-mac-${candidateArch}`,
+            "chrome-headless-shell",
+          ));
+        }
+        return [
+          ...macArchitectures.map((candidateArch) => path.join(
+            cacheDir,
+            name,
+            `chrome-mac-${candidateArch}`,
+            "Google Chrome for Testing.app",
+            "Contents",
+            "MacOS",
+            "Google Chrome for Testing",
+          )),
+          path.join(cacheDir, name, "chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium"),
+        ];
+      }
+      if (name.startsWith("chromium_headless_shell-")) return [];
+      return [
+        path.join(cacheDir, name, "chrome-linux64", "chrome"),
+        path.join(cacheDir, name, "chrome-linux", "chrome"),
+      ];
+    });
 }
 
-function findChromiumExecutable(): string {
-  const configured = process.env.WAYANG_CHROMIUM_PATH || process.env.CHROME_PATH || process.env.CHROMIUM_PATH;
-  const candidates = [
-    configured,
-    ...playwrightChromiumCandidates(),
+export function getSystemChromiumCandidates(
+  platform: NodeJS.Platform = process.platform,
+  homeDir = os.homedir(),
+): string[] {
+  if (platform === "darwin") {
+    return [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      path.join(homeDir, "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome"),
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+      path.join(homeDir, "Applications", "Chromium.app", "Contents", "MacOS", "Chromium"),
+    ];
+  }
+  return [
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome-stable",
     "/usr/bin/google-chrome",
     "/opt/google/chrome/chrome",
-  ].filter(Boolean) as string[];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
+  ];
+}
+
+export function getChromiumCandidates(
+  configured: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+  processArch: NodeJS.Architecture = process.arch,
+  homeDir = os.homedir(),
+  cacheEntryNames?: readonly string[],
+  cpuModels?: readonly string[],
+): string[] {
+  const hostArchitecture = getChromiumHostArchitecture(platform, processArch, cpuModels);
+  return [
+    ...(configured ? [configured] : []),
+    ...getPlaywrightChromiumCandidates(platform, hostArchitecture, homeDir, cacheEntryNames),
+    ...getSystemChromiumCandidates(platform, homeDir),
+  ];
+}
+
+export function resolveChromiumExecutableCandidate(candidate: string): string | null {
+  if (!path.isAbsolute(candidate)) return null;
+  try {
+    const canonical = fs.realpathSync.native(candidate);
+    if (!fs.statSync(canonical).isFile()) return null;
+    fs.accessSync(canonical, fs.constants.X_OK);
+    return canonical;
+  } catch {
+    return null;
+  }
+}
+
+function findChromiumExecutable(): string {
+  const configured = process.env.WAYANG_CHROMIUM_PATH || process.env.CHROME_PATH || process.env.CHROMIUM_PATH;
+  if (configured && !path.isAbsolute(configured)) {
+    throw new Error("Configured Chromium executable path must be absolute.");
+  }
+  for (const candidate of getChromiumCandidates(configured)) {
+    const resolved = resolveChromiumExecutableCandidate(candidate);
+    if (resolved) return resolved;
   }
   for (const name of ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"]) {
-    const found = spawnSync("command", ["-v", name], { shell: true, encoding: "utf-8" });
-    const stdout = found.stdout.trim();
-    if (found.status === 0 && stdout) return stdout.split(/\r?\n/)[0];
+    const found = executableOnPath(name);
+    if (found) return found;
   }
   throw new Error("Chromium executable not found. Set WAYANG_CHROMIUM_PATH to a Chromium/Chrome binary.");
 }
@@ -123,29 +283,18 @@ function hash(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex").slice(0, 12);
 }
 
-function profileKey(projectCwd: string, sessionId: string | null, persistence: "project" | "session"): string {
+function profileKey(projectCwd: string, sessionId: string | null, persistence: BrowserPersistence): string {
+  if (persistence === "shared") return "shared";
   if (persistence === "session" && sessionId) return `session-${sanitizeKeySegment(sessionId.slice(0, 36))}`;
   return `${sanitizeKeySegment(path.basename(projectCwd))}-${hash(projectCwd)}`;
 }
 
-function resolveLookup(lookup: BrowserSessionLookup): { sessionId: string | null; projectCwd: string; persistence: "project" | "session" } {
-  const sessionId = lookup.sessionId || null;
-  const persistence = lookup.persistence || "project";
-  if (lookup.projectCwd) {
-    return { sessionId, projectCwd: normalizeSessionCwd(lookup.projectCwd), persistence };
-  }
-  if (sessionId) {
-    const session = getSessionById(sessionId);
-    if (!session) throw new Error("Session not found");
-    return { sessionId, projectCwd: normalizeSessionCwd(session.cwd), persistence };
-  }
-  throw new Error("sessionId or projectCwd is required");
-}
-
 function createInitialState(lookup: BrowserSessionLookup): BrowserSessionState {
-  const resolved = resolveLookup(lookup);
+  const resolved = resolveBrowserSessionLookup(lookup);
   const key = profileKey(resolved.projectCwd, resolved.sessionId, resolved.persistence);
-  const rootDir = path.join(resolved.projectCwd, ".pi", "browser-workbench");
+  const rootDir = resolved.persistence === "shared"
+    ? path.join(process.env.WAYANG_DATA_DIR || process.env.PI_WEB_UI_DATA_DIR || path.join(os.homedir(), ".wayang"), "browser-workbench")
+    : path.join(resolved.projectCwd, ".pi", "browser-workbench");
   const profileDir = path.join(rootDir, "profiles", key);
   const downloadsDir = path.join(rootDir, "downloads", key);
   const artifactsDir = path.join(rootDir, "artifacts", key);
@@ -160,7 +309,7 @@ function createInitialState(lookup: BrowserSessionLookup): BrowserSessionState {
     localOnlyRecommended: false,
     needsUser: false,
     cdpReady: false,
-    viewerTransport: canUseVncTransport() ? "vnc" : "cdp-screencast",
+    viewerTransport: selectedViewerTransport(canUseVncTransport()),
     viewerWsPath: `/ws/browser-vnc?${new URLSearchParams(resolved.sessionId ? { session_id: resolved.sessionId } : { project_cwd: resolved.projectCwd }).toString()}`,
     cdpScreencastWsPath: `/ws/browser?${new URLSearchParams(resolved.sessionId ? { session_id: resolved.sessionId } : { project_cwd: resolved.projectCwd }).toString()}`,
     vncReady: false,
@@ -176,11 +325,118 @@ function createInitialState(lookup: BrowserSessionLookup): BrowserSessionState {
     },
     updatedAt: now(),
     logs: [],
+    controlGeneration: 0,
   };
 }
 
 function cloneState(state: BrowserSessionState): BrowserSessionState {
   return { ...state, profile: { ...state.profile }, logs: [...state.logs] };
+}
+
+export function sanitizeBrowserErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error || "");
+  if (/Configured Chromium executable path must be absolute/i.test(message)) return "Configured Chromium executable path must be absolute.";
+  if (/Chromium executable not found/i.test(message)) return "Chromium executable not found. Configure WAYANG_CHROMIUM_PATH.";
+  if (/VNC transport requested/i.test(message)) return "VNC transport is unavailable.";
+  if (/agent control is paused|control changed during|sensitive field|not a fillable field|No destination field found/i.test(message)) return message;
+  if (/Session not found|sessionId or projectCwd is required/i.test(message)) return message;
+  return "Browser operation failed";
+}
+
+export type BrowserPublicActor = "ui" | "agent";
+
+export function sanitizeBrowserUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return parsed.protocol;
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function sanitizeTitleAgainstUrl(title: string | undefined, activeUrl: string | undefined): string | undefined {
+  if (!title) return undefined;
+  const titleAsUrl = sanitizeBrowserUrl(title);
+  if (titleAsUrl && /^[a-z][a-z0-9+.-]*:/i.test(title)) return titleAsUrl;
+  if (!activeUrl) return title;
+  try {
+    const parsed = new URL(activeUrl);
+    let sanitized = title;
+    if (parsed.search) sanitized = sanitized.split(parsed.search).join("");
+    if (parsed.hash) sanitized = sanitized.split(parsed.hash).join("");
+    return sanitized;
+  } catch {
+    return title;
+  }
+}
+
+function toPublicRuntimeState(runtime: BrowserRuntime, actor: BrowserPublicActor): BrowserPublicState {
+  const state = runtime.state;
+  const hideAgentPage = actor === "agent" && (state.controlMode !== "agent" || runtime.credentialInspection.mode === "blocked");
+  const actorUrl = actor === "agent" ? sanitizeBrowserUrl(state.activeUrl) : state.activeUrl;
+  const actorTitle = actor === "agent" ? sanitizeTitleAgainstUrl(state.activeTitle, state.activeUrl) : state.activeTitle;
+  const activeUrl = hideAgentPage ? undefined : actor === "agent"
+    ? redactKnownCredentialValues(actorUrl, runtime.credentialInspection.values)
+    : actorUrl;
+  const activeTitle = hideAgentPage ? undefined : actor === "agent"
+    ? redactKnownCredentialValues(actorTitle, runtime.credentialInspection.values)
+    : actorTitle;
+  return {
+    sessionId: state.sessionId,
+    projectCwd: state.projectCwd,
+    status: state.status,
+    controlMode: state.controlMode,
+    secretTainted: state.secretTainted,
+    localOnlyRecommended: state.localOnlyRecommended,
+    needsUser: state.needsUser,
+    needsUserReason: state.needsUserReason,
+    lastResumeAt: state.lastResumeAt,
+    activeUrl,
+    activeTitle,
+    cdpReady: state.cdpReady,
+    viewerTransport: state.viewerTransport,
+    viewerWsPath: state.viewerWsPath,
+    cdpScreencastWsPath: state.cdpScreencastWsPath,
+    vncReady: state.vncReady,
+    profile: { persistence: state.profile.persistence },
+    startedAt: state.startedAt,
+    updatedAt: state.updatedAt,
+    lastError: state.lastError ? sanitizeBrowserErrorMessage(state.lastError) : undefined,
+    credentialInspection: runtime.credentialInspection.mode === "none" ? undefined : runtime.credentialInspection.mode,
+  };
+}
+
+/** UI-only conversion for WebSocket viewers and legacy internal callers. */
+export function toPublicBrowserState(state: BrowserSessionState): BrowserPublicState {
+  const runtime = runtimes.get(state.key);
+  return runtime ? toPublicRuntimeState(runtime, "ui") : {
+    sessionId: state.sessionId,
+    projectCwd: state.projectCwd,
+    status: state.status,
+    controlMode: state.controlMode,
+    secretTainted: state.secretTainted,
+    localOnlyRecommended: state.localOnlyRecommended,
+    needsUser: state.needsUser,
+    needsUserReason: state.needsUserReason,
+    lastResumeAt: state.lastResumeAt,
+    activeUrl: state.activeUrl,
+    activeTitle: state.activeTitle,
+    cdpReady: state.cdpReady,
+    viewerTransport: state.viewerTransport,
+    viewerWsPath: state.viewerWsPath,
+    cdpScreencastWsPath: state.cdpScreencastWsPath,
+    vncReady: state.vncReady,
+    profile: { persistence: state.profile.persistence },
+    startedAt: state.startedAt,
+    updatedAt: state.updatedAt,
+    lastError: state.lastError ? sanitizeBrowserErrorMessage(state.lastError) : undefined,
+  };
 }
 
 function getRuntime(lookup: BrowserSessionLookup): BrowserRuntime {
@@ -190,7 +446,15 @@ function getRuntime(lookup: BrowserSessionLookup): BrowserRuntime {
     if (state.sessionId && !existing.state.sessionId) existing.state.sessionId = state.sessionId;
     return existing;
   }
-  const runtime: BrowserRuntime = { state, child: null, xvfbChild: null, vncChild: null, stopping: false };
+  const runtime: BrowserRuntime = {
+    state,
+    child: null,
+    xvfbChild: null,
+    vncChild: null,
+    stopping: false,
+    mutationTail: Promise.resolve(),
+    credentialInspection: { mode: "none", values: [], allowUsed: false },
+  };
   runtimes.set(state.key, runtime);
   return runtime;
 }
@@ -225,16 +489,96 @@ async function createPageTarget(port: number): Promise<ChromeTarget> {
   }
 }
 
+export function selectPageTarget(targets: ChromeTarget[], activeTargetId?: string, activeUrl?: string): ChromeTarget | undefined {
+  const pages = targets.filter((target) => target.type === "page" && target.webSocketDebuggerUrl);
+  return pages.find((target) => target.id === activeTargetId)
+    ?? pages.find((target) => Boolean(activeUrl) && target.url === activeUrl)
+    ?? pages.find((target) => target.url !== "about:blank")
+    ?? pages[0];
+}
+
+async function visiblePageTargetIds(targets: ChromeTarget[]): Promise<string[]> {
+  const pages = targets.filter((target) => target.type === "page" && target.webSocketDebuggerUrl);
+  const visibility = await Promise.all(pages.map(async (target) => {
+    let cdp: CdpConnection | null = null;
+    try {
+      cdp = await CdpConnection.connect(target.webSocketDebuggerUrl!, 1_000);
+      const result = await cdp.send<any>("Runtime.evaluate", { expression: "document.visibilityState", returnByValue: true }, 1_000);
+      return result?.result?.value === "visible" ? target : undefined;
+    } catch {
+      return undefined;
+    } finally {
+      cdp?.close();
+    }
+  }));
+  return visibility.filter((target): target is ChromeTarget => Boolean(target)).map((target) => target.id);
+}
+
+export function selectActivePageTarget(
+  targets: ChromeTarget[],
+  visibleTargetIds: string[],
+  activeTargetId?: string,
+  activeUrl?: string,
+): ChromeTarget | undefined {
+  const pages = targets.filter((target) => target.type === "page" && target.webSocketDebuggerUrl);
+  const visible = pages.filter((target) => visibleTargetIds.includes(target.id));
+  if (visible.length === 1) return visible[0];
+  return selectPageTarget(pages, activeTargetId, activeUrl);
+}
+
+function clearCredentialInspection(runtime: BrowserRuntime): void {
+  runtime.credentialInspection = { mode: "none", values: [], allowUsed: false };
+}
+
 export async function getPageTarget(state: BrowserSessionState): Promise<ChromeTarget> {
   if (!state.cdpPort) throw new Error("Browser is not running");
   const targets = await fetchJson<ChromeTarget[]>(`http://127.0.0.1:${state.cdpPort}/json/list`);
-  const page = targets.find((target) => target.type === "page" && target.webSocketDebuggerUrl)
+  const visibleTargetIds = await visiblePageTargetIds(targets);
+  const page = selectActivePageTarget(targets, visibleTargetIds, state.activeTargetId, state.activeUrl)
     ?? await createPageTarget(state.cdpPort);
-  if (!page.webSocketDebuggerUrl) throw new Error("Chrome target did not expose webSocketDebuggerUrl");
+  if (!page.webSocketDebuggerUrl) throw new Error("Chrome target did not expose a debugger connection");
+  state.activeTargetId = page.id;
   state.activeUrl = page.url || state.activeUrl;
   state.activeTitle = page.title || state.activeTitle;
   state.updatedAt = now();
   return page;
+}
+
+interface TopLevelDocumentIdentity {
+  frameId: string;
+  loaderId: string;
+  identity: string;
+}
+
+async function readTopLevelDocumentIdentity(cdp: CdpConnection): Promise<TopLevelDocumentIdentity> {
+  const tree = await cdp.send<any>("Page.getFrameTree");
+  const frame = tree?.frameTree?.frame;
+  const frameId = typeof frame?.id === "string" ? frame.id : "";
+  const loaderId = typeof frame?.loaderId === "string" ? frame.loaderId : "";
+  if (!frameId || !loaderId) throw new Error("Top-level document identity is unavailable");
+  return { frameId, loaderId, identity: `${frameId}:${loaderId}` };
+}
+
+function reconcileCredentialDocumentIdentity(runtime: BrowserRuntime, targetId: string, documentIdentity: string): void {
+  const sensitive = runtime.credentialInspection;
+  if (sensitive.mode === "none") return;
+  if (sensitive.targetId !== targetId || sensitive.documentIdentity !== documentIdentity) clearCredentialInspection(runtime);
+}
+
+async function probeRuntimeDocument(runtime: BrowserRuntime): Promise<void> {
+  if (runtime.state.status !== "running") return;
+  const target = await getPageTarget(runtime.state);
+  const cdp = await CdpConnection.connect(target.webSocketDebuggerUrl!);
+  try {
+    const document = await readTopLevelDocumentIdentity(cdp);
+    reconcileCredentialDocumentIdentity(runtime, target.id, document.identity);
+  } finally {
+    cdp.close();
+  }
+}
+
+export async function refreshBrowserNavigationState(lookup: BrowserSessionLookup): Promise<void> {
+  await probeRuntimeDocument(getRuntime(lookup));
 }
 
 export function getBrowserStatus(lookup: BrowserSessionLookup): BrowserSessionState {
@@ -242,14 +586,145 @@ export function getBrowserStatus(lookup: BrowserSessionLookup): BrowserSessionSt
   return cloneState(runtime.state);
 }
 
+export function getPublicBrowserStatus(lookup: BrowserSessionLookup, actor: BrowserPublicActor = "ui"): BrowserPublicState {
+  return toPublicRuntimeState(getRuntime(lookup), actor);
+}
+
 export function listBrowserSessions(): BrowserSessionState[] {
   return Array.from(runtimes.values()).map((runtime) => cloneState(runtime.state));
+}
+
+export function listPublicBrowserSessions(actor: BrowserPublicActor = "ui"): BrowserPublicState[] {
+  return Array.from(runtimes.values()).map((runtime) => toPublicRuntimeState(runtime, actor));
+}
+
+export function registerBrowserStopHook(hook: () => Promise<void>): () => void {
+  browserStopHooks.add(hook);
+  return () => browserStopHooks.delete(hook);
+}
+
+async function lockBrowserCredentialsForLifecycle(): Promise<void> {
+  await Promise.allSettled(Array.from(browserStopHooks, (hook) => hook()));
+}
+
+export function assertBrowserAgentControl(lookup: BrowserSessionLookup): number {
+  const state = getRuntime(lookup).state;
+  if (state.controlMode !== "agent") {
+    const error = new Error("Browser agent control is paused");
+    (error as Error & { statusCode?: number }).statusCode = 409;
+    throw error;
+  }
+  return state.controlGeneration;
+}
+
+export function assertBrowserControlGeneration(lookup: BrowserSessionLookup, generation: number): void {
+  const state = getRuntime(lookup).state;
+  if (state.controlMode !== "agent" || state.controlGeneration !== generation) {
+    const error = new Error("Browser control changed during the operation");
+    (error as Error & { statusCode?: number }).statusCode = 409;
+    throw error;
+  }
+}
+
+function agentWorkError(message: string): Error {
+  const error = new Error(message);
+  (error as Error & { statusCode?: number }).statusCode = 409;
+  return error;
+}
+
+function assertAgentGeneration(runtime: BrowserRuntime, generation: number | undefined): void {
+  if (generation === undefined) return;
+  if (runtime.state.controlMode !== "agent" || runtime.state.controlGeneration !== generation) {
+    throw agentWorkError("Browser control changed during the operation");
+  }
+}
+
+function assertAgentWork(runtime: BrowserRuntime, generation: number | undefined, kind: AgentWorkKind): void {
+  assertAgentGeneration(runtime, generation);
+  if (generation === undefined) return;
+  if (runtime.credentialInspection.mode === "blocked") {
+    throw agentWorkError("Credential inspection requires explicit UI authorization");
+  }
+  if (runtime.credentialInspection.mode === "text-allowed" && kind === "inspection-screenshot") {
+    throw agentWorkError("Agent screenshots remain blocked after credential fill");
+  }
+  if (runtime.credentialInspection.mode === "text-allowed" && kind === "mutation") {
+    throw agentWorkError("Agent mutations remain blocked after credential fill until document replacement");
+  }
+}
+
+function regexEscape(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function percentHexInsensitivePattern(value: string): RegExp {
+  let pattern = "";
+  for (let index = 0; index < value.length;) {
+    const triplet = value.slice(index, index + 3);
+    if (/^%[0-9a-f]{2}$/i.test(triplet)) {
+      pattern += "%";
+      for (const digit of triplet.slice(1)) {
+        pattern += /[a-f]/i.test(digit) ? `[${digit.toLowerCase()}${digit.toUpperCase()}]` : digit;
+      }
+      index += 3;
+      continue;
+    }
+    pattern += regexEscape(value[index]);
+    index += 1;
+  }
+  return new RegExp(pattern, "g");
+}
+
+function credentialRedactionRepresentations(secret: string): Array<{ value: string; percentHexInsensitive: boolean }> {
+  const exact = [
+    secret,
+    Buffer.from(secret, "utf8").toString("base64"),
+    Buffer.from(secret, "utf8").toString("base64url"),
+  ];
+  const encoded: string[] = [];
+  try { encoded.push(encodeURIComponent(secret)); } catch { /* invalid scalar sequence: raw/base64 still apply */ }
+  try { encoded.push(encodeURI(secret)); } catch { /* invalid scalar sequence: raw/base64 still apply */ }
+  try { encoded.push(new URLSearchParams({ value: secret }).toString().slice("value=".length)); } catch { /* raw/base64 still apply */ }
+  return [
+    ...exact.map((value) => ({ value, percentHexInsensitive: false })),
+    ...encoded.map((value) => ({ value, percentHexInsensitive: true })),
+  ].filter((candidate) => candidate.value.length > 0);
+}
+
+export function redactKnownCredentialValues<T>(value: T, knownValues: string[]): T {
+  const candidates = [...new Map(
+    knownValues.filter(Boolean)
+      .flatMap(credentialRedactionRepresentations)
+      .map((candidate) => [`${candidate.percentHexInsensitive ? "percent" : "exact"}:${candidate.value}`, candidate] as const),
+  ).values()].sort((a, b) => b.value.length - a.value.length);
+  const visit = (item: unknown): unknown => {
+    if (typeof item === "string") {
+      let redacted = item;
+      for (const candidate of candidates) {
+        redacted = candidate.percentHexInsensitive
+          ? redacted.replace(percentHexInsensitivePattern(candidate.value), SENSITIVE_VALUE_REDACTION)
+          : redacted.split(candidate.value).join(SENSITIVE_VALUE_REDACTION);
+      }
+      return redacted;
+    }
+    if (Array.isArray(item)) return item.map(visit);
+    if (item && typeof item === "object") {
+      return Object.fromEntries(Object.entries(item).map(([key, entry]) => [key, visit(entry)]));
+    }
+    return item;
+  };
+  return visit(value) as T;
 }
 
 function persistRuntimeState(runtime: BrowserRuntime): void {
   fs.mkdirSync(path.dirname(runtime.state.profile.runtimePath), { recursive: true });
   const { logs: _logs, ...persisted } = runtime.state;
-  fs.writeFileSync(runtime.state.profile.runtimePath, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+  const safePersisted = redactKnownCredentialValues({
+    ...persisted,
+    activeUrl: sanitizeBrowserUrl(persisted.activeUrl),
+    activeTitle: sanitizeTitleAgainstUrl(persisted.activeTitle, persisted.activeUrl),
+  }, runtime.credentialInspection.values);
+  fs.writeFileSync(runtime.state.profile.runtimePath, JSON.stringify(safePersisted, null, 2), { mode: 0o600 });
 }
 
 async function waitForTcpPort(port: number, timeoutMs = STARTUP_TIMEOUT_MS): Promise<void> {
@@ -313,10 +788,16 @@ export function getBrowserVncPort(lookup: BrowserSessionLookup): number {
   return runtime.state.vncPort;
 }
 
-export async function startBrowser(lookup: BrowserSessionLookup): Promise<BrowserSessionState> {
+export async function startBrowser(lookup: BrowserSessionLookup, expectedControlGeneration?: number): Promise<BrowserSessionState> {
   const runtime = getRuntime(lookup);
   const state = runtime.state;
-  if (state.status === "running" && runtime.child && runtime.child.exitCode === null) return cloneState(state);
+  assertAgentGeneration(runtime, expectedControlGeneration);
+  if (state.status === "running") await probeRuntimeDocument(runtime);
+  assertAgentWork(runtime, expectedControlGeneration, "mutation");
+  if (state.status === "running" && runtime.child && runtime.child.exitCode === null) {
+    assertAgentWork(runtime, expectedControlGeneration, "mutation");
+    return cloneState(state);
+  }
   if (state.status === "starting") return cloneState(state);
 
   fs.mkdirSync(state.profile.profileDir, { recursive: true, mode: 0o700 });
@@ -328,6 +809,7 @@ export async function startBrowser(lookup: BrowserSessionLookup): Promise<Browse
   const executable = findChromiumExecutable();
   const cdpPort = await allocatePort();
   const useVnc = canUseVncTransport();
+  const viewerTransport = selectedViewerTransport(useVnc);
   const display = useVnc ? await allocateDisplay() : undefined;
   const vncPort = useVnc ? await allocatePort() : undefined;
 
@@ -337,8 +819,8 @@ export async function startBrowser(lookup: BrowserSessionLookup): Promise<Browse
   state.vncReady = false;
   state.vncPort = vncPort;
   state.display = display;
-  state.viewerTransport = useVnc ? "vnc" : "cdp-screencast";
-  state.viewerWsPath = useVnc
+  state.viewerTransport = viewerTransport;
+  state.viewerWsPath = viewerTransport === "vnc"
     ? `/ws/browser-vnc?${new URLSearchParams(state.sessionId ? { session_id: state.sessionId } : { project_cwd: state.projectCwd }).toString()}`
     : state.cdpScreencastWsPath;
   state.lastError = undefined;
@@ -348,11 +830,17 @@ export async function startBrowser(lookup: BrowserSessionLookup): Promise<Browse
   persistRuntimeState(runtime);
 
   try {
+    assertAgentWork(runtime, expectedControlGeneration, "mutation");
     if (useVnc && display && vncPort) {
-      const xvfb = spawn("Xvfb", [display, "-screen", "0", "1440x900x24", "-nolisten", "tcp", "-ac"], {
+      const xvfbExecutable = executableOnPath("Xvfb");
+      const vncExecutable = executableOnPath("x11vnc");
+      if (!xvfbExecutable || !vncExecutable) throw new Error("VNC transport dependencies disappeared during startup");
+      const xvfb = spawn(xvfbExecutable, [display, "-screen", "0", "1280x720x24", "-nolisten", "tcp", "-ac"], {
         cwd: state.projectCwd,
         detached: process.platform !== "win32",
         stdio: ["ignore", "pipe", "pipe"],
+        shell: false,
+        env: browserChildEnvironment(),
       });
       runtime.xvfbChild = xvfb;
       xvfb.stdout?.on("data", (chunk) => appendChunk(runtime, chunk));
@@ -368,18 +856,23 @@ export async function startBrowser(lookup: BrowserSessionLookup): Promise<Browse
       });
       await sleep(500);
 
-      const vnc = spawn("x11vnc", [
+      const vnc = spawn(vncExecutable, [
         "-display", display,
         "-localhost",
         "-nopw",
         "-forever",
         "-shared",
         "-rfbport", String(vncPort),
+        "-wait", "8",
+        "-defer", "8",
+        "-threads",
         "-quiet",
       ], {
         cwd: state.projectCwd,
         detached: process.platform !== "win32",
         stdio: ["ignore", "pipe", "pipe"],
+        shell: false,
+        env: browserChildEnvironment(),
       });
       runtime.vncChild = vnc;
       vnc.stdout?.on("data", (chunk) => appendChunk(runtime, chunk));
@@ -401,7 +894,7 @@ export async function startBrowser(lookup: BrowserSessionLookup): Promise<Browse
       `--remote-debugging-address=127.0.0.1`,
       `--remote-debugging-port=${cdpPort}`,
       `--user-data-dir=${state.profile.profileDir}`,
-      `--window-size=1440,900`,
+      `--window-size=1280,720`,
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--no-first-run",
@@ -414,8 +907,9 @@ export async function startBrowser(lookup: BrowserSessionLookup): Promise<Browse
     const child = spawn(executable, args, {
       cwd: state.projectCwd,
       detached: process.platform !== "win32",
-      env: { ...process.env, ...(display ? { DISPLAY: display } : {}) },
+      env: browserChildEnvironment(display ? { DISPLAY: display } : {}),
       stdio: ["ignore", "pipe", "pipe"],
+      shell: false,
     });
     runtime.child = child;
 
@@ -438,6 +932,7 @@ export async function startBrowser(lookup: BrowserSessionLookup): Promise<Browse
     state.updatedAt = now();
     appendLog(runtime, `chromium CDP ready; viewer transport=${state.viewerTransport}`);
     persistRuntimeState(runtime);
+    assertAgentWork(runtime, expectedControlGeneration, "mutation");
     return cloneState(state);
   } catch (err: any) {
     state.status = "errored";
@@ -446,6 +941,7 @@ export async function startBrowser(lookup: BrowserSessionLookup): Promise<Browse
     state.lastError = err?.message || String(err);
     appendLog(runtime, `startup failed: ${state.lastError}`);
     await stopBrowser(lookup);
+    if (err && typeof err === "object" && (err as { statusCode?: number }).statusCode === 409) throw err;
     state.status = "errored";
     state.lastError = err?.message || String(err);
     persistRuntimeState(runtime);
@@ -453,8 +949,14 @@ export async function startBrowser(lookup: BrowserSessionLookup): Promise<Browse
   }
 }
 
-export async function stopBrowser(lookup: BrowserSessionLookup): Promise<BrowserSessionState> {
+export async function stopBrowser(lookup: BrowserSessionLookup, expectedControlGeneration?: number): Promise<BrowserSessionState> {
   const runtime = getRuntime(lookup);
+  assertAgentGeneration(runtime, expectedControlGeneration);
+  if (runtime.state.status === "running") await probeRuntimeDocument(runtime);
+  assertAgentWork(runtime, expectedControlGeneration, "mutation");
+  await lockBrowserCredentialsForLifecycle();
+  clearCredentialInspection(runtime);
+  assertAgentWork(runtime, expectedControlGeneration, "mutation");
   runtime.stopping = true;
   const children = [runtime.child, runtime.vncChild, runtime.xvfbChild];
   for (const child of children) terminateChild(child);
@@ -481,17 +983,18 @@ export async function stopBrowser(lookup: BrowserSessionLookup): Promise<Browser
   runtime.state.display = undefined;
   runtime.state.updatedAt = now();
   persistRuntimeState(runtime);
+  assertAgentWork(runtime, expectedControlGeneration, "mutation");
   return cloneState(runtime.state);
 }
 
-export async function restartBrowser(lookup: BrowserSessionLookup): Promise<BrowserSessionState> {
-  await stopBrowser(lookup);
-  return startBrowser(lookup);
+export async function restartBrowser(lookup: BrowserSessionLookup, expectedControlGeneration?: number): Promise<BrowserSessionState> {
+  await stopBrowser(lookup, expectedControlGeneration);
+  return startBrowser(lookup, expectedControlGeneration);
 }
 
-export async function resetBrowserProfile(lookup: BrowserSessionLookup): Promise<BrowserSessionState> {
+export async function resetBrowserProfile(lookup: BrowserSessionLookup, expectedControlGeneration?: number): Promise<BrowserSessionState> {
   const runtime = getRuntime(lookup);
-  await stopBrowser(lookup);
+  await stopBrowser(lookup, expectedControlGeneration);
   const profileDir = runtime.state.profile.profileDir;
   if (fs.existsSync(profileDir)) {
     const trashDir = path.join(runtime.state.profile.rootDir, "profile-trash");
@@ -505,11 +1008,16 @@ export async function resetBrowserProfile(lookup: BrowserSessionLookup): Promise
   runtime.state.needsUser = false;
   runtime.state.needsUserReason = undefined;
   persistRuntimeState(runtime);
+  assertAgentWork(runtime, expectedControlGeneration, "mutation");
   return cloneState(runtime.state);
 }
 
 export function setBrowserControlMode(lookup: BrowserSessionLookup, mode: BrowserControlMode, reason?: string): BrowserSessionState {
   const runtime = getRuntime(lookup);
+  if (mode === "agent" && runtime.credentialInspection.mode !== "none") {
+    throw agentWorkError("Credential inspection must be authorized through the UI-only credential route");
+  }
+  if (runtime.state.controlMode !== mode) runtime.state.controlGeneration += 1;
   runtime.state.controlMode = mode;
   runtime.state.needsUser = mode === "user" || mode === "paused";
   runtime.state.needsUserReason = runtime.state.needsUser ? reason : undefined;
@@ -519,56 +1027,139 @@ export function setBrowserControlMode(lookup: BrowserSessionLookup, mode: Browse
   return cloneState(runtime.state);
 }
 
-async function withCdp<T>(state: BrowserSessionState, fn: (cdp: CdpConnection) => Promise<T>): Promise<T> {
-  const target = await getPageTarget(state);
-  const cdp = await CdpConnection.connect(target.webSocketDebuggerUrl!);
-  try {
-    return await fn(cdp);
-  } finally {
-    cdp.close();
-  }
-}
-
-export async function navigateBrowser(lookup: BrowserSessionLookup, url: string): Promise<BrowserSessionState> {
+export function recordBrowserCredentialFill(
+  lookup: BrowserSessionLookup,
+  context: BrowserCredentialContext,
+  values: { username?: string; password?: string; totp?: string },
+): BrowserSessionState {
   const runtime = getRuntime(lookup);
-  if (runtime.state.status !== "running") await startBrowser(lookup);
-  const normalizedUrl = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url) ? url : `https://${url}`;
-  await withCdp(runtime.state, async (cdp) => {
-    await cdp.send("Page.enable");
-    await cdp.send("Runtime.enable");
-    const loaded = new Promise<void>((resolve) => {
-      const off = cdp.on("Page.loadEventFired", () => {
-        off();
-        resolve();
-      });
-      setTimeout(() => {
-        off();
-        resolve();
-      }, 10_000).unref?.();
-    });
-    await cdp.send("Page.navigate", { url: normalizedUrl });
-    await loaded;
-    const info = await cdp.send<any>("Runtime.evaluate", {
-      expression: "({ url: location.href, title: document.title })",
-      returnByValue: true,
-    });
-    const value = info?.result?.value ?? {};
-    runtime.state.activeUrl = value.url || normalizedUrl;
-    runtime.state.activeTitle = value.title || runtime.state.activeTitle;
-  });
+  const knownValues = [values.username, values.password, values.totp].filter((value): value is string => typeof value === "string" && value.length > 0);
+  const sameDocument = runtime.credentialInspection.targetId === context.targetId &&
+    runtime.credentialInspection.documentIdentity === context.documentIdentity;
+  runtime.credentialInspection = {
+    mode: "blocked",
+    values: [...new Set([...(sameDocument ? runtime.credentialInspection.values : []), ...knownValues])],
+    targetId: context.targetId,
+    documentIdentity: context.documentIdentity,
+    allowUsed: false,
+  };
+  if (runtime.state.controlMode !== "user") runtime.state.controlGeneration += 1;
+  runtime.state.controlMode = "user";
+  runtime.state.needsUser = true;
+  runtime.state.needsUserReason = "Credential values were filled; agent inspection is blocked";
   runtime.state.updatedAt = now();
   persistRuntimeState(runtime);
   return cloneState(runtime.state);
 }
 
-export async function browserSnapshot(lookup: BrowserSessionLookup, mode: "text" | "screenshot" = "text"): Promise<BrowserSnapshot> {
+export async function allowAgentAfterCredentialFill(lookup: BrowserSessionLookup): Promise<BrowserSessionState> {
   const runtime = getRuntime(lookup);
-  if (runtime.state.status !== "running") await startBrowser(lookup);
+  if (runtime.state.status === "running") await probeRuntimeDocument(runtime);
+  if (runtime.credentialInspection.mode !== "blocked" || runtime.credentialInspection.allowUsed) {
+    throw agentWorkError("Credential inspection authorization is unavailable or already used");
+  }
+  runtime.credentialInspection.mode = "text-allowed";
+  runtime.credentialInspection.allowUsed = true;
+  runtime.state.controlGeneration += 1;
+  runtime.state.controlMode = "agent";
+  runtime.state.needsUser = false;
+  runtime.state.needsUserReason = undefined;
+  runtime.state.lastResumeAt = now();
+  runtime.state.updatedAt = now();
+  persistRuntimeState(runtime);
+  return cloneState(runtime.state);
+}
+
+async function serializeRuntimeMutation<T>(runtime: BrowserRuntime, action: () => Promise<T>): Promise<T> {
+  const previous = runtime.mutationTail;
+  let release!: () => void;
+  runtime.mutationTail = new Promise<void>((resolve) => { release = resolve; });
+  await previous.catch(() => undefined);
+  try {
+    return await action();
+  } finally {
+    release();
+  }
+}
+
+async function withCdp<T>(
+  state: BrowserSessionState,
+  fn: (cdp: CdpConnection) => Promise<T>,
+  expectedControlGeneration?: number,
+  kind: AgentWorkKind = "inspection-text",
+): Promise<T> {
+  const runtime = runtimes.get(state.key) ?? getRuntime({ projectCwd: state.projectCwd, sessionId: state.sessionId, persistence: state.profile.persistence });
+  assertAgentGeneration(runtime, expectedControlGeneration);
+  const target = await getPageTarget(state);
+  assertAgentGeneration(runtime, expectedControlGeneration);
+  const cdp = await CdpConnection.connect(target.webSocketDebuggerUrl!);
+  try {
+    const beforeDocument = await readTopLevelDocumentIdentity(cdp);
+    reconcileCredentialDocumentIdentity(runtime, target.id, beforeDocument.identity);
+    assertAgentWork(runtime, expectedControlGeneration, kind);
+    const result = await fn(cdp);
+    const afterDocument = await readTopLevelDocumentIdentity(cdp);
+    reconcileCredentialDocumentIdentity(runtime, target.id, afterDocument.identity);
+    assertAgentWork(runtime, expectedControlGeneration, kind);
+    return expectedControlGeneration === undefined
+      ? result
+      : redactKnownCredentialValues(result, runtime.credentialInspection.values);
+  } finally {
+    cdp.close();
+  }
+}
+
+export async function navigateBrowser(lookup: BrowserSessionLookup, url: string, expectedControlGeneration?: number): Promise<BrowserSessionState> {
+  const runtime = getRuntime(lookup);
+  if (runtime.state.status !== "running") await startBrowser(lookup, expectedControlGeneration);
+  const normalizedUrl = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url) ? url : `https://${url}`;
+  return serializeRuntimeMutation(runtime, async () => {
+    if (expectedControlGeneration !== undefined) assertBrowserControlGeneration(lookup, expectedControlGeneration);
+    await withCdp(runtime.state, async (cdp) => {
+      await cdp.send("Page.enable");
+      await cdp.send("Runtime.enable");
+      let finishLoad!: () => void;
+      const loaded = new Promise<void>((resolve) => {
+        const off = cdp.on("Page.loadEventFired", () => finishLoad());
+        const timer = setTimeout(() => finishLoad(), 10_000);
+        timer.unref?.();
+        finishLoad = () => {
+          clearTimeout(timer);
+          off();
+          resolve();
+        };
+      });
+      const navigation = await cdp.send<any>("Page.navigate", { url: normalizedUrl });
+      if (navigation?.loaderId) await loaded;
+      else finishLoad();
+      if (expectedControlGeneration !== undefined) assertBrowserControlGeneration(lookup, expectedControlGeneration);
+      const info = await cdp.send<any>("Runtime.evaluate", {
+        expression: domHelpersExpression("return { url: __wayangRedact(location.href), title: __wayangRedact(document.title) };") ,
+        returnByValue: true,
+      });
+      const value = info?.result?.value ?? {};
+      runtime.state.activeUrl = value.url || normalizedUrl;
+      runtime.state.activeTitle = value.title || runtime.state.activeTitle;
+    }, expectedControlGeneration, "mutation");
+    assertAgentWork(runtime, expectedControlGeneration, "mutation");
+    runtime.state.updatedAt = now();
+    persistRuntimeState(runtime);
+    return cloneState(runtime.state);
+  });
+}
+
+export async function browserSnapshot(
+  lookup: BrowserSessionLookup,
+  mode: "text" | "screenshot" = "text",
+  expectedControlGeneration?: number,
+): Promise<BrowserSnapshot> {
+  const runtime = getRuntime(lookup);
+  if (runtime.state.status !== "running") await startBrowser(lookup, expectedControlGeneration);
   return withCdp(runtime.state, async (cdp) => {
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
     const info = await cdp.send<any>("Runtime.evaluate", {
-      expression: "({ url: location.href, title: document.title, text: document.body ? document.body.innerText : '' })",
+      expression: domHelpersExpression("return { url: __wayangRedact(location.href), title: __wayangRedact(document.title), text: document.body ? __wayangRedact(document.body.innerText || '') : '' };") ,
       returnByValue: true,
     });
     const value = info?.result?.value ?? {};
@@ -581,10 +1172,35 @@ export async function browserSnapshot(lookup: BrowserSessionLookup, mode: "text"
       return { url: value.url || "", title: value.title || "", screenshot: shot?.data ? `data:image/jpeg;base64,${shot.data}` : undefined };
     }
     return { url: value.url || "", title: value.title || "", text: String(value.text || "").slice(0, 50_000) };
-  });
+  }, expectedControlGeneration, mode === "screenshot" ? "inspection-screenshot" : "inspection-text");
+}
+
+export const SENSITIVE_VALUE_REDACTION = "[REDACTED]";
+
+const SENSITIVE_FIELD_PATTERN = /(?:pass(?:word|code)?|otp|totp|one[ _-]?time|verification|auth(?:entication)?[ _-]?code|recovery|secret|card(?:[ _-]?(?:number|no))?|cc[ _-]?(?:number|num|csc|cvc|cvv)|cvc|cvv|security[ _-]?code|pin)/i;
+const SENSITIVE_AUTOCOMPLETE_PATTERN = /(?:current-password|new-password|one-time-code|cc-number|cc-csc|cc-exp|cc-exp-month|cc-exp-year)/i;
+
+export function isSensitiveFieldDescriptor(field: { type?: unknown; name?: unknown; id?: unknown; autocomplete?: unknown; placeholder?: unknown; ariaLabel?: unknown }): boolean {
+  if (String(field.type || "").toLowerCase() === "password") return true;
+  if (SENSITIVE_AUTOCOMPLETE_PATTERN.test(String(field.autocomplete || ""))) return true;
+  return SENSITIVE_FIELD_PATTERN.test([field.name, field.id, field.placeholder, field.ariaLabel].map((value) => String(value || "")).join(" "));
 }
 
 const DOM_HELPERS_SCRIPT = String.raw`
+function __wayangSensitive(el) {
+  const type = String(el.getAttribute("type") || "").toLowerCase();
+  const autocomplete = String(el.getAttribute("autocomplete") || "");
+  const identity = [el.id, el.getAttribute("name"), el.getAttribute("placeholder"), el.getAttribute("aria-label")].filter(Boolean).join(" ");
+  return type === "password" || /(?:current-password|new-password|one-time-code|cc-number|cc-csc|cc-exp|cc-exp-month|cc-exp-year)/i.test(autocomplete) || /(?:pass(?:word|code)?|otp|totp|one[ _-]?time|verification|auth(?:entication)?[ _-]?code|recovery|secret|card(?:[ _-]?(?:number|no))?|cc[ _-]?(?:number|num|csc|cvc|cvv)|cvc|cvv|security[ _-]?code|pin)/i.test(identity);
+}
+function __wayangSensitiveValues() {
+  return Array.from(document.querySelectorAll("input,textarea,select,[contenteditable='true']")).filter(__wayangSensitive).map((el) => String(el.value || el.textContent || "")).filter(Boolean);
+}
+function __wayangRedact(value) {
+  let text = String(value == null ? "" : value);
+  for (const secret of __wayangSensitiveValues()) text = text.split(secret).join("[REDACTED]");
+  return text;
+}
 function __wayangVisible(el) {
   const rect = el.getBoundingClientRect();
   if (!rect || rect.width <= 0 || rect.height <= 0) return false;
@@ -633,10 +1249,11 @@ function __wayangSelector(el) {
   return parts.join(" > ") || el.localName.toLowerCase();
 }
 function __wayangText(el) {
+  if (__wayangSensitive(el)) return "[REDACTED]";
   const raw = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement
     ? el.value
     : (el.innerText || el.textContent || "");
-  return String(raw).replace(/\s+/g, " ").trim().slice(0, 500);
+  return __wayangRedact(raw).replace(/\s+/g, " ").trim().slice(0, 500);
 }
 function __wayangName(el) {
   const labels = el.id ? Array.from(document.querySelectorAll("label[for=\"" + __wayangAttrEscape(el.id) + "\"]")).map((label) => label.textContent || "") : [];
@@ -672,8 +1289,8 @@ function __wayangElementInfo(el, index) {
     type: el.getAttribute("type") || undefined,
     name: __wayangName(el) || undefined,
     text: __wayangText(el) || undefined,
-    value: el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement ? String(el.value || "").slice(0, 500) : undefined,
-    href: el instanceof HTMLAnchorElement ? el.href : undefined,
+    value: el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement ? (__wayangSensitive(el) && el.value ? "[REDACTED]" : String(el.value || "").slice(0, 500)) : undefined,
+    href: el instanceof HTMLAnchorElement ? __wayangRedact(el.href) : undefined,
     placeholder: el.getAttribute("placeholder") || undefined,
     checked: el instanceof HTMLInputElement && ["checkbox", "radio"].includes(el.type) ? el.checked : undefined,
     disabled: "disabled" in el ? Boolean(el.disabled) : undefined,
@@ -691,7 +1308,12 @@ function sanitizeLimit(limit: number | undefined, fallback: number, max: number)
   return Math.max(1, Math.min(max, Math.floor(Number(limit))));
 }
 
-async function evaluatePage<T>(state: BrowserSessionState, expression: string): Promise<T> {
+async function evaluatePage<T>(
+  state: BrowserSessionState,
+  expression: string,
+  expectedControlGeneration?: number,
+  kind: AgentWorkKind = "inspection-text",
+): Promise<T> {
   return withCdp(state, async (cdp) => {
     await cdp.send("Runtime.enable");
     const info = await cdp.send<any>("Runtime.evaluate", {
@@ -705,27 +1327,28 @@ async function evaluatePage<T>(state: BrowserSessionState, expression: string): 
       throw new Error(String(message));
     }
     return info?.result?.value as T;
-  });
+  }, expectedControlGeneration, kind);
 }
 
 export async function browserDomSnapshot(
   lookup: BrowserSessionLookup,
   options: { includeText?: boolean; limit?: number } = {},
+  expectedControlGeneration?: number,
 ): Promise<BrowserDomSnapshot> {
   const runtime = getRuntime(lookup);
-  if (runtime.state.status !== "running") await startBrowser(lookup);
+  if (runtime.state.status !== "running") await startBrowser(lookup, expectedControlGeneration);
   const limit = sanitizeLimit(options.limit, 80, 300);
   const includeText = Boolean(options.includeText);
   const snapshot = await evaluatePage<BrowserDomSnapshot>(runtime.state, domHelpersExpression(`
     const selector = "a,button,input,textarea,select,[role],[onclick],[contenteditable='true'],summary,label,h1,h2,h3,h4,h5,h6";
     const candidates = Array.from(document.querySelectorAll(selector)).filter(__wayangVisible).slice(0, ${limit});
     return {
-      url: location.href,
-      title: document.title,
-      text: ${includeText} && document.body ? String(document.body.innerText || "").slice(0, 50000) : undefined,
+      url: __wayangRedact(location.href),
+      title: __wayangRedact(document.title),
+      text: ${includeText} && document.body ? __wayangRedact(document.body.innerText || "").slice(0, 50000) : undefined,
       elements: candidates.map((el, index) => __wayangElementInfo(el, index)),
     };
-  `));
+  `), expectedControlGeneration, "inspection-text");
   runtime.state.activeUrl = snapshot.url || runtime.state.activeUrl;
   runtime.state.activeTitle = snapshot.title || runtime.state.activeTitle;
   runtime.state.updatedAt = now();
@@ -737,20 +1360,21 @@ export async function queryBrowserSelector(
   lookup: BrowserSessionLookup,
   selector: string,
   options: { limit?: number } = {},
+  expectedControlGeneration?: number,
 ): Promise<BrowserSelectorQueryResult> {
   const runtime = getRuntime(lookup);
-  if (runtime.state.status !== "running") await startBrowser(lookup);
+  if (runtime.state.status !== "running") await startBrowser(lookup, expectedControlGeneration);
   const limit = sanitizeLimit(options.limit, 25, 200);
   const snapshot = await evaluatePage<BrowserSelectorQueryResult>(runtime.state, domHelpersExpression(`
     const selector = ${JSON.stringify(selector)};
     const elements = Array.from(document.querySelectorAll(selector)).slice(0, ${limit});
     return {
-      url: location.href,
-      title: document.title,
+      url: __wayangRedact(location.href),
+      title: __wayangRedact(document.title),
       selector,
       elements: elements.map((el, index) => __wayangElementInfo(el, index)),
     };
-  `));
+  `), expectedControlGeneration, "inspection-text");
   runtime.state.activeUrl = snapshot.url || runtime.state.activeUrl;
   runtime.state.activeTitle = snapshot.title || runtime.state.activeTitle;
   runtime.state.updatedAt = now();
@@ -758,7 +1382,7 @@ export async function queryBrowserSelector(
   return snapshot;
 }
 
-async function getSelectorClickPoint(state: BrowserSessionState, selector: string, index: number): Promise<{ x: number; y: number; url: string; title: string }> {
+async function getSelectorClickPoint(state: BrowserSessionState, selector: string, index: number, expectedControlGeneration?: number): Promise<{ x: number; y: number; url: string; title: string }> {
   return evaluatePage(state, domHelpersExpression(`
     const selector = ${JSON.stringify(selector)};
     const index = ${Math.max(0, Math.floor(index || 0))};
@@ -768,29 +1392,55 @@ async function getSelectorClickPoint(state: BrowserSessionState, selector: strin
     el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
     if (typeof el.focus === "function") el.focus({ preventScroll: true });
     const rect = el.getBoundingClientRect();
-    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, url: location.href, title: document.title };
-  `));
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, url: __wayangRedact(location.href), title: __wayangRedact(document.title) };
+  `), expectedControlGeneration, "mutation");
 }
 
-export async function clickBrowserSelector(lookup: BrowserSessionLookup, selector: string, index = 0): Promise<BrowserSessionState> {
+export async function clickBrowserSelector(lookup: BrowserSessionLookup, selector: string, index = 0, expectedControlGeneration?: number): Promise<BrowserSessionState> {
   const runtime = getRuntime(lookup);
-  if (runtime.state.status !== "running") await startBrowser(lookup);
-  const point = await getSelectorClickPoint(runtime.state, selector, index);
-  await withCdp(runtime.state, async (cdp) => {
-    await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1 });
-    await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1 });
+  if (runtime.state.status !== "running") await startBrowser(lookup, expectedControlGeneration);
+  return serializeRuntimeMutation(runtime, async () => {
+    assertAgentGeneration(runtime, expectedControlGeneration);
+    const point = await getSelectorClickPoint(runtime.state, selector, index, expectedControlGeneration);
+    await withCdp(runtime.state, async (cdp) => {
+      await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1 });
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1 });
+    }, expectedControlGeneration, "mutation");
+    assertAgentWork(runtime, expectedControlGeneration, "mutation");
+    runtime.state.activeUrl = point.url || runtime.state.activeUrl;
+    runtime.state.activeTitle = point.title || runtime.state.activeTitle;
+    runtime.state.updatedAt = now();
+    persistRuntimeState(runtime);
+    return cloneState(runtime.state);
   });
-  runtime.state.activeUrl = point.url || runtime.state.activeUrl;
-  runtime.state.activeTitle = point.title || runtime.state.activeTitle;
-  runtime.state.updatedAt = now();
-  persistRuntimeState(runtime);
-  return cloneState(runtime.state);
 }
 
-export async function fillBrowserSelector(lookup: BrowserSessionLookup, selector: string, text: string, index = 0): Promise<BrowserSessionState> {
+async function assertPublicFillTarget(state: BrowserSessionState, selector?: string, index = 0, expectedControlGeneration?: number): Promise<void> {
+  const descriptor = await evaluatePage<{ sensitive: boolean; fillable: boolean }>(state, domHelpersExpression(`
+    const selector = ${selector === undefined ? "null" : JSON.stringify(selector)};
+    const index = ${Math.max(0, Math.floor(index || 0))};
+    const el = selector === null ? document.activeElement : Array.from(document.querySelectorAll(selector))[index];
+    if (!el) throw new Error("No destination field found");
+    return {
+      sensitive: __wayangSensitive(el),
+      fillable: !el.disabled && !el.readOnly && (el.isContentEditable || el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement),
+    };
+  `), expectedControlGeneration, "mutation");
+  if (!descriptor.fillable) throw new Error("Destination is not a fillable field");
+  if (descriptor.sensitive) {
+    const error = new Error("Public text cannot be filled into a sensitive field");
+    (error as Error & { statusCode?: number }).statusCode = 409;
+    throw error;
+  }
+}
+
+export async function fillBrowserSelector(lookup: BrowserSessionLookup, selector: string, text: string, index = 0, expectedControlGeneration?: number): Promise<BrowserSessionState> {
   const runtime = getRuntime(lookup);
-  if (runtime.state.status !== "running") await startBrowser(lookup);
-  const result = await evaluatePage<{ url: string; title: string }>(runtime.state, domHelpersExpression(`
+  if (runtime.state.status !== "running") await startBrowser(lookup, expectedControlGeneration);
+  return serializeRuntimeMutation(runtime, async () => {
+    assertAgentGeneration(runtime, expectedControlGeneration);
+    await assertPublicFillTarget(runtime.state, selector, index, expectedControlGeneration);
+    const result = await evaluatePage<{ url: string; title: string }>(runtime.state, domHelpersExpression(`
     const selector = ${JSON.stringify(selector)};
     const text = ${JSON.stringify(text)};
     const index = ${Math.max(0, Math.floor(index || 0))};
@@ -813,29 +1463,31 @@ export async function fillBrowserSelector(lookup: BrowserSessionLookup, selector
     }
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { url: location.href, title: document.title };
-  `));
-  runtime.state.activeUrl = result.url || runtime.state.activeUrl;
-  runtime.state.activeTitle = result.title || runtime.state.activeTitle;
-  runtime.state.updatedAt = now();
-  persistRuntimeState(runtime);
-  return cloneState(runtime.state);
+    return { url: __wayangRedact(location.href), title: __wayangRedact(document.title) };
+  `), expectedControlGeneration, "mutation");
+    assertAgentWork(runtime, expectedControlGeneration, "mutation");
+    runtime.state.activeUrl = result.url || runtime.state.activeUrl;
+    runtime.state.activeTitle = result.title || runtime.state.activeTitle;
+    runtime.state.updatedAt = now();
+    persistRuntimeState(runtime);
+    return cloneState(runtime.state);
+  });
 }
 
-export async function extractBrowserLinks(lookup: BrowserSessionLookup, options: { limit?: number } = {}): Promise<BrowserLinksResult> {
+export async function extractBrowserLinks(lookup: BrowserSessionLookup, options: { limit?: number } = {}, expectedControlGeneration?: number): Promise<BrowserLinksResult> {
   const runtime = getRuntime(lookup);
-  if (runtime.state.status !== "running") await startBrowser(lookup);
+  if (runtime.state.status !== "running") await startBrowser(lookup, expectedControlGeneration);
   const limit = sanitizeLimit(options.limit, 100, 500);
   const result = await evaluatePage<BrowserLinksResult>(runtime.state, domHelpersExpression(`
     const links = Array.from(document.querySelectorAll("a[href]")).slice(0, ${limit}).map((el, index) => ({
       index,
       text: __wayangText(el) || el.getAttribute("aria-label") || el.getAttribute("title") || "",
-      href: el.href,
+      href: __wayangRedact(el.href),
       selector: __wayangSelector(el),
       visible: __wayangVisible(el),
     }));
-    return { url: location.href, title: document.title, links };
-  `));
+    return { url: __wayangRedact(location.href), title: __wayangRedact(document.title), links };
+  `), expectedControlGeneration, "inspection-text");
   runtime.state.activeUrl = result.url || runtime.state.activeUrl;
   runtime.state.activeTitle = result.title || runtime.state.activeTitle;
   runtime.state.updatedAt = now();
@@ -843,9 +1495,19 @@ export async function extractBrowserLinks(lookup: BrowserSessionLookup, options:
   return result;
 }
 
-export async function browserAccessibilitySnapshot(lookup: BrowserSessionLookup, options: { limit?: number } = {}): Promise<BrowserAccessibilitySnapshot> {
+export function redactSensitiveValue(value: unknown, sensitiveValues: string[] = [], sensitiveContext = false): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  let text = String(value);
+  if (sensitiveContext && text) return SENSITIVE_VALUE_REDACTION;
+  for (const secret of sensitiveValues) {
+    if (secret) text = text.split(secret).join(SENSITIVE_VALUE_REDACTION);
+  }
+  return text;
+}
+
+export async function browserAccessibilitySnapshot(lookup: BrowserSessionLookup, options: { limit?: number } = {}, expectedControlGeneration?: number): Promise<BrowserAccessibilitySnapshot> {
   const runtime = getRuntime(lookup);
-  if (runtime.state.status !== "running") await startBrowser(lookup);
+  if (runtime.state.status !== "running") await startBrowser(lookup, expectedControlGeneration);
   const limit = sanitizeLimit(options.limit, 120, 500);
   return withCdp(runtime.state, async (cdp) => {
     await cdp.send("Accessibility.enable");
@@ -854,57 +1516,449 @@ export async function browserAccessibilitySnapshot(lookup: BrowserSessionLookup,
       returnByValue: true,
     });
     const page = info?.result?.value ?? {};
+    const sensitiveResult = await cdp.send<any>("Runtime.evaluate", {
+      expression: `(() => { ${DOM_HELPERS_SCRIPT}\nreturn Array.from(document.querySelectorAll("input,textarea,select,[contenteditable='true']")).filter(__wayangSensitive).map((el) => String(el.value || el.textContent || "")).filter(Boolean).slice(0, 100); })()`,
+      returnByValue: true,
+    });
+    const sensitiveValues = Array.isArray(sensitiveResult?.result?.value)
+      ? sensitiveResult.result.value.map((value: unknown) => String(value)).filter(Boolean)
+      : [];
     const tree = await cdp.send<any>("Accessibility.getFullAXTree");
     const nodes = Array.isArray(tree?.nodes) ? tree.nodes : [];
     const simplified = nodes
       .filter((node: any) => !node.ignored)
-      .map((node: any) => ({
-        role: node.role?.value,
-        name: node.name?.value,
-        value: node.value?.value,
-        description: node.description?.value,
-        ignored: node.ignored,
-      }))
+      .map((node: any) => {
+        const name = redactSensitiveValue(node.name?.value, sensitiveValues);
+        const sensitiveContext = SENSITIVE_FIELD_PATTERN.test(name || "");
+        return {
+          role: node.role?.value,
+          name,
+          value: redactSensitiveValue(node.value?.value, sensitiveValues, sensitiveContext),
+          description: redactSensitiveValue(node.description?.value, sensitiveValues),
+          ignored: node.ignored,
+        };
+      })
       .filter((node: any) => node.role || node.name || node.value || node.description)
       .slice(0, limit);
-    runtime.state.activeUrl = page.url || runtime.state.activeUrl;
-    runtime.state.activeTitle = page.title || runtime.state.activeTitle;
+    const safeUrl = redactSensitiveValue(page.url, sensitiveValues) || "";
+    const safeTitle = redactSensitiveValue(page.title, sensitiveValues) || "";
+    runtime.state.activeUrl = safeUrl || runtime.state.activeUrl;
+    runtime.state.activeTitle = safeTitle || runtime.state.activeTitle;
     runtime.state.updatedAt = now();
     persistRuntimeState(runtime);
-    return { url: page.url || "", title: page.title || "", nodes: simplified };
+    return { url: safeUrl, title: safeTitle, nodes: simplified };
+  }, expectedControlGeneration, "inspection-text");
+}
+
+export async function clickBrowser(lookup: BrowserSessionLookup, x: number, y: number, expectedControlGeneration?: number): Promise<BrowserSessionState> {
+  const runtime = getRuntime(lookup);
+  if (runtime.state.status !== "running") await startBrowser(lookup, expectedControlGeneration);
+  return serializeRuntimeMutation(runtime, async () => {
+    assertAgentGeneration(runtime, expectedControlGeneration);
+    await withCdp(runtime.state, async (cdp) => {
+      await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+    }, expectedControlGeneration, "mutation");
+    assertAgentWork(runtime, expectedControlGeneration, "mutation");
+    return cloneState(runtime.state);
   });
 }
 
-export async function clickBrowser(lookup: BrowserSessionLookup, x: number, y: number): Promise<BrowserSessionState> {
+async function insertTextIntoBrowser(lookup: BrowserSessionLookup, text: string, publicOnly = false, expectedControlGeneration?: number): Promise<BrowserSessionState> {
   const runtime = getRuntime(lookup);
-  if (runtime.state.status !== "running") await startBrowser(lookup);
-  await withCdp(runtime.state, async (cdp) => {
-    await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
-    await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+  if (runtime.state.status !== "running") await startBrowser(lookup, expectedControlGeneration);
+  return serializeRuntimeMutation(runtime, async () => {
+    assertAgentGeneration(runtime, expectedControlGeneration);
+    if (publicOnly) await assertPublicFillTarget(runtime.state, undefined, 0, expectedControlGeneration);
+    await withCdp(runtime.state, async (cdp) => {
+      await cdp.send("Input.insertText", { text });
+    }, expectedControlGeneration, "mutation");
+    assertAgentWork(runtime, expectedControlGeneration, "mutation");
+    runtime.state.updatedAt = now();
+    persistRuntimeState(runtime);
+    return cloneState(runtime.state);
   });
-  return cloneState(runtime.state);
 }
 
-async function insertTextIntoBrowser(lookup: BrowserSessionLookup, text: string): Promise<BrowserSessionState> {
+export async function typePublicBrowser(lookup: BrowserSessionLookup, text: string, expectedControlGeneration?: number): Promise<BrowserSessionState> {
+  return insertTextIntoBrowser(lookup, text, true, expectedControlGeneration);
+}
+
+export interface BrowserCredentialContext {
+  runtimeKey: string;
+  targetId: string;
+  documentIdentity: string;
+  url: string;
+  origin: string;
+  /** Present only for the capability-bound Protected broker path. */
+  capabilityBinding?: import("./types.js").ProtectedBrowserBinding;
+}
+
+export async function getBrowserCredentialContext(lookup: BrowserSessionLookup): Promise<BrowserCredentialContext> {
   const runtime = getRuntime(lookup);
-  if (runtime.state.status !== "running") await startBrowser(lookup);
-  await withCdp(runtime.state, async (cdp) => {
-    await cdp.send("Input.insertText", { text });
+  if (runtime.state.status !== "running") throw new Error("Browser is not running");
+  const target = await getPageTarget(runtime.state);
+  const page = await withCdp(runtime.state, async (cdp) => {
+    const info = await cdp.send<any>("Runtime.evaluate", {
+      expression: "({ url: location.href, origin: location.origin })",
+      returnByValue: true,
+    });
+    const document = await readTopLevelDocumentIdentity(cdp);
+    return { ...(info?.result?.value ?? {}), documentIdentity: document.identity };
   });
+  const url = String(page.url || target.url || "");
+  const origin = String(page.origin || "");
+  if (!url || !origin || origin === "null") throw new Error("Current page does not have a credential-safe origin");
+  runtime.state.activeTargetId = target.id;
+  runtime.state.activeUrl = url;
   runtime.state.updatedAt = now();
   persistRuntimeState(runtime);
-  return cloneState(runtime.state);
+  return { runtimeKey: runtime.state.key, targetId: target.id, documentIdentity: String(page.documentIdentity), url, origin };
 }
 
-export async function typePublicBrowser(lookup: BrowserSessionLookup, text: string): Promise<BrowserSessionState> {
-  return insertTextIntoBrowser(lookup, text);
+export async function fillBrowserCredential(
+  lookup: BrowserSessionLookup,
+  values: { username?: string; password?: string; totp?: string },
+  expected?: BrowserCredentialContext,
+): Promise<Array<"username" | "password" | "totp">> {
+  const runtime = getRuntime(lookup);
+  if (runtime.state.status !== "running") throw new Error("Browser is not running");
+  return serializeRuntimeMutation(runtime, () => withCdp(runtime.state, async (cdp) => {
+    if (expected) {
+      const current = await cdp.send<any>("Runtime.evaluate", {
+        expression: "({ url: location.href, origin: location.origin })",
+        returnByValue: true,
+      });
+      const page = current?.result?.value ?? {};
+      const document = await readTopLevelDocumentIdentity(cdp);
+      if (runtime.state.key !== expected.runtimeKey || runtime.state.activeTargetId !== expected.targetId || document.identity !== expected.documentIdentity || page.origin !== expected.origin) {
+        throw new Error("Credential choice is no longer valid for this page");
+      }
+    }
+    const documentResult = await cdp.send<any>("Runtime.evaluate", { expression: "document", returnByValue: false });
+    const objectId = documentResult?.result?.objectId;
+    if (!objectId) throw new Error("Credential fill could not access the page");
+    const result = await cdp.send<any>("Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: `function(values) {
+        const eligible = (el) => {
+          if (el.disabled || el.readOnly || (el instanceof HTMLInputElement && el.type === "hidden")) return false;
+          const rect = el.getBoundingClientRect();
+          const style = getComputedStyle(el);
+          if (rect.width <= 0 || rect.height <= 0 || style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+          return typeof el.checkVisibility !== "function" || el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+        };
+        const identity = (el) => [el.id, el.name, el.placeholder, el.getAttribute("aria-label"), el.autocomplete].filter(Boolean).join(" ");
+        const setValue = (el, value) => {
+          el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+          el.focus({ preventScroll: true });
+          const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+          if (setter) setter.call(el, value); else el.value = value;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        };
+        const inputs = Array.from(document.querySelectorAll("input,textarea")).filter(eligible);
+        const passwordCandidates = inputs.filter((el) => el instanceof HTMLInputElement && el.type === "password");
+        const totpCandidates = inputs.filter((el) => /one-time-code/i.test(el.autocomplete || "") || /(?:otp|totp|verification|auth(?:entication)?[ _-]?code)/i.test(identity(el)));
+        if (typeof values.password === "string" && passwordCandidates.length !== 1) return { error: "required-password-field", filled: [] };
+        if (typeof values.totp === "string" && totpCandidates.length !== 1) return { error: "required-totp-field", filled: [] };
+        const password = passwordCandidates[0];
+        const totp = totpCandidates[0];
+        const usernameEligible = inputs.filter((el) => el !== password && el !== totp && (!(el instanceof HTMLInputElement) || ["text", "email", "tel", ""].includes(el.type)));
+        const strongUsername = usernameEligible.filter((el) => /username|email/i.test(el.autocomplete || "") || /(?:user|email|login)/i.test(identity(el)));
+        const username = strongUsername.length === 1 ? strongUsername[0] : strongUsername.length === 0 && usernameEligible.length === 1 ? usernameEligible[0] : undefined;
+        const filled = [];
+        if (typeof values.username === "string" && username) { setValue(username, values.username); filled.push("username"); }
+        if (typeof values.password === "string" && password) { setValue(password, values.password); filled.push("password"); }
+        if (typeof values.totp === "string" && totp) { setValue(totp, values.totp); filled.push("totp"); }
+        return { filled };
+      }`,
+      arguments: [{ value: values }],
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    if (result?.exceptionDetails) throw new Error("Credential fill failed in the page");
+    const value = result?.result?.value ?? {};
+    if (value.error === "required-password-field") throw new Error("Credential fill requires exactly one eligible password field");
+    if (value.error === "required-totp-field") throw new Error("Credential fill requires exactly one eligible verification-code field");
+    const filled = Array.isArray(value.filled) ? value.filled : [];
+    return filled.filter((kind: unknown): kind is "username" | "password" | "totp" => kind === "username" || kind === "password" || kind === "totp");
+  }));
 }
 
-export async function pasteTextBrowser(lookup: BrowserSessionLookup, text: string): Promise<BrowserSessionState> {
-  return insertTextIntoBrowser(lookup, text);
+export async function pasteTextBrowser(lookup: BrowserSessionLookup, text: string, expectedControlGeneration?: number): Promise<BrowserSessionState> {
+  return insertTextIntoBrowser(lookup, text, false, expectedControlGeneration);
 }
 
 export async function stopAllBrowsers(): Promise<void> {
-  const lookups = Array.from(runtimes.values()).map((runtime) => ({ sessionId: runtime.state.sessionId, projectCwd: runtime.state.projectCwd }));
+  const lookups = Array.from(runtimes.values()).map((runtime) => ({
+    sessionId: runtime.state.sessionId,
+    projectCwd: runtime.state.projectCwd,
+    persistence: runtime.state.profile.persistence,
+  }));
   await Promise.all(lookups.map((lookup) => stopBrowser(lookup).catch(() => undefined)));
+}
+
+export interface ManagedChromiumDownloadWillBegin {
+  frameId: string;
+  guid: string;
+  url: string;
+  suggestedFilename: string;
+}
+
+export interface ManagedChromiumDownloadProgress {
+  guid: string;
+  totalBytes: number;
+  receivedBytes: number;
+  state: "inProgress" | "completed" | "canceled";
+}
+
+export interface ManagedChromiumRuntimeOptions {
+  /** Pre-resolved, caller-owned private directories. This primitive never selects a profile scope. */
+  profileDir: string;
+  downloadsDir: string;
+  /** `allow` keeps browser-selected filenames; `allowAndName` stores GUID names. */
+  downloadBehavior?: "allow" | "allowAndName";
+  workingDirectory: string;
+  onDownloadWillBegin?: (event: ManagedChromiumDownloadWillBegin) => void;
+  onDownloadProgress?: (event: ManagedChromiumDownloadProgress) => void;
+  /** Browser-lifetime observation of every top-level page target URL. */
+  onTopLevelNavigation?: (url: string) => void;
+  onUnexpectedExit?: () => void;
+}
+
+export interface ManagedChromiumDocumentIdentity {
+  targetId: string;
+  frameId: string;
+  loaderId: string;
+  identity: string;
+  url: string;
+}
+
+export interface ManagedChromiumPageAttachment {
+  /** A page-target-only CDP connection owned by the caller. */
+  cdp: CdpConnection;
+  target: ChromeTarget;
+  close(): void;
+}
+
+/**
+ * Internal reusable Chromium lifecycle primitive. Registry ownership, public
+ * state, profile selection, authorization, and operation policy deliberately
+ * remain with the caller. In particular, instances are never added to the
+ * generic browser registry above.
+ */
+export class ManagedChromiumRuntime {
+  private child: ChildProcess | null = null;
+  private browserCdp: CdpConnection | null = null;
+  private cdpPort: number | null = null;
+  private lifecycleTail: Promise<void> = Promise.resolve();
+
+  constructor(private readonly options: ManagedChromiumRuntimeOptions) {}
+
+  get running(): boolean {
+    return Boolean(this.child && this.child.exitCode === null && this.browserCdp && this.cdpPort);
+  }
+
+  private serializeLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+    const prior = this.lifecycleTail;
+    let release!: () => void;
+    this.lifecycleTail = new Promise<void>((resolve) => { release = resolve; });
+    return prior.catch(() => undefined).then(operation).finally(release);
+  }
+
+  async start(assertAuthorizedBeforeBrowserCdp?: () => Promise<void>): Promise<void> {
+    return this.serializeLifecycle(async () => {
+      if (this.running) return;
+      fs.mkdirSync(this.options.profileDir, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(this.options.downloadsDir, { recursive: true, mode: 0o700 });
+      const executable = findChromiumExecutable();
+      const port = await allocatePort();
+      const child = spawn(executable, [
+        "--remote-debugging-address=127.0.0.1",
+        `--remote-debugging-port=${port}`,
+        `--user-data-dir=${this.options.profileDir}`,
+        "--window-size=1280,720",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--headless=new",
+        "about:blank",
+      ], {
+        cwd: this.options.workingDirectory,
+        detached: process.platform !== "win32",
+        env: browserChildEnvironment(),
+        stdio: ["ignore", "ignore", "ignore"],
+        shell: false,
+      });
+      this.child = child;
+      this.cdpPort = port;
+      const exited = new Promise<boolean>((resolve) => child.once("exit", () => resolve(true)));
+      try {
+        await waitForCdp(port);
+        if (child.exitCode !== null) throw new Error("Managed Chromium exited during startup");
+        const browserCdp = await connectBrowserCdp(port);
+        this.browserCdp = browserCdp;
+        if (this.options.onTopLevelNavigation) {
+          const observeTarget = (event: any) => {
+            const target = event?.targetInfo;
+            if (target?.type === "page" && typeof target.url === "string") {
+              this.options.onTopLevelNavigation?.(target.url);
+            }
+          };
+          browserCdp.on("Target.targetCreated", observeTarget);
+          browserCdp.on("Target.targetInfoChanged", observeTarget);
+          await assertAuthorizedBeforeBrowserCdp?.();
+          await browserCdp.send("Target.setDiscoverTargets", { discover: true });
+        }
+        if (this.options.onDownloadWillBegin) {
+          browserCdp.on("Browser.downloadWillBegin", (event: ManagedChromiumDownloadWillBegin) => {
+            this.options.onDownloadWillBegin?.({ ...event });
+          });
+        }
+        if (this.options.onDownloadProgress) {
+          browserCdp.on("Browser.downloadProgress", (event: ManagedChromiumDownloadProgress) => {
+            this.options.onDownloadProgress?.({ ...event });
+          });
+        }
+        await assertAuthorizedBeforeBrowserCdp?.();
+        await browserCdp.send("Browser.setDownloadBehavior", {
+          behavior: this.options.downloadBehavior ?? "allowAndName",
+          downloadPath: this.options.downloadsDir,
+          eventsEnabled: true,
+        });
+        await this.pageTarget();
+        child.once("exit", () => {
+          if (this.child !== child) return;
+          this.browserCdp?.close();
+          this.browserCdp = null;
+          this.child = null;
+          this.cdpPort = null;
+          this.options.onUnexpectedExit?.();
+        });
+      } catch (error) {
+        this.browserCdp?.close();
+        this.browserCdp = null;
+        terminateChild(child);
+        await Promise.race([exited.then(() => undefined), sleep(3_000).then(() => killChild(child))]);
+        this.child = null;
+        this.cdpPort = null;
+        throw error;
+      }
+    });
+  }
+
+  async cancelDownload(guid: string, assertAuthorizedBeforeBrowserCdp?: () => Promise<void>): Promise<void> {
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(guid)) throw new Error("Managed Chromium download identifier is invalid");
+    const browserCdp = this.browserCdp;
+    if (!this.running || !browserCdp) throw new Error("Managed Chromium is not running");
+    await assertAuthorizedBeforeBrowserCdp?.();
+    await browserCdp.send("Browser.cancelDownload", { guid });
+  }
+
+  async stop(): Promise<void> {
+    return this.serializeLifecycle(async () => {
+      const child = this.child;
+      this.browserCdp?.close();
+      this.browserCdp = null;
+      this.child = null;
+      this.cdpPort = null;
+      if (!child) return;
+      terminateChild(child);
+      await Promise.race([
+        new Promise<void>((resolve) => {
+          if (child.exitCode !== null) resolve();
+          else child.once("exit", () => resolve());
+        }),
+        sleep(3_000).then(() => killChild(child)),
+      ]);
+    });
+  }
+
+  private async pageTarget(): Promise<ChromeTarget> {
+    const port = this.cdpPort;
+    if (!this.running || !port) throw new Error("Managed Chromium is not running");
+    const targets = await fetchJson<ChromeTarget[]>(`http://127.0.0.1:${port}/json/list`);
+    const target = selectPageTarget(targets) ?? await createPageTarget(port);
+    if (!target.webSocketDebuggerUrl) throw new Error("Chrome target did not expose a debugger connection");
+    return target;
+  }
+
+  async attachPageCdpViewer(): Promise<ManagedChromiumPageAttachment> {
+    if (!this.running) throw new Error("Managed Chromium is not running");
+    const target = await this.pageTarget();
+    if (!this.running) throw new Error("Managed Chromium stopped during viewer attachment");
+    const cdp = await CdpConnection.connect(target.webSocketDebuggerUrl!);
+    let closed = false;
+    return {
+      cdp,
+      target,
+      close() {
+        if (closed) return;
+        closed = true;
+        cdp.close();
+      },
+    };
+  }
+
+  async withPageCdp<T>(operation: (cdp: CdpConnection, target: ChromeTarget) => Promise<T>): Promise<T> {
+    const attachment = await this.attachPageCdpViewer();
+    try {
+      return await operation(attachment.cdp, attachment.target);
+    } finally {
+      attachment.close();
+    }
+  }
+
+  async documentIdentity(): Promise<ManagedChromiumDocumentIdentity> {
+    return this.withPageCdp(async (cdp, target) => {
+      const document = await readTopLevelDocumentIdentity(cdp);
+      const location = await cdp.send<any>("Runtime.evaluate", {
+        expression: "location.href",
+        returnByValue: true,
+      });
+      return {
+        targetId: target.id,
+        frameId: document.frameId,
+        loaderId: document.loaderId,
+        identity: `${target.id}:${document.identity}`,
+        url: String(location?.result?.value ?? target.url ?? ""),
+      };
+    });
+  }
+
+  async navigate(url: string): Promise<ManagedChromiumDocumentIdentity> {
+    return this.withPageCdp(async (cdp, target) => {
+      await cdp.send("Page.enable");
+      let finishLoad!: () => void;
+      const loaded = new Promise<void>((resolve) => {
+        const off = cdp.on("Page.loadEventFired", () => finishLoad());
+        const timer = setTimeout(() => finishLoad(), 10_000);
+        timer.unref?.();
+        finishLoad = () => {
+          clearTimeout(timer);
+          off();
+          resolve();
+        };
+      });
+      const result = await cdp.send<any>("Page.navigate", { url });
+      if (result?.errorText) {
+        finishLoad();
+        throw new Error("Managed Chromium navigation failed");
+      }
+      if (result?.loaderId) await loaded;
+      else finishLoad();
+      const document = await readTopLevelDocumentIdentity(cdp);
+      const location = await cdp.send<any>("Runtime.evaluate", { expression: "location.href", returnByValue: true });
+      return {
+        targetId: target.id,
+        frameId: document.frameId,
+        loaderId: document.loaderId,
+        identity: `${target.id}:${document.identity}`,
+        url: String(location?.result?.value ?? url),
+      };
+    });
+  }
 }

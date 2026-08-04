@@ -41,7 +41,11 @@ test("incremental catalog parses unknown/changed files once and unchanged scans 
   const file = path.join(project, "fixture.jsonl");
   fs.writeFileSync(file, syntheticSession("fixture-id", project));
   const state = createAdapter();
-  const catalog = new SessionCatalog(state.adapter, root);
+  const catalog = new SessionCatalog(state.adapter, root, {
+    authorizeCwd: () => true,
+    getPolicyGeneration: () => 1,
+    refreshProjection: () => undefined,
+  });
 
   try {
     const cold = await catalog.scan();
@@ -69,6 +73,135 @@ test("incremental catalog parses unknown/changed files once and unchanged scans 
   }
 });
 
+test("header authorization buffers exactly through newline and no body byte", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-catalog-header-boundary-"));
+  const project = path.join(root, "--header-boundary-project--");
+  fs.mkdirSync(project, { recursive: true });
+  const file = path.join(project, "boundary.jsonl");
+  const header = JSON.stringify({
+    type: "session",
+    version: 3,
+    id: "header-boundary-id",
+    timestamp: "2026-01-01T00:00:00.000Z",
+    cwd: project,
+  });
+  const bodyCanary = "BODY_BYTE_MUST_NOT_BE_BUFFERED_BEFORE_AUTHORIZATION";
+  fs.writeFileSync(file, `${header}\n${bodyCanary}\n`);
+  const state = createAdapter();
+  let observed = "";
+  let authorizationCalled = false;
+  const catalog = new SessionCatalog(state.adapter, root, {
+    observePreAuthorizationBytes(bytes) {
+      assert.equal(authorizationCalled, false);
+      observed = Buffer.from(bytes).toString("utf8");
+    },
+    authorizeCwd(cwd) {
+      authorizationCalled = true;
+      assert.equal(cwd, project);
+      assert.equal(observed, `${header}\n`);
+      assert.equal(observed.includes(bodyCanary), false);
+      return false;
+    },
+    getPolicyGeneration: () => 1,
+    refreshProjection: () => undefined,
+  });
+  try {
+    const result = await catalog.scan();
+    assert.equal(authorizationCalled, true);
+    assert.equal(observed, `${header}\n`);
+    assert.equal(result.headerBytes, Buffer.byteLength(`${header}\n`));
+    assert.equal(result.parseBytes, 0);
+    assert.equal(result.parsed, 0);
+    assert.equal(state.commits[0]?.parsed.length, 0);
+  } finally {
+    await catalog.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("protected catalog authorization reads only a bounded header and never parses body text", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-catalog-protected-"));
+  const project = path.join(root, "--protected-project--");
+  fs.mkdirSync(project, { recursive: true });
+  const file = path.join(project, "protected.jsonl");
+  const canary = "PROTECTED_BODY_CANARY ".repeat(100_000);
+  fs.writeFileSync(file, syntheticSession("protected-id", project, [
+    { type: "message", id: "private", message: { role: "user", content: canary } },
+  ]));
+  const state = createAdapter();
+  const authorizedCwds: string[] = [];
+  const catalog = new SessionCatalog(state.adapter, root, {
+    authorizeCwd(cwd) {
+      authorizedCwds.push(cwd);
+      return false;
+    },
+    getPolicyGeneration: () => 1,
+    refreshProjection: () => undefined,
+  });
+  try {
+    const result = await catalog.scan();
+    assert.deepEqual(authorizedCwds, [project]);
+    assert.equal(result.discovered, 1);
+    assert.equal(result.parsed, 0);
+    assert.equal(result.parseBytes, 0);
+    assert.ok(result.headerBytes <= 64 * 1024);
+    assert.equal(state.commits[0]?.parsed.length, 0);
+  } finally {
+    await catalog.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("catalog discards first-message and model metadata when policy protects during worker parse", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-catalog-policy-race-"));
+  const project = path.join(root, "--policy-race-project--");
+  fs.mkdirSync(project, { recursive: true });
+  const file = path.join(project, "race.jsonl");
+  fs.writeFileSync(file, syntheticSession("policy-race-id", project, [
+    {
+      type: "message",
+      id: "assistant-race",
+      parentId: "user-a",
+      timestamp: "2026-01-01T00:00:03.000Z",
+      message: { role: "assistant", content: "MODEL_METADATA_CANARY", provider: "offline", model: "protected-race-model" },
+    },
+  ]));
+  const state = createAdapter();
+  let allowed = true;
+  let generation = 10;
+  let tightened = false;
+  const catalog = new SessionCatalog(state.adapter, root, {
+    authorizeCwd: () => allowed,
+    getPolicyGeneration: () => generation,
+    refreshProjection: () => undefined,
+    onAuthorizedBodyTransferred() {
+      if (tightened) return;
+      tightened = true;
+      allowed = false;
+      generation++;
+    },
+  });
+  try {
+    const raced = await catalog.scan();
+    assert.equal(tightened, true);
+    assert.ok(raced.parseBytes > 0, "worker should parse the synthetic body before commit-time rejection");
+    assert.equal(raced.parsed, 0);
+    assert.equal(state.commits[0]?.parsed.length, 0);
+    assert.equal(JSON.stringify(state.commits[0]?.parsed).includes("Public synthetic fixture text"), false);
+    assert.equal(JSON.stringify(state.commits[0]?.parsed).includes("protected-race-model"), false);
+
+    // The discarded fingerprint was not committed, so the next scan retries;
+    // current protected policy still permits only the bounded header.
+    const retry = await catalog.scan();
+    assert.equal(retry.parsed, 0);
+    assert.equal(retry.parseBytes, 0);
+    assert.equal(state.commits[1]?.parsed.length, 0);
+  } finally {
+    await catalog.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("large metadata parsing stays off the main event loop", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-catalog-loop-test-"));
   const project = path.join(root, "--synthetic-project--");
@@ -90,7 +223,11 @@ test("large metadata parsing stays off the main event loop", async () => {
   }
   fs.writeFileSync(file, syntheticSession("large-fixture-id", project, entries));
   const state = createAdapter();
-  const catalog = new SessionCatalog(state.adapter, root);
+  const catalog = new SessionCatalog(state.adapter, root, {
+    authorizeCwd: () => true,
+    getPolicyGeneration: () => 1,
+    refreshProjection: () => undefined,
+  });
   let maxTimerDelay = 0;
   let expected = Date.now() + 10;
   const timer = setInterval(() => {

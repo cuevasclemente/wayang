@@ -16,9 +16,15 @@ concurrency:
 
 jobs:
   linux:
-    name: Linux / Node 22.19
+    name: Linux / Node ${{ matrix.node-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          - 22.19.0
+          - 26.4.0
     env:
       # Build and test tooling is intentionally installed even if a caller sets NODE_ENV.
       NPM_CONFIG_INCLUDE: dev
@@ -30,7 +36,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22.19.0
+          node-version: ${{ matrix.node-version }}
           cache: npm
           # setup-node caches npm's download cache, not node_modules.
           cache-dependency-path: |
@@ -70,7 +76,7 @@ jobs:
         run: npm run test:scripts
 
   macos-smoke:
-    name: macOS smoke / Node 22.19
+    name: macOS smoke / Node 26.4
     runs-on: macos-latest
     timeout-minutes: 30
     env:
@@ -81,10 +87,15 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Use canonical macOS temporary root
+        # macOS exposes /var as a symlink to /private/var. Security tests use
+        # canonical roots, so keep synthetic fixtures on the canonical runner path.
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22.19.0
+          node-version: 26.4.0
           cache: npm
           # setup-node caches npm's download cache, not node_modules.
           cache-dependency-path: |
@@ -104,8 +115,14 @@ jobs:
         working-directory: e2e
         run: npm ci
 
+      - name: Install Playwright Chromium
+        working-directory: e2e
+        run: npx playwright install chromium
+
       - name: Run backend tests
         working-directory: backend
+        env:
+          WAYANG_BROWSER_INTEGRATION: "1"
         run: npm test
 
       - name: Build backend
@@ -125,7 +142,7 @@ jobs:
         run: make smoke
 
   playwright:
-    name: Playwright / Linux / Node 22.19
+    name: Playwright / Linux / Node 26.4
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -142,7 +159,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22.19.0
+          node-version: 26.4.0
           cache: npm
           # setup-node caches npm's download cache, not node_modules or browsers.
           cache-dependency-path: |

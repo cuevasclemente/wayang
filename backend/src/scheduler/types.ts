@@ -13,6 +13,8 @@ export interface ScheduledJobRow {
   cwd: string;
   provider: string | null;
   model: string | null;
+  /** Null preserves legacy jobs and resolves through the project default at run time. */
+  agent_profile_id: string | null;
   permission_mode: string;
   command_guard_mode: ScheduledJobCommandGuardMode;
   timeout_ms: number;
@@ -46,6 +48,7 @@ export interface ScheduledJobInput {
   cwd?: string;
   provider?: string | null;
   model?: string | null;
+  agent_profile_id?: string | null;
   permission_mode?: string;
   command_guard_mode?: ScheduledJobCommandGuardMode;
   timeout_ms?: number;

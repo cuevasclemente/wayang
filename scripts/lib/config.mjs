@@ -1,5 +1,6 @@
 import { randomBytes, scrypt as nodeScrypt } from "node:crypto";
 import { closeSync, chmodSync, fsyncSync, mkdirSync, openSync, renameSync, writeFileSync } from "node:fs";
+import { isIP } from "node:net";
 import { dirname, resolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -106,20 +107,73 @@ export async function createPasswordHash(password) {
   return ["scrypt", "1", n, r, p, keyLength, salt.toString("base64url"), hash.toString("base64url")].join("$");
 }
 
-export function normalizePublicOrigin(value) {
+function normalizeHttpOrigin(value, label) {
   let parsed;
   try {
     parsed = new URL(value);
   } catch {
-    throw new Error("Public browser origin must be an absolute http(s) origin");
+    throw new Error(`${label} must be an absolute http(s) origin`);
   }
   if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) {
-    throw new Error("Public browser origin must not contain credentials, a path, query, or fragment");
+    throw new Error(`${label} must not contain credentials, a path, query, or fragment`);
   }
   return parsed.origin;
 }
 
+export function normalizePublicOrigin(value) {
+  return normalizeHttpOrigin(value, "Public browser origin");
+}
+
+function hasExactOriginSyntax(value) {
+  // This raw check is needed because WHATWG parsing erases empty components, controls, and dot segments.
+  const match = value.match(/^https?:\/\/([^/?#@\\\u0000-\u0020\u007f]+)\/?$/i);
+  return Boolean(match && !match[1].endsWith(":"));
+}
+
+export function normalizeCompanionUrl(value) {
+  const origin = normalizeHttpOrigin(value, "Companion tool backend URL");
+  if (!hasExactOriginSyntax(value)) {
+    throw new Error("Companion tool backend URL must not contain credentials, a path, query, fragment, control characters, or backslashes");
+  }
+  return origin;
+}
+
+export function recommendCompanionUrl({ publicOrigin, host, port }) {
+  if (publicOrigin) return publicOrigin;
+
+  const normalizedHost = typeof host === "string" ? host.trim().toLowerCase() : "";
+  if (normalizedHost === "::1" || normalizedHost === "[::1]") return `http://[::1]:${port}`;
+  if (normalizedHost === "localhost") return `http://localhost:${port}`;
+
+  const octets = normalizedHost.split(".");
+  const isIpv4Loopback = octets.length === 4
+    && octets[0] === "127"
+    && octets.every((octet) => /^(?:0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255);
+  return `http://${isIpv4Loopback ? normalizedHost : "127.0.0.1"}:${port}`;
+}
+
+export async function promptForCompanionUrl({ publicOrigin, host, port, existingValue, ask, notice }) {
+  const recommendation = normalizeCompanionUrl(recommendCompanionUrl({ publicOrigin, host, port }));
+  let safeFallback = recommendation;
+
+  if (existingValue) {
+    try {
+      safeFallback = normalizeCompanionUrl(existingValue);
+      if (safeFallback !== recommendation) {
+        notice(`The recommended companion pi-tool backend URL for this configuration is ${recommendation}.`);
+      }
+    } catch {
+      notice("Existing WAYANG_URL is invalid and must be replaced; its value was not displayed.");
+    }
+  }
+
+  const answer = await ask("Companion pi-tool backend URL", safeFallback);
+  return normalizeCompanionUrl(answer);
+}
+
 export function isLoopbackHost(host) {
   const normalized = host.trim().toLowerCase();
-  return normalized === "localhost" || normalized === "::1" || normalized === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(normalized);
+  if (normalized === "localhost" || normalized === "::1" || normalized === "[::1]") return true;
+  if (isIP(normalized) !== 4) return false;
+  return normalized.split(".")[0] === "127";
 }

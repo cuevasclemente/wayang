@@ -1,14 +1,17 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Group, Panel, Separator, usePanelRef } from "react-resizable-panels";
 import {
+  AlertCircle,
   Columns3,
   FolderOpen,
+  Loader2,
   LogOut,
   MessageSquare,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
+  Settings as SettingsIcon,
   Terminal,
 } from "lucide-react";
 import {
@@ -24,8 +27,25 @@ import { ChatPanel } from "./panels/ChatPanel";
 import { NewSessionPanel } from "./panels/NewSessionPanel";
 import { RightPanel } from "./panels/RightPanel";
 import { ScheduledJobsPanel } from "./panels/ScheduledJobsPanel";
+import { ProtectedAutomationsPanel } from "./panels/ProtectedAutomationsPanel";
+import { isCurrentSessionPath, parseSessionPath, sessionPath } from "./routing/sessionRoute";
+import { SettingsDialog, type SettingsTab } from "./components/settings/SettingsDialog";
 
 type MobileTab = "sessions" | "chat" | "tools";
+
+type RouteResolution =
+  | { kind: "idle" }
+  | { kind: "loading"; requestedId: string }
+  | { kind: "ready"; requestedId: string }
+  | { kind: "not_found"; requestedId: string }
+  | { kind: "error"; requestedId: string };
+
+function initialRouteResolution(): RouteResolution {
+  const route = parseSessionPath(window.location.pathname);
+  if (route.kind === "root") return { kind: "idle" };
+  if (route.kind === "session") return { kind: "loading", requestedId: route.sessionId };
+  return { kind: "not_found", requestedId: route.requestedPath };
+}
 
 function useMediaQuery(query: string): boolean {
   const [matches, setMatches] = useState(
@@ -82,6 +102,11 @@ function App({ authEnabled, onLogout }: AppProps) {
   const [showNewSession, setShowNewSession] = useState(false);
   const [activeScheduledJobId, setActiveScheduledJobId] = useState<string | null>(null);
   const [showScheduledJobs, setShowScheduledJobs] = useState(false);
+  const [activeProtectedAutomationJobId, setActiveProtectedAutomationJobId] = useState<string | null>(null);
+  const [showProtectedAutomations, setShowProtectedAutomations] = useState(false);
+  const [settingsRequest, setSettingsRequest] = useState<{ tab: SettingsTab; projectCwd: string | null } | null>(null);
+  const [routeResolution, setRouteResolution] = useState<RouteResolution>(initialRouteResolution);
+  const routeRequestGenerationRef = useRef(0);
 
   const isMobile = useMediaQuery("(max-width: 768px)");
   const [mobileTab, setMobileTab] = useState<MobileTab>("chat");
@@ -90,32 +115,41 @@ function App({ authEnabled, onLogout }: AppProps) {
     setSessionChangeTrigger((n) => n + 1);
   }, []);
 
-  const handleSelectSession = useCallback(
-    (session: Session) => {
+  const navigateToSession = useCallback(
+    (session: Session, messageId: string | null = null) => {
+      // Known metadata can render immediately. Any in-flight URL restoration
+      // is stale as soon as the user makes an explicit selection.
+      routeRequestGenerationRef.current += 1;
+      setRouteResolution({ kind: "ready", requestedId: session.id });
       setActiveSession(session);
       setActiveProjectCwd(session.cwd.replace(/\/+$/, "") || "/");
+      setShowNewSession(false);
       setShowScheduledJobs(false);
-      // Clear any prior scroll target when switching through the normal flow.
-      setScrollToMessageId(null);
+      setShowProtectedAutomations(false);
+      setScrollToMessageId(messageId);
+      if (!isCurrentSessionPath(session.id)) {
+        window.history.pushState(window.history.state, "", sessionPath(session.id));
+      }
       if (isMobile) setMobileTab("chat");
     },
     [isMobile],
+  );
+
+  const handleSelectSession = useCallback(
+    (session: Session) => navigateToSession(session),
+    [navigateToSession],
   );
 
   const handleSelectSearchResult = useCallback(
     (session: Session, messageId: string | null) => {
       // Navigate immediately with search-owned metadata. Runtime enrichment is
       // asynchronous and can only update the still-selected row.
-      setActiveSession(session);
-      setActiveProjectCwd(session.cwd.replace(/\/+$/, "") || "/");
-      setShowScheduledJobs(false);
-      setScrollToMessageId(messageId);
-      if (isMobile) setMobileTab("chat");
+      navigateToSession(session, messageId);
       void getSession(session.id).then((resolved) => {
         setActiveSession((current) => current?.id === session.id ? resolved : current);
       }).catch(() => {});
     },
-    [isMobile],
+    [navigateToSession],
   );
 
   const handleSelectProject = useCallback((cwd: string) => {
@@ -129,6 +163,7 @@ function App({ authEnabled, onLogout }: AppProps) {
       handleSessionChange();
       setShowNewSession(false);
       setShowScheduledJobs(false);
+      setShowProtectedAutomations(false);
     },
     [handleSelectSession, handleSessionChange],
   );
@@ -137,6 +172,84 @@ function App({ authEnabled, onLogout }: AppProps) {
   const rightPanelRef = usePanelRef();
   const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [rightCollapsed, setRightCollapsed] = useState(false);
+
+  const handleBrowseSessions = useCallback(() => {
+    if (isMobile) {
+      setMobileTab("sessions");
+    } else {
+      leftPanelRef.current?.expand();
+    }
+  }, [isMobile, leftPanelRef]);
+
+  const handleRemovedActiveSession = useCallback(() => {
+    routeRequestGenerationRef.current += 1;
+    setActiveSession(null);
+    setScrollToMessageId(null);
+    setRouteResolution({ kind: "idle" });
+    if (window.location.pathname !== "/") {
+      window.history.replaceState(window.history.state, "", "/");
+    }
+  }, []);
+
+  const resolveRoute = useCallback((pathname: string) => {
+    const generation = ++routeRequestGenerationRef.current;
+    const route = parseSessionPath(pathname);
+
+    setShowNewSession(false);
+    setShowScheduledJobs(false);
+    setShowProtectedAutomations(false);
+    setScrollToMessageId(null);
+
+    if (route.kind === "root") {
+      setActiveSession(null);
+      setActiveProjectCwd(null);
+      setRouteResolution({ kind: "idle" });
+      return;
+    }
+
+    if (route.kind === "invalid") {
+      setActiveSession(null);
+      setActiveProjectCwd(null);
+      setRouteResolution({ kind: "not_found", requestedId: route.requestedPath });
+      if (window.matchMedia("(max-width: 768px)").matches) setMobileTab("sessions");
+      return;
+    }
+
+    setActiveSession(null);
+    setActiveProjectCwd(null);
+    setRouteResolution({ kind: "loading", requestedId: route.sessionId });
+
+    void getSession(route.sessionId).then((session) => {
+      if (generation !== routeRequestGenerationRef.current) return;
+      setActiveSession(session);
+      setActiveProjectCwd(session.cwd.replace(/\/+$/, "") || "/");
+      setRouteResolution({ kind: "ready", requestedId: session.id });
+      setMobileTab((current) => window.matchMedia("(max-width: 768px)").matches ? "chat" : current);
+      if (window.location.pathname !== route.canonicalPath) {
+        window.history.replaceState(window.history.state, "", route.canonicalPath);
+      }
+    }).catch((error: unknown) => {
+      if (generation !== routeRequestGenerationRef.current) return;
+      setActiveSession(null);
+      setActiveProjectCwd(null);
+      if (error instanceof ApiError && error.status === 404) {
+        setRouteResolution({ kind: "not_found", requestedId: route.sessionId });
+        if (window.matchMedia("(max-width: 768px)").matches) setMobileTab("sessions");
+        return;
+      }
+      setRouteResolution({ kind: "error", requestedId: route.sessionId });
+    });
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => resolveRoute(window.location.pathname);
+    resolveRoute(window.location.pathname);
+    window.addEventListener("popstate", handlePopState);
+    return () => {
+      routeRequestGenerationRef.current += 1;
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, [resolveRoute]);
 
   // Fetch user info
   useEffect(() => {
@@ -163,6 +276,18 @@ function App({ authEnabled, onLogout }: AppProps) {
     (jobId: string | null) => {
       setActiveScheduledJobId(jobId);
       setShowScheduledJobs(true);
+      setShowProtectedAutomations(false);
+      setShowNewSession(false);
+      if (isMobile) setMobileTab("chat");
+    },
+    [isMobile],
+  );
+
+  const handleSelectProtectedAutomation = useCallback(
+    (jobId: string | null) => {
+      setActiveProtectedAutomationJobId(jobId);
+      setShowProtectedAutomations(true);
+      setShowScheduledJobs(false);
       setShowNewSession(false);
       if (isMobile) setMobileTab("chat");
     },
@@ -181,6 +306,8 @@ function App({ authEnabled, onLogout }: AppProps) {
         cwd: "",
         provider: null,
         model: null,
+        agent_profile_id: null,
+        pending_agent_switch: null,
         created_at: Date.now(),
         last_active: Date.now(),
         archived: 0,
@@ -193,8 +320,10 @@ function App({ authEnabled, onLogout }: AppProps) {
         runtime_is_streaming: false,
         runtime_subscriber_count: 0,
         runtime_last_activity_at: null,
+        bash_mode: "unavailable",
+        browser_mode: "unavailable",
       };
-      handleSelectSession(placeholder);
+      navigateToSession(placeholder);
       void getSession(sessionId).then((session) => {
         setActiveSession((current) => {
           if (current?.id !== sessionId) return current;
@@ -204,7 +333,7 @@ function App({ authEnabled, onLogout }: AppProps) {
         handleSessionChange();
       }).catch(() => {});
     },
-    [handleSelectSession, handleSessionChange],
+    [navigateToSession, handleSessionChange],
   );
 
   const sessionsPanel = (
@@ -213,27 +342,35 @@ function App({ authEnabled, onLogout }: AppProps) {
       active={!isMobile || mobileTab === "sessions"}
       activeProjectCwd={activeProjectCwd}
       activeScheduledJobId={showScheduledJobs ? activeScheduledJobId : null}
+      activeProtectedAutomationJobId={showProtectedAutomations ? activeProtectedAutomationJobId : null}
       onSelect={handleSelectSession}
       onSelectSearchResult={handleSelectSearchResult}
       onSelectProject={handleSelectProject}
       onNewSessionForProject={handleCreateSessionForProject}
+      onOpenProjectSettings={(cwd) => setSettingsRequest({ tab: "projects", projectCwd: cwd })}
       onSelectScheduledJob={handleSelectScheduledJob}
-      onArchiveActive={() => setActiveSession(null)}
+      onSelectProtectedAutomation={handleSelectProtectedAutomation}
+      onArchiveActive={handleRemovedActiveSession}
       refreshTrigger={sessionChangeTrigger}
       onNewSession={() => {
         setShowNewSession(true);
         setShowScheduledJobs(false);
+        setShowProtectedAutomations(false);
         if (isMobile) setMobileTab("chat");
       }}
     />
   );
+
+  const hasRouteNotice = routeResolution.kind === "loading"
+    || routeResolution.kind === "not_found"
+    || routeResolution.kind === "error";
 
   const centerPanel = (
     <div className="relative h-full w-full overflow-hidden">
       {/* Keep ChatPanel mounted so its browser-level WebSocket survives local
           navigation between center-pane tools. Session changes still use the
           existing switch_session message instead of constructing a new socket. */}
-      <div className={`h-full ${showNewSession || showScheduledJobs ? "hidden" : ""}`}>
+      <div className={`h-full ${showNewSession || showScheduledJobs || showProtectedAutomations || hasRouteNotice ? "hidden" : ""}`}>
         <ChatPanel
           activeSession={activeSession}
           onSessionChange={handleSessionChange}
@@ -242,6 +379,15 @@ function App({ authEnabled, onLogout }: AppProps) {
           onScrollToMessageHandled={() => setScrollToMessageId(null)}
         />
       </div>
+      {hasRouteNotice && (
+        <div className="absolute inset-0 bg-neutral-950">
+          <SessionRouteNotice
+            resolution={routeResolution}
+            onRetry={() => resolveRoute(window.location.pathname)}
+            onBrowse={handleBrowseSessions}
+          />
+        </div>
+      )}
       {showNewSession && (
         <div className="absolute inset-0 bg-neutral-950">
           <NewSessionPanel
@@ -265,6 +411,17 @@ function App({ authEnabled, onLogout }: AppProps) {
           />
         </div>
       )}
+      {showProtectedAutomations && (
+        <div className="absolute inset-0 bg-neutral-950">
+          <ProtectedAutomationsPanel
+            selectedJobId={activeProtectedAutomationJobId}
+            sourceSessionId={activeSessionId}
+            onSelectJob={handleSelectProtectedAutomation}
+            onChanged={handleSessionChange}
+            onClose={() => setShowProtectedAutomations(false)}
+          />
+        </div>
+      )}
     </div>
   );
 
@@ -272,6 +429,7 @@ function App({ authEnabled, onLogout }: AppProps) {
     <RightPanel
       sessionId={activeSessionId}
       sessionCwd={activeSession?.cwd ?? null}
+      browserMode={activeSession?.browser_mode ?? "unavailable"}
     />
   );
 
@@ -285,6 +443,7 @@ function App({ authEnabled, onLogout }: AppProps) {
         leftCollapsed={leftCollapsed}
         rightCollapsed={rightCollapsed}
         isMobile={isMobile}
+        onOpenSettings={() => setSettingsRequest({ tab: "projects", projectCwd: activeProjectCwd })}
         onToggleLeft={() => {
           if (leftCollapsed) {
             leftPanelRef.current?.expand();
@@ -305,11 +464,19 @@ function App({ authEnabled, onLogout }: AppProps) {
         <>
           <div className="relative flex-1 min-h-0 overflow-hidden">
             <div
-              className={`absolute inset-0 ${mobileTab === "sessions" ? "" : "hidden"}`}
+              className={`absolute inset-0 flex flex-col ${mobileTab === "sessions" ? "" : "hidden"}`}
               aria-hidden={mobileTab !== "sessions"}
               inert={mobileTab !== "sessions"}
             >
-              {sessionsPanel}
+              {routeResolution.kind === "not_found" && (
+                <SessionRouteNotice
+                  resolution={routeResolution}
+                  onRetry={() => resolveRoute(window.location.pathname)}
+                  onBrowse={handleBrowseSessions}
+                  compact
+                />
+              )}
+              <div className="min-h-0 flex-1">{sessionsPanel}</div>
             </div>
             <div
               className={`absolute inset-0 ${mobileTab === "chat" ? "" : "hidden"}`}
@@ -353,7 +520,100 @@ function App({ authEnabled, onLogout }: AppProps) {
           </Group>
         </div>
       )}
+
+      {settingsRequest && (
+        <SettingsDialog
+          initialTab={settingsRequest.tab}
+          initialProjectCwd={settingsRequest.projectCwd}
+          onClose={() => setSettingsRequest(null)}
+          onChanged={handleSessionChange}
+        />
+      )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Session route status
+// ---------------------------------------------------------------------------
+
+function shortRequestedId(requestedId: string): string {
+  if (requestedId.length <= 24) return requestedId;
+  return `${requestedId.slice(0, 12)}…${requestedId.slice(-8)}`;
+}
+
+function SessionRouteNotice({
+  resolution,
+  onRetry,
+  onBrowse,
+  compact = false,
+}: {
+  resolution: RouteResolution;
+  onRetry: () => void;
+  onBrowse: () => void;
+  compact?: boolean;
+}) {
+  if (resolution.kind === "idle" || resolution.kind === "ready") return null;
+
+  const loading = resolution.kind === "loading";
+  const notFound = resolution.kind === "not_found";
+  const title = loading
+    ? "Loading session…"
+    : notFound
+      ? "Session not found"
+      : "Unable to load session";
+  const description = notFound
+    ? "It may have been deleted or is unavailable on this Wayang instance."
+    : "Wayang could not load this session right now. Check the connection and try again.";
+
+  return (
+    <section
+      role={loading ? "status" : "alert"}
+      aria-live={loading ? "polite" : "assertive"}
+      data-testid={`session-route-${loading ? "loading" : notFound ? "not-found" : "error"}`}
+      className={compact
+        ? "shrink-0 border-b border-neutral-800 bg-neutral-900/70 px-4 py-3"
+        : "flex h-full items-center justify-center px-6 text-center"}
+    >
+      <div className={compact ? "mx-auto max-w-xl" : "max-w-md"}>
+        <div className={`flex ${compact ? "items-start" : "flex-col items-center"} gap-3`}>
+          {loading
+            ? <Loader2 size={compact ? 18 : 24} className="shrink-0 animate-spin text-blue-400" />
+            : <AlertCircle size={compact ? 18 : 28} className={notFound ? "shrink-0 text-amber-400" : "shrink-0 text-red-400"} />}
+          <div className={compact ? "min-w-0 flex-1" : ""}>
+            <h1 className={`${compact ? "text-sm" : "text-lg"} font-semibold text-neutral-100`}>{title}</h1>
+            {!loading && (
+              <>
+                <p className="mt-1 break-all font-mono text-xs text-neutral-500">
+                  {shortRequestedId(resolution.requestedId)}
+                </p>
+                <p className="mt-2 text-sm leading-relaxed text-neutral-400">{description}</p>
+                <div className={`mt-3 flex flex-wrap gap-2 ${compact ? "" : "justify-center"}`}>
+                  {!notFound && (
+                    <button
+                      type="button"
+                      data-testid="session-route-retry"
+                      onClick={onRetry}
+                      className="rounded bg-blue-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-600"
+                    >
+                      Retry
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    data-testid="session-route-browse"
+                    onClick={onBrowse}
+                    className="rounded border border-neutral-700 px-3 py-1.5 text-xs font-semibold text-neutral-200 hover:bg-neutral-800"
+                  >
+                    Browse sessions
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -369,6 +629,7 @@ interface HeaderBarProps {
   leftCollapsed: boolean;
   rightCollapsed: boolean;
   isMobile: boolean;
+  onOpenSettings: () => void;
   onToggleLeft: () => void;
   onToggleRight: () => void;
 }
@@ -381,6 +642,7 @@ function HeaderBar({
   leftCollapsed,
   rightCollapsed,
   isMobile,
+  onOpenSettings,
   onToggleLeft,
   onToggleRight,
 }: HeaderBarProps) {
@@ -425,6 +687,15 @@ function HeaderBar({
         )}
       </div>
       <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onOpenSettings}
+          title="Workspace and capability settings"
+          aria-label="Open workspace and capability settings"
+          className="rounded p-1.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-100"
+        >
+          <SettingsIcon size={15} />
+        </button>
         <Chip title={meError ? `Error: ${meError}` : undefined}>
           <span className="text-neutral-500">user:</span>{" "}
           <span className="text-neutral-200">{username}</span>

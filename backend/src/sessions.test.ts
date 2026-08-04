@@ -4,9 +4,23 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager, type SessionInfo } from "@earendil-works/pi-coding-agent";
-import { close, init } from "./db.js";
+import { close, failNextCommitStoreMutationPersistenceForTests, getStore, init } from "./db.js";
 import { createOpenInterview, getInterviewForSession } from "./interviews.js";
-import { archiveSession, createSession, deleteSession, getSessionById, listSessions, normalizeSessionCwd, syncPiSessionFiles, updatePiSessionFile } from "./sessions.js";
+import { createAgentProfile } from "./agent-profiles.js";
+import {
+  archiveSession,
+  beginAgentSwitch,
+  createSession,
+  deleteSession,
+  getSessionById,
+  isLegacyPrivateSessionQuarantined,
+  listSessions,
+  normalizeSessionCwd,
+  syncPiSessionFiles,
+  updatePiSessionFile,
+  updateSessionAgentProfile,
+  updateSessionModel,
+} from "./sessions.js";
 
 // These regression cases exercise the rollback-only SDK scanner with mocked
 // SessionInfo values. Incremental-catalog behavior has isolated tests in
@@ -286,6 +300,69 @@ test("deleteSession permanently deletes transcript and sync skips stale discover
     } else {
       process.env.WAYANG_DATA_DIR = previousDataDir;
     }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy private quarantine fails closed unless the durable marker is exactly false", () => {
+  assert.equal(isLegacyPrivateSessionQuarantined({ legacy_private_session_quarantine: false }), false);
+  assert.equal(isLegacyPrivateSessionQuarantined({ legacy_private_session_quarantine: true }), true);
+  assert.equal(isLegacyPrivateSessionQuarantined({} as any), true);
+  assert.equal(isLegacyPrivateSessionQuarantined({ legacy_private_session_quarantine: null } as any), true);
+  assert.equal(isLegacyPrivateSessionQuarantined(undefined), true);
+  assert.equal(isLegacyPrivateSessionQuarantined(null), true);
+});
+
+test("quarantined sessions deny assignment changes while archive and delete remain available", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-session-quarantine-"));
+  const projectDir = path.join(dir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = dir;
+  try {
+    init();
+    const session = createSession(projectDir, "Quarantined fixture");
+    const alternate = createAgentProfile({ name: "Synthetic alternate profile" });
+    const row = getStore().sessions.find((candidate) => candidate.id === session.id)!;
+    row.legacy_private_session_quarantine = true;
+    row.legacy_capability_ineligible = true;
+
+    assert.throws(
+      () => updateSessionAgentProfile(session.id, alternate.id),
+      /Quarantined legacy sessions cannot switch agent profiles/,
+    );
+    assert.throws(
+      () => updateSessionModel(session.id, "alternate-model", "synthetic-provider"),
+      /Quarantined legacy sessions cannot change models/,
+    );
+
+    archiveSession(session.id);
+    assert.equal(getSessionById(session.id)?.archived, 1);
+    assert.equal(deleteSession(session.id)?.session.id, session.id);
+    assert.equal(getSessionById(session.id), undefined);
+  } finally {
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("new sessions carry explicit capability eligibility markers", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-session-capability-markers-"));
+  const projectDir = path.join(dir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = dir;
+  try {
+    init();
+    const session = createSession(projectDir, "Capability markers");
+    assert.equal(session.legacy_private_session_quarantine, false);
+    assert.equal(session.legacy_capability_ineligible, false);
+  } finally {
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

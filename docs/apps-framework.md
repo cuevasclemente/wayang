@@ -39,7 +39,11 @@ An app is an ordinary local project. Wayang discovers/registers its manifest, al
 
 The backend and UI can register and manage apps without a global pi installation. Agent-initiated conveniences such as `register_app`, `list_apps`, `start_app`, `stop_app`, and `update_app_state` require a compatible, separately reviewed Wayang/pi extension. A public checkout must not assume a personal extension is installed; workflows should degrade to manual Apps-pane controls.
 
-Companion tools normally address the backend through `WAYANG_URL`, defaulting to `http://127.0.0.1:8787`. If built-in authentication is enabled, an external tool also needs an intentionally designed authenticated integration; do not embed browser cookies or shared passwords in tool arguments or source.
+The reviewed in-process companion resolves a Wayang-issued capability from the exact Pi session ID and sends both that opaque capability and the source Wayang session ID on every Apps request. The backend validates the durable source session, reauthorizes its agent profile against the target project on every operation, and accepts the capability only on loopback `/api/apps` routes. It is never exported through environment variables or forwarded through the app proxy. A loopback `Origin` header alone is not agent authorization.
+
+Registration, discovery/listing, state updates, and stop remain available to an authorized source agent and never launch manifest code. App `devCommand` values are unsandboxed same-user shell commands, however. Until Wayang has deterministic long-lived filesystem and control-plane sandboxing for app processes, agent-initiated start and restart fail closed whenever any registered project is protected—even when the target app is in a standard project. The actionable fallback is for the human to review the app and start or restart it from the authenticated Apps pane. Protected mode therefore does not globally disable manual Apps use.
+
+Companion tools normally address the backend through `WAYANG_URL`, defaulting to `http://127.0.0.1:8787`. External tools do not receive the in-process session capability; do not embed browser cookies, shared passwords, or internal capabilities in arguments, source, or environment variables.
 
 ## Browser bridge
 
@@ -80,3 +84,4 @@ Direct localhost iframe URLs are suitable only when the browser and app processe
 - Wayang manages local app process lifecycle and bridge state.
 - There is no app marketplace, per-app permissions model, hostile-code isolation, or multi-user authorization in v0.1.
 - Automatic agent-driven focus/opening depends on optional companion tooling; manual selection is the portable default.
+- Agent launch/relaunch is unavailable while any registered project is protected; authenticated manual launch remains available after review.

@@ -6,6 +6,7 @@ import { TerminalView } from "../components/TerminalView";
 import { CapabilitiesPanel } from "../components/CapabilitiesPanel";
 import { AppsPanel } from "./AppsPanel";
 import { BrowserPanel } from "./BrowserPanel";
+import type { BrowserSurfaceMode } from "../api/client";
 
 type Tab = "files" | "terminal" | "pi" | "apps" | "browser";
 
@@ -42,9 +43,10 @@ function saveTab(sessionId: string | null, tab: Tab) {
 interface RightPanelProps {
   sessionId: string | null;
   sessionCwd: string | null;
+  browserMode: BrowserSurfaceMode;
 }
 
-export function RightPanel({ sessionId, sessionCwd }: RightPanelProps) {
+export function RightPanel({ sessionId, sessionCwd, browserMode }: RightPanelProps) {
   const [tab, setTab] = useState<Tab>(() => loadSavedTab(sessionId));
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
 
@@ -56,8 +58,9 @@ export function RightPanel({ sessionId, sessionCwd }: RightPanelProps) {
   // Clear file selection and restore this session's last tools tab when session changes.
   useEffect(() => {
     setSelectedFilePath(null);
-    setTab(loadSavedTab(sessionId));
-  }, [sessionId]);
+    const saved = loadSavedTab(sessionId);
+    setTab(saved === "browser" && browserMode === "unavailable" ? "files" : saved);
+  }, [sessionId, browserMode]);
 
   return (
     <section className="h-full flex flex-col bg-neutral-950">
@@ -77,9 +80,11 @@ export function RightPanel({ sessionId, sessionCwd }: RightPanelProps) {
         <TabButton active={tab === "apps"} onClick={() => handleTabChange("apps")}>
           Apps
         </TabButton>
-        <TabButton active={tab === "browser"} onClick={() => handleTabChange("browser")}>
-          Browser
-        </TabButton>
+        {browserMode !== "unavailable" && (
+          <TabButton active={tab === "browser"} onClick={() => handleTabChange("browser")}>
+            Browser
+          </TabButton>
+        )}
       </header>
       <div className="flex-1 min-h-0">
         {tab === "files" && (
@@ -99,7 +104,14 @@ export function RightPanel({ sessionId, sessionCwd }: RightPanelProps) {
         {tab === "terminal" && <TerminalView sessionId={sessionId} />}
         {tab === "pi" && <CapabilitiesPanel sessionCwd={sessionCwd} />}
         {tab === "apps" && <AppsPanel sessionId={sessionId} sessionCwd={sessionCwd} />}
-        {tab === "browser" && <BrowserPanel sessionId={sessionId} sessionCwd={sessionCwd} />}
+        {tab === "browser" && browserMode !== "unavailable" && (
+          <BrowserPanel
+            key={`${sessionId ?? sessionCwd ?? "no-session"}:${browserMode}`}
+            sessionId={sessionId}
+            sessionCwd={sessionCwd}
+            browserMode={browserMode}
+          />
+        )}
       </div>
     </section>
   );

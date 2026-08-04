@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help doctor bootstrap install configure pi-login build start dev test test-scripts test-e2e install-e2e-browser check smoke
+.PHONY: help doctor bootstrap install configure setup-capability-approval pi-login browser-credentials-unlock build start dev test test-scripts test-e2e install-e2e-browser check smoke
 
 help: ## Show this help (the safe, non-mutating default)
 	@printf '%s\n' 'Wayang v0.1 source-checkout commands:'
@@ -23,10 +23,16 @@ install: ## Deterministically install backend, frontend, and E2E dependencies
 configure: ## Run the interactive, secret-safe configuration wizard
 	@node scripts/configure.mjs
 
+setup-capability-approval: ## Optional manual preflight; service startup initializes missing cooldown state automatically
+	@node scripts/run-with-env.mjs -- node scripts/setup-capability-approval.mjs
+
 pi-login: ## Start the checkout's pi CLI for an interactive /login
 	@test -x backend/node_modules/.bin/pi || { printf '%s\n' 'Local pi is missing; run make install first.' >&2; exit 1; }
 	@printf '%s\n' 'In pi, run /login, choose a provider, then run /quit.'
 	@./backend/node_modules/.bin/pi --no-session
+
+browser-credentials-unlock: ## Unlock Bitwarden for guarded Browser-panel fills (interactive)
+	@node scripts/run-with-env.mjs -- node scripts/browser-credentials-unlock.mjs
 
 build: ## Build the backend and production frontend
 	npm --prefix backend run build

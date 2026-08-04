@@ -14,6 +14,25 @@ test("cron computes next and previous occurrences on minute boundaries", () => {
   assert.equal(previousCronOccurrence("*/15 * * * *", base), new Date(2026, 0, 1, 9, 0, 0).getTime());
 });
 
+test("cron skips a nonexistent spring-forward wall time and exposes both fallback instants", { concurrency: false }, () => {
+  const previousTz = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    const springBase = new Date(2026, 2, 7, 3, 0, 0).getTime();
+    assert.equal(nextCronOccurrence("30 2 * * *", springBase), new Date(2026, 2, 9, 2, 30, 0).getTime());
+
+    const fallbackBase = new Date("2026-11-01T00:00:00-04:00").getTime();
+    const first = nextCronOccurrence("30 1 * * *", fallbackBase)!;
+    const second = nextCronOccurrence("30 1 * * *", first)!;
+    assert.equal(new Date(first).getHours(), 1);
+    assert.equal(new Date(second).getHours(), 1);
+    assert.equal(second - first, 60 * 60 * 1_000);
+  } finally {
+    if (previousTz === undefined) delete process.env.TZ;
+    else process.env.TZ = previousTz;
+  }
+});
+
 test("cron uses Vixie OR semantics when day-of-month and day-of-week are both restricted", () => {
   const base = new Date(2026, 0, 1, 0, 0, 0).getTime();
   // Friday Jan 2 2026 matches day-of-week even though day-of-month is not 15.

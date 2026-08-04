@@ -1,4 +1,5 @@
 import { createPiSession, runPromptAndWait, setCommandGuardMode } from "../pi-bridge.js";
+import { authorizeProjectAction, resolveEffectiveSessionConfig } from "../policy.js";
 import { createSession, touchSession, updatePiSessionFile } from "../sessions.js";
 import { nextCronOccurrence, previousCronOccurrence } from "./cron.js";
 import {
@@ -92,6 +93,22 @@ export class SchedulerManager {
       });
     }
 
+    const authorization = authorizeProjectAction({
+      cwd: latest.cwd,
+      actor: "scheduled",
+      agentProfileId: latest.agent_profile_id,
+    });
+    if (!authorization.allowed) {
+      if (trigger === "manual") throw new Error(authorization.reason ?? "Scheduled project access denied");
+      return createScheduledRun({
+        jobId: latest.id,
+        trigger,
+        scheduledFor,
+        status: "skipped",
+        errorMessage: authorization.reason ?? "scheduled project access denied",
+      });
+    }
+
     if (trigger === "schedule" && latest.last_run_at !== null) {
       const previous = previousCronOccurrence(latest.cron_expr, (scheduledFor ?? Date.now()) + 1000);
       if (previous !== null && latest.last_run_at >= previous) {
@@ -130,16 +147,45 @@ export class SchedulerManager {
   private async executeRun(job: ScheduledJobRow, run: ScheduledRunRow): Promise<void> {
     let sessionId: string | null = null;
     try {
-      const session = createSession(job.cwd, {
-        title: `[scheduled] ${job.name}`,
-        provider: job.provider ?? undefined,
-        model: job.model ?? undefined,
-        scheduledJobId: job.id,
+      // Re-fetch after dispatch so edits between timer/manual trigger and the
+      // asynchronous executor cannot retain stale authority.
+      const latest = getScheduledJob(job.id);
+      if (!latest) throw new Error("Scheduled job not found");
+      const authorization = authorizeProjectAction({
+        cwd: latest.cwd,
+        actor: "scheduled",
+        agentProfileId: latest.agent_profile_id,
+      });
+      if (!authorization.allowed || !authorization.project || !authorization.agentProfile) {
+        throw new Error(authorization.reason ?? "Scheduled project access denied");
+      }
+      const effective = resolveEffectiveSessionConfig({
+        project: authorization.project,
+        agentProfile: authorization.agentProfile,
+        explicitProvider: latest.provider,
+        explicitModel: latest.model,
+        purpose: "scheduled",
+      });
+      const session = createSession(latest.cwd, {
+        title: `[scheduled] ${latest.name}`,
+        provider: effective.provider ?? undefined,
+        model: effective.model ?? undefined,
+        agentProfileId: effective.agent_profile_id,
+        scheduledJobId: latest.id,
         scheduledRunId: run.id,
       });
       sessionId = session.id;
       updateScheduledRun(run.id, { session_id: sessionId });
-      const handle = await createPiSession(session.id, job.cwd, job.provider, job.model, session.pi_session_file);
+      // This is the final authorization boundary before Pi can read project
+      // resources or transcript bytes. permission_mode never participates.
+      assertScheduledRuntimeAuthorized(session.cwd, session.agent_profile_id ?? null);
+      const handle = await createPiSession(
+        session.id,
+        session.cwd,
+        session.provider,
+        session.model,
+        session.pi_session_file,
+      );
       if (handle.sessionFile) updatePiSessionFile(session.id, handle.sessionFile);
       applyScheduledCommandGuardMode(session.id, job);
 
@@ -178,6 +224,13 @@ export class SchedulerManager {
     const timer = this.timers.get(jobId);
     if (timer) clearTimeout(timer);
     this.timers.delete(jobId);
+  }
+}
+
+export function assertScheduledRuntimeAuthorized(cwd: string, agentProfileId: string | null): void {
+  const decision = authorizeProjectAction({ cwd, actor: "scheduled", agentProfileId });
+  if (!decision.allowed) {
+    throw new Error(decision.reason ?? "Scheduled project access denied before runtime creation");
   }
 }
 
