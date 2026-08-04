@@ -58,8 +58,12 @@ test("password records match the backend scrypt contract", async () => {
 
 test("loopback detection and public-origin validation reject ambiguous exposure", () => {
   assert.equal(isLoopbackHost("127.0.0.1"), true);
+  assert.equal(isLoopbackHost("127.42.3.4"), true);
   assert.equal(isLoopbackHost("::1"), true);
   assert.equal(isLoopbackHost("0.0.0.0"), false);
+  assert.equal(isLoopbackHost("127.0.0.999"), false);
+  assert.equal(isLoopbackHost("127.0.0.1.example"), false);
+  assert.equal(isLoopbackHost("127.00.00.01"), false);
   assert.equal(normalizePublicOrigin("https://wayang.example"), "https://wayang.example");
   assert.throws(() => normalizePublicOrigin("not a URL"), {
     message: "Public browser origin must be an absolute http(s) origin",

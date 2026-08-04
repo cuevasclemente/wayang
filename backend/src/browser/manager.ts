@@ -87,14 +87,9 @@ function appendChunk(runtime: BrowserRuntime, chunk: Buffer | string): void {
 function executableOnPath(name: string): string | null {
   if (name.includes(path.sep)) return null;
   for (const directory of (process.env.PATH || "").split(path.delimiter)) {
-    if (!directory) continue;
-    const candidate = path.join(directory, name);
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return fs.realpathSync(candidate);
-    } catch {
-      // continue
-    }
+    if (!path.isAbsolute(directory)) continue;
+    const resolved = resolveChromiumExecutableCandidate(path.join(directory, name));
+    if (resolved) return resolved;
   }
   return null;
 }
@@ -252,10 +247,26 @@ export function getChromiumCandidates(
   ];
 }
 
+export function resolveChromiumExecutableCandidate(candidate: string): string | null {
+  if (!path.isAbsolute(candidate)) return null;
+  try {
+    const canonical = fs.realpathSync.native(candidate);
+    if (!fs.statSync(canonical).isFile()) return null;
+    fs.accessSync(canonical, fs.constants.X_OK);
+    return canonical;
+  } catch {
+    return null;
+  }
+}
+
 function findChromiumExecutable(): string {
   const configured = process.env.WAYANG_CHROMIUM_PATH || process.env.CHROME_PATH || process.env.CHROMIUM_PATH;
+  if (configured && !path.isAbsolute(configured)) {
+    throw new Error("Configured Chromium executable path must be absolute.");
+  }
   for (const candidate of getChromiumCandidates(configured)) {
-    if (fs.existsSync(candidate)) return candidate;
+    const resolved = resolveChromiumExecutableCandidate(candidate);
+    if (resolved) return resolved;
   }
   for (const name of ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"]) {
     const found = executableOnPath(name);
@@ -324,6 +335,7 @@ function cloneState(state: BrowserSessionState): BrowserSessionState {
 
 export function sanitizeBrowserErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error || "");
+  if (/Configured Chromium executable path must be absolute/i.test(message)) return "Configured Chromium executable path must be absolute.";
   if (/Chromium executable not found/i.test(message)) return "Chromium executable not found. Configure WAYANG_CHROMIUM_PATH.";
   if (/VNC transport requested/i.test(message)) return "VNC transport is unavailable.";
   if (/agent control is paused|control changed during|sensitive field|not a fillable field|No destination field found/i.test(message)) return message;

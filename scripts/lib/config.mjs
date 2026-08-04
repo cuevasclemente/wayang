@@ -1,5 +1,6 @@
 import { randomBytes, scrypt as nodeScrypt } from "node:crypto";
 import { closeSync, chmodSync, fsyncSync, mkdirSync, openSync, renameSync, writeFileSync } from "node:fs";
+import { isIP } from "node:net";
 import { dirname, resolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -172,5 +173,7 @@ export async function promptForCompanionUrl({ publicOrigin, host, port, existing
 
 export function isLoopbackHost(host) {
   const normalized = host.trim().toLowerCase();
-  return normalized === "localhost" || normalized === "::1" || normalized === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(normalized);
+  if (normalized === "localhost" || normalized === "::1" || normalized === "[::1]") return true;
+  if (isIP(normalized) !== 4) return false;
+  return normalized.split(".")[0] === "127";
 }

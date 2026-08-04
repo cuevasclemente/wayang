@@ -770,6 +770,85 @@ test("scheduled prompt ignores intermediate turn and agent end events until the 
   assert.equal(settled, true);
 });
 
+test("scheduled steering remains active after queue acceptance until the top-level run is idle", async () => {
+  const steerReturned = deferred();
+  const agentIdle = deferred();
+  let settled = false;
+  let promptCalls = 0;
+  let steerCalls = 0;
+
+  const session: ScheduledPromptSession = {
+    isStreaming: true,
+    messages: [],
+    async prompt() { promptCalls++; },
+    async steer() {
+      steerCalls++;
+      await steerReturned.promise;
+    },
+    async abort() {},
+    async waitForIdle() {
+      await agentIdle.promise;
+    },
+  };
+
+  const waiting = waitForScheduledPrompt(session, "synthetic queued steering").then(() => {
+    settled = true;
+  });
+  steerReturned.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "queue acceptance and intermediate retry/compaction events are not settlement");
+  assert.equal(promptCalls, 0);
+  assert.equal(steerCalls, 1);
+
+  agentIdle.resolve();
+  await waiting;
+  assert.equal(settled, true);
+});
+
+test("scheduled steering timeout waits for abort and the original queued completion", async () => {
+  const steerFinished = deferred();
+  const agentIdle = deferred();
+  const abortStarted = deferred();
+  const allowAbortToFinish = deferred();
+  let waitingSettled = false;
+
+  const session: ScheduledPromptSession = {
+    isStreaming: true,
+    messages: [],
+    async prompt() { assert.fail("streaming sessions must steer instead of prompting"); },
+    async steer() {
+      await steerFinished.promise;
+    },
+    async abort() {
+      abortStarted.resolve();
+      await allowAbortToFinish.promise;
+      steerFinished.resolve();
+      agentIdle.resolve();
+    },
+    async waitForIdle() {
+      await agentIdle.promise;
+    },
+  };
+
+  const waiting = waitForScheduledPrompt(session, "synthetic queued timeout", { timeoutMs: 10 })
+    .then(
+      () => assert.fail("timed out scheduled steering unexpectedly completed"),
+      (error) => {
+        waitingSettled = true;
+        assert.match(error instanceof Error ? error.message : String(error), /^Prompt timed out after 10ms/);
+      },
+    );
+
+  await Promise.race([
+    abortStarted.promise,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("abort did not start")), 1_000)),
+  ]);
+  assert.equal(waitingSettled, false, "timeout must not release bookkeeping before abort and queued work settle");
+  allowAbortToFinish.resolve();
+  await waiting;
+  assert.equal(waitingSettled, true);
+});
+
 test("scheduled prompt timeout aborts and remains pending until the agent is idle", async () => {
   const promptFinished = deferred();
   const abortStarted = deferred();

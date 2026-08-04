@@ -31,6 +31,7 @@ import {
   redactKnownCredentialValues,
   registerBrowserStopHook,
   redactSensitiveValue,
+  resolveChromiumExecutableCandidate,
   selectActivePageTarget,
   selectPageTarget,
   setBrowserControlMode,
@@ -404,6 +405,28 @@ test("active page selection uses one uniquely visible target and otherwise prese
 });
 
 const SYNTHETIC_HOME = "/synthetic/home";
+
+test("Chromium executable candidates must be absolute canonical executable files", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-chromium-candidate-"));
+  try {
+    const executable = path.join(root, "chrome");
+    const notExecutable = path.join(root, "not-executable");
+    const directory = path.join(root, "directory");
+    const symlink = path.join(root, "chrome-link");
+    fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    fs.writeFileSync(notExecutable, "not executable", { mode: 0o600 });
+    fs.mkdirSync(directory);
+    fs.symlinkSync(executable, symlink);
+
+    assert.equal(resolveChromiumExecutableCandidate("relative/chrome"), null);
+    assert.equal(resolveChromiumExecutableCandidate(directory), null);
+    assert.equal(resolveChromiumExecutableCandidate(notExecutable), null);
+    assert.equal(resolveChromiumExecutableCandidate(executable), fs.realpathSync.native(executable));
+    assert.equal(resolveChromiumExecutableCandidate(symlink), fs.realpathSync.native(executable));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("Chromium candidates preserve configured, Playwright, then system precedence", () => {
   assert.deepEqual(

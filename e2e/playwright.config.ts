@@ -23,10 +23,12 @@ const piAgentDir = path.join(tempRoot, "pi-agent");
 const piSessionsDir = path.join(piAgentDir, "sessions");
 const dataDir = path.join(tempRoot, "web-ui-data");
 const syntheticHome = path.join(tempRoot, "home");
+const syntheticRuntimeDir = path.join(tempRoot, "runtime");
 const syntheticViteEnvDir = path.join(tempRoot, "vite-env");
 const productionMode = process.env.WAYANG_E2E_PRODUCTION === "1";
 fs.mkdirSync(piSessionsDir, { recursive: true });
 fs.mkdirSync(syntheticHome, { recursive: true, mode: 0o700 });
+fs.mkdirSync(syntheticRuntimeDir, { recursive: true, mode: 0o700 });
 fs.mkdirSync(syntheticViteEnvDir, { recursive: true, mode: 0o700 });
 
 const loopbackNoProxy = "127.0.0.1,localhost,::1";
@@ -67,7 +69,6 @@ const allowedEnvironmentNames = [
   "LANG",
   "LC_ALL",
   "TZ",
-  "XDG_RUNTIME_DIR",
   "CI",
 ] as const;
 const allowedEnvironment = Object.fromEntries(
@@ -88,6 +89,7 @@ const backendEnvironment = {
   HOME: syntheticHome,
   USER: "wayang-e2e",
   LOGNAME: "wayang-e2e",
+  XDG_RUNTIME_DIR: syntheticRuntimeDir,
   WAYANG_HOST: host,
   WAYANG_PORT: String(backendPort),
   WAYANG_PUBLIC_ORIGIN: frontendUrl,
@@ -110,12 +112,27 @@ const frontendEnvironment = {
   HOME: syntheticHome,
   USER: "wayang-e2e",
   LOGNAME: "wayang-e2e",
+  XDG_RUNTIME_DIR: syntheticRuntimeDir,
   WAYANG_E2E_VITE_ENV_DIR: syntheticViteEnvDir,
   VITE_WAYANG_BACKEND_URL: backendUrl,
   VITE_WAYANG_LATENCY_PROFILE: "1",
   NO_PROXY: loopbackNoProxy,
   no_proxy: loopbackNoProxy,
 };
+
+function assertIsolatedServerEnvironment(environment: Record<string, string>): void {
+  if (environment.HOME !== syntheticHome || environment.XDG_RUNTIME_DIR !== syntheticRuntimeDir) {
+    throw new Error("E2E server environment must use only synthetic home and runtime roots");
+  }
+  const forbiddenNames = /(?:API_KEY|TOKEN|SECRET|PASSWORD|AUTH|CREDENTIAL|CAPABILITY|PIN)/i;
+  const unexpected = Object.keys(environment).filter((name) => forbiddenNames.test(name));
+  if (unexpected.length > 0) {
+    throw new Error(`E2E server environment contains forbidden variable names: ${unexpected.join(", ")}`);
+  }
+}
+
+assertIsolatedServerEnvironment(backendEnvironment);
+assertIsolatedServerEnvironment(frontendEnvironment);
 
 export default defineConfig({
   testDir: "./tests",
