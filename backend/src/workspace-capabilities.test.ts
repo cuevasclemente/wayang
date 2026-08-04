@@ -64,10 +64,18 @@ function pair(capability_id: "wayang.host-execution.v1" | "wayang.protected-brow
 test("fresh stores contain no capability authority", () => {
   init();
   const store = getStore();
-  assert.equal(store.agentProfiles.length, 1);
-  assert.equal(store.agentProfiles[0]!.resource_mode, "project_only");
-  assert.equal("capability_grants" in store.agentProfiles[0]!, false);
-  assert.equal("authorization_revision" in store.agentProfiles[0]!, false);
+  const defaultProfile = store.agentProfiles.find(
+    (profile) => profile.id === store.workspaceSettings.default_agent_profile_id,
+  );
+  assert.ok(defaultProfile);
+  assert.equal(defaultProfile.builtin_kind, null);
+  assert.equal(defaultProfile.resource_mode, "project_only");
+  assert.equal(defaultProfile.memory_access, "none");
+  assert.deepEqual(defaultProfile.allowed_tools, []);
+  assert.deepEqual(defaultProfile.allowed_extensions, []);
+  assert.ok(store.agentProfiles.every((profile) => !(
+    "capability_grants" in profile || "authorization_revision" in profile
+  )));
   assert.deepEqual(store.workspaceCapabilityAssociations, []);
   assert.deepEqual(store.workspaceCapabilityApprovalEvents, []);
 });
