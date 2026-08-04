@@ -1,11 +1,12 @@
-import { isIP } from "node:net";
-
 function normalizedAddress(value: string): string {
-  return value.trim().toLowerCase().split("%", 1)[0]!.replace(/^\[|\]$/gu, "");
+  return value.trim().toLowerCase().replace(/^\[|\]$/gu, "");
 }
 
 function isIpv4Loopback(value: string): boolean {
-  return isIP(value) === 4 && value.split(".", 1)[0] === "127";
+  const octets = value.split(".");
+  return octets.length === 4
+    && octets[0] === "127"
+    && octets.every((octet) => /^(?:0|[1-9]\d{0,2})$/u.test(octet) && Number(octet) <= 255);
 }
 
 /** Strict socket-address check; hostnames are never accepted as peer addresses. */

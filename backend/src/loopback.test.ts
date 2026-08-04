@@ -16,6 +16,8 @@ test("strict loopback parsing rejects malformed numeric names and non-loopback a
     "127.example.test",
     "127.0.0.999",
     "127.00.00.01",
+    "127.0.0.1%lo0",
+    "::1%lo0",
     "::ffff:127.0.0.999",
     "192.0.2.1",
     "::",

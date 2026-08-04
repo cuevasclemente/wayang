@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getStore, flush, type AppRegistrationRow } from "../db.js";
+import { canonicalizeProjectCwd } from "../projects.js";
 import { getSessionById, listSessions } from "../sessions.js";
 import type { AppManifest, AppRegistrationInput, AppStatus, RegisteredApp } from "./types.js";
 
@@ -28,7 +29,7 @@ export function validateAppId(id: string): void {
 }
 
 function normalizeCwd(cwd: string): string {
-  return path.resolve(cwd).replace(/\/+$/, "") || "/";
+  return canonicalizeProjectCwd(cwd);
 }
 
 function ensureWithin(parent: string, child: string, label: string): void {

@@ -470,6 +470,11 @@ test("only exact seeded Wren receives broad Standard compatibility, including sc
 });
 
 test("exact Wren sandbox spans ordinary host paths while masking every Protected project", async (t) => {
+  const availability = getBashSandboxAvailability();
+  if (!availability.available) {
+    t.skip(availability.reason || "sandbox unavailable");
+    return;
+  }
   close();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-wren-host-workspace-"));
   const standardRoot = path.join(root, "standard");

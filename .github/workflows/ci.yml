@@ -87,6 +87,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Use canonical macOS temporary root
+        # macOS exposes /var as a symlink to /private/var. Security tests use
+        # canonical roots, so keep synthetic fixtures on the canonical runner path.
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -110,8 +115,14 @@ jobs:
         working-directory: e2e
         run: npm ci
 
+      - name: Install Playwright Chromium
+        working-directory: e2e
+        run: npx playwright install chromium
+
       - name: Run backend tests
         working-directory: backend
+        env:
+          WAYANG_BROWSER_INTEGRATION: "1"
         run: npm test
 
       - name: Build backend
@@ -171,6 +182,14 @@ jobs:
       - name: Install Playwright Chromium
         working-directory: e2e
         run: npx playwright install --with-deps chromium
+
+      - name: Run backend browser integration tests
+        working-directory: backend
+        env:
+          WAYANG_BROWSER_INTEGRATION: "1"
+        run: |
+          export WAYANG_CHROMIUM_PATH="$(node -e "console.log(require('../e2e/node_modules/@playwright/test').chromium.executablePath())")"
+          node --import tsx --test src/browser/manager.test.ts
 
       - name: Create isolated synthetic home
         env:

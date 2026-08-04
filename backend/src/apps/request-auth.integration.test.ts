@@ -72,8 +72,10 @@ http.createServer((_req, res) => {
 
 test("Apps agent capability is source-attributed, target-authorized, and launch-fail-closed", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-apps-agent-auth-"));
-  const project = path.join(root, "project-a");
-  const protectedProject = path.join(root, "project-b");
+  const rootAlias = `${root}-alias`;
+  fs.symlinkSync(root, rootAlias, "dir");
+  const project = path.join(rootAlias, "project-a");
+  const protectedProject = path.join(rootAlias, "project-b");
   const envResultPath = path.join(root, "app-env-result.json");
   fs.mkdirSync(project);
   fs.mkdirSync(protectedProject);
@@ -127,6 +129,7 @@ test("Apps agent capability is source-attributed, target-authorized, and launch-
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
+    fs.unlinkSync(rootAlias);
     fs.rmSync(root, { recursive: true, force: true });
   });
 

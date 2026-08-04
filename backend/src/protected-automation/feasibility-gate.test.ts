@@ -22,9 +22,15 @@ test("Milestone 0 protected automation synthetic Linux feasibility gate", { time
   assert.equal(report.verdict, "NO-GO", "do not weaken the gate when current primitives cannot meet the boundary");
   const dependency = report.checks.find((item) => item.id === "sandbox_dependencies");
   assert.ok(dependency, "the report must include dependency readiness");
-  if (dependency.status === "BLOCKED") return;
+  if (dependency.status === "BLOCKED") {
+    t.skip(`sandbox dependencies unavailable: ${dependency.detail}`);
+    return;
+  }
   const runtimeBlocked = report.checks.find((item) => item.id === "runtime_probe" && item.status === "BLOCKED");
-  if (runtimeBlocked) return;
+  if (runtimeBlocked) {
+    t.skip(`sandbox runtime probe unavailable: ${runtimeBlocked.detail}`);
+    return;
+  }
 
   for (const id of CURRENT_RUNTIME_BLOCKERS) {
     const finding = report.checks.find((item) => item.id === id);

@@ -10,6 +10,13 @@ import type { ProtectedAutomationJobRow, ProtectedAutomationRunRow } from "./typ
 
 let root = "";
 
+function productionRunnerSkipReason(): string | false {
+  if (process.platform !== "linux") return "Linux-only runner";
+  try { fs.accessSync("/usr/bin/bwrap", fs.constants.X_OK); }
+  catch { return "production runner integration requires executable /usr/bin/bwrap"; }
+  return false;
+}
+
 beforeEach(() => {
   close();
   root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-production-bwrap-"));
@@ -32,7 +39,7 @@ afterEach(() => {
 });
 
 test("production runner executes the exact snapshot with only reviewed roots and environment", {
-  skip: process.platform !== "linux" ? "Linux-only runner" : false,
+  skip: productionRunnerSkipReason(),
   timeout: 30_000,
 }, async () => {
   const projectRoot = path.join(root, "project");

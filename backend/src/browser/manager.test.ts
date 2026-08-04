@@ -44,6 +44,8 @@ import {
   sanitizeBrowserUrl,
 } from "./manager.js";
 
+const browserIntegrationTest = process.env.WAYANG_BROWSER_INTEGRATION === "1" ? test : test.skip;
+
 function reversibleRepresentations(value: string): string[] {
   const component = encodeURIComponent(value);
   const uri = encodeURI(value);
@@ -188,7 +190,7 @@ test("agent pause gate is enforced and control generation changes across handoff
   }
 });
 
-test("DOM, selector, and accessibility outputs redact sensitive canaries and public fill is rejected", { timeout: 45_000 }, async (t) => {
+browserIntegrationTest("DOM, selector, and accessibility outputs redact sensitive canaries and public fill is rejected", { timeout: 45_000 }, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-browser-redaction-"));
   const lookup = { projectCwd: root, persistence: "project" as const };
   const previousTransport = process.env.WAYANG_BROWSER_TRANSPORT;
@@ -225,7 +227,7 @@ test("DOM, selector, and accessibility outputs redact sensitive canaries and pub
   await assert.rejects(() => typePublicBrowser(lookup, "public-text"), /sensitive field/i);
 });
 
-test("credential gate follows document identity, unions sequential fills, redacts public state, and blocks every agent mutation", { timeout: 45_000 }, async (t) => {
+browserIntegrationTest("credential gate follows document identity, unions sequential fills, redacts public state, and blocks every agent mutation", { timeout: 45_000 }, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-credential-inspection-"));
   const lookup = { projectCwd: root, persistence: "project" as const };
   const username = "Known User+tag@example.test";
@@ -336,7 +338,7 @@ test("credential gate follows document identity, unions sequential fills, redact
   await assert.rejects(() => fillBrowserCredential(lookup, { totp }, ambiguousTotpContext), /exactly one eligible verification-code field/i);
 });
 
-test("in-flight pause suppresses results and queued mutation never executes after generation changes", { timeout: 45_000 }, async (t) => {
+browserIntegrationTest("in-flight pause suppresses results and queued mutation never executes after generation changes", { timeout: 45_000 }, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-control-race-"));
   const lookup = { projectCwd: root, persistence: "project" as const };
   const baseUrl = await localPageServer(t, (req, res) => {

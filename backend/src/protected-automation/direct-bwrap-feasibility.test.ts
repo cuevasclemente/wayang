@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { accessSync, constants } from 'node:fs'
 import { link, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -9,8 +10,15 @@ import {
   validateDirectBwrapWritableRoot,
 } from './direct-bwrap-feasibility.js'
 
+function directBwrapSkipReason(): string | false {
+  if (process.platform !== 'linux') return 'direct bubblewrap feasibility is Linux-only'
+  try { accessSync('/usr/bin/bwrap', constants.X_OK) }
+  catch { return 'direct bubblewrap integration requires executable /usr/bin/bwrap' }
+  return false
+}
+
 test('direct bubblewrap is a GO only when every Linux protected-automation requirement passes', {
-  skip: process.platform !== 'linux' ? 'direct bubblewrap feasibility is Linux-only' : false,
+  skip: directBwrapSkipReason(),
   timeout: 30_000,
 }, async () => {
   const report = await runDirectBwrapFeasibility()
