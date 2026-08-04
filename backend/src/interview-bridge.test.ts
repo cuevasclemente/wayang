@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { close, init } from "./db.js";
-import { getInterviewForSession, markDelivered, submitInterview as submitInterviewWithContext } from "./interviews.js";
+import { getInterviewForSession, submitInterview as submitInterviewWithContext } from "./interviews.js";
 import { PiInterviewBridge } from "./interview-bridge.js";
 import { WAYANG_WEBSOCKET_SUBMISSION_CONTEXT } from "./interview-provenance.js";
 
@@ -58,35 +58,26 @@ test("bridge persists before notifying and resolves only a matching live waiter"
     assert.equal(outcome.submission.submissionId, submitted.record.submission_id);
     assert.deepEqual(outcome.answers, [{ id: "q1", value: "a", label: "A", wasCustom: false, index: 0 }]);
   }
-  assert.equal(getInterviewForSession("session-1", requestId)?.delivery_mode, "tool_result");
+  assert.equal(getInterviewForSession("session-1", requestId)?.status, "submitted");
+  assert.equal(getInterviewForSession("session-1", requestId)?.delivery_mode, undefined);
+  assert.equal(bridge.hasToolResultHandoff("session-1", requestId), true);
+  bridge.completeToolResultHandoff("session-1", requestId);
+  assert.equal(bridge.hasToolResultHandoff("session-1", requestId), false);
 }));
 
-test("delivery persistence failure leaves the live waiter recoverable for retry", async () => withStore(async () => {
-  let deliveryAttempts = 0;
-  const bridge = new PiInterviewBridge({
-    getInterviewForSession,
-    markDelivered(...args) {
-      deliveryAttempts++;
-      if (deliveryAttempts === 1) throw new Error("synthetic delivery persistence failure");
-      return markDelivered(...args);
-    },
-  });
+test("session teardown releases an unresolved tool-result handoff for durable recovery", async () => withStore(async () => {
+  const bridge = new PiInterviewBridge();
   const waiting = bridge.createRequestWithOutcome("session-1", QUESTIONS, { timeoutMs: 1_000 });
   const [request] = bridge.getPendingRequests("session-1");
   const submitted = submitInterview("session-1", request!.requestId, [{ id: "q1", value: "a", wasCustom: false }]);
   assert.equal(submitted.ok, true);
   if (!submitted.ok) return;
-
-  assert.equal(bridge.resolveSubmitted(submitted.record), false);
-  assert.equal(getInterviewForSession("session-1", request!.requestId)?.status, "submitted");
   assert.equal(bridge.resolveSubmitted(submitted.record), true);
-  const outcome = await waiting;
-  assert.equal(outcome.status, "submitted");
-  if (outcome.status === "submitted") {
-    assert.equal(outcome.submission.submissionId, submitted.record.submission_id);
-    assert.equal(outcome.answers[0]?.value, "a");
-  }
-  assert.equal(deliveryAttempts, 2);
+  await waiting;
+  assert.equal(bridge.hasToolResultHandoff("session-1", request!.requestId), true);
+  bridge.cancelSession("session-1");
+  assert.equal(bridge.hasToolResultHandoff("session-1", request!.requestId), false);
+  assert.equal(getInterviewForSession("session-1", request!.requestId)?.status, "submitted");
 }));
 
 test("grace expiry leaves the durable request open and reports pending", async () => withStore(async () => {

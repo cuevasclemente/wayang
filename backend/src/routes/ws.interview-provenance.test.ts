@@ -158,7 +158,7 @@ test("authorized questionnaire WebSocket derives omitted provenance and ignores 
       answers: [{ id: "q1", value: "small", wasCustom: false }],
     }));
     const missingAck = await untilMessage((message) => message.type === "interview_response_ack" && message.requestId === requestIds[0]);
-    assert.equal(missingAck.status, "delivered");
+    assert.equal(missingAck.status, "submitted");
     assert.equal((await missingPayloadWaiter).status, "submitted");
 
     ws.send(JSON.stringify({
@@ -169,11 +169,12 @@ test("authorized questionnaire WebSocket derives omitted provenance and ignores 
       authenticated_principal: "FORGED_CLIENT_PRINCIPAL",
     }));
     const forgedAck = await untilMessage((message) => message.type === "interview_response_ack" && message.requestId === requestIds[1]);
-    assert.equal(forgedAck.status, "delivered");
+    assert.equal(forgedAck.status, "submitted");
     assert.equal((await forgedPayloadWaiter).status, "submitted");
 
     for (const requestId of requestIds) {
       const record = getInterviewForSession(session.id, requestId);
+      assert.equal(record?.status, "submitted");
       assert.equal(record?.submission_channel, WAYANG_WEBSOCKET_SUBMISSION_CHANNEL);
       assert.equal(record?.authenticated_principal, WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL);
     }

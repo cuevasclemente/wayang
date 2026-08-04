@@ -892,6 +892,8 @@ test("scheduled prompt timeout aborts and remains pending until the agent is idl
 });
 
 test("delayed questionnaire content exposes both durable request and submission IDs to the agent", () => {
+  const authority = (globalThis as any).__wayang_command_guard_human_input_authority;
+  assert.equal(typeof authority?.resolveInterviewSubmission, "function");
   const content = interviewSubmissionContent({
     request_id: "request-12345678",
     submission_id: "submission-12345678",

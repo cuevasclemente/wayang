@@ -171,8 +171,19 @@ test("real SDK stdio filters tools and environment, discards stderr, and termina
     };
     childPid = childResult.pid;
     assert.equal(childResult.echo, "synthetic-echo");
-    assert.deepEqual(childResult.envKeys, ["LANG", "PATH", "USER"]);
-    assert.deepEqual(childResult.envValues.sort(), ["/usr/local/bin:/usr/bin:/bin", "C", "synthetic-user"].sort());
+    const observedChildEnvironment = new Map(childResult.envKeys.map((key, index) => [key, childResult.envValues[index]!]));
+    const expectedKeys = process.platform === "darwin"
+      ? ["__CF_USER_TEXT_ENCODING", "LANG", "PATH", "USER"]
+      : ["LANG", "PATH", "USER"];
+    assert.deepEqual(childResult.envKeys, expectedKeys);
+    assert.equal(observedChildEnvironment.get("LANG"), "C");
+    assert.equal(observedChildEnvironment.get("PATH"), "/usr/local/bin:/usr/bin:/bin");
+    assert.equal(observedChildEnvironment.get("USER"), "synthetic-user");
+    if (process.platform === "darwin") {
+      // macOS inserts this non-secret Core Foundation encoding hint when Node
+      // starts even though the spawn environment itself is an exact allowlist.
+      assert.match(observedChildEnvironment.get("__CF_USER_TEXT_ENCODING") ?? "", /^0x[0-9a-f]+:0x[0-9a-f]+:0x[0-9a-f]+$/iu);
+    }
     const serializedEnvironment = JSON.stringify({ keys: childResult.envKeys, values: childResult.envValues });
     assert.doesNotMatch(serializedEnvironment, /HOME|OPENAI|EXA_API|WAYANG_APPS|COMMAND_GUARD|BW_SESSION|PROVIDER_VALUE|CAPABILITY_VALUE|PIN_VALUE|PATH_VALUE_CANARY/);
     for (const forbiddenValue of [

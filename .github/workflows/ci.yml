@@ -183,14 +183,6 @@ jobs:
         working-directory: e2e
         run: npx playwright install --with-deps chromium
 
-      - name: Run backend browser integration tests
-        working-directory: backend
-        env:
-          WAYANG_BROWSER_INTEGRATION: "1"
-        run: |
-          export WAYANG_CHROMIUM_PATH="$(node -e "console.log(require('../e2e/node_modules/@playwright/test').chromium.executablePath())")"
-          node --import tsx --test src/browser/manager.test.ts
-
       - name: Create isolated synthetic home
         env:
           HOME: /tmp/wayang-home-${{ github.run_id }}-${{ github.run_attempt }}

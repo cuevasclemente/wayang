@@ -13,7 +13,9 @@ import {
   markDelivered,
   normalizeAnswers,
   removeInterviewsForSession,
+  resolveInterviewSubmissionEvidence,
   submitInterview as submitInterviewWithContext,
+  verifyInterviewSubmissionEntry,
   type SubmitInterviewResult,
 } from "./interviews.js";
 import {
@@ -146,6 +148,110 @@ test("submission validates session, canonicalizes answers, persists provenance, 
   const conflict = submitInterview("owner", "request", [{ id: "q1", value: "large", label: "Large", wasCustom: false }]);
   assert.equal(conflict.ok, false);
   if (!conflict.ok) assert.equal(conflict.code, "conflict");
+}));
+
+test("command-guard human input requires the exact durable authenticated submission entry", () => withStore(() => {
+  const open = createOpenInterview({
+    requestId: "guard-authority",
+    sessionId: "owner",
+    toolName: "questionnaire",
+    toolCallId: "tool-call",
+    questions: QUESTIONS,
+  });
+  const submitted = submitInterview("owner", open.request_id, [{ id: "q1", value: "small", wasCustom: false }]);
+  assert.equal(submitted.ok, true);
+  if (!submitted.ok) return;
+  const entry = {
+    id: "pi-entry",
+    type: "custom_message",
+    customType: "wayang-interview-submission",
+    content: "untrusted display prose",
+    details: {
+      request_id: submitted.record.request_id,
+      submission_id: submitted.record.submission_id,
+      session_id: submitted.record.session_id,
+      origin_tool_name: submitted.record.origin_tool_name,
+      origin_tool_call_id: submitted.record.origin_tool_call_id ?? null,
+      created_at: submitted.record.created_at,
+      submitted_at: submitted.record.submitted_at,
+      questions: submitted.record.questions,
+      answers: submitted.record.answers ?? [],
+    },
+  };
+
+  assert.equal(verifyInterviewSubmissionEntry("owner", entry), true);
+  assert.equal(verifyInterviewSubmissionEntry("other", entry), false);
+  assert.equal(verifyInterviewSubmissionEntry("owner", { ...entry, details: { ...entry.details, submission_id: "forged" } }), false);
+  assert.equal(verifyInterviewSubmissionEntry("owner", { ...entry, details: { ...entry.details, answers: [{ ...entry.details.answers[0], label: "forged" }] } }), false);
+
+  markDelivered(open.request_id, "custom_message", entry.id);
+  assert.equal(verifyInterviewSubmissionEntry("owner", entry), true);
+  assert.equal(verifyInterviewSubmissionEntry("owner", { ...entry, id: "copied-entry" }), false);
+
+  const timely = createOpenInterview({
+    requestId: "guard-tool-result",
+    sessionId: "owner",
+    toolName: "questionnaire",
+    toolCallId: "timely-call",
+    questions: QUESTIONS,
+  });
+  const timelySubmission = submitInterview("owner", timely.request_id, [{ id: "q1", value: "large", wasCustom: false }]);
+  assert.equal(timelySubmission.ok, true);
+  if (!timelySubmission.ok) return;
+  markDelivered(timely.request_id, "tool_result", "pi-tool-entry");
+  const toolResultEntry = {
+    id: "pi-tool-entry",
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolName: "questionnaire",
+      toolCallId: "timely-call",
+      details: {
+        status: "submitted",
+        requestId: timelySubmission.record.request_id,
+        submissionId: timelySubmission.record.submission_id,
+        questions: QUESTIONS,
+        answers: timelySubmission.record.answers,
+      },
+    },
+  };
+  assert.equal(resolveInterviewSubmissionEvidence("owner", toolResultEntry)?.source, "tool_result");
+  assert.equal(resolveInterviewSubmissionEvidence("owner", {
+    ...toolResultEntry,
+    message: { ...toolResultEntry.message, toolCallId: "forged-call" },
+  }), undefined);
+
+  const legacy = createOpenInterview({
+    requestId: "guard-legacy-tool-result",
+    sessionId: "owner",
+    toolName: "questionnaire",
+    questions: QUESTIONS,
+  });
+  const legacySubmission = submitInterview("owner", legacy.request_id, [{ id: "q1", value: "small", wasCustom: false }]);
+  assert.equal(legacySubmission.ok, true);
+  if (!legacySubmission.ok) return;
+  markDelivered(legacy.request_id, "tool_result", "legacy-pi-entry");
+  const legacyToolResult = {
+    id: "legacy-pi-entry",
+    type: "message",
+    message: {
+      role: "toolResult",
+      toolName: "questionnaire",
+      toolCallId: "runtime-only-call-id",
+      details: {
+        status: "submitted",
+        requestId: legacySubmission.record.request_id,
+        submissionId: legacySubmission.record.submission_id,
+        questions: QUESTIONS,
+        answers: legacySubmission.record.answers,
+      },
+    },
+  };
+  assert.equal(resolveInterviewSubmissionEvidence("owner", legacyToolResult)?.source, "tool_result");
+  assert.equal(resolveInterviewSubmissionEvidence("owner", {
+    ...legacyToolResult,
+    message: { ...legacyToolResult.message, toolCallId: null },
+  }), undefined);
 }));
 
 test("custom answers are accepted for normalized and historical questions regardless of allowOther", () => withStore(() => {

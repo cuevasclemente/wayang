@@ -27,7 +27,7 @@ import { performance } from "node:perf_hooks";
 import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
 import { recordLatencyMetric } from "./latency-metrics.js";
 import { getInterviewBridge } from "./interview-bridge.js";
-import type { InterviewRecord } from "./interviews.js";
+import { resolveInterviewSubmissionEvidence, verifyInterviewSubmissionEntry, type InterviewRecord } from "./interviews.js";
 import {
   beginAgentSwitch,
   completeAgentSwitch,
@@ -226,6 +226,9 @@ const piSessionFileToWebSessionId = new Map<string, string>();
 (globalThis as any).__pi_command_guard_cwd_sessions = cwdToSessionId;
 (globalThis as any).__pi_command_guard_pi_sessions = piSessionToWebSessionId;
 (globalThis as any).__pi_command_guard_session_files = piSessionFileToWebSessionId;
+(globalThis as any).__wayang_command_guard_human_input_authority = Object.freeze({
+  resolveInterviewSubmission: (sessionId: string, entry: unknown) => resolveInterviewSubmissionEvidence(sessionId, entry) ?? null,
+});
 
 // Lazy-initialized singletons
 let _authStorage: AuthStorage | null = null;
@@ -2894,8 +2897,28 @@ function findInterviewSubmissionEntry(handle: PiSessionHandle, record: Interview
     entry.type === "custom_message" &&
     entry.customType === "wayang-interview-submission" &&
     entry.details?.request_id === record.request_id &&
-    entry.details?.submission_id === record.submission_id
+    entry.details?.submission_id === record.submission_id &&
+    verifyInterviewSubmissionEntry(record.session_id, entry)
   ))?.id;
+}
+
+export async function findInterviewToolResultEntry(sessionId: string, record: InterviewRecord): Promise<string | undefined> {
+  if (record.session_id !== sessionId) throw new Error("Interview tool-result session mismatch");
+  const sessionRow = getSessionById(sessionId);
+  if (!sessionRow) throw new Error("Interview session no longer exists");
+  const handle = getPiSession(sessionId) ?? await createPiSession(
+    sessionId,
+    sessionRow.cwd,
+    sessionRow.provider,
+    sessionRow.model,
+    sessionRow.pi_session_file,
+  );
+  return handle.session.sessionManager.getEntries().find((entry: any) => {
+    const evidence = resolveInterviewSubmissionEvidence(sessionId, entry);
+    return evidence?.source === "tool_result"
+      && evidence.requestId === record.request_id
+      && evidence.submissionId === record.submission_id;
+  })?.id;
 }
 
 /**

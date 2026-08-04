@@ -64,7 +64,11 @@ import {
   updateSessionTitle,
 } from "../sessions.js";
 import { getInterviewBridge } from "../interview-bridge.js";
-import { deliverSubmittedInterview, drainSubmittedInterviews } from "../interview-delivery.js";
+import {
+  confirmInterviewToolResultDelivery,
+  drainSubmittedInterviews,
+  retrySubmittedInterviewDelivery,
+} from "../interview-delivery.js";
 import { cancelInterview, submitInterview } from "../interviews.js";
 import {
   WAYANG_WEBSOCKET_SUBMISSION_CONTEXT,
@@ -1047,15 +1051,28 @@ function handleInterviewResponse(
 
   const record = submitted.record;
   const resolvedLiveWaiter = getInterviewBridge().resolveSubmitted(record);
-  if (!resolvedLiveWaiter && record.status === "submitted") {
+  if (resolvedLiveWaiter) {
+    void (async () => {
+      try {
+        const timeoutMs = record.origin_tool_call_id ? 30_000 : 2_000;
+        if (await confirmInterviewToolResultDelivery(record, { timeoutMs })) return;
+      } catch {
+        // Fall through to bounded custom-message recovery.
+      }
+      await retrySubmittedInterviewDelivery(record);
+    })().catch((error) => {
+      console.warn(`[interviews] delivery retained for request ${requestId}: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  } else if (record.status === "submitted") {
     // Do not await delivery: receipt has already been made durable and the
-    // dispatcher will retain/retry failures from WebSocket setup or startup.
-    void deliverSubmittedInterview(record).catch((error) => {
+    // dispatcher retains failures after bounded immediate retries, with later
+    // WebSocket/startup drains providing another recovery opportunity.
+    void retrySubmittedInterviewDelivery(record).catch((error) => {
       console.warn(`[interviews] delivery retained for request ${requestId}: ${error instanceof Error ? error.message : String(error)}`);
     });
   }
 
-  const currentStatus = resolvedLiveWaiter ? "delivered" : record.status;
+  const currentStatus = record.status;
   sendSafe(ws, {
     type: "interview_response_ack",
     requestId,

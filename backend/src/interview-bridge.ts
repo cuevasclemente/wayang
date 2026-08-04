@@ -9,7 +9,6 @@ import {
   createOpenInterview,
   getInterviewForSession,
   listOpenInterviews,
-  markDelivered,
   type CreateOpenInterviewInput,
   type InterviewAnswer,
   type InterviewQuestion,
@@ -57,12 +56,10 @@ type RequestCallback = (req: InterviewRequest) => void;
 
 interface InterviewBridgeStore {
   getInterviewForSession: typeof getInterviewForSession;
-  markDelivered: typeof markDelivered;
 }
 
 const DEFAULT_INTERVIEW_BRIDGE_STORE: InterviewBridgeStore = {
   getInterviewForSession,
-  markDelivered,
 };
 
 function requestFrom(record: InterviewRecord): InterviewRequest {
@@ -77,6 +74,7 @@ function requestFrom(record: InterviewRecord): InterviewRequest {
 export class PiInterviewBridge {
   private pending = new Map<string, PendingInterview>();
   private listeners = new Set<RequestCallback>();
+  private toolResultHandoffs = new Map<string, string>();
 
   constructor(private readonly store: InterviewBridgeStore = DEFAULT_INTERVIEW_BRIDGE_STORE) {}
 
@@ -140,21 +138,10 @@ export class PiInterviewBridge {
       || !authoritative.answers
     ) return false;
 
-    let delivered: InterviewRecord | undefined;
-    try {
-      delivered = this.store.markDelivered(authoritative.request_id, "tool_result");
-    } catch {
-      // Keep the waiter and timer live. The WebSocket path will retain the
-      // durable submission for custom-message delivery/retry instead.
-      return false;
-    }
-    if (
-      !delivered
-      || delivered.status !== "delivered"
-      || delivered.delivery_mode !== "tool_result"
-      || delivered.submission_id !== authoritative.submission_id
-    ) return false;
-
+    // Keep the record submitted until the exact matching Pi tool-result entry
+    // is visible in the persisted branch. A crash before then remains
+    // recoverable through delayed custom-message delivery.
+    this.toolResultHandoffs.set(authoritative.request_id, authoritative.session_id);
     clearTimeout(pending.timer);
     this.pending.delete(authoritative.request_id);
     pending.resolve({
@@ -164,6 +151,14 @@ export class PiInterviewBridge {
       answers: authoritative.answers,
     });
     return true;
+  }
+
+  hasToolResultHandoff(sessionId: string, requestId: string): boolean {
+    return this.toolResultHandoffs.get(requestId) === sessionId;
+  }
+
+  completeToolResultHandoff(sessionId: string, requestId: string): void {
+    if (this.toolResultHandoffs.get(requestId) === sessionId) this.toolResultHandoffs.delete(requestId);
   }
 
   /** Explicit cancellation is terminal only while the original waiter is live. */
@@ -183,6 +178,9 @@ export class PiInterviewBridge {
       clearTimeout(pending.timer);
       this.pending.delete(id);
       pending.resolve({ status: "cancelled", request: pending.request });
+    }
+    for (const [requestId, ownerSessionId] of this.toolResultHandoffs) {
+      if (ownerSessionId === sessionId) this.toolResultHandoffs.delete(requestId);
     }
   }
 
