@@ -34,6 +34,7 @@
  */
 
 import * as fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import { Router } from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import type { Server } from "http";

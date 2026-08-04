@@ -12,7 +12,7 @@ import {
   type ApprovalResponse,
   type ExternalActionRequestInput,
 } from "./action-approval-bridge.js";
-import { createApp } from "./app.js";
+import { closeWayangServer, createApp } from "./app.js";
 import { AuthService } from "./auth/service.js";
 import { close, init } from "./db.js";
 import { stopPiSession } from "./pi-bridge.js";
@@ -214,6 +214,7 @@ async function fixture(t: TestContext) {
     sessionDays: 30,
     sessionStorePath: path.join(dataDir, "auth-sessions.json"),
     trustProxy: "loopback",
+    proxyIdentityHeader: "",
     cookieSecure: "auto",
     allowedOrigins: [origin],
   });
@@ -234,7 +235,7 @@ async function fixture(t: TestContext) {
     for (const ws of sockets) {
       try { ws.terminate(); } catch {}
     }
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await closeWayangServer(server);
     close();
     if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
     else process.env.WAYANG_DATA_DIR = previousDataDir;
