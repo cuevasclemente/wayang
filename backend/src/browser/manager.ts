@@ -78,33 +78,128 @@ function allocatePort(): Promise<number> {
   });
 }
 
-function playwrightChromiumCandidates(): string[] {
-  const cacheDir = path.join(os.homedir(), ".cache", "ms-playwright");
+export function getPlaywrightCacheRoot(
+  platform: NodeJS.Platform = process.platform,
+  homeDir = os.homedir(),
+): string {
+  return platform === "darwin"
+    ? path.join(homeDir, "Library", "Caches", "ms-playwright")
+    : path.join(homeDir, ".cache", "ms-playwright");
+}
+
+export function getChromiumHostArchitecture(
+  platform: NodeJS.Platform = process.platform,
+  processArch: NodeJS.Architecture = process.arch,
+  cpuModels?: readonly string[],
+): NodeJS.Architecture {
+  if (platform !== "darwin") return processArch;
+  const detectedCpuModels = cpuModels ?? os.cpus().map((cpu) => cpu.model);
+  return detectedCpuModels.some((model) => model.includes("Apple")) ? "arm64" : processArch;
+}
+
+function playwrightEntryRevision(name: string): number {
+  return Number(name.match(/-(\d+)$/)?.[1] ?? 0);
+}
+
+function playwrightEntryProductOrder(name: string): number {
+  return name.startsWith("chromium-") ? 0 : 1;
+}
+
+export function getPlaywrightChromiumCandidates(
+  platform: NodeJS.Platform = process.platform,
+  hostArchitecture: NodeJS.Architecture = process.arch,
+  homeDir = os.homedir(),
+  cacheEntryNames?: readonly string[],
+): string[] {
+  const cacheDir = getPlaywrightCacheRoot(platform, homeDir);
+  let entries: readonly string[];
   try {
-    return fs.readdirSync(cacheDir)
-      .filter((name) => name.startsWith("chromium-"))
-      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
-      .flatMap((name) => [
-        path.join(cacheDir, name, "chrome-linux64", "chrome"),
-        path.join(cacheDir, name, "chrome-linux", "chrome"),
-      ]);
+    entries = cacheEntryNames ?? fs.readdirSync(cacheDir);
   } catch {
     return [];
   }
+
+  return entries
+    .filter((name) => /^(?:chromium|chromium_headless_shell)-\d+$/.test(name))
+    .sort((a, b) => (
+      playwrightEntryRevision(b) - playwrightEntryRevision(a)
+      || playwrightEntryProductOrder(a) - playwrightEntryProductOrder(b)
+    ))
+    .flatMap((name) => {
+      if (platform === "darwin") {
+        // Unknown macOS architectures conservatively probe both supported Playwright layouts.
+        const macArchitectures = hostArchitecture === "arm64" || hostArchitecture === "x64"
+          ? [hostArchitecture]
+          : ["arm64", "x64"];
+        if (name.startsWith("chromium_headless_shell-")) {
+          return macArchitectures.map((candidateArch) => path.join(
+            cacheDir,
+            name,
+            `chrome-headless-shell-mac-${candidateArch}`,
+            "chrome-headless-shell",
+          ));
+        }
+        return [
+          ...macArchitectures.map((candidateArch) => path.join(
+            cacheDir,
+            name,
+            `chrome-mac-${candidateArch}`,
+            "Google Chrome for Testing.app",
+            "Contents",
+            "MacOS",
+            "Google Chrome for Testing",
+          )),
+          path.join(cacheDir, name, "chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium"),
+        ];
+      }
+      if (name.startsWith("chromium_headless_shell-")) return [];
+      return [
+        path.join(cacheDir, name, "chrome-linux64", "chrome"),
+        path.join(cacheDir, name, "chrome-linux", "chrome"),
+      ];
+    });
 }
 
-function findChromiumExecutable(): string {
-  const configured = process.env.WAYANG_CHROMIUM_PATH || process.env.CHROME_PATH || process.env.CHROMIUM_PATH;
-  const candidates = [
-    configured,
-    ...playwrightChromiumCandidates(),
+export function getSystemChromiumCandidates(
+  platform: NodeJS.Platform = process.platform,
+  homeDir = os.homedir(),
+): string[] {
+  if (platform === "darwin") {
+    return [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      path.join(homeDir, "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome"),
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+      path.join(homeDir, "Applications", "Chromium.app", "Contents", "MacOS", "Chromium"),
+    ];
+  }
+  return [
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome-stable",
     "/usr/bin/google-chrome",
     "/opt/google/chrome/chrome",
-  ].filter(Boolean) as string[];
-  for (const candidate of candidates) {
+  ];
+}
+
+export function getChromiumCandidates(
+  configured: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+  processArch: NodeJS.Architecture = process.arch,
+  homeDir = os.homedir(),
+  cacheEntryNames?: readonly string[],
+  cpuModels?: readonly string[],
+): string[] {
+  const hostArchitecture = getChromiumHostArchitecture(platform, processArch, cpuModels);
+  return [
+    ...(configured ? [configured] : []),
+    ...getPlaywrightChromiumCandidates(platform, hostArchitecture, homeDir, cacheEntryNames),
+    ...getSystemChromiumCandidates(platform, homeDir),
+  ];
+}
+
+function findChromiumExecutable(): string {
+  const configured = process.env.WAYANG_CHROMIUM_PATH || process.env.CHROME_PATH || process.env.CHROMIUM_PATH;
+  for (const candidate of getChromiumCandidates(configured)) {
     if (fs.existsSync(candidate)) return candidate;
   }
   for (const name of ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"]) {
