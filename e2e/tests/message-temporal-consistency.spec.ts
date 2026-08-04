@@ -51,7 +51,10 @@ async function installDeterministicStreamingSocket(page: import("@playwright/tes
           return;
         }
         this.emit({ type: "message_start", message: { id, role: "user", content: message.content } });
-        window.setTimeout(() => this.emit({ type: "agent_end", messages: [] }), 20);
+        window.setTimeout(() => {
+          this.emit({ type: "agent_end", messages: [], will_retry: false });
+          this.emit({ type: "agent_settled" });
+        }, 20);
       }
 
       close(): void {
@@ -117,6 +120,7 @@ test("keeps a mid-stream second user message after the active assistant output",
     await page.waitForFunction(() => {
       return !document.querySelector('[data-testid="chat-streaming"]');
     }, null, { timeout: 150_000 });
+    await expect(page.getByTestId("chat-send-button")).toHaveText("Send");
 
     const report = await getChatOrderReport(page);
     reportText = formatChatOrderReport(report);

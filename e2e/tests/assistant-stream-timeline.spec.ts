@@ -55,7 +55,37 @@ async function installTimelineSocket(page: Page, history: unknown[] = []): Promi
           this.advanceTimeline();
         };
         (window as unknown as { finishSyntheticTimeline: () => void }).finishSyntheticTimeline = () => {
-          this.emit({ type: "agent_end", messages: [] });
+          this.emit({ type: "agent_end", messages: [], will_retry: false });
+          this.emit({ type: "agent_settled" });
+        };
+        (window as unknown as { emitIntermediateAgentEnd: () => void }).emitIntermediateAgentEnd = () => {
+          this.emit({ type: "agent_end", messages: [], will_retry: true });
+        };
+        (window as unknown as { emitSyntheticSettlement: () => void }).emitSyntheticSettlement = () => {
+          this.emit({ type: "agent_settled" });
+        };
+        (window as unknown as { emitSyntheticSettledHistory: () => void }).emitSyntheticSettledHistory = () => {
+          this.emit({
+            type: "history",
+            session_id: this.sessionId,
+            selection_id: this.selectionId,
+            reason: "agent_settled_reconciliation",
+            messages: [
+              {
+                type: "user",
+                id: "timeline-user",
+                message: { role: "user", content: "Exercise the synthetic progressive assistant timeline." },
+              },
+              {
+                type: "assistant",
+                id: "timeline-assistant",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: `${timelineMarkers.opening}\n${timelineMarkers.conclusion}` }],
+                },
+              },
+            ],
+          });
         };
         window.setTimeout(() => {
           this.readyState = TimelineWebSocket.OPEN;
@@ -206,6 +236,51 @@ test("preserves assistant text, thinking, and tool chronology while streaming an
   await expect(settledAssistant).toContainText(markers.conclusion);
   await expandThinking(settledAssistant);
   await expectMarkerOrder(settledAssistant, orderedMarkers);
+});
+
+test("keeps retrying runs active until settlement", async ({ page, request }) => {
+  await installTimelineSocket(page);
+  const session = await createE2eSession(request, "e2e retry lifecycle");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Exercise the synthetic progressive assistant timeline.");
+  await expect(page.getByTestId("chat-streaming")).toContainText(markers.opening);
+
+  await page.evaluate(() => {
+    (window as unknown as { emitIntermediateAgentEnd: () => void }).emitIntermediateAgentEnd();
+  });
+
+  await expect(page.getByTestId("chat-send-button")).toContainText("Queue");
+
+  await page.evaluate(() => {
+    (window as unknown as { finishSyntheticTimeline: () => void }).finishSyntheticTimeline();
+  });
+  await expect(page.getByTestId("chat-send-button")).toContainText("Send");
+});
+
+test("settled history replaces residual mobile streaming content without duplication", async ({ page, request }) => {
+  await installTimelineSocket(page);
+  const session = await createE2eSession(request, "e2e settled history replacement");
+  await openSessionInUi(page, session);
+  await page.setViewportSize({ width: 412, height: 915 });
+
+  await sendPrompt(page, "Exercise the synthetic progressive assistant timeline.");
+  const streaming = page.getByTestId("chat-streaming");
+  await expect(streaming).toContainText(markers.opening);
+
+  await page.evaluate(() => {
+    (window as unknown as { emitSyntheticSettlement: () => void }).emitSyntheticSettlement();
+  });
+  await expect(streaming).toContainText(markers.opening);
+
+  await page.evaluate(() => {
+    (window as unknown as { emitSyntheticSettledHistory: () => void }).emitSyntheticSettledHistory();
+  });
+  await expect(streaming).toHaveCount(0);
+  const settledAssistants = page.locator('[data-testid="chat-message"][data-role="assistant"]');
+  await expect(settledAssistants).toHaveCount(1);
+  await expect(settledAssistants.first()).toContainText(markers.opening);
+  await expect(settledAssistants.first()).toContainText(markers.conclusion);
 });
 
 test("preserves chronology when normalizing stored assistant and tool-result messages", async ({ page, request }) => {

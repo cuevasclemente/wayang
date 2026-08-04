@@ -2830,6 +2830,12 @@ export function ChatPanel({
             chatWsProfile("stale_history_ignored", { sessionId: msg.session_id, selectionId: msg.selection_id });
             return;
           }
+          if (msg.reason === "agent_settled_reconciliation") {
+            // Keep reconnect-era partial output visible until its authoritative
+            // settled snapshot is actually available, then replace it atomically
+            // with durable history rather than briefly rendering both copies.
+            setStreamingBlocksSynced({ content: [] });
+          }
           const historyMessages: ChatMessage[] = Array.isArray(msg.messages)
             ? msg.messages
             : [];
@@ -2966,10 +2972,9 @@ export function ChatPanel({
           }
 
           setStreamingBlocksSynced({ content: [] });
-          isStreamingRef.current = false;
-          pinActiveTurnScrollRef.current = false;
-          setActiveTurnScrollAnchorText(null);
-          setIsStreaming(false);
+          // Pi can retry or compact after agent_end. Keep the top-level run
+          // active until agent_settled so a prompt sent in that interval stays
+          // queued instead of being inserted ahead of continuation output.
           onSessionChange?.();
           return;
         }
@@ -2990,6 +2995,8 @@ export function ChatPanel({
         if (msg.type === "agent_settled") {
           setIsCompacting(false);
           isStreamingRef.current = false;
+          pinActiveTurnScrollRef.current = false;
+          setActiveTurnScrollAnchorText(null);
           setIsStreaming(false);
           onSessionChange?.();
           return;
