@@ -13,6 +13,9 @@ const proxy = {
 };
 
 export default defineConfig({
+  // E2E points Vite at an empty synthetic directory so file-based .env loading
+  // cannot bypass the test server's explicit secret-free environment allowlist.
+  envDir: process.env.WAYANG_E2E_VITE_ENV_DIR,
   plugins: [react(), tailwindcss()],
   build: {
     target: "esnext",
