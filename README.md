@@ -4,6 +4,12 @@ Wayang is a browser-based, chat-first workbench for the [pi coding-agent harness
 
 **Status:** v0.1 is early-stage software for one trusted user. Linux and macOS source checkouts are supported.
 
+## Why “Wayang”?
+
+Wayang takes its name from Indonesia's [wayang puppet-theatre traditions](https://ich.unesco.org/en/RL/wayang-puppet-theatre-00063). A performance is guided by a *dalang*, who brings figures, voices, and story together for an audience. The name is an analogy for this workbench: it gives one human a visible place to coordinate agents, tools, projects, and long-running work while keeping the machinery inspectable.
+
+The project borrows the name with respect; it is not an attempt to reproduce or represent those living traditions.
+
 ## Security first
 
 > **Wayang controls a powerful local agent. It can expose project files, command execution, browser profiles, provider access, and transcripts. Project allowlist/protected-mode guards and per-exec filesystem sandboxing are targeted controls, not a general same-user or network sandbox. Sandboxed bash has unrestricted proxy-mediated outbound TCP access. The exact migration-seeded Wren profile in a Standard project—including scheduled runs—retains global Pi resources, ordinary host filesystem read/write access, and visible Unix IPC, while registered Protected projects and protected backing artifacts remain masked. Reviewed project+profile capability assignments can deliberately grant direct host execution or control of an authenticated browser; those are broad cooperative powers of the Wayang OS user, not containment. Wayang is not safe for mutually untrusted users or public Internet exposure.**
