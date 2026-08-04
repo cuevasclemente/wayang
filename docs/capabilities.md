@@ -51,7 +51,7 @@ The Capabilities screen is an inventory aid. A bridge card can describe the Waya
 
 External-action approvals are ephemeral UI state, not chat messages or browser storage. Disconnecting does not approve an action: a live request may replay on reconnect until its bounded timeout, while interruption or session teardown cancels it. Deselecting the active session closes its chat transport so the old session is no longer counted as having an interactive approver.
 
-Bridge admission is fail-closed before request creation: v1 permits one pending request per session, a 32 KiB UTF-8 summary, 512-byte session IDs, 256-byte connector/workspace/tool names, 2 KiB targets, exact 64-hex argument hashes, and integer timeouts from 1 through 300,000 ms. Metadata containing control characters is rejected; values are never truncated to fit. On a terminal decision, the authoritative pending snapshot is sent before the submitter's acknowledgement, making multi-tab and lost-ack reconciliation deterministic.
+Bridge admission is fail-closed before request creation: v1 permits one pending request per session, a 64 KiB UTF-8 summary, 512-byte session IDs, 256-byte connector/workspace/tool names, 2 KiB targets, exact 64-hex argument hashes, and integer timeouts from 1 through 300,000 ms. Metadata containing control characters is rejected; values are never truncated to fit. On a terminal decision, the authoritative pending snapshot is sent before the submitter's acknowledgement, making multi-tab and lost-ack reconciliation deterministic.
 
 The bridge does not turn unrelated shell or browser activity into approved external actions.
 

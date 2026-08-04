@@ -2744,6 +2744,7 @@ function latchPiSessionHandleCapabilityDenial(handle: PiSessionHandle): void {
     // Invalidate every creation-time closure and exact protected binding.
     handle.runtimeGeneration = randomUUID();
   }
+  getActionApprovalBridge().cancelSession(handle.id, "runtime capability authority revoked");
   const trustedHostBashTool = handle.trustedHostBashTool;
   if (trustedHostBashTool) {
     trustedHostBashTool.revoked = true;
@@ -2807,6 +2808,7 @@ export function latchPiSessionCapabilityDenial(
     sessionCapabilityDenialGenerations.set(id, getPiSessionCapabilityDenialGeneration(id) + 1n);
     const handle = lookup.get(id);
     if (handle) latchPiSessionHandleCapabilityDenial(handle);
+    else getActionApprovalBridge().cancelSession(id, "runtime capability authority revoked");
   }
 }
 

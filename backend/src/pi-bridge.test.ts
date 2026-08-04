@@ -46,6 +46,7 @@ import { createHostBashOperations } from "./host-execution.js";
 import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability, revokeWorkspaceCapabilityAssociation } from "./workspace-capabilities.js";
 import type { PendingAgentSwitch } from "./workspace-types.js";
 import type { ProtectedBrowserToolRuntime } from "./browser/protected-tools.js";
+import { getActionApprovalBridge } from "./action-approval-bridge.js";
 
 function syntheticProtectedRuntime(
   mode: "agent" | "user" | "paused",
@@ -179,8 +180,20 @@ test("Pi bridge capability denial latches tools and aborts active runtime author
     },
     activeInteractiveTurn: { token: "stale" },
   } as unknown as PiSessionHandle;
+  const actionBridge = getActionApprovalBridge();
+  const detachApprovalClient = actionBridge.attachClient(handle.id, "synthetic-denial-client");
+  const approval = actionBridge.requestApproval(handle.id, {
+    connector: "synthetic-connector",
+    toolName: "write_after_revocation",
+    summary: "Synthetic write that must be cancelled by capability denial",
+    argumentsHash: "a".repeat(64),
+  });
+  assert.equal(actionBridge.getPendingRequests(handle.id).length, 1);
 
   latchPiSessionCapabilityDenial([handle.id], { get: (id) => id === handle.id ? handle : undefined });
+  assert.equal(actionBridge.getPendingRequests(handle.id).length, 0);
+  assert.equal((await approval).status, "cancelled");
+  detachApprovalClient();
   assert.equal(handle.capabilityAuthorityDenied, true);
   assert.notEqual(handle.runtimeGeneration, "old-generation");
   assert.equal(handle.bashMode, "unavailable");
@@ -204,6 +217,25 @@ test("Pi bridge capability denial latches tools and aborts active runtime author
 
   cleanupRelease.resolve();
   await closePiSessionAuthorities(handle);
+});
+
+test("capability denial cancels external actions before a starting runtime publishes a handle", async () => {
+  const sessionId = "synthetic-starting-denial-session";
+  const actionBridge = getActionApprovalBridge();
+  const detachApprovalClient = actionBridge.attachClient(sessionId, "synthetic-starting-denial-client");
+  const approval = actionBridge.requestApproval(sessionId, {
+    connector: "synthetic-connector",
+    toolName: "write_before_publication",
+    summary: "Synthetic starting-runtime write that must be cancelled",
+    argumentsHash: "b".repeat(64),
+  });
+  assert.equal(actionBridge.getPendingRequests(sessionId).length, 1);
+
+  latchPiSessionCapabilityDenial([sessionId], { get: () => undefined });
+
+  assert.equal(actionBridge.getPendingRequests(sessionId).length, 0);
+  assert.equal((await approval).status, "cancelled");
+  detachApprovalClient();
 });
 
 test("capability invalidation TERM/KILLs an active host process group before delayed mutation", {
