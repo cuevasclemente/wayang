@@ -103,6 +103,10 @@ interface QueuedUserMessage {
   id: string;
   content: string;
   attachments?: PendingAttachment[];
+  attachmentNames?: string[];
+  transportGeneration?: number;
+  cancelStatus: "registering" | "ready" | "cancelling" | "unavailable";
+  cancelError?: string;
 }
 
 interface PendingAttachment extends QueuedAttachment {
@@ -1620,7 +1624,13 @@ function UserMessage({
   );
 }
 
-function QueuedUserMessages({ messages }: { messages: QueuedUserMessage[] }) {
+function QueuedUserMessages({
+  messages,
+  onCancel,
+}: {
+  messages: QueuedUserMessage[];
+  onCancel: (messageId: string) => void;
+}) {
   if (messages.length === 0) return null;
 
   return (
@@ -1630,42 +1640,80 @@ function QueuedUserMessages({ messages }: { messages: QueuedUserMessage[] }) {
         Queued for the next turn
       </div>
       <div className="space-y-1">
-        {messages.map((message, index) => (
-          <div
-            key={message.id}
-            data-testid="chat-queued-user-message"
-            data-role="user"
-            className="rounded border border-amber-900/50 bg-amber-950/20 px-3 py-2 text-xs text-neutral-300"
-          >
-            <div>
-              <span className="mr-2 font-mono text-amber-400/80">#{index + 1}</span>
-              <span className="whitespace-pre-wrap break-words">
-                {message.content || (message.attachments?.length ? "[File attachment]" : "")}
-              </span>
-            </div>
-            {message.attachments && message.attachments.length > 0 && (
-              <div className="mt-2 flex flex-wrap gap-1.5">
-                {message.attachments.map((attachment) => attachment.kind === "image" && attachment.previewUrl ? (
-                  <img
-                    key={attachment.id}
-                    src={attachment.previewUrl}
-                    alt={attachment.fileName}
-                    title={`${attachment.fileName} (${formatAttachmentBytes(attachment.size)})`}
-                    className="h-12 w-12 rounded border border-amber-800/50 object-cover"
-                  />
-                ) : (
-                  <div
-                    key={attachment.id}
-                    title={`${attachment.fileName} (${formatAttachmentBytes(attachment.size)})`}
-                    className="max-w-[14rem] truncate rounded border border-amber-800/50 bg-neutral-950/70 px-2 py-1 text-[11px] text-neutral-300"
-                  >
-                    📄 {attachment.fileName}
-                  </div>
-                ))}
+        {messages.map((message, index) => {
+          const canCancel = message.cancelStatus === "ready";
+          const cancelLabel = message.cancelStatus === "cancelling" ? "Cancelling…" : "Cancel";
+          const cancelTitle = message.cancelStatus === "registering"
+            ? "Waiting for the backend to register this queued message"
+            : message.cancelStatus === "unavailable"
+              ? message.cancelError || "This message is no longer cancellable"
+              : "Remove this message without interrupting the active turn";
+          return (
+            <div
+              key={message.id}
+              data-testid="chat-queued-user-message"
+              data-queued-message-id={message.id}
+              data-role="user"
+              className="rounded border border-amber-900/50 bg-amber-950/20 px-3 py-2 text-xs text-neutral-300"
+            >
+              <div className="flex items-start gap-2">
+                <div className="min-w-0 flex-1">
+                  <span className="mr-2 font-mono text-amber-400/80">#{index + 1}</span>
+                  <span className="whitespace-pre-wrap break-words">
+                    {message.content || ((message.attachments?.length || message.attachmentNames?.length) ? "[File attachment]" : "")}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  data-testid="chat-cancel-queued-message"
+                  disabled={!canCancel}
+                  onClick={() => onCancel(message.id)}
+                  title={cancelTitle}
+                  aria-label={`Cancel queued message ${index + 1}`}
+                  className="shrink-0 rounded border border-red-900/60 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-red-300 hover:bg-red-950/40 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {cancelLabel}
+                </button>
               </div>
-            )}
-          </div>
-        ))}
+              {message.attachments && message.attachments.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {message.attachments.map((attachment) => attachment.kind === "image" && attachment.previewUrl ? (
+                    <img
+                      key={attachment.id}
+                      src={attachment.previewUrl}
+                      alt={attachment.fileName}
+                      title={`${attachment.fileName} (${formatAttachmentBytes(attachment.size)})`}
+                      className="h-12 w-12 rounded border border-amber-800/50 object-cover"
+                    />
+                  ) : (
+                    <div
+                      key={attachment.id}
+                      title={`${attachment.fileName} (${formatAttachmentBytes(attachment.size)})`}
+                      className="max-w-[14rem] truncate rounded border border-amber-800/50 bg-neutral-950/70 px-2 py-1 text-[11px] text-neutral-300"
+                    >
+                      📄 {attachment.fileName}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {!message.attachments?.length && message.attachmentNames && message.attachmentNames.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {message.attachmentNames.map((name, attachmentIndex) => (
+                    <div
+                      key={`${name}-${attachmentIndex}`}
+                      className="max-w-[14rem] truncate rounded border border-amber-800/50 bg-neutral-950/70 px-2 py-1 text-[11px] text-neutral-300"
+                    >
+                      📄 {name}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {message.cancelError && (
+                <p role="alert" className="mt-1 text-[11px] text-red-300">{message.cancelError}</p>
+              )}
+            </div>
+          );
+        })}
       </div>
       <p className="mt-1 text-[11px] text-neutral-500">
         These messages stay out of the transcript until pi accepts them, keeping chat order stable during long tool runs.
@@ -2496,6 +2544,11 @@ export function ChatPanel({
   const pinActiveTurnScrollRef = useRef(false);
   const lastProgrammaticScrollAtRef = useRef(0);
   const queuedUserMessagesRef = useRef<QueuedUserMessage[]>([]);
+  const submittedUserMessagesRef = useRef(new Map<string, {
+    content: string;
+    attachments: PendingAttachment[];
+    transportGeneration: number;
+  }>());
   const deferredUserMessagesRef = useRef<ChatMessage[]>([]);
   const streamingBlocksRef = useRef<StreamingBlocks>({ content: [] });
   const interviewQueueRef = useRef<QueuedInterview[]>([]);
@@ -2619,6 +2672,7 @@ export function ChatPanel({
 
     const queuedIndex = queuedUserMessagesRef.current.findIndex(matchesQueuedMessage);
     if (queuedIndex === -1) return false;
+    submittedUserMessagesRef.current.delete(queuedUserMessagesRef.current[queuedIndex].id);
 
     setQueuedMessagesSynced((prev) => {
       const index = prev.findIndex(matchesQueuedMessage);
@@ -2901,6 +2955,124 @@ export function ChatPanel({
             setWsStatus("disconnected");
             setIsSessionHistoryLoading(false);
             appendRuntimeError(String(msg.error || "Failed to load session"));
+          }
+          return;
+        }
+
+        if (msg.type === "queued_message_snapshot") {
+          if (
+            msg.session_id !== activeSessionIdRef.current
+            || msg.selection_id !== selectionIdRef.current
+            || !Array.isArray(msg.messages)
+          ) return;
+          const snapshot = msg.messages.flatMap((candidate: unknown) => {
+            if (!candidate || typeof candidate !== "object") return [];
+            const record = candidate as Record<string, unknown>;
+            if (typeof record.client_message_id !== "string" || typeof record.content !== "string") return [];
+            return [{
+              id: record.client_message_id,
+              content: record.content,
+              attachmentNames: Array.isArray(record.attachment_names)
+                ? record.attachment_names.filter((name): name is string => typeof name === "string")
+                : [],
+              transportGeneration,
+              cancelStatus: "ready" as const,
+            }];
+          });
+          const snapshotIds = new Set(snapshot.map((message) => message.id));
+          setMessages((current) => current.filter((message) => !(
+            message.__localPending === true
+            && typeof message.__localId === "string"
+            && snapshotIds.has(message.__localId)
+          )));
+          setQueuedMessagesSynced((current) => {
+            const existing = new Map(current.map((message) => [message.id, message]));
+            return [
+              ...snapshot.map((message) => ({
+                ...message,
+                ...submittedUserMessagesRef.current.get(message.id),
+                ...existing.get(message.id),
+                cancelStatus: "ready" as const,
+                cancelError: undefined,
+              })),
+              ...current.filter((message) => (
+                !snapshotIds.has(message.id)
+                && message.cancelStatus === "registering"
+                && message.transportGeneration === transportGeneration
+              )),
+            ];
+          });
+          return;
+        }
+
+        if (msg.type === "queued_message_ack") {
+          if (msg.session_id !== activeSessionIdRef.current || typeof msg.client_message_id !== "string") return;
+          if (msg.status === "accepted") {
+            submittedUserMessagesRef.current.delete(msg.client_message_id);
+            setQueuedMessagesSynced((current) => current.filter((message) => message.id !== msg.client_message_id));
+            return;
+          }
+          const submitted = submittedUserMessagesRef.current.get(msg.client_message_id);
+          if (msg.status === "queued") {
+            setMessages((current) => current.filter((message) => !(
+              message.__localPending === true && message.__localId === msg.client_message_id
+            )));
+            setQueuedMessagesSynced((current) => {
+              const existing = current.find((message) => message.id === msg.client_message_id);
+              const next: QueuedUserMessage = {
+                id: msg.client_message_id,
+                content: submitted?.content ?? existing?.content ?? "",
+                attachments: submitted?.attachments ?? existing?.attachments,
+                attachmentNames: existing?.attachmentNames,
+                transportGeneration,
+                cancelStatus: msg.cancellable === true ? "ready" : "unavailable",
+                cancelError: msg.cancellable === true
+                  ? undefined
+                  : "Targeted cancellation is unavailable for this queued message.",
+              };
+              return existing
+                ? current.map((message) => message.id === msg.client_message_id ? next : message)
+                : [...current, next];
+            });
+            return;
+          }
+          submittedUserMessagesRef.current.delete(msg.client_message_id);
+          setMessages((current) => current.filter((message) => !(
+            message.__localPending === true && message.__localId === msg.client_message_id
+          )));
+          setQueuedMessagesSynced((current) => current.map((message) => (
+            message.id === msg.client_message_id
+              ? {
+                  ...message,
+                  cancelStatus: "unavailable",
+                  cancelError: typeof msg.error === "string" ? msg.error : "The queued message was rejected.",
+                }
+              : message
+          )));
+          return;
+        }
+
+        if (msg.type === "queued_message_cancel_ack") {
+          if (msg.session_id !== activeSessionIdRef.current || typeof msg.client_message_id !== "string") return;
+          if (msg.status === "cancelled") {
+            submittedUserMessagesRef.current.delete(msg.client_message_id);
+            setQueuedMessagesSynced((current) => current.filter((message) => message.id !== msg.client_message_id));
+          } else {
+            setQueuedMessagesSynced((current) => current.map((message) => (
+              message.id === msg.client_message_id
+                ? msg.status === "error"
+                  ? {
+                      ...message,
+                      cancelStatus: "ready",
+                      cancelError: typeof msg.error === "string" ? msg.error : "Could not cancel this message. Try again.",
+                    }
+                  : {
+                      ...message,
+                      cancelStatus: "unavailable",
+                      cancelError: "This message was already accepted and can no longer be cancelled.",
+                    }
+                : message
+            )));
           }
           return;
         }
@@ -3479,6 +3651,8 @@ export function ChatPanel({
       setWsStatus("disconnected");
       setMessagesOwnerSessionId(null);
       setMessages([]);
+      clearQueuedAndDeferredUserMessages();
+      submittedUserMessagesRef.current.clear();
       setIsSessionHistoryLoading(false);
       return;
     }
@@ -3495,6 +3669,7 @@ export function ChatPanel({
     setVisibleMessageStart(0);
     setMessages([]);
     clearQueuedAndDeferredUserMessages();
+    submittedUserMessagesRef.current.clear();
     setPendingAttachments([]);
     setAttachmentError("");
     const sessionError = activeSessionErrorRef.current;
@@ -3743,11 +3918,22 @@ export function ChatPanel({
     const queuedMessageId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const queuedAttachments: PendingAttachment[] = attachments;
     const turnAnchorText = trimmed || (attachments.length > 0 ? "File attachment" : "");
+    submittedUserMessagesRef.current.set(queuedMessageId, {
+      content: trimmed,
+      attachments: queuedAttachments,
+      transportGeneration: transportGenerationRef.current,
+    });
 
     if (hasActiveAssistantOutput()) {
       setQueuedMessagesSynced((prev) => [
         ...prev,
-        { id: queuedMessageId, content: trimmed, attachments: queuedAttachments },
+        {
+          id: queuedMessageId,
+          content: trimmed,
+          attachments: queuedAttachments,
+          transportGeneration: transportGenerationRef.current,
+          cancelStatus: "registering",
+        },
       ]);
     } else {
       // Optimistically place the just-submitted user message in the timeline.
@@ -3767,6 +3953,7 @@ export function ChatPanel({
     sendWs({
       type: "message",
       content: trimmed,
+      client_message_id: queuedMessageId,
       attachments: attachments.map((attachment) => ({
         name: attachment.fileName,
         mimeType: attachment.mimeType,
@@ -3806,6 +3993,24 @@ export function ChatPanel({
     setQueuedMessagesSynced,
     clearRuntimeError,
   ]);
+
+  const handleCancelQueuedMessage = useCallback((messageId: string) => {
+    const queuedMessage = queuedUserMessagesRef.current.find((message) => message.id === messageId);
+    if (!queuedMessage || queuedMessage.cancelStatus !== "ready" || wsStatus !== "connected") return;
+    setQueuedMessagesSynced((current) => current.map((message) => (
+      message.id === messageId
+        ? { ...message, cancelStatus: "cancelling", cancelError: undefined }
+        : message
+    )));
+    const sent = sendWs({ type: "cancel_queued_message", client_message_id: messageId });
+    if (!sent) {
+      setQueuedMessagesSynced((current) => current.map((message) => (
+        message.id === messageId
+          ? { ...message, cancelStatus: "ready", cancelError: "Reconnect before cancelling this message." }
+          : message
+      )));
+    }
+  }, [sendWs, setQueuedMessagesSynced, wsStatus]);
 
   const handleResendMessage = useCallback((msg: ChatMessage) => {
     const messageId = typeof msg.id === "string" ? msg.id : null;
@@ -4650,7 +4855,7 @@ export function ChatPanel({
         )}
       </div>
 
-      <QueuedUserMessages messages={queuedUserMessages} />
+      <QueuedUserMessages messages={queuedUserMessages} onCancel={handleCancelQueuedMessage} />
 
       {/* ---- Interactive prompts: never persisted into chat history ---- */}
       {visibleExternalActionApprovals.length > 0 && (
