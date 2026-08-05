@@ -18,6 +18,7 @@ import {
   classifyMemoryTool,
   installAgentToolPolicyGuard,
   RESTRICTED_BUILTIN_TOOLS,
+  WAYANG_INTERACTIVE_COMMUNICATION_APPENDIX,
 } from "./agent-runtime.js";
 import { commandGuardIdentityPinPath } from "./command-guard-pin.js";
 import { close, commitStoreMutation, init } from "./db.js";
@@ -101,6 +102,57 @@ test("restricted resource loader uses pre-load exclusions and exact root AGENTS 
     }]);
     assert.deepEqual(result.tools, [...RESTRICTED_BUILTIN_TOOLS]);
     assert.equal(result.tools?.map(String).includes("bash"), true);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("interactive communication appendix reaches restricted and Standard sessions but not scheduled runs", async () => {
+  const f = fixture("wayang-runtime-interactive-communication-");
+  try {
+    fs.writeFileSync(path.join(f.agentDir, "APPEND_SYSTEM.md"), "synthetic global append");
+    const profile = createAgentProfile({ name: "Communication profile", instructions: "synthetic profile overlay" });
+    const project = createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
+    const interactive = createSession(f.cwd, { agentProfileId: profile.id });
+
+    const restricted = await buildAgentResourceLoader({
+      cwd: f.cwd, agentDir: f.agentDir, agentProfile: profile, project, sourceSessionId: interactive.id,
+    });
+    assert.equal(restricted.restricted, true);
+    assert.deepEqual(restricted.resourceLoader.getAppendSystemPrompt(), [
+      "synthetic profile overlay",
+      WAYANG_INTERACTIVE_COMMUNICATION_APPENDIX,
+    ]);
+
+    commitWorkspaceCapabilityActivation({
+      capability_id: "wayang.standard-resources.v1",
+      project_id: project.id,
+      agent_profile_id: profile.id,
+      operation_digest: "f".repeat(64),
+    });
+    const standard = await buildAgentResourceLoader({
+      cwd: f.cwd, agentDir: f.agentDir, agentProfile: profile, project, sourceSessionId: interactive.id,
+    });
+    assert.equal(standard.restricted, false);
+    assert.deepEqual(standard.resourceLoader.getAppendSystemPrompt(), [
+      "synthetic global append",
+      "synthetic profile overlay",
+      WAYANG_INTERACTIVE_COMMUNICATION_APPENDIX,
+    ]);
+
+    const scheduled = createSession(f.cwd, { agentProfileId: profile.id });
+    commitStoreMutation((draft) => {
+      const row = draft.sessions.find((candidate) => candidate.id === scheduled.id)!;
+      row.scheduled_job_id = "synthetic-job";
+      row.scheduled_run_id = "synthetic-run";
+    });
+    const scheduledResources = await buildAgentResourceLoader({
+      cwd: f.cwd, agentDir: f.agentDir, agentProfile: profile, project, sourceSessionId: scheduled.id,
+    });
+    assert.deepEqual(scheduledResources.resourceLoader.getAppendSystemPrompt(), [
+      "synthetic global append",
+      "synthetic profile overlay",
+    ]);
   } finally {
     f.cleanup();
   }

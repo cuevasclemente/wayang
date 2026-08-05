@@ -36,6 +36,18 @@ import {
 
 export const STANDARD_RESOURCES_CAPABILITY_ID = "wayang.standard-resources.v1" as const;
 
+export const WAYANG_INTERACTIVE_COMMUNICATION_APPENDIX = `## Wayang interactive communication
+
+For substantive work, acknowledge the request before extended reasoning or tool use. During longer work, provide concise user-visible checkpoints when there are material findings, decisions, blockers, or useful opportunities to steer; do not narrate every command or add ceremony to quick mechanical tasks. Share conclusions and decision rationale, never hidden chain-of-thought.`;
+
+function interactiveCommunicationAppendix(sourceSessionId: string | undefined): string[] {
+  if (!sourceSessionId) return [];
+  const row = getSessionById(sourceSessionId);
+  return row && row.scheduled_job_id === null && row.scheduled_run_id === null
+    ? [WAYANG_INTERACTIVE_COMMUNICATION_APPENDIX]
+    : [];
+}
+
 export interface ExactStandardResourcesWitness {
   readonly capabilityId: typeof STANDARD_RESOURCES_CAPABILITY_ID;
   readonly projectId: string;
@@ -711,6 +723,8 @@ export async function buildAgentResourceLoader(options: {
   sourceSessionId?: string;
   forceInMemorySettings?: boolean;
 }): Promise<AgentResourceLoaderResult> {
+  const communicationAppendix = interactiveCommunicationAppendix(options.sourceSessionId);
+  const profileInstructions = options.agentProfile.instructions;
   const standardResourcesWitness = options.sourceSessionId
     ? resolveCurrentStandardResourcesWitness({
         sourceSessionId: options.sourceSessionId,
@@ -724,7 +738,16 @@ export async function buildAgentResourceLoader(options: {
     : SettingsManager.create(options.cwd, options.agentDir);
 
   if (standardResourcesWitness) {
-    const resourceLoader = new DefaultResourceLoader({ cwd: options.cwd, agentDir: options.agentDir, settingsManager });
+    const resourceLoader = new DefaultResourceLoader({
+      cwd: options.cwd,
+      agentDir: options.agentDir,
+      settingsManager,
+      appendSystemPromptOverride: (base) => [
+        ...base,
+        ...(profileInstructions ? [profileInstructions] : []),
+        ...communicationAppendix,
+      ],
+    });
     await resourceLoader.reload();
     const releaseWitness = options.sourceSessionId
       ? resolveCurrentStandardResourcesWitness({
@@ -749,7 +772,6 @@ export async function buildAgentResourceLoader(options: {
 
   // noExtensions is a pre-load exclusion. No extension path or factory is
   // supplied here, so an excluded factory cannot execute before filtering.
-  const profileInstructions = options.agentProfile.instructions;
   const resourceLoader = new DefaultResourceLoader({
     cwd: options.cwd,
     agentDir: options.agentDir,
@@ -761,7 +783,10 @@ export async function buildAgentResourceLoader(options: {
     noContextFiles: true,
     agentsFilesOverride: () => ({ agentsFiles: exactProjectAgentsFile(options.cwd) }),
     systemPromptOverride: () => undefined,
-    appendSystemPromptOverride: () => profileInstructions ? [profileInstructions] : [],
+    appendSystemPromptOverride: () => [
+      ...(profileInstructions ? [profileInstructions] : []),
+      ...communicationAppendix,
+    ],
   });
   await resourceLoader.reload();
 
