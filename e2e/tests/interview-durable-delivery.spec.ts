@@ -150,3 +150,63 @@ test("retains an immutable interview response through reconnect and advances the
   ), { sessionId: session.id, requestId: firstRequestId })).toBe(false);
 
 });
+
+test("drops a stale interview response when the request was already answered differently", async ({ page, request }) => {
+  await installInterviewSocketMock(page);
+  const session = await createE2eSession(request, "e2e conflicting interview");
+  await openSessionInUi(page, session);
+  await expect(page.getByTestId("chat-input")).toBeEnabled();
+
+  await page.evaluate(({ sessionId, firstRequestId, secondRequestId }) => {
+    const socket = (window as unknown as { __interviewSocketTest: { emit: (payload: Record<string, unknown>) => void } }).__interviewSocketTest;
+    socket.emit({
+      type: "interview_request",
+      requestId: firstRequestId,
+      sessionId,
+      createdAt: 10,
+      questions: [{
+        id: "first",
+        label: "First",
+        prompt: "First durable question",
+        options: [{ value: "yes", label: "Yes" }],
+        allowOther: false,
+      }],
+    });
+    socket.emit({
+      type: "interview_request",
+      requestId: secondRequestId,
+      sessionId,
+      createdAt: 20,
+      questions: [{
+        id: "second",
+        label: "Second",
+        prompt: "Second queued question",
+        options: [{ value: "no", label: "No" }],
+        allowOther: false,
+      }],
+    });
+  }, { sessionId: session.id, firstRequestId, secondRequestId });
+
+  await expect(page.getByTestId("interview-queue")).toContainText("Questionnaire 1 of 2");
+  await expect(page.getByTestId("interview-form")).toContainText("First durable question");
+  await page.getByRole("button", { name: /Yes/ }).click();
+  await expect(page.getByTestId("interview-submission-status")).toContainText("waiting for durable acknowledgement");
+
+  await page.evaluate(({ sessionId, firstRequestId }) => {
+    const socket = (window as unknown as { __interviewSocketTest: { emit: (payload: Record<string, unknown>) => void } }).__interviewSocketTest;
+    socket.emit({
+      type: "interview_response_ack",
+      requestId: firstRequestId,
+      sessionId,
+      status: "rejected",
+      errorCode: "conflict",
+      error: "Interview was already submitted with different answers",
+    });
+  }, { sessionId: session.id, firstRequestId });
+
+  await expect(page.getByTestId("interview-form")).toContainText("Second queued question");
+  await expect(page.getByTestId("interview-queue")).not.toContainText("Questionnaire 1 of 2");
+  await expect.poll(async () => page.evaluate(({ sessionId, requestId }) => (
+    window.sessionStorage.getItem(`wayang:interview-submission:${sessionId}`)?.includes(requestId) ?? false
+  ), { sessionId: session.id, requestId: firstRequestId })).toBe(false);
+});
