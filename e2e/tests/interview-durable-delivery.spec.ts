@@ -191,6 +191,44 @@ test("drops a stale interview response when the request was already answered dif
   await expect(page.getByTestId("interview-form")).toContainText("First durable question");
   await page.getByRole("button", { name: /Yes/ }).click();
   await expect(page.getByTestId("interview-submission-status")).toContainText("waiting for durable acknowledgement");
+  await expect.poll(async () => page.evaluate((requestId) => (
+    window.sessionStorage.getItem(`wayang-interview-draft:${requestId}`) !== null
+  ), firstRequestId)).toBe(true);
+
+  const unrelatedRequestId = "e2e-interview-unrelated";
+  await page.evaluate(({ sessionId, unrelatedRequestId }) => {
+    const storageKey = `wayang:interview-submission:${sessionId}`;
+    const stored = JSON.parse(window.sessionStorage.getItem(storageKey) ?? "[]") as unknown[];
+    stored.push({
+      requestId: unrelatedRequestId,
+      sessionId,
+      questions: [{
+        id: "unrelated",
+        label: "Unrelated",
+        prompt: "Unrelated cached question",
+        options: [{ value: "yes", label: "Yes" }],
+        allowOther: true,
+      }],
+      answers: [{ id: "unrelated", value: "yes", label: "Yes", wasCustom: false, index: 1 }],
+      submittedAt: Date.now(),
+    });
+    window.sessionStorage.setItem(storageKey, JSON.stringify(stored));
+  }, { sessionId: session.id, unrelatedRequestId });
+
+  await page.evaluate(({ sessionId, firstRequestId }) => {
+    const socket = (window as unknown as { __interviewSocketTest: { emit: (payload: Record<string, unknown>) => void } }).__interviewSocketTest;
+    socket.emit({
+      type: "interview_response_ack",
+      requestId: firstRequestId,
+      sessionId,
+      status: "rejected",
+      errorCode: "invalid_answers",
+      error: "Synthetic retryable rejection",
+    });
+  }, { sessionId: session.id, firstRequestId });
+
+  await expect(page.getByTestId("interview-form")).toContainText("First durable question");
+  await expect(page.getByTestId("interview-retry-button")).toBeVisible();
 
   await page.evaluate(({ sessionId, firstRequestId }) => {
     const socket = (window as unknown as { __interviewSocketTest: { emit: (payload: Record<string, unknown>) => void } }).__interviewSocketTest;
@@ -209,4 +247,10 @@ test("drops a stale interview response when the request was already answered dif
   await expect.poll(async () => page.evaluate(({ sessionId, requestId }) => (
     window.sessionStorage.getItem(`wayang:interview-submission:${sessionId}`)?.includes(requestId) ?? false
   ), { sessionId: session.id, requestId: firstRequestId })).toBe(false);
+  await expect.poll(async () => page.evaluate(({ sessionId, requestId }) => (
+    window.sessionStorage.getItem(`wayang:interview-submission:${sessionId}`)?.includes(requestId) ?? false
+  ), { sessionId: session.id, requestId: unrelatedRequestId })).toBe(true);
+  await expect.poll(async () => page.evaluate((requestId) => (
+    window.sessionStorage.getItem(`wayang-interview-draft:${requestId}`)
+  ), firstRequestId)).toBeNull();
 });
