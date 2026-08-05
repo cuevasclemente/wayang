@@ -14,7 +14,12 @@ import {
 } from "./action-approval-bridge.js";
 import { closeWayangServer, createApp } from "./app.js";
 import { AuthService } from "./auth/service.js";
-import { close, init } from "./db.js";
+import { close, commitStoreMutation, init } from "./db.js";
+import type {
+  ReservePinAttemptResult,
+  SettingsPinAttemptPort,
+  VerifyPinAttemptResult,
+} from "./workspace-capability-approval/types.js";
 import { stopPiSession } from "./pi-bridge.js";
 import { createSession } from "./sessions.js";
 
@@ -23,9 +28,41 @@ interface ServerMessage {
   [key: string]: unknown;
 }
 
+const SYNTHETIC_IDENTITY_PIN = "12345678";
+
+class SyntheticPinAttemptPort implements SettingsPinAttemptPort {
+  readonly reserves: Parameters<SettingsPinAttemptPort["reserve"]>[0][] = [];
+  readonly verifications: Parameters<SettingsPinAttemptPort["verifyAndConsume"]>[0][] = [];
+  readonly cancellations: Parameters<SettingsPinAttemptPort["cancelAndConsume"]>[0][] = [];
+
+  async reserve(input: Parameters<SettingsPinAttemptPort["reserve"]>[0]): Promise<ReservePinAttemptResult> {
+    this.reserves.push({ ...input });
+    return { status: "reserved" };
+  }
+
+  async verifyAndConsume(
+    input: Parameters<SettingsPinAttemptPort["verifyAndConsume"]>[0],
+  ): Promise<VerifyPinAttemptResult> {
+    this.verifications.push({ ...input });
+    return input.pin === SYNTHETIC_IDENTITY_PIN
+      ? { status: "verified" }
+      : { status: "wrong_pin" };
+  }
+
+  async cancelAndConsume(
+    input: Parameters<SettingsPinAttemptPort["cancelAndConsume"]>[0],
+  ): Promise<void> {
+    this.cancellations.push({ ...input });
+  }
+}
+
 class CountingActionApprovalBridge extends PiActionApprovalBridge {
   responseCalls = 0;
   private readonly attachedClients = new Map<string, number>();
+
+  constructor(readonly syntheticPinAttempts: SyntheticPinAttemptPort) {
+    super(syntheticPinAttempts);
+  }
 
   override attachClient(sessionId: string, clientId: string): () => void {
     const detach = super.attachClient(sessionId, clientId);
@@ -45,14 +82,15 @@ class CountingActionApprovalBridge extends PiActionApprovalBridge {
     return this.attachedClients.get(sessionId) ?? 0;
   }
 
-  override respondForSession(
+  override async respondForSession(
     sessionId: string,
     requestId: string,
     argumentsHash: string,
     approved: unknown,
-  ): ApprovalResponse {
+    pin?: unknown,
+  ): Promise<ApprovalResponse> {
     this.responseCalls += 1;
-    return super.respondForSession(sessionId, requestId, argumentsHash, approved);
+    return super.respondForSession(sessionId, requestId, argumentsHash, approved, pin);
   }
 }
 
@@ -191,6 +229,30 @@ function isAck(requestId: string, status: string, sessionId: string, selectionId
   );
 }
 
+function isTerminal(requestId: string, status: string, sessionId: string, selectionId: string) {
+  return (message: ServerMessage): boolean => (
+    message.type === "external_action_terminal"
+    && message.requestId === requestId
+    && message.status === status
+    && message.sessionId === sessionId
+    && message.selection_id === selectionId
+  );
+}
+
+function isResolutionFrame(requestId: string, sessionId: string, selectionId: string) {
+  return (message: ServerMessage): boolean => (
+    (message.type === "external_action_terminal"
+      && message.requestId === requestId
+      && message.sessionId === sessionId
+      && message.selection_id === selectionId)
+    || isSnapshotFor(sessionId, selectionId)(message)
+    || (message.type === "external_action_response_ack"
+      && message.requestId === requestId
+      && message.sessionId === sessionId
+      && message.selection_id === selectionId)
+  );
+}
+
 async function fixture(t: TestContext) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-action-ws-"));
   const sharedCwd = path.join(dataDir, "shared-project");
@@ -198,12 +260,19 @@ async function fixture(t: TestContext) {
   const previousDataDir = process.env.WAYANG_DATA_DIR;
   process.env.WAYANG_DATA_DIR = dataDir;
 
-  const bridge = new CountingActionApprovalBridge();
+  const pinAttempts = new SyntheticPinAttemptPort();
+  const bridge = new CountingActionApprovalBridge(pinAttempts);
   (globalThis as typeof globalThis & { __pi_action_approval_bridge?: PiActionApprovalBridge }).__pi_action_approval_bridge = bridge;
   init();
   const interactiveSession = createSession(sharedCwd, "interactive action session");
   const otherSession = createSession(sharedCwd, "other action session");
   const headlessSession = createSession(sharedCwd, "headless scheduled action session");
+  const quarantinedSession = createSession(sharedCwd, "quarantined legacy action session");
+  commitStoreMutation((draft) => {
+    const row = draft.sessions.find((candidate) => candidate.id === quarantinedSession.id);
+    assert.ok(row);
+    row.legacy_private_session_quarantine = true;
+  });
 
   const port = await availablePort();
   const origin = `http://127.0.0.1:${port}`;
@@ -232,6 +301,7 @@ async function fixture(t: TestContext) {
     bridge.cancelSession(interactiveSession.id, "test cleanup");
     bridge.cancelSession(otherSession.id, "test cleanup");
     bridge.cancelSession(headlessSession.id, "test cleanup");
+    bridge.cancelSession(quarantinedSession.id, "test cleanup");
     for (const ws of sockets) {
       try { ws.terminate(); } catch {}
     }
@@ -250,7 +320,15 @@ async function fixture(t: TestContext) {
     return connection;
   };
 
-  return { bridge, interactiveSession, otherSession, headlessSession, connect };
+  return {
+    bridge,
+    pinAttempts,
+    interactiveSession,
+    otherSession,
+    headlessSession,
+    quarantinedSession,
+    connect,
+  };
 }
 
 function withoutField(packet: Record<string, unknown>, field: string): Record<string, unknown> {
@@ -270,8 +348,32 @@ test("closing the sole chat socket detaches the old session approval client", as
   assert.equal(bridge.hasClient(interactiveSession.id), false);
 });
 
+test("a quarantined session socket never becomes an external-action approval client", async (t) => {
+  const { bridge, pinAttempts, quarantinedSession, connect } = await fixture(t);
+  const selectionId = "selection-quarantined";
+  const client = await connect(quarantinedSession.id, selectionId);
+  await client.inbox.take((message) => (
+    message.type === "session_ready"
+    && message.session_id === quarantinedSession.id
+    && message.selection_id === selectionId
+  ));
+
+  await waitUntil(() => bridge.attachedClientCount(quarantinedSession.id) === 0);
+  assert.equal(bridge.hasClient(quarantinedSession.id), false);
+  const quarantinedInput = actionInput("sha256:quarantined");
+  assert.deepEqual(await bridge.requestApproval(quarantinedSession.id, quarantinedInput), {
+    status: "denied",
+    requestId: null,
+    sessionId: quarantinedSession.id,
+    argumentsHash: quarantinedInput.argumentsHash,
+  } satisfies ApprovalDecision);
+  assert.deepEqual(bridge.getPendingRequests(quarantinedSession.id), []);
+  assert.equal(pinAttempts.reserves.length, 0);
+  assert.equal(pinAttempts.verifications.length, 0);
+});
+
 test("external action responses do not default a missing session identity", async (t) => {
-  const { bridge, interactiveSession, connect } = await fixture(t);
+  const { bridge, pinAttempts, interactiveSession, connect } = await fixture(t);
   const selectionId = "selection-missing-session";
   const client = await connect(interactiveSession.id, selectionId);
   await client.inbox.take(isSnapshotFor(interactiveSession.id, selectionId, 0));
@@ -296,6 +398,8 @@ test("external action responses do not default a missing session identity", asyn
   assert.equal(ack.status, "rejected");
   assert.equal(ack.sessionId, null);
   assert.equal(bridge.responseCalls, 0);
+  assert.equal(pinAttempts.reserves.length, 0);
+  assert.equal(pinAttempts.verifications.length, 0);
   assert.equal(bridge.getPendingRequests(interactiveSession.id).length, 1);
 
   bridge.cancelRequest(request.requestId, "test cleanup");
@@ -318,7 +422,7 @@ test("external action responses validate every identity field and decision befor
 
   for (const malformedCase of malformedCases) {
     await t.test(malformedCase.name, async (t) => {
-      const { bridge, interactiveSession, connect } = await fixture(t);
+      const { bridge, pinAttempts, interactiveSession, connect } = await fixture(t);
       const selectionId = `selection-${malformedCase.name.replaceAll(" ", "-")}`;
       const client = await connect(interactiveSession.id, selectionId);
       await client.inbox.take(isSnapshotFor(interactiveSession.id, selectionId, 0));
@@ -344,6 +448,8 @@ test("external action responses validate every identity field and decision befor
       const ack = await client.inbox.take((message) => message.type === "external_action_response_ack");
       assert.equal(ack.status, "rejected", malformedCase.name);
       assert.equal(bridge.responseCalls, 0, malformedCase.name);
+      assert.equal(pinAttempts.reserves.length, 0, malformedCase.name);
+      assert.equal(pinAttempts.verifications.length, 0, malformedCase.name);
       assert.equal(bridge.getPendingRequests(interactiveSession.id).length, 1, malformedCase.name);
 
       bridge.cancelRequest(request.requestId, "test cleanup");
@@ -352,8 +458,73 @@ test("external action responses validate every identity field and decision befor
   }
 });
 
+test("approved WebSocket responses deny and consume wrong or missing PIN attempts", async (t) => {
+  for (const pinCase of [
+    { name: "missing PIN", pin: undefined, adapterPin: "" },
+    { name: "wrong PIN", pin: "87654321", adapterPin: "87654321" },
+  ] as const) {
+    await t.test(pinCase.name, async (t) => {
+      const { bridge, pinAttempts, interactiveSession, connect } = await fixture(t);
+      const selectionId = `selection-${pinCase.name.replaceAll(" ", "-")}`;
+      const client = await connect(interactiveSession.id, selectionId);
+      await client.inbox.take(isSnapshotFor(interactiveSession.id, selectionId, 0));
+
+      const pending = bridge.requestApproval(
+        interactiveSession.id,
+        actionInput(`sha256:${pinCase.name}`),
+        { timeoutMs: 5_000 },
+      );
+      const [request] = bridge.getPendingRequests(interactiveSession.id);
+      assert.ok(request);
+      await client.inbox.take(isRequest(request.requestId, request.sessionId, selectionId));
+
+      client.ws.send(JSON.stringify({
+        type: "external_action_response",
+        requestId: request.requestId,
+        sessionId: request.sessionId,
+        selection_id: selectionId,
+        argumentsHash: request.argumentsHash,
+        approved: true,
+        ...(pinCase.pin === undefined ? {} : { pin: pinCase.pin }),
+      }));
+
+      assert.deepEqual(await pending, {
+        status: "denied",
+        requestId: request.requestId,
+        sessionId: request.sessionId,
+        argumentsHash: request.argumentsHash,
+      } satisfies ApprovalDecision);
+      assert.equal(bridge.responseCalls, 1);
+      assert.equal(pinAttempts.reserves.length, 1);
+      assert.equal(pinAttempts.reserves[0].realm, "wayang.external-actions.v1");
+      assert.deepEqual(pinAttempts.verifications.map((attempt) => attempt.pin), [pinCase.adapterPin]);
+      assert.deepEqual(bridge.getPendingRequests(interactiveSession.id), []);
+
+      const terminal = await client.inbox.take(isResolutionFrame(
+        request.requestId,
+        request.sessionId,
+        selectionId,
+      ));
+      assert.ok(isTerminal(request.requestId, "denied", request.sessionId, selectionId)(terminal));
+      const snapshot = await client.inbox.take(isResolutionFrame(
+        request.requestId,
+        request.sessionId,
+        selectionId,
+      ));
+      assert.ok(isSnapshotFor(request.sessionId, selectionId, 0)(snapshot));
+      const ack = await client.inbox.take(isResolutionFrame(
+        request.requestId,
+        request.sessionId,
+        selectionId,
+      ));
+      assert.ok(isAck(request.requestId, "denied", request.sessionId, selectionId)(ack));
+      assert.equal(ack.errorCode, "wrong_pin");
+    });
+  }
+});
+
 test("external action WebSocket transport is reconnect-safe and exact-session fail-closed", async (t) => {
-  const { bridge, interactiveSession, otherSession, headlessSession, connect } = await fixture(t);
+  const { bridge, pinAttempts, interactiveSession, otherSession, headlessSession, connect } = await fixture(t);
   const firstSelection = "selection-first-tab";
   const secondSelection = "selection-second-tab";
   const first = await connect(interactiveSession.id, firstSelection);
@@ -437,6 +608,8 @@ test("external action WebSocket transport is reconnect-safe and exact-session fa
   }));
   await first.inbox.take(isAck(exactRequest.requestId, "rejected", exactRequest.sessionId, firstSelection));
   assert.equal(bridge.getPendingRequests(interactiveSession.id).length, 1);
+  assert.equal(pinAttempts.reserves.length, 0);
+  assert.equal(pinAttempts.verifications.length, 0);
 
   first.ws.send(JSON.stringify({
     type: "external_action_response",
@@ -445,6 +618,7 @@ test("external action WebSocket transport is reconnect-safe and exact-session fa
     selection_id: firstSelection,
     argumentsHash: exactRequest.argumentsHash,
     approved: true,
+    pin: SYNTHETIC_IDENTITY_PIN,
   }));
   assert.deepEqual(await exactPending, {
     status: "approved",
@@ -452,17 +626,44 @@ test("external action WebSocket transport is reconnect-safe and exact-session fa
     sessionId: exactRequest.sessionId,
     argumentsHash: exactRequest.argumentsHash,
   } satisfies ApprovalDecision);
-  // respondForSession emits its terminal event synchronously. The terminal
-  // listener therefore queues the authoritative snapshot before this socket's
-  // response handler queues its acknowledgement. Clients reconcile from the
-  // snapshot first and treat the later ack as secondary status confirmation.
-  const firstResolutionFrame = await first.inbox.take((message) => (
-    isSnapshotFor(interactiveSession.id, firstSelection, 0)(message)
-    || isAck(exactRequest.requestId, "approved", exactRequest.sessionId, firstSelection)(message)
+  assert.equal(pinAttempts.reserves.length, 1);
+  assert.equal(pinAttempts.reserves[0].realm, "wayang.external-actions.v1");
+  assert.match(pinAttempts.reserves[0].operationDigest, /^[a-f0-9]{64}$/);
+  assert.deepEqual(pinAttempts.verifications.map((attempt) => attempt.pin), [SYNTHETIC_IDENTITY_PIN]);
+
+  // Every attached tab receives the explicit terminal status before its
+  // authoritative empty snapshot. The submitting tab receives its ack last.
+  const firstTerminal = await first.inbox.take(isResolutionFrame(
+    exactRequest.requestId,
+    exactRequest.sessionId,
+    firstSelection,
   ));
-  assert.equal(firstResolutionFrame.type, "external_action_snapshot");
-  await first.inbox.take(isAck(exactRequest.requestId, "approved", exactRequest.sessionId, firstSelection));
-  await second.inbox.take(isSnapshotFor(interactiveSession.id, secondSelection, 0));
+  assert.ok(isTerminal(exactRequest.requestId, "approved", exactRequest.sessionId, firstSelection)(firstTerminal));
+  const firstSnapshot = await first.inbox.take(isResolutionFrame(
+    exactRequest.requestId,
+    exactRequest.sessionId,
+    firstSelection,
+  ));
+  assert.ok(isSnapshotFor(interactiveSession.id, firstSelection, 0)(firstSnapshot));
+  const firstAck = await first.inbox.take(isResolutionFrame(
+    exactRequest.requestId,
+    exactRequest.sessionId,
+    firstSelection,
+  ));
+  assert.ok(isAck(exactRequest.requestId, "approved", exactRequest.sessionId, firstSelection)(firstAck));
+
+  const secondTerminal = await second.inbox.take(isResolutionFrame(
+    exactRequest.requestId,
+    exactRequest.sessionId,
+    secondSelection,
+  ));
+  assert.ok(isTerminal(exactRequest.requestId, "approved", exactRequest.sessionId, secondSelection)(secondTerminal));
+  const secondSnapshot = await second.inbox.take(isResolutionFrame(
+    exactRequest.requestId,
+    exactRequest.sessionId,
+    secondSelection,
+  ));
+  assert.ok(isSnapshotFor(interactiveSession.id, secondSelection, 0)(secondSnapshot));
 
   // Replay a still-live request after reconnect, then process a response while
   // intentionally ignoring its ack. The next snapshot reconciles the lost ack.
@@ -493,6 +694,13 @@ test("external action WebSocket transport is reconnect-safe and exact-session fa
     sessionId: replayRequest.sessionId,
     argumentsHash: replayRequest.argumentsHash,
   } satisfies ApprovalDecision);
+  await second.inbox.take(isTerminal(
+    replayRequest.requestId,
+    "denied",
+    replayRequest.sessionId,
+    secondSelection,
+  ));
+  await second.inbox.take(isSnapshotFor(interactiveSession.id, secondSelection, 0));
   await closeSocket(reconnected.ws); // discard the response ack and terminal snapshot
 
   const afterLostAckSelection = "selection-after-lost-ack";
@@ -505,7 +713,19 @@ test("external action WebSocket transport is reconnect-safe and exact-session fa
   await second.inbox.take(isRequest(timeoutRequest.requestId, interactiveSession.id, secondSelection));
   await afterLostAck.inbox.take(isRequest(timeoutRequest.requestId, interactiveSession.id, afterLostAckSelection));
   assert.equal((await timeoutPending).status, "timeout");
+  await second.inbox.take(isTerminal(
+    timeoutRequest.requestId,
+    "timeout",
+    timeoutRequest.sessionId,
+    secondSelection,
+  ));
   await second.inbox.take(isSnapshotFor(interactiveSession.id, secondSelection, 0));
+  await afterLostAck.inbox.take(isTerminal(
+    timeoutRequest.requestId,
+    "timeout",
+    timeoutRequest.sessionId,
+    afterLostAckSelection,
+  ));
   await afterLostAck.inbox.take(isSnapshotFor(interactiveSession.id, afterLostAckSelection, 0));
 
   const interruptPending = bridge.requestApproval(interactiveSession.id, actionInput("sha256:interrupt"), { timeoutMs: 5_000 });

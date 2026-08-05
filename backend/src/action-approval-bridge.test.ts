@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
-  PiActionApprovalBridge,
+  PiActionApprovalBridge as ProductionPiActionApprovalBridge,
   getActionApprovalBridge,
   type ActionApprovalBridge,
   type ApprovalDecision,
@@ -10,6 +10,40 @@ import {
   type ExternalActionRequest,
   type ExternalActionRequestInput,
 } from "./action-approval-bridge.js";
+import type {
+  ReservePinAttemptResult,
+  SettingsPinAttemptPort,
+  VerifyPinAttemptResult,
+} from "./workspace-capability-approval/types.js";
+
+const LEGACY_TEST_PIN_ATTEMPTS: SettingsPinAttemptPort = {
+  async reserve(): Promise<ReservePinAttemptResult> { return { status: "reserved" }; },
+  async verifyAndConsume(): Promise<VerifyPinAttemptResult> { return { status: "verified" }; },
+  async cancelAndConsume(): Promise<void> {},
+};
+
+/** Keeps pre-PIN bridge regressions focused on their original invariant. */
+class PiActionApprovalBridge extends ProductionPiActionApprovalBridge {
+  constructor() {
+    super(LEGACY_TEST_PIN_ATTEMPTS);
+  }
+
+  override respondForSession(
+    sessionId: string,
+    requestId: string,
+    hash: string,
+    approved: unknown,
+    pin?: unknown,
+  ) {
+    return super.respondForSession(
+      sessionId,
+      requestId,
+      hash,
+      approved,
+      pin ?? (approved === true ? "12345678" : undefined),
+    );
+  }
+}
 
 function argumentsHash(label: string): string {
   return createHash("sha256").update(label).digest("hex");
@@ -90,32 +124,32 @@ test("action approval replays pending metadata and requires the exact session an
   assert.deepEqual(bridge.getPendingRequests("session-a"), [emitted]);
 
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "other-session",
       emitted.requestId,
       emitted.argumentsHash,
       true,
-    ).status,
+    )).status,
     "rejected",
   );
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "session-a",
       emitted.requestId,
       "sha256:different-arguments",
       true,
-    ).status,
+    )).status,
     "rejected",
   );
   assert.equal(bridge.getPendingRequests("session-a").length, 1);
 
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "session-a",
       emitted.requestId,
       emitted.argumentsHash,
       true,
-    ).status,
+    )).status,
     "approved",
   );
   assert.deepEqual(
@@ -152,12 +186,12 @@ test("action approval survives last-client detach and replays after reconnect", 
   const [replayedRequest] = bridge.getPendingRequests("session-reconnect");
   assert.deepEqual(replayedRequest, originalRequest);
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "session-reconnect",
       replayedRequest.requestId,
       replayedRequest.argumentsHash,
       true,
-    ).status,
+    )).status,
     "approved",
   );
   assert.deepEqual(
@@ -183,22 +217,22 @@ test("action approval rejects malformed runtime decisions without resolving", as
   assert.ok(request);
 
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "session-malformed",
       "stale-request-id",
       "sha256:stale-arguments",
       true,
-    ).status,
+    )).status,
     "stale",
   );
   for (const malformed of ["false", 1] as const) {
     assert.equal(
-      bridge.respondForSession(
+      (await bridge.respondForSession(
         "session-malformed",
         request.requestId,
         request.argumentsHash,
         malformed,
-      ).status,
+      )).status,
       "rejected",
     );
   }
@@ -206,12 +240,12 @@ test("action approval rejects malformed runtime decisions without resolving", as
   assert.deepEqual(terminals, []);
 
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "session-malformed",
       request.requestId,
       request.argumentsHash,
       false,
-    ).status,
+    )).status,
     "denied",
   );
   assert.deepEqual(
@@ -258,12 +292,12 @@ test("action approval supports explicit denial", async () => {
   const pending = bridge.requestApproval("session-denial", actionInput());
   assert.ok(request);
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "session-denial",
       request.requestId,
       request.argumentsHash,
       false,
-    ).status,
+    )).status,
     "denied",
   );
   assert.deepEqual(
@@ -403,12 +437,12 @@ test("action approval abort cancellation removes the request and makes responses
   assert.deepEqual(terminals, ["cancelled"]);
   assert.deepEqual(bridge.getPendingRequests("session-abort"), []);
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "session-abort",
       request.requestId,
       request.argumentsHash,
       true,
-    ).status,
+    )).status,
     "stale",
   );
 });
@@ -446,12 +480,12 @@ test("action approval cancellation targets exactly one request", async () => {
   );
 
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "session-cancel-other",
       requests[1].requestId,
       requests[1].argumentsHash,
       true,
-    ).status,
+    )).status,
     "approved",
   );
   assert.deepEqual(
@@ -508,7 +542,7 @@ test("action approval broadcasts cloned terminal events without request metadata
 
   const pending = bridge.requestApproval("session-terminal", actionInput());
   assert.ok(request);
-  bridge.respondForSession(
+  await bridge.respondForSession(
     "session-terminal",
     request.requestId,
     request.argumentsHash,
@@ -540,7 +574,7 @@ test("action approval broadcasts cloned terminal events without request metadata
     actionInput({ argumentsHash: "sha256:after-unsubscribe" }),
   );
   const [deniedRequest] = bridge.getPendingRequests("session-terminal");
-  bridge.respondForSession(
+  await bridge.respondForSession(
     "session-terminal",
     deniedRequest.requestId,
     deniedRequest.argumentsHash,
@@ -586,7 +620,7 @@ test("action approval session cleanup cancels only matching requests", async () 
 
   const remaining = requests.find((request) => request.sessionId === "session-two");
   assert.ok(remaining);
-  bridge.respondForSession(
+  await bridge.respondForSession(
     "session-two",
     remaining.requestId,
     remaining.argumentsHash,
@@ -631,12 +665,12 @@ test("action approval defensively clones input, request events, and pending repl
   assert.equal(secondReplay.argumentsHash, argumentsHash("sha256:clone"));
 
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "session-clone",
       secondReplay.requestId,
       argumentsHash("sha256:clone"),
       true,
-    ).status,
+    )).status,
     "approved",
   );
   assert.deepEqual(
@@ -668,12 +702,12 @@ test("action approval synchronously rejects a response after its deadline", asyn
   }
 
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "session-deadline",
       request.requestId,
       request.argumentsHash,
       true,
-    ).status,
+    )).status,
     "stale",
   );
   assert.deepEqual(
@@ -758,12 +792,12 @@ test("action approval responses are stale after timeout", async () => {
     ),
   );
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "session-stale",
       request.requestId,
       request.argumentsHash,
       true,
-    ).status,
+    )).status,
     "stale",
   );
 });
@@ -800,7 +834,7 @@ test("action approval exposes no secret-capable request fields beyond display me
   assert.equal(JSON.stringify(emitted).includes("synthetic-access-value"), false);
   assert.equal(JSON.stringify(emitted).includes("synthetic-authorization-value"), false);
 
-  bridge.respondForSession(
+  await bridge.respondForSession(
     "session-fields",
     emitted.requestId,
     emitted.argumentsHash,
@@ -842,7 +876,7 @@ test("action approval accepts exact runtime admission boundaries", async () => {
   assert.equal(requests[0].timeoutMs, 300_000);
   assert.deepEqual(bridge.getPendingRequests(sessionId), [requests[0]]);
   assert.equal(
-    bridge.respondForSession(sessionId, requests[0].requestId, maximumInput.argumentsHash, false).status,
+    (await bridge.respondForSession(sessionId, requests[0].requestId, maximumInput.argumentsHash, false)).status,
     "denied",
   );
   assert.deepEqual(
@@ -854,13 +888,17 @@ test("action approval accepts exact runtime admission boundaries", async () => {
   const minimumPending = bridge.requestApproval(sessionId, minimumInput, { timeoutMs: 1 });
   const minimumRequest = requests[1];
   assert.equal(minimumRequest.timeoutMs, 1);
+  // A 1 ms request is admitted, but approval now performs asynchronous durable
+  // PIN reservation/verification and may legitimately expire before it can
+  // complete. Denial is synchronous and proves the exact lower admission bound
+  // without making the test scheduler-speed dependent.
   assert.equal(
-    bridge.respondForSession(sessionId, minimumRequest.requestId, minimumInput.argumentsHash, true).status,
-    "approved",
+    (await bridge.respondForSession(sessionId, minimumRequest.requestId, minimumInput.argumentsHash, false)).status,
+    "denied",
   );
   assert.deepEqual(
     await minimumPending,
-    decision("approved", minimumRequest.requestId, sessionId, minimumInput.argumentsHash),
+    decision("denied", minimumRequest.requestId, sessionId, minimumInput.argumentsHash),
   );
 });
 
@@ -1004,18 +1042,263 @@ test("action approval admits only one pending request per session", async () => 
   assert.deepEqual(bridge.getPendingRequests("session-concurrent"), [requests[0]]);
 
   assert.equal(
-    bridge.respondForSession(
+    (await bridge.respondForSession(
       "session-concurrent",
       requests[0].requestId,
       requests[0].argumentsHash,
       false,
-    ).status,
+    )).status,
     "denied",
   );
   assert.deepEqual(
     await firstPending,
     decision("denied", requests[0].requestId, "session-concurrent", firstInput.argumentsHash),
   );
+});
+
+test("PIN-gated approval reserves an exact immutable external-action digest", async () => {
+  const reserves: Parameters<SettingsPinAttemptPort["reserve"]>[0][] = [];
+  const verifies: Parameters<SettingsPinAttemptPort["verifyAndConsume"]>[0][] = [];
+  const pinAttempts: SettingsPinAttemptPort = {
+    async reserve(input) { reserves.push(input); return { status: "reserved" }; },
+    async verifyAndConsume(input) { verifies.push(input); return { status: "verified" }; },
+    async cancelAndConsume() {},
+  };
+  const bridge = new ProductionPiActionApprovalBridge(pinAttempts);
+  bridge.attachClient("session-pin", "client-a");
+  const pending = bridge.requestApproval("session-pin", actionInput(), { timeoutMs: 1_000 });
+  const [request] = bridge.getPendingRequests("session-pin");
+
+  assert.deepEqual(
+    await bridge.respondForSession("session-pin", request.requestId, request.argumentsHash, true, "12345678"),
+    { status: "approved" },
+  );
+  assert.equal(reserves.length, 1);
+  assert.equal(reserves[0].realm, "wayang.external-actions.v1");
+  assert.equal(reserves[0].requestId, request.requestId);
+  assert.equal(reserves[0].expiresAt, request.createdAt + request.timeoutMs);
+  assert.equal(reserves[0].operationDigest, createHash("sha256").update(JSON.stringify({
+    realm: "wayang.external-actions.v1",
+    requestId: request.requestId,
+    sessionId: request.sessionId,
+    connector: request.connector,
+    workspace: request.workspace ?? null,
+    toolName: request.toolName,
+    target: request.target ?? null,
+    summary: request.summary,
+    argumentsHash: request.argumentsHash,
+    createdAt: request.createdAt,
+    timeoutMs: request.timeoutMs,
+    expiresAt: request.createdAt + request.timeoutMs,
+  })).digest("hex"));
+  assert.deepEqual(
+    { ...verifies[0], now: undefined },
+    {
+      realm: "wayang.external-actions.v1",
+      reservationId: reserves[0].reservationId,
+      requestId: request.requestId,
+      pin: "12345678",
+      now: undefined,
+    },
+  );
+  assert.deepEqual(await pending, decision("approved", request.requestId, request.sessionId, request.argumentsHash));
+});
+
+test("wrong and malformed PIN attempts each consume and deny the exact action", async () => {
+  for (const submittedPin of ["87654321", "not-eight-digits", undefined, "x".repeat(2_000)]) {
+    const verifiedPins: string[] = [];
+    const pinAttempts: SettingsPinAttemptPort = {
+      async reserve() { return { status: "reserved" }; },
+      async verifyAndConsume(input) {
+        verifiedPins.push(input.pin);
+        return { status: "wrong_pin" };
+      },
+      async cancelAndConsume() {},
+    };
+    const bridge = new ProductionPiActionApprovalBridge(pinAttempts);
+    bridge.attachClient("session-wrong-pin", "client-a");
+    const pending = bridge.requestApproval("session-wrong-pin", actionInput());
+    const [request] = bridge.getPendingRequests("session-wrong-pin");
+
+    assert.deepEqual(
+      await bridge.respondForSession(
+        request.sessionId,
+        request.requestId,
+        request.argumentsHash,
+        true,
+        submittedPin,
+      ),
+      { status: "denied", errorCode: "wrong_pin" },
+    );
+    assert.deepEqual(await pending, decision("denied", request.requestId, request.sessionId, request.argumentsHash));
+    assert.deepEqual(bridge.getPendingRequests(request.sessionId), []);
+    assert.equal(verifiedPins.length, 1);
+    if (submittedPin === undefined || (typeof submittedPin === "string" && Buffer.byteLength(submittedPin) > 1_024)) {
+      assert.equal(verifiedPins[0], "");
+    }
+  }
+});
+
+test("missing and unavailable PIN authority fail approval closed", async () => {
+  const cases: Array<SettingsPinAttemptPort | undefined> = [
+    undefined,
+    {
+      async reserve() { return { status: "unavailable" }; },
+      async verifyAndConsume() { return { status: "unavailable" }; },
+      async cancelAndConsume() {},
+    },
+    {
+      async reserve() { return { status: "reserved" }; },
+      async verifyAndConsume() { return { status: "unavailable" }; },
+      async cancelAndConsume() {},
+    },
+    {
+      async reserve(): Promise<ReservePinAttemptResult> { throw new Error("synthetic reserve failure"); },
+      async verifyAndConsume() { return { status: "verified" }; },
+      async cancelAndConsume() {},
+    },
+    {
+      async reserve() { return { status: "reserved" }; },
+      async verifyAndConsume(): Promise<VerifyPinAttemptResult> { throw new Error("synthetic verify failure"); },
+      async cancelAndConsume() {},
+    },
+  ];
+  for (const pinAttempts of cases) {
+    const bridge = new ProductionPiActionApprovalBridge(pinAttempts);
+    bridge.attachClient("session-unavailable", "client-a");
+    const pending = bridge.requestApproval("session-unavailable", actionInput());
+    const [request] = bridge.getPendingRequests("session-unavailable");
+    assert.deepEqual(
+      await bridge.respondForSession(request.sessionId, request.requestId, request.argumentsHash, true, "12345678"),
+      { status: "denied", errorCode: "pin_unavailable" },
+    );
+    assert.equal((await pending).status, "denied");
+    assert.deepEqual(bridge.getPendingRequests(request.sessionId), []);
+  }
+});
+
+test("cooldown and adapter busy never approve and leave a live action retryable", async () => {
+  const retryAt = Date.now() + 30_000;
+  for (const reserveResult of [
+    { status: "cooldown" as const, retryAt },
+    { status: "busy" as const },
+  ]) {
+    let attempts = 0;
+    const pinAttempts: SettingsPinAttemptPort = {
+      async reserve() { attempts += 1; return reserveResult; },
+      async verifyAndConsume() { throw new Error("verification must not run"); },
+      async cancelAndConsume() {},
+    };
+    const bridge = new ProductionPiActionApprovalBridge(pinAttempts);
+    bridge.attachClient("session-retry", "client-a");
+    const pending = bridge.requestApproval("session-retry", actionInput());
+    const [request] = bridge.getPendingRequests("session-retry");
+    const response = await bridge.respondForSession(
+      request.sessionId,
+      request.requestId,
+      request.argumentsHash,
+      true,
+      "12345678",
+    );
+    assert.deepEqual(response, reserveResult.status === "cooldown"
+      ? { status: "rejected", errorCode: "cooldown", retryAt }
+      : { status: "rejected", errorCode: "realm_busy" });
+    assert.equal(attempts, 1);
+    assert.deepEqual(bridge.getPendingRequests(request.sessionId), [request]);
+    assert.deepEqual(
+      await bridge.respondForSession(request.sessionId, request.requestId, request.argumentsHash, false),
+      { status: "denied" },
+    );
+    assert.equal((await pending).status, "denied");
+  }
+});
+
+test("exact request, session, and hash validation precedes every PIN attempt", async () => {
+  let attempts = 0;
+  const pinAttempts: SettingsPinAttemptPort = {
+    async reserve() { attempts += 1; return { status: "reserved" }; },
+    async verifyAndConsume() { return { status: "verified" }; },
+    async cancelAndConsume() {},
+  };
+  const bridge = new ProductionPiActionApprovalBridge(pinAttempts);
+  bridge.attachClient("session-exact", "client-a");
+  const pending = bridge.requestApproval("session-exact", actionInput());
+  const [request] = bridge.getPendingRequests("session-exact");
+
+  assert.equal((await bridge.respondForSession("other", request.requestId, request.argumentsHash, true, "12345678")).status, "rejected");
+  assert.equal((await bridge.respondForSession(request.sessionId, request.requestId, argumentsHash("other"), true, "12345678")).status, "rejected");
+  assert.equal((await bridge.respondForSession(request.sessionId, "invented", request.argumentsHash, true, "12345678")).status, "stale");
+  assert.equal((await bridge.respondForSession(request.sessionId, request.requestId, request.argumentsHash, "true", "12345678")).status, "rejected");
+  assert.equal(attempts, 0);
+  await bridge.respondForSession(request.sessionId, request.requestId, request.argumentsHash, false);
+  assert.equal((await pending).status, "denied");
+});
+
+test("concurrent approval responses cannot double-attempt or outrun direct denial", async () => {
+  let releaseReservation!: (result: ReservePinAttemptResult) => void;
+  let reserveCalls = 0;
+  let verifyCalls = 0;
+  let cancelCalls = 0;
+  const pinAttempts: SettingsPinAttemptPort = {
+    reserve() {
+      reserveCalls += 1;
+      return new Promise<ReservePinAttemptResult>((resolve) => { releaseReservation = resolve; });
+    },
+    async verifyAndConsume() { verifyCalls += 1; return { status: "verified" }; },
+    async cancelAndConsume() { cancelCalls += 1; },
+  };
+  const bridge = new ProductionPiActionApprovalBridge(pinAttempts);
+  bridge.attachClient("session-race", "client-a");
+  const pending = bridge.requestApproval("session-race", actionInput());
+  const [request] = bridge.getPendingRequests("session-race");
+  const firstApproval = bridge.respondForSession(request.sessionId, request.requestId, request.argumentsHash, true, "12345678");
+
+  assert.deepEqual(
+    await bridge.respondForSession(request.sessionId, request.requestId, request.argumentsHash, true, "12345678"),
+    { status: "rejected", errorCode: "realm_busy" },
+  );
+  assert.deepEqual(
+    await bridge.respondForSession(request.sessionId, request.requestId, request.argumentsHash, false),
+    { status: "denied" },
+  );
+  releaseReservation({ status: "reserved" });
+  assert.deepEqual(await firstApproval, { status: "stale", errorCode: "request_not_pending" });
+  assert.equal((await pending).status, "denied");
+  assert.equal(reserveCalls, 1);
+  assert.equal(verifyCalls, 0);
+  assert.equal(cancelCalls, 1);
+});
+
+test("display metadata rejects format, bidi, unsafe controls, and unpaired surrogates", async () => {
+  const unsafeCases: Array<{ sessionId?: string; input: ExternalActionRequestInput }> = [
+    { sessionId: "session\u2066isolate", input: actionInput({ argumentsHash: "session-bidi" }) },
+    { input: actionInput({ connector: "linear\u202Eoverride", argumentsHash: "connector-bidi" }) },
+    { input: actionInput({ workspace: "workspace\u200Bhidden", argumentsHash: "workspace-format" }) },
+    { input: actionInput({ toolName: "create\u2069issue", argumentsHash: "tool-bidi" }) },
+    { input: actionInput({ target: "TEAM\u061C-1", argumentsHash: "target-format" }) },
+    { input: actionInput({ summary: "Approve\u202Edenied", argumentsHash: "summary-bidi" }) },
+    { input: actionInput({ summary: "unsafe\u0000summary", argumentsHash: "summary-control" }) },
+    { input: actionInput({ summary: "unsafe\u000bsummary", argumentsHash: "summary-vertical-tab" }) },
+    { input: actionInput({ summary: "unpaired\uD800summary", argumentsHash: "summary-surrogate" }) },
+  ];
+  for (const { sessionId = "session-display", input } of unsafeCases) {
+    const bridge = new ProductionPiActionApprovalBridge(LEGACY_TEST_PIN_ATTEMPTS);
+    bridge.attachClient(sessionId, "client-a");
+    assert.deepEqual(
+      await bridge.requestApproval(sessionId, input),
+      decision("denied", null, sessionId, input.argumentsHash),
+    );
+    assert.deepEqual(bridge.getPendingRequests(sessionId), []);
+  }
+
+  const bridge = new ProductionPiActionApprovalBridge(LEGACY_TEST_PIN_ATTEMPTS);
+  bridge.attachClient("session-safe-summary", "client-a");
+  const input = actionInput({ summary: "First line\r\n\tindented second line", argumentsHash: "safe-summary" });
+  const pending = bridge.requestApproval("session-safe-summary", input);
+  const [request] = bridge.getPendingRequests("session-safe-summary");
+  assert.equal(request.summary, input.summary);
+  await bridge.respondForSession(request.sessionId, request.requestId, request.argumentsHash, false);
+  assert.equal((await pending).status, "denied");
 });
 
 test("action approval singleton satisfies the exported bridge contract", () => {
@@ -1025,7 +1308,7 @@ test("action approval singleton satisfies the exported bridge contract", () => {
   assert.strictEqual(first, second);
   assert.strictEqual(
     (globalThis as typeof globalThis & {
-      __pi_action_approval_bridge?: PiActionApprovalBridge;
+      __pi_action_approval_bridge?: ProductionPiActionApprovalBridge;
     }).__pi_action_approval_bridge,
     first,
   );

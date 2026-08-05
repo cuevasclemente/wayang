@@ -212,6 +212,8 @@ const FALLBACK_SLASH_COMMANDS: SlashCommandOption[] = [
 const CHAT_DRAFT_STORAGE_PREFIX = "wayang:chat-draft:";
 const INTERVIEW_SUBMISSION_STORAGE_PREFIX = "wayang:interview-submission:";
 const INTERVIEW_ACK_TIMEOUT_MS = 10_000;
+const EXTERNAL_ACTION_ACK_TIMEOUT_MS = 10_000;
+const MAX_RETAINED_EXTERNAL_ACTION_OUTCOMES = 20;
 const INITIAL_TRANSCRIPT_TAIL_ROWS = 200;
 const TRANSCRIPT_HYDRATION_CHUNK_ROWS = 200;
 
@@ -401,6 +403,7 @@ function parseExternalActionRequest(
     || (request.target !== undefined && typeof request.target !== "string")
   ) return null;
 
+  const expired = Date.now() >= request.createdAt + request.timeoutMs;
   return {
     requestId: request.requestId,
     sessionId: expectedSessionId,
@@ -414,6 +417,8 @@ function parseExternalActionRequest(
     createdAt: request.createdAt,
     timeoutMs: request.timeoutMs,
     submitting: false,
+    status: expired ? "timeout" : "pending",
+    live: !expired,
   };
 }
 
@@ -426,12 +431,79 @@ function upsertExternalAction(
   if (index === -1) return [...current, incoming].sort((a, b) => a.createdAt - b.createdAt);
   const existing = current[index];
   const next = [...current];
-  next[index] = {
-    ...incoming,
-    submitting: existing.submitting,
-    responseError: existing.responseError,
-  };
+  next[index] = isExternalActionTerminalStatus(existing.status)
+    ? existing
+    : {
+        ...incoming,
+        submitting: existing.submitting,
+        status: ["awaiting_ack", "rejected", "uncertain"].includes(existing.status)
+          ? existing.status
+          : incoming.status,
+        live: incoming.live,
+        lastSentAt: existing.lastSentAt,
+        retryAt: existing.retryAt,
+        responseError: existing.responseError,
+      };
   return next.sort((a, b) => a.createdAt - b.createdAt);
+}
+
+function isExternalActionTerminalStatus(status: ExternalActionApprovalRequest["status"]): boolean {
+  return ["approved", "denied", "timeout", "cancelled", "stale"].includes(status);
+}
+
+function boundExternalActionApprovalOutcomes(requests: ExternalActionApprovalRequest[]): {
+  requests: ExternalActionApprovalRequest[];
+  evicted: number;
+} {
+  const settled = requests.filter((request) => !request.live);
+  if (settled.length <= MAX_RETAINED_EXTERNAL_ACTION_OUTCOMES) return { requests, evicted: 0 };
+  const retainedKeys = new Set(
+    settled
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, MAX_RETAINED_EXTERNAL_ACTION_OUTCOMES)
+      .map(externalActionKey),
+  );
+  return {
+    requests: requests.filter((request) => request.live || retainedKeys.has(externalActionKey(request))),
+    evicted: settled.length - retainedKeys.size,
+  };
+}
+
+function focusExternalActionCard(requestId: string): void {
+  window.requestAnimationFrame(() => {
+    const card = document.querySelector<HTMLElement>(
+      `[data-testid="external-action-approval"][data-approval-request-id="${CSS.escape(requestId)}"]`,
+    );
+    (card ?? document.querySelector<HTMLElement>("[data-testid=\"chat-input\"]"))?.focus();
+  });
+}
+
+function externalActionRejectionMessage(errorCode: unknown, retryAt: unknown): string {
+  const retryTime = typeof retryAt === "number" && Number.isFinite(retryAt)
+    ? new Date(retryAt).toLocaleTimeString()
+    : null;
+  switch (errorCode) {
+    case "cooldown":
+    case "pin_cooldown":
+      return retryTime
+        ? `Identity PIN verification is cooling down. Try again after ${retryTime}.`
+        : "Identity PIN verification is cooling down. Try again later.";
+    case "realm_busy":
+    case "busy":
+    case "pin_busy":
+      return "Another identity PIN verification is in progress. Try again when it finishes.";
+    case "wrong_pin":
+    case "invalid_pin":
+    case "pin_invalid":
+      return "The identity PIN was not accepted. This action was denied and was not approved.";
+    case "pin_unavailable":
+    case "pin_not_configured":
+      return "Identity PIN verification is unavailable, so the action cannot be approved.";
+    default:
+      return typeof errorCode === "string" && errorCode
+        ? `The server rejected this response (${errorCode}).`
+        : "The server rejected this response.";
+  }
 }
 
 function loadChatDraft(sessionId: string | null): string {
@@ -2014,54 +2086,77 @@ function CommandGuardPinPrompt({
   prompt,
   command,
   reason,
+  externalAction = false,
   onSubmit,
   onCancel,
 }: {
   prompt: string;
   command?: string;
   reason?: string;
+  externalAction?: boolean;
   onSubmit: (pin: string) => void;
   onCancel: () => void;
 }) {
   const [pin, setPin] = useState("");
+  const [validationError, setValidationError] = useState("");
+  const pinValid = /^\d{8}$/.test(pin);
 
   return (
     <form
+      data-testid="identity-pin-prompt"
+      role="dialog"
+      aria-label={externalAction ? "External action identity PIN" : "Command guard identity PIN"}
+      aria-describedby="identity-pin-description"
       className="border border-red-900/60 rounded-lg overflow-hidden bg-neutral-900"
       onSubmit={(e) => {
         e.preventDefault();
+        if (!pinValid) {
+          setValidationError("Enter the complete 8-digit identity PIN.");
+          return;
+        }
         onSubmit(pin);
         setPin("");
+        setValidationError("");
       }}
     >
       <div className="px-4 py-3 border-b border-neutral-800">
         <div className="text-[10px] uppercase tracking-wider text-red-400 mb-1 font-semibold">
-          Command guard identity check
+          {externalAction ? "External action identity check" : "Command guard identity check"}
         </div>
         <p className="text-sm text-neutral-200">{prompt}</p>
         {reason && <p className="mt-2 text-xs text-neutral-400">{reason}</p>}
         {command && (
           <div className="mt-3">
             <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1 font-semibold">
-              Command under review
+              {externalAction ? "External action under review" : "Command under review"}
             </div>
             <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded border border-neutral-800 bg-neutral-950 px-3 py-2 text-xs text-red-100">
               {command}
             </pre>
           </div>
         )}
-        <p className="text-xs text-neutral-500 mt-2">
-          Enter the 8-digit identity PIN. This is separate from sudo and is not stored in chat history.
+        <p id="identity-pin-description" className="text-xs text-neutral-500 mt-2">
+          {externalAction
+            ? "Enter the 8-digit identity PIN to approve only this exact action. The PIN is sent transiently with the response and is not stored in chat history."
+            : "Enter the 8-digit identity PIN. This is separate from sudo and is not stored in chat history."}
         </p>
       </div>
       <div className="p-4 flex items-center gap-2">
+        <label htmlFor="identity-pin-input" className="sr-only">8-digit identity PIN</label>
         <input
+          id="identity-pin-input"
+          aria-describedby="identity-pin-description"
           type="password"
           inputMode="numeric"
           pattern="[0-9]{8}"
+          minLength={8}
           maxLength={8}
+          required
           value={pin}
-          onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 8))}
+          onChange={(e) => {
+            setPin(e.target.value.replace(/\D/g, "").slice(0, 8));
+            setValidationError("");
+          }}
           onKeyDown={(e) => {
             if (e.key === "Escape") {
               e.preventDefault();
@@ -2074,8 +2169,8 @@ function CommandGuardPinPrompt({
           autoComplete="off"
           autoFocus
         />
-        <button type="submit" className="px-3 py-2 text-xs font-semibold rounded bg-red-700 hover:bg-red-600 text-white">
-          Verify
+        <button type="submit" disabled={!pinValid} className="px-3 py-2 text-xs font-semibold rounded bg-red-700 hover:bg-red-600 text-white disabled:cursor-not-allowed disabled:opacity-50">
+          {externalAction ? "Approve with PIN" : "Verify"}
         </button>
         <button
           type="button"
@@ -2088,6 +2183,7 @@ function CommandGuardPinPrompt({
           Cancel
         </button>
       </div>
+      {validationError && <p className="px-4 pb-3 text-xs text-red-300" role="status">{validationError}</p>}
     </form>
   );
 }
@@ -2353,7 +2449,9 @@ export function ChatPanel({
     command?: string;
     reason?: string;
     requestedMode?: CommandGuardMode;
+    externalActionKey?: string;
   } | null>(null);
+  const [externalActionRetentionNotice, setExternalActionRetentionNotice] = useState("");
   const [todoState, setTodoState] = useState<TodoState>({ todos: [], source: "none" });
   const [isTodoPanelOpen, setIsTodoPanelOpen] = useState(false);
   const [contextUsage, setContextUsage] = useState<{
@@ -2500,13 +2598,22 @@ export function ChatPanel({
   const streamingBlocksRef = useRef<StreamingBlocks>({ content: [] });
   const interviewQueueRef = useRef<QueuedInterview[]>([]);
   const externalActionApprovalsRef = useRef<ExternalActionApprovalRequest[]>([]);
+  const activeCommandGuardPinPromptRef = useRef(activeCommandGuardPinPrompt);
+  const identityPinReturnFocusRef = useRef<HTMLButtonElement | null>(null);
   const isRestoringDraftRef = useRef(false);
   activeSessionErrorRef.current = activeSession?.error ?? null;
   activeSessionRuntimeStreamingRef.current = Boolean(activeSession?.runtime_is_streaming);
+  activeCommandGuardPinPromptRef.current = activeCommandGuardPinPrompt;
 
   useLayoutEffect(() => {
     selectedSessionIdRef.current = activeSessionId;
     selectionGenerationRef.current += 1;
+    const prompt = activeCommandGuardPinPromptRef.current;
+    if (prompt?.sessionId && prompt.sessionId !== activeSessionId) {
+      activeCommandGuardPinPromptRef.current = null;
+      identityPinReturnFocusRef.current = null;
+      setActiveCommandGuardPinPrompt(null);
+    }
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -2552,9 +2659,14 @@ export function ChatPanel({
   const setExternalActionApprovalsSynced = useCallback((
     updater: (prev: ExternalActionApprovalRequest[]) => ExternalActionApprovalRequest[],
   ) => {
-    const next = updater(externalActionApprovalsRef.current);
-    externalActionApprovalsRef.current = next;
-    setExternalActionApprovals(next);
+    const bounded = boundExternalActionApprovalOutcomes(updater(externalActionApprovalsRef.current));
+    externalActionApprovalsRef.current = bounded.requests;
+    setExternalActionApprovals(bounded.requests);
+    if (bounded.evicted > 0) {
+      setExternalActionRetentionNotice(
+        `Removed ${bounded.evicted} older settled action ${bounded.evicted === 1 ? "card" : "cards"} to keep this view bounded. Disappearance is not evidence of approval.`,
+      );
+    }
   }, []);
 
   const visibleExternalActionApprovals = useMemo(() => {
@@ -3123,7 +3235,8 @@ export function ChatPanel({
           });
           setCommandGuardSaving(false);
           if (msg.pinRequired) {
-            setActiveCommandGuardPinPrompt({
+            setActiveCommandGuardPinPrompt((current) => current ?? {
+              sessionId: activeSessionIdRef.current ?? undefined,
               prompt: msg.error || "Identity PIN required to disable command guard",
               requestedMode: "off",
             });
@@ -3162,16 +3275,92 @@ export function ChatPanel({
             const request = parseExternalActionRequest(value, sessionId, selectionId);
             return request ? [request] : [];
           });
-          // A sync-complete snapshot is authoritative. Re-enable requests that
-          // remain pending (the old response did not settle), and remove a
-          // locally disabled card when its acknowledgement was lost after the
-          // backend had already resolved it.
-          setExternalActionApprovalsSynced((current) => [
-            ...current.filter((request) => (
-              request.sessionId !== sessionId || request.selectionId !== selectionId
-            )),
-            ...requests,
-          ]);
+          // A sync-complete snapshot is authoritative about what remains
+          // pending, but absence is not evidence that a local response was
+          // approved. Preserve omitted cards as an explicit unknown outcome.
+          setExternalActionApprovalsSynced((current) => {
+            const scopedCurrent = current.filter((request) => (
+              request.sessionId === sessionId && request.selectionId === selectionId
+            ));
+            const incomingByKey = new Map(requests.map((request) => [externalActionKey(request), request]));
+            const reconciled = requests.map((request): ExternalActionApprovalRequest => {
+              const existing = scopedCurrent.find((candidate) => externalActionKey(candidate) === externalActionKey(request));
+              if (!existing) return request;
+              if (isExternalActionTerminalStatus(existing.status)) return existing;
+              const responseWasUnconfirmed = existing.submitting || existing.status === "awaiting_ack";
+              return {
+                ...request,
+                submitting: false,
+                status: responseWasUnconfirmed
+                  ? "uncertain"
+                  : existing.status === "unknown"
+                    ? request.status
+                    : existing.status,
+                live: true,
+                lastSentAt: existing.lastSentAt,
+                retryAt: existing.retryAt,
+                responseError: responseWasUnconfirmed
+                  ? "The server still lists this request as pending; the previous response was not confirmed."
+                  : existing.status === "unknown"
+                    ? undefined
+                    : existing.responseError,
+              };
+            });
+            const omitted = scopedCurrent
+              .filter((request) => !incomingByKey.has(externalActionKey(request)))
+              .map((request) => (
+                !request.live || isExternalActionTerminalStatus(request.status)
+                  ? request
+                  : {
+                      ...request,
+                      submitting: false,
+                      status: "unknown" as const,
+                      live: false,
+                      responseError: "This card is retained because the server snapshot omitted it without a terminal outcome visible to this browser.",
+                    }
+              ));
+            return [
+              ...current.filter((request) => (
+                request.sessionId !== sessionId || request.selectionId !== selectionId
+              )),
+              ...reconciled,
+              ...omitted,
+            ].sort((a, b) => a.createdAt - b.createdAt);
+          });
+          return;
+        }
+
+        if (msg.type === "external_action_terminal") {
+          const requestId = typeof msg.requestId === "string" ? msg.requestId : null;
+          const sessionId = typeof msg.sessionId === "string" ? msg.sessionId : null;
+          const selectionId = typeof msg.selection_id === "string" ? msg.selection_id : null;
+          const status = typeof msg.status === "string" ? msg.status : null;
+          if (
+            !requestId
+            || !sessionId
+            || !selectionId
+            || sessionId !== activeSessionIdRef.current
+            || selectionId !== selectionIdRef.current
+            || !["approved", "denied", "timeout", "cancelled"].includes(status ?? "")
+          ) return;
+          const key = `${sessionId}\0${selectionId}\0${requestId}`;
+          setExternalActionApprovalsSynced((current) => current.map((request) => (
+            externalActionKey(request) === key
+              ? {
+                  ...request,
+                  submitting: false,
+                  status: status as "approved" | "denied" | "timeout" | "cancelled",
+                  live: false,
+                  responseError: undefined,
+                }
+              : request
+          )));
+          const closedActionPrompt = activeCommandGuardPinPromptRef.current?.externalActionKey === key;
+          setActiveCommandGuardPinPrompt((current) => current?.externalActionKey === key ? null : current);
+          if (closedActionPrompt) {
+            identityPinReturnFocusRef.current = null;
+            focusExternalActionCard(requestId);
+          }
           return;
         }
 
@@ -3188,15 +3377,50 @@ export function ChatPanel({
             || selectionId !== selectionIdRef.current
             || !["approved", "denied", "stale", "rejected"].includes(status ?? "")
           ) return;
-          setExternalActionApprovalsSynced((current) => {
-            const key = `${sessionId}\0${selectionId}\0${requestId}`;
-            if (status !== "rejected") {
-              return current.filter((request) => externalActionKey(request) !== key);
+          const key = `${sessionId}\0${selectionId}\0${requestId}`;
+          setExternalActionApprovalsSynced((current) => current.map((request) => {
+            if (externalActionKey(request) !== key) return request;
+            // Explicit terminal events are authoritative. A delayed response
+            // from another tab or an expiry race may acknowledge stale or
+            // rejected after terminal; it can enrich a matching denial but can
+            // never downgrade or replace the recorded outcome.
+            if (isExternalActionTerminalStatus(request.status)) {
+              return request.status === "denied"
+                && status === "denied"
+                && typeof msg.errorCode === "string"
+                ? { ...request, responseError: externalActionRejectionMessage(msg.errorCode, msg.retryAt) }
+                : request;
             }
-            return current.map((request) => externalActionKey(request) === key
-              ? { ...request, submitting: false, responseError: "The server rejected this response. Review the action and try again." }
-              : request);
-          });
+            if (status === "rejected") {
+              const retryAt = typeof msg.retryAt === "number" && Number.isFinite(msg.retryAt) ? msg.retryAt : undefined;
+              const stillLive = Date.now() < request.createdAt + request.timeoutMs;
+              return {
+                ...request,
+                submitting: false,
+                status: stillLive ? "rejected" as const : "timeout" as const,
+                live: stillLive,
+                retryAt: stillLive ? retryAt : undefined,
+                responseError: stillLive ? externalActionRejectionMessage(msg.errorCode, retryAt) : undefined,
+              };
+            }
+            return {
+              ...request,
+              submitting: false,
+              status: status as "approved" | "denied" | "stale",
+              live: false,
+              responseError: status === "denied" && typeof msg.errorCode === "string"
+                ? externalActionRejectionMessage(msg.errorCode, msg.retryAt)
+                : undefined,
+            };
+          }));
+          if (status !== "rejected") {
+            const closedActionPrompt = activeCommandGuardPinPromptRef.current?.externalActionKey === key;
+            setActiveCommandGuardPinPrompt((current) => current?.externalActionKey === key ? null : current);
+            if (closedActionPrompt) {
+              identityPinReturnFocusRef.current = null;
+              focusExternalActionCard(requestId);
+            }
+          }
           return;
         }
 
@@ -3248,11 +3472,25 @@ export function ChatPanel({
           return;
         }
 
-        // Command guard identity PIN requests
+        // Command guard identity PIN requests are session-bound. A delayed
+        // request from a prior selection must never collect a PIN in the newly
+        // selected session.
         if (msg.type === "command_guard_pin_request") {
+          const promptSessionId = typeof msg.sessionId === "string" ? msg.sessionId : null;
+          if (!promptSessionId || promptSessionId !== activeSessionIdRef.current) return;
+          if (activeCommandGuardPinPromptRef.current) {
+            if (typeof msg.requestId === "string") {
+              ws.send(JSON.stringify({
+                type: "command_guard_pin_response",
+                requestId: msg.requestId,
+                cancelled: true,
+              }));
+            }
+            return;
+          }
           setActiveCommandGuardPinPrompt({
             requestId: msg.requestId,
-            sessionId: msg.sessionId || activeSessionIdRef.current,
+            sessionId: promptSessionId,
             prompt: msg.prompt || "Identity PIN required",
             command: typeof msg.command === "string" ? msg.command : undefined,
             reason: typeof msg.reason === "string" ? msg.reason : undefined,
@@ -3381,6 +3619,16 @@ export function ChatPanel({
             ? { ...item, submission: { ...item.submission, state: "retry", message: "Connection closed before acknowledgement; this answer will be resent after reconnect." } }
             : item
         )));
+        setExternalActionApprovalsSynced((current) => current.map((request) => (
+          request.submitting
+            ? {
+                ...request,
+                submitting: false,
+                status: "uncertain" as const,
+                responseError: "The connection closed before acknowledgement. The action may still be pending; review before trying again.",
+              }
+            : request
+        )));
 
         void canRetryAuthenticatedTransport().then((canRetry) => {
           if (!canRetry || ev.code === 1008 || !activeSessionIdRef.current || wsRef.current) return;
@@ -3450,6 +3698,7 @@ export function ChatPanel({
     // selection generation. The new selection's snapshot repopulates only
     // requests that are still live on the backend.
     setExternalActionApprovalsSynced(() => []);
+    setExternalActionRetentionNotice("");
     if (!activeSessionId) {
       // A durable chat socket may switch directly between selected sessions,
       // but a null selection has no backend identity to bind to. Retire the
@@ -3562,6 +3811,62 @@ export function ChatPanel({
     }, 1_000);
     return () => window.clearInterval(interval);
   }, [setInterviewQueueSynced]);
+
+  // Expiry and acknowledgement uncertainty are browser-visible safety states,
+  // not reasons to erase a request. The backend terminal event remains
+  // authoritative if it arrives later.
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      const now = Date.now();
+      setExternalActionApprovalsSynced((current) => {
+        let changed = false;
+        const next = current.map((request) => {
+          if (request.live && now >= request.createdAt + request.timeoutMs) {
+            changed = true;
+            return {
+              ...request,
+              submitting: false,
+              status: "timeout" as const,
+              live: false,
+              retryAt: undefined,
+              responseError: undefined,
+            };
+          }
+          if (
+            request.submitting
+            && request.lastSentAt
+            && now - request.lastSentAt >= EXTERNAL_ACTION_ACK_TIMEOUT_MS
+          ) {
+            changed = true;
+            return {
+              ...request,
+              submitting: false,
+              status: "uncertain" as const,
+              responseError: "No acknowledgement or terminal event arrived within 10 seconds. The outcome is uncertain; review before trying again.",
+            };
+          }
+          if (request.retryAt && now >= request.retryAt) {
+            changed = true;
+            return { ...request, retryAt: undefined };
+          }
+          return request;
+        });
+        return changed ? next : current;
+      });
+    }, 250);
+    return () => window.clearInterval(interval);
+  }, [setExternalActionApprovalsSynced]);
+
+  useEffect(() => {
+    const key = activeCommandGuardPinPrompt?.externalActionKey;
+    if (!key) return;
+    const request = externalActionApprovals.find((candidate) => externalActionKey(candidate) === key);
+    if (!request || !request.live) {
+      identityPinReturnFocusRef.current = null;
+      setActiveCommandGuardPinPrompt((current) => current?.externalActionKey === key ? null : current);
+      focusExternalActionCard(request?.requestId ?? activeCommandGuardPinPrompt?.externalActionKey?.split("\0").at(-1) ?? "");
+    }
+  }, [activeCommandGuardPinPrompt?.externalActionKey, externalActionApprovals]);
 
   // ------------------------------------------------------------------
   // Handlers
@@ -3841,10 +4146,11 @@ export function ChatPanel({
   }, [restoreQueuedMessagesToComposer, sendWs]);
 
   const handleCommandGuardToggle = useCallback(() => {
-    if (wsStatus !== "connected" || commandGuardSaving) return;
+    if (wsStatus !== "connected" || commandGuardSaving || activeCommandGuardPinPrompt) return;
     const nextMode: CommandGuardMode = commandGuardState?.mode === "off" ? "balanced" : "off";
     if (nextMode === "off") {
       setActiveCommandGuardPinPrompt({
+        sessionId: activeSessionIdRef.current ?? undefined,
         prompt: "Identity PIN required to disable command guard",
         reason: "Disabling command guard is a high-impact safety-control change.",
         requestedMode: "off",
@@ -3859,25 +4165,37 @@ export function ChatPanel({
       source: "pending",
     }));
     sendWs({ type: "command_guard", mode: nextMode });
-  }, [commandGuardSaving, commandGuardState?.mode, sendWs, wsStatus]);
+  }, [activeCommandGuardPinPrompt, commandGuardSaving, commandGuardState?.mode, sendWs, wsStatus]);
 
-  const handleExternalActionRespond = useCallback((
+  const sendExternalActionResponse = useCallback((
     request: ExternalActionApprovalRequest,
     approved: boolean,
+    pin?: string,
   ) => {
-    let exactRequest: ExternalActionApprovalRequest | undefined;
-    setExternalActionApprovalsSynced((current) => current.map((candidate) => {
-      if (
-        externalActionKey(candidate) !== externalActionKey(request)
-        || candidate.submitting
-        || candidate.sessionId !== activeSessionIdRef.current
-        || candidate.selectionId !== selectionIdRef.current
-      ) return candidate;
-      exactRequest = candidate;
-      return { ...candidate, submitting: true, responseError: undefined };
-    }));
-    if (!exactRequest) return;
+    const key = externalActionKey(request);
+    const exactRequest = externalActionApprovalsRef.current.find((candidate) => (
+      externalActionKey(candidate) === key
+      && candidate.live
+      && !candidate.submitting
+      && candidate.sessionId === activeSessionIdRef.current
+      && candidate.selectionId === selectionIdRef.current
+      && Date.now() < candidate.createdAt + candidate.timeoutMs
+    ));
+    if (!exactRequest || (approved && !/^\d{8}$/.test(pin ?? ""))) return;
 
+    const lastSentAt = Date.now();
+    setExternalActionApprovalsSynced((current) => current.map((candidate) => (
+      externalActionKey(candidate) === key
+        ? {
+            ...candidate,
+            submitting: true,
+            status: "awaiting_ack" as const,
+            lastSentAt,
+            retryAt: undefined,
+            responseError: undefined,
+          }
+        : candidate
+    )));
     const sent = sendWs({
       type: "external_action_response",
       requestId: exactRequest.requestId,
@@ -3885,15 +4203,67 @@ export function ChatPanel({
       selection_id: exactRequest.selectionId,
       argumentsHash: exactRequest.argumentsHash,
       approved,
+      ...(approved ? { pin } : {}),
     });
     if (!sent) {
       setExternalActionApprovalsSynced((current) => current.map((candidate) => (
-        externalActionKey(candidate) === externalActionKey(exactRequest!)
-          ? { ...candidate, submitting: false, responseError: "Reconnect before responding to this action." }
+        externalActionKey(candidate) === key
+          ? {
+              ...candidate,
+              submitting: false,
+              status: "uncertain" as const,
+              responseError: "The response could not be sent. Reconnect and review the action before trying again.",
+            }
           : candidate
       )));
     }
   }, [sendWs, setExternalActionApprovalsSynced]);
+
+  const handleExternalActionRespond = useCallback((
+    request: ExternalActionApprovalRequest,
+    approved: boolean,
+    trigger: HTMLButtonElement,
+  ) => {
+    const key = externalActionKey(request);
+    const exactRequest = externalActionApprovalsRef.current.find((candidate) => (
+      externalActionKey(candidate) === key
+      && candidate.live
+      && !candidate.submitting
+      && candidate.sessionId === activeSessionIdRef.current
+      && candidate.selectionId === selectionIdRef.current
+    ));
+    if (!exactRequest) return;
+    if (!approved) {
+      setActiveCommandGuardPinPrompt((current) => current?.externalActionKey === key ? null : current);
+      sendExternalActionResponse(exactRequest, false);
+      return;
+    }
+    if (activeCommandGuardPinPrompt) {
+      setExternalActionApprovalsSynced((current) => current.map((candidate) => (
+        externalActionKey(candidate) === key
+          ? { ...candidate, responseError: "Finish or cancel the current identity PIN prompt before approving this action." }
+          : candidate
+      )));
+      return;
+    }
+    setExternalActionApprovalsSynced((current) => current.map((candidate) => (
+      externalActionKey(candidate) === key ? { ...candidate, responseError: undefined } : candidate
+    )));
+    identityPinReturnFocusRef.current = trigger;
+    setActiveCommandGuardPinPrompt({
+      sessionId: exactRequest.sessionId,
+      prompt: "Enter your identity PIN to approve this external action",
+      command: exactRequest.summary,
+      reason: "Wayang binds approval to the exact connector request, argument hash, session, and selection. The companion extension remains responsible for making this preview truthful.",
+      externalActionKey: key,
+    });
+  }, [activeCommandGuardPinPrompt, sendExternalActionResponse, setExternalActionApprovalsSynced]);
+
+  const handleExternalActionDismiss = useCallback((request: ExternalActionApprovalRequest) => {
+    if (request.live) return;
+    const key = externalActionKey(request);
+    setExternalActionApprovalsSynced((current) => current.filter((candidate) => externalActionKey(candidate) !== key));
+  }, [setExternalActionApprovalsSynced]);
 
   const handleInterviewSubmit = useCallback(
     (answers: InterviewAnswer[]) => {
@@ -3967,7 +4337,23 @@ export function ChatPanel({
 
   const handleCommandGuardPinSubmit = useCallback((pin: string) => {
     if (!activeCommandGuardPinPrompt) return;
-    if (activeCommandGuardPinPrompt.requestId) {
+    if (
+      activeCommandGuardPinPrompt.sessionId
+      && activeCommandGuardPinPrompt.sessionId !== activeSessionIdRef.current
+    ) {
+      setActiveCommandGuardPinPrompt(null);
+      return;
+    }
+    if (activeCommandGuardPinPrompt.externalActionKey) {
+      const request = externalActionApprovalsRef.current.find((candidate) => (
+        externalActionKey(candidate) === activeCommandGuardPinPrompt.externalActionKey
+      ));
+      if (request) {
+        sendExternalActionResponse(request, true, pin);
+        identityPinReturnFocusRef.current = null;
+        focusExternalActionCard(request.requestId);
+      }
+    } else if (activeCommandGuardPinPrompt.requestId) {
       sendWs({
         type: "command_guard_pin_response",
         requestId: activeCommandGuardPinPrompt.requestId,
@@ -3978,11 +4364,21 @@ export function ChatPanel({
       sendWs({ type: "command_guard", mode: activeCommandGuardPinPrompt.requestedMode, pin });
     }
     setActiveCommandGuardPinPrompt(null);
-  }, [activeCommandGuardPinPrompt, sendWs]);
+  }, [activeCommandGuardPinPrompt, sendExternalActionResponse, sendWs]);
 
   const handleCommandGuardPinCancel = useCallback(() => {
     if (!activeCommandGuardPinPrompt) return;
-    if (activeCommandGuardPinPrompt.requestId) {
+    // Cancelling an external-action PIN prompt is deliberately local: it
+    // returns to the still-live card without approving or denying it.
+    if (activeCommandGuardPinPrompt.externalActionKey) {
+      const returnFocus = identityPinReturnFocusRef.current;
+      const requestId = activeCommandGuardPinPrompt.externalActionKey.split("\0").at(-1) ?? "";
+      identityPinReturnFocusRef.current = null;
+      window.requestAnimationFrame(() => {
+        if (returnFocus?.isConnected && !returnFocus.disabled) returnFocus.focus();
+        else focusExternalActionCard(requestId);
+      });
+    } else if (activeCommandGuardPinPrompt.requestId) {
       sendWs({
         type: "command_guard_pin_response",
         requestId: activeCommandGuardPinPrompt.requestId,
@@ -4653,17 +5049,24 @@ export function ChatPanel({
       <QueuedUserMessages messages={queuedUserMessages} />
 
       {/* ---- Interactive prompts: never persisted into chat history ---- */}
-      {visibleExternalActionApprovals.length > 0 && (
+      {(visibleExternalActionApprovals.length > 0 || externalActionRetentionNotice) && (
         <section
           data-testid="external-action-approvals"
           aria-label="External action approvals"
           className="max-h-[50vh] shrink-0 space-y-2 overflow-y-auto border-t border-amber-900/60 bg-neutral-950 px-3 py-2"
         >
+          {externalActionRetentionNotice && (
+            <div className="flex items-start justify-between gap-3 rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-xs text-neutral-300" role="status">
+              <span>{externalActionRetentionNotice}</span>
+              <button type="button" className="shrink-0 underline" onClick={() => setExternalActionRetentionNotice("")}>Dismiss notice</button>
+            </div>
+          )}
           {visibleExternalActionApprovals.map((request) => (
             <ExternalActionApproval
               key={externalActionKey(request)}
               request={request}
               onRespond={handleExternalActionRespond}
+              onDismiss={handleExternalActionDismiss}
             />
           ))}
         </section>
@@ -4708,10 +5111,11 @@ export function ChatPanel({
       {activeCommandGuardPinPrompt && (
         <div className="shrink-0 border-t border-red-900/50 bg-neutral-950 px-3 py-2">
           <CommandGuardPinPrompt
-            key={activeCommandGuardPinPrompt.requestId}
+            key={activeCommandGuardPinPrompt.requestId ?? activeCommandGuardPinPrompt.externalActionKey ?? "command-guard-mode"}
             prompt={activeCommandGuardPinPrompt.prompt}
             command={activeCommandGuardPinPrompt.command}
             reason={activeCommandGuardPinPrompt.reason}
+            externalAction={Boolean(activeCommandGuardPinPrompt.externalActionKey)}
             onSubmit={handleCommandGuardPinSubmit}
             onCancel={handleCommandGuardPinCancel}
           />

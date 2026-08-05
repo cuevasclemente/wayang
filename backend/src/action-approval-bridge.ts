@@ -6,7 +6,8 @@
  * exact proposed call with argumentsHash.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import type { SettingsPinAttemptPort } from "./workspace-capability-approval/types.js";
 
 export interface ExternalActionRequest {
   requestId: string;
@@ -32,6 +33,15 @@ export interface ExternalActionRequestInput {
 
 export type ApprovalTerminalStatus = "approved" | "denied" | "timeout" | "cancelled";
 export type ApprovalResponseStatus = "approved" | "denied" | "stale" | "rejected";
+export type ApprovalResponseErrorCode =
+  | "request_not_pending"
+  | "request_identity_mismatch"
+  | "invalid_decision"
+  | "realm_busy"
+  | "cooldown"
+  | "pin_unavailable"
+  | "wrong_pin"
+  | "request_expired";
 
 export interface ApprovalDecision {
   status: ApprovalTerminalStatus;
@@ -42,7 +52,8 @@ export interface ApprovalDecision {
 
 export interface ApprovalResponse {
   status: ApprovalResponseStatus;
-  reason?: string;
+  errorCode?: ApprovalResponseErrorCode;
+  retryAt?: number;
 }
 
 export interface ApprovalTerminalEvent {
@@ -64,13 +75,14 @@ export interface ActionApprovalBridge {
     input: ExternalActionRequestInput,
     options?: ApprovalRequestOptions,
   ): Promise<ApprovalDecision>;
-  /** Accepts untrusted transport input and resolves only literal boolean decisions. */
+  /** Accepts untrusted transport input; approval additionally requires one PIN attempt. */
   respondForSession(
     sessionId: string,
     requestId: string,
     argumentsHash: string,
     approved: unknown,
-  ): ApprovalResponse;
+    pin?: unknown,
+  ): Promise<ApprovalResponse>;
   cancelRequest(requestId: string, reason?: string): boolean;
   cancelSession(sessionId: string, reason?: string): void;
   onRequest(callback: (request: ExternalActionRequest) => void): () => void;
@@ -86,6 +98,7 @@ interface PendingApproval {
   expiresAt: number;
   resolve: (decision: ApprovalDecision) => void;
   timer: ReturnType<typeof setTimeout>;
+  approvalInProgress: boolean;
   removeAbortListener?: () => void;
 }
 
@@ -97,7 +110,10 @@ const MAX_CONNECTOR_BYTES = 256;
 const MAX_WORKSPACE_BYTES = 256;
 const MAX_TOOL_NAME_BYTES = 256;
 const MAX_TARGET_BYTES = 2_048;
-const CONTROL_CHARACTER_PATTERN = /\p{Cc}/u;
+const MAX_PIN_BYTES = 1_024;
+const EXTERNAL_ACTION_APPROVAL_REALM = "wayang.external-actions.v1";
+const UNSAFE_METADATA_PATTERN = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const UNSAFE_SUMMARY_PATTERN = /[\p{Cf}\p{Cs}\u0000-\u0008\u000b-\u000c\u000e-\u001f\u007f-\u009f]/u;
 const ARGUMENTS_HASH_PATTERN = /^[0-9a-fA-F]{64}$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -197,8 +213,33 @@ function isBoundedMetadata(value: unknown, maxBytes: number): value is string {
     typeof value === "string"
     && value.length > 0
     && Buffer.byteLength(value, "utf8") <= maxBytes
-    && !CONTROL_CHARACTER_PATTERN.test(value)
+    && !UNSAFE_METADATA_PATTERN.test(value)
   );
+}
+
+function isBoundedSummary(value: unknown): value is string {
+  return typeof value === "string"
+    && Buffer.byteLength(value, "utf8") > 0
+    && Buffer.byteLength(value, "utf8") <= MAX_SUMMARY_BYTES
+    && !UNSAFE_SUMMARY_PATTERN.test(value);
+}
+
+function approvalOperationDigest(pending: PendingApproval): string {
+  const request = pending.request;
+  return createHash("sha256").update(JSON.stringify({
+    realm: EXTERNAL_ACTION_APPROVAL_REALM,
+    requestId: request.requestId,
+    sessionId: request.sessionId,
+    connector: request.connector,
+    workspace: request.workspace ?? null,
+    toolName: request.toolName,
+    target: request.target ?? null,
+    summary: request.summary,
+    argumentsHash: request.argumentsHash,
+    createdAt: request.createdAt,
+    timeoutMs: request.timeoutMs,
+    expiresAt: pending.expiresAt,
+  })).digest("hex");
 }
 
 function deniedAdmissionDecision(
@@ -241,6 +282,20 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
   private readonly pending = new Map<string, PendingApproval>();
   private readonly requestListeners = new Set<RequestCallback>();
   private readonly terminalListeners = new Set<TerminalCallback>();
+  private pinAttempts: SettingsPinAttemptPort | undefined;
+
+  constructor(pinAttempts?: SettingsPinAttemptPort) {
+    this.pinAttempts = pinAttempts;
+  }
+
+  /** Production installs exactly one shared hardened attempt authority. */
+  installPinAttempts(pinAttempts: SettingsPinAttemptPort): void {
+    if (this.pinAttempts && this.pinAttempts !== pinAttempts
+      && (this.clients.size > 0 || this.pending.size > 0)) {
+      throw new Error("External-action PIN attempt authority cannot change while approvals are live");
+    }
+    this.pinAttempts = pinAttempts;
+  }
 
   attachClient(sessionId: string, clientId: string): () => void {
     let sessionClients = this.clients.get(sessionId);
@@ -295,9 +350,7 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
       || (workspace !== undefined && !isBoundedMetadata(workspace, MAX_WORKSPACE_BYTES))
       || !isBoundedMetadata(toolName, MAX_TOOL_NAME_BYTES)
       || (target !== undefined && !isBoundedMetadata(target, MAX_TARGET_BYTES))
-      || typeof summary !== "string"
-      || Buffer.byteLength(summary, "utf8") === 0
-      || Buffer.byteLength(summary, "utf8") > MAX_SUMMARY_BYTES
+      || !isBoundedSummary(summary)
       || typeof argumentsHash !== "string"
       || !ARGUMENTS_HASH_PATTERN.test(argumentsHash)
       || typeof timeoutMs !== "number"
@@ -396,10 +449,11 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
       }, request.timeoutMs);
 
       this.pending.set(request.requestId, {
-        request,
+        request: Object.freeze(request),
         expiresAt: request.createdAt + request.timeoutMs,
         resolve,
         timer,
+        approvalInProgress: false,
         ...(signal && abortHandler
           ? { removeAbortListener: () => signal.remove(abortHandler) }
           : {}),
@@ -409,33 +463,162 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
     });
   }
 
-  respondForSession(
+  async respondForSession(
     sessionId: string,
     requestId: string,
     argumentsHash: string,
     approved: unknown,
-  ): ApprovalResponse {
+    pin?: unknown,
+  ): Promise<ApprovalResponse> {
     const pending = this.pending.get(requestId);
     if (!pending) {
-      return { status: "stale", reason: "request is no longer pending" };
+      return { status: "stale", errorCode: "request_not_pending" };
     }
     if (Date.now() >= pending.expiresAt) {
       this.finish(requestId, "timeout");
-      return { status: "stale", reason: "request is no longer pending" };
+      return { status: "stale", errorCode: "request_expired" };
     }
     if (
-      pending.request.sessionId !== sessionId ||
-      pending.request.argumentsHash !== argumentsHash
+      pending.request.sessionId !== sessionId
+      || pending.request.argumentsHash !== argumentsHash
     ) {
-      return { status: "rejected", reason: "request identity mismatch" };
+      return { status: "rejected", errorCode: "request_identity_mismatch" };
     }
     if (approved !== true && approved !== false) {
-      return { status: "rejected", reason: "approval decision must be boolean" };
+      return { status: "rejected", errorCode: "invalid_decision" };
     }
 
-    const status: ApprovalTerminalStatus = approved ? "approved" : "denied";
-    this.finish(requestId, status);
-    return { status };
+    // Denial is deliberately PIN-free, including while an approval attempt is
+    // awaiting the adapter. The racing attempt rechecks this exact object and
+    // can never approve after terminal denial.
+    if (approved === false) {
+      this.finish(requestId, "denied");
+      return { status: "denied" };
+    }
+    if (pending.approvalInProgress) {
+      return { status: "rejected", errorCode: "realm_busy" };
+    }
+
+    const pinAttempts = this.pinAttempts;
+    if (!pinAttempts) {
+      this.finish(requestId, "denied");
+      return { status: "denied", errorCode: "pin_unavailable" };
+    }
+
+    pending.approvalInProgress = true;
+    const reservationId = randomUUID();
+    const reservationInput = {
+      realm: EXTERNAL_ACTION_APPROVAL_REALM,
+      reservationId,
+      requestId: pending.request.requestId,
+      operationDigest: approvalOperationDigest(pending),
+      expiresAt: pending.expiresAt,
+    };
+    let reservation: Awaited<ReturnType<SettingsPinAttemptPort["reserve"]>>;
+    try {
+      reservation = await pinAttempts.reserve(reservationInput);
+    } catch {
+      if (this.pending.get(requestId) !== pending) {
+        return { status: "stale", errorCode: "request_not_pending" };
+      }
+      this.finish(requestId, "denied");
+      return { status: "denied", errorCode: "pin_unavailable" };
+    }
+
+    if (reservation.status === "cooldown" || reservation.status === "busy") {
+      if (reservation.status === "cooldown"
+        && (!Number.isSafeInteger(reservation.retryAt) || reservation.retryAt < 0)) {
+        if (this.pending.get(requestId) !== pending) {
+          return { status: "stale", errorCode: "request_not_pending" };
+        }
+        this.finish(requestId, "denied");
+        return { status: "denied", errorCode: "pin_unavailable" };
+      }
+      if (this.pending.get(requestId) !== pending) {
+        return { status: "stale", errorCode: "request_not_pending" };
+      }
+      if (Date.now() >= pending.expiresAt) {
+        this.finish(requestId, "timeout");
+        return { status: "stale", errorCode: "request_expired" };
+      }
+      pending.approvalInProgress = false;
+      return reservation.status === "cooldown"
+        ? { status: "rejected", errorCode: "cooldown", retryAt: reservation.retryAt }
+        : { status: "rejected", errorCode: "realm_busy" };
+    }
+    if (reservation.status === "unavailable") {
+      if (this.pending.get(requestId) !== pending) {
+        return { status: "stale", errorCode: "request_not_pending" };
+      }
+      this.finish(requestId, "denied");
+      return { status: "denied", errorCode: "pin_unavailable" };
+    }
+
+    // A denial, cancellation, or timeout can race the durable reservation.
+    // Consume that orphaned reservation best-effort and never revive the action.
+    if (this.pending.get(requestId) !== pending || Date.now() >= pending.expiresAt) {
+      const expired = this.pending.get(requestId) === pending;
+      if (expired) this.finish(requestId, "timeout");
+      await pinAttempts.cancelAndConsume({
+        realm: EXTERNAL_ACTION_APPROVAL_REALM,
+        reservationId,
+        requestId: pending.request.requestId,
+        reason: expired ? "expired" : "backend_failure",
+        now: Date.now(),
+      }).catch(() => undefined);
+      return expired
+        ? { status: "stale", errorCode: "request_expired" }
+        : { status: "stale", errorCode: "request_not_pending" };
+    }
+
+    let verification: Awaited<ReturnType<SettingsPinAttemptPort["verifyAndConsume"]>>;
+    try {
+      verification = await pinAttempts.verifyAndConsume({
+        realm: EXTERNAL_ACTION_APPROVAL_REALM,
+        reservationId,
+        requestId: pending.request.requestId,
+        // Malformed and oversized values still perform one opaque adapter
+        // attempt, using a bounded guaranteed-wrong candidate.
+        pin: typeof pin === "string" && Buffer.byteLength(pin, "utf8") <= MAX_PIN_BYTES ? pin : "",
+        now: Date.now(),
+      });
+    } catch {
+      await pinAttempts.cancelAndConsume({
+        realm: EXTERNAL_ACTION_APPROVAL_REALM,
+        reservationId,
+        requestId: pending.request.requestId,
+        reason: "backend_failure",
+        now: Date.now(),
+      }).catch(() => undefined);
+      if (this.pending.get(requestId) !== pending) {
+        return { status: "stale", errorCode: "request_not_pending" };
+      }
+      this.finish(requestId, "denied");
+      return { status: "denied", errorCode: "pin_unavailable" };
+    }
+
+    if (this.pending.get(requestId) !== pending) {
+      return { status: "stale", errorCode: "request_not_pending" };
+    }
+    if (verification.status === "verified") {
+      if (Date.now() >= pending.expiresAt) {
+        this.finish(requestId, "timeout");
+        return { status: "stale", errorCode: "request_expired" };
+      }
+      this.finish(requestId, "approved");
+      return { status: "approved" };
+    }
+    if (verification.status === "expired") {
+      this.finish(requestId, "timeout");
+      return { status: "stale", errorCode: "request_expired" };
+    }
+
+    // A wrong/malformed PIN and unavailable verification both consume and
+    // terminally deny this exact action. Neither can be retried.
+    this.finish(requestId, "denied");
+    return verification.status === "wrong_pin"
+      ? { status: "denied", errorCode: "wrong_pin" }
+      : { status: "denied", errorCode: "pin_unavailable" };
   }
 
   cancelRequest(requestId: string, _reason?: string): boolean {
@@ -519,12 +702,19 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
 
 type ActionApprovalGlobal = typeof globalThis & {
   __pi_action_approval_bridge?: PiActionApprovalBridge;
+  __pi_action_approval_pin_attempts?: SettingsPinAttemptPort;
 };
+
+export function installActionApprovalPinAttempts(pinAttempts: SettingsPinAttemptPort): void {
+  const scope = globalThis as ActionApprovalGlobal;
+  scope.__pi_action_approval_bridge?.installPinAttempts(pinAttempts);
+  scope.__pi_action_approval_pin_attempts = pinAttempts;
+}
 
 export function getActionApprovalBridge(): PiActionApprovalBridge {
   const scope = globalThis as ActionApprovalGlobal;
   if (!scope.__pi_action_approval_bridge) {
-    scope.__pi_action_approval_bridge = new PiActionApprovalBridge();
+    scope.__pi_action_approval_bridge = new PiActionApprovalBridge(scope.__pi_action_approval_pin_attempts);
   }
   return scope.__pi_action_approval_bridge;
 }
