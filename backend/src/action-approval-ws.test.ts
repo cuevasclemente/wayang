@@ -13,6 +13,7 @@ import {
   type ExternalActionRequestInput,
 } from "./action-approval-bridge.js";
 import { closeWayangServer, createApp } from "./app.js";
+import { getCommandGuardIdentityBridge } from "./command-guard-bridge.js";
 import { AuthService } from "./auth/service.js";
 import { close, commitStoreMutation, init } from "./db.js";
 import type {
@@ -302,6 +303,8 @@ async function fixture(t: TestContext) {
     bridge.cancelSession(otherSession.id, "test cleanup");
     bridge.cancelSession(headlessSession.id, "test cleanup");
     bridge.cancelSession(quarantinedSession.id, "test cleanup");
+    getCommandGuardIdentityBridge().cancelSession(interactiveSession.id);
+    getCommandGuardIdentityBridge().cancelSession(otherSession.id);
     for (const ws of sockets) {
       try { ws.terminate(); } catch {}
     }
@@ -370,6 +373,84 @@ test("a quarantined session socket never becomes an external-action approval cli
   assert.deepEqual(bridge.getPendingRequests(quarantinedSession.id), []);
   assert.equal(pinAttempts.reserves.length, 0);
   assert.equal(pinAttempts.verifications.length, 0);
+});
+
+test("command-guard PIN requests and responses remain exact-selection-bound", async (t) => {
+  const { interactiveSession, connect } = await fixture(t);
+  const firstSelection = "guard-selection-first";
+  const secondSelection = "guard-selection-second";
+  const client = await connect(interactiveSession.id, firstSelection);
+  await client.inbox.take(isSnapshotFor(interactiveSession.id, firstSelection, 0));
+
+  const guardBridge = getCommandGuardIdentityBridge();
+  const pendingPin = guardBridge.requestIdentityPin(
+    interactiveSession.id,
+    "Synthetic command-guard challenge",
+    5_000,
+    { command: "synthetic-command", reason: "synthetic reason" },
+  );
+  const firstRequest = await client.inbox.take((message) => (
+    message.type === "command_guard_pin_request"
+    && message.sessionId === interactiveSession.id
+    && message.selection_id === firstSelection
+  ));
+  assert.equal(typeof firstRequest.requestId, "string");
+  const requestId = firstRequest.requestId as string;
+
+  client.ws.send(JSON.stringify({
+    type: "command_guard_pin_response",
+    requestId,
+    sessionId: interactiveSession.id,
+    pin: SYNTHETIC_IDENTITY_PIN,
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(guardBridge.getPendingRequests(interactiveSession.id).length, 1);
+
+  client.ws.send(JSON.stringify({
+    type: "command_guard_pin_response",
+    requestId,
+    sessionId: interactiveSession.id,
+    selection_id: "guard-selection-stale",
+    pin: SYNTHETIC_IDENTITY_PIN,
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(guardBridge.getPendingRequests(interactiveSession.id).length, 1);
+
+  client.ws.send(JSON.stringify({
+    type: "switch_session",
+    session_id: interactiveSession.id,
+    selection_id: secondSelection,
+  }));
+  await client.inbox.take(isSnapshotFor(interactiveSession.id, secondSelection, 0));
+  const replay = await client.inbox.take((message) => (
+    message.type === "command_guard_pin_request"
+    && message.requestId === requestId
+    && message.sessionId === interactiveSession.id
+    && message.selection_id === secondSelection
+  ));
+  assert.equal(replay.selection_id, secondSelection);
+
+  // A same-session response from the superseded selection cannot resolve the
+  // waiter after the socket has rebound to a new selection generation.
+  client.ws.send(JSON.stringify({
+    type: "command_guard_pin_response",
+    requestId,
+    sessionId: interactiveSession.id,
+    selection_id: firstSelection,
+    pin: SYNTHETIC_IDENTITY_PIN,
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(guardBridge.getPendingRequests(interactiveSession.id).length, 1);
+
+  client.ws.send(JSON.stringify({
+    type: "command_guard_pin_response",
+    requestId,
+    sessionId: interactiveSession.id,
+    selection_id: secondSelection,
+    pin: SYNTHETIC_IDENTITY_PIN,
+  }));
+  assert.equal(await pendingPin, SYNTHETIC_IDENTITY_PIN);
+  assert.deepEqual(guardBridge.getPendingRequests(interactiveSession.id), []);
 });
 
 test("external action responses do not default a missing session identity", async (t) => {
