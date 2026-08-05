@@ -432,6 +432,61 @@ test("restricted direct paths allow only the project, permitted memory, and own 
   }
 });
 
+test("Protected restricted agents read ordinary and Standard paths but write only their project", () => {
+  const f = fixture("wayang-runtime-protected-read-lattice-");
+  const ordinaryRoot = path.join(f.dir, "ordinary");
+  const standardRoot = path.join(f.dir, "standard-project");
+  const otherProtectedRoot = path.join(f.dir, "other-protected");
+  try {
+    fs.mkdirSync(ordinaryRoot);
+    fs.mkdirSync(standardRoot);
+    fs.mkdirSync(otherProtectedRoot);
+    const ordinaryFile = path.join(ordinaryRoot, "ordinary.txt");
+    const standardFile = path.join(standardRoot, "standard.txt");
+    const otherProtectedFile = path.join(otherProtectedRoot, "protected.txt");
+    fs.writeFileSync(ordinaryFile, "ordinary");
+    fs.writeFileSync(standardFile, "standard");
+    fs.writeFileSync(otherProtectedFile, "protected");
+
+    const sourceProfile = createAgentProfile({ name: "Protected reader" });
+    const standardProfile = createAgentProfile({ name: "Standard owner" });
+    const otherProtectedProfile = createAgentProfile({ name: "Other Protected owner" });
+    const sourceProject = createProject({
+      cwd: f.cwd,
+      default_agent_profile_id: sourceProfile.id,
+      access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [sourceProfile.id] },
+    });
+    createProject({
+      cwd: standardRoot,
+      default_agent_profile_id: standardProfile.id,
+      access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [standardProfile.id] },
+    });
+    createProject({
+      cwd: otherProtectedRoot,
+      default_agent_profile_id: otherProtectedProfile.id,
+      access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [otherProtectedProfile.id] },
+    });
+    const source = createSession(f.cwd, { agentProfileId: sourceProfile.id });
+    const decide = (toolName: string, target: string) => authorizeAgentToolCall({
+      cwd: f.cwd,
+      project: sourceProject,
+      agentProfile: sourceProfile,
+      toolName,
+      params: { path: target },
+      sourceSessionId: source.id,
+    });
+
+    assert.equal(decide("read", ordinaryFile).allowed, true);
+    assert.equal(decide("read", standardFile).allowed, true, "Standard project run allowlists do not block Protected reads");
+    assert.equal(decide("edit", ordinaryFile).allowed, false);
+    assert.equal(decide("write", standardFile).allowed, false);
+    assert.equal(decide("read", otherProtectedFile).allowed, false);
+    assert.equal(decide("find", f.dir).allowed, false, "broad scans intersecting another Protected project fail closed");
+  } finally {
+    f.cleanup();
+  }
+});
+
 test("direct read, grep, and find deny backend artifacts while the source session reads only its own attachment", async () => {
   const f = fixture("wayang-runtime-artifacts-");
   try {

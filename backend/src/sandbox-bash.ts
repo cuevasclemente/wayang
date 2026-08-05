@@ -124,14 +124,13 @@ export function buildBashSandboxPolicy(
     : false;
   const deniedRead = new Set<string>();
   const deniedWrite = new Set<string>();
+  const sourceProtected = sourceAuthorization.project?.access_policy.privacy_mode === "protected";
   for (const project of projects) {
     const otherProtectedProject = project.access_policy.privacy_mode === "protected"
       && project.id !== sourceAuthorization.project?.id;
-    const deniedProject = otherProtectedProject || !projectAllowsAgentProfile(project, profile.id);
-    if (deniedProject) {
-      deniedRead.add(project.cwd);
-      deniedWrite.add(project.cwd);
-    }
+    const excludedByAllowlist = !projectAllowsAgentProfile(project, profile.id);
+    if (otherProtectedProject || (excludedByAllowlist && !sourceProtected)) deniedRead.add(project.cwd);
+    if (otherProtectedProject || excludedByAllowlist) deniedWrite.add(project.cwd);
   }
 
   for (const root of getProtectedArtifactReadRoots()) deniedRead.add(root);

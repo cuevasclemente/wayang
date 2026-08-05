@@ -285,7 +285,8 @@ export function authorizeAgentToolCall(options: {
     }
   }
 
-  if (restricted) {
+  const sourceProtected = project.access_policy.privacy_mode === "protected";
+  if (restricted && (!sourceProtected || isMutation)) {
     const canonicalProjectRoot = canonicalMemoryRoot(project.cwd);
     const inProject = pathIsWithin(canonicalPath, canonicalProjectRoot);
     const inPermittedMemory = Boolean(memoryRoot && pathIsWithin(canonicalPath, memoryRoot));
@@ -293,7 +294,9 @@ export function authorizeAgentToolCall(options: {
     if (!inProject && !inPermittedMemory && !inPermittedAttachments) {
       return {
         allowed: false,
-        reason: "Restricted agents are confined to their project, permitted memory roots, and own attachments",
+        reason: sourceProtected
+          ? "Protected agents may write only their project and permitted memory roots"
+          : "Restricted agents are confined to their project, permitted memory roots, and own attachments",
         canonicalPath,
       };
     }
@@ -303,7 +306,9 @@ export function authorizeAgentToolCall(options: {
     if (targetProject.access_policy.privacy_mode === "protected" && targetProject.id !== project.id) {
       return { allowed: false, reason: "Agents outside a Protected project cannot access its path", canonicalPath };
     }
-    if (!projectAllowsAgentProfile(targetProject, agentProfile.id)) {
+    const protectedReadFromStandard = sourceProtected && isRead
+      && targetProject.access_policy.privacy_mode === "standard";
+    if (!protectedReadFromStandard && !projectAllowsAgentProfile(targetProject, agentProfile.id)) {
       return { allowed: false, reason: "Agent is not allowed to access the project path", canonicalPath };
     }
   }

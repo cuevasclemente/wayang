@@ -357,6 +357,8 @@ test("actual concurrent sandboxes isolate an allowed Standard project from an un
   const protectedPolicy = buildBashSandboxPolicy(sourceB.id);
   assert.ok(standardPolicy.deniedReadRoots.includes(fs.realpathSync(projectB)));
   assert.ok(standardPolicy.deniedWriteRoots.includes(fs.realpathSync(projectB)));
+  assert.equal(protectedPolicy.deniedReadRoots.includes(fs.realpathSync(projectA)), false);
+  assert.ok(protectedPolicy.deniedWriteRoots.includes(fs.realpathSync(projectA)));
   assert.equal(protectedPolicy.deniedReadRoots.includes(fs.realpathSync(projectB)), false);
   assert.equal(protectedPolicy.deniedWriteRoots.includes(fs.realpathSync(projectB)), false);
   assert.deepEqual(protectedPolicy.config.filesystem.allowWrite, [fs.realpathSync(projectB)]);
@@ -365,11 +367,12 @@ test("actual concurrent sandboxes isolate an allowed Standard project from an un
   const bOwn = path.join(projectB, "only-b.txt");
   const [a, b] = await Promise.all([
     run(sourceA.id, `cat ${quote(aOwn)} && test ! -e ${quote(bOwn)} && printf ok > ${quote(path.join(projectA, "a-write.txt"))}`),
-    run(sourceB.id, `cat ${quote(bOwn)} && test ! -e ${quote(aOwn)} && (/usr/bin/curl --silent --show-error --max-time 5 http://127.0.0.1:${loopback.port}/ | grep -q '^ok$') && printf ok > ${quote(path.join(projectB, "b-write.txt"))}`),
+    run(sourceB.id, `cat ${quote(bOwn)} && cat ${quote(aOwn)} && (! printf blocked > ${quote(path.join(projectA, "blocked-by-protected.txt"))}) && (/usr/bin/curl --silent --show-error --max-time 5 http://127.0.0.1:${loopback.port}/ | grep -q '^ok$') && printf ok > ${quote(path.join(projectB, "b-write.txt"))}`),
   ]);
   assert.equal(a.code, 0, a.output);
   assert.equal(b.code, 0, b.output);
   assert.equal(fs.readFileSync(path.join(projectA, "a-write.txt"), "utf8"), "ok");
+  assert.equal(fs.existsSync(path.join(projectA, "blocked-by-protected.txt")), false);
   assert.equal(fs.readFileSync(path.join(projectB, "b-write.txt"), "utf8"), "ok");
 });
 
