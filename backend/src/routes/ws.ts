@@ -9,7 +9,7 @@
  *     { type: "set_permission", mode: string }
  *     { type: "set_goal", goal: string }
  *     { type: "subagent_spawn", agent: string, task: string, mode: "single"|"parallel"|"chain" }
- *     { type: "external_action_response", requestId, sessionId, selection_id, argumentsHash, approved }
+ *     { type: "external_action_response", requestId, sessionId, selection_id, argumentsHash, approved, pin? }
  *
  *   Server → Client:
  *     { type: "history", messages: [...] }
@@ -29,7 +29,8 @@
  *     { type: "agent_settled" }
  *     { type: "queue_update", steering: string[], followUp: string[] }
  *     { type: "external_action_request", requestId, sessionId, selection_id, argumentsHash, ...displayMetadata }
- *     { type: "external_action_response_ack", requestId, sessionId, selection_id, status }
+ *     { type: "external_action_response_ack", requestId, sessionId, selection_id, status, errorCode?, retryAt? }
+ *     { type: "external_action_terminal", requestId, sessionId, selection_id, status }
  *     { type: "external_action_snapshot", sessionId, selection_id, requests, syncComplete: true }
  */
 
@@ -81,7 +82,13 @@ import {
 } from "../interview-provenance.js";
 import { getSudoBridge, type SudoRequest } from "../sudo-bridge.js";
 import { getCommandGuardIdentityBridge, type CommandGuardIdentityRequest } from "../command-guard-bridge.js";
-import { getActionApprovalBridge, type ExternalActionRequest } from "../action-approval-bridge.js";
+import {
+  getActionApprovalBridge,
+  type ActionApprovalBridge,
+  type ApprovalResponse,
+  type ApprovalTerminalEvent,
+  type ExternalActionRequest,
+} from "../action-approval-bridge.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
 import { authorizeProjectAction } from "../policy.js";
 import type { AuthService } from "../auth/service.js";
@@ -118,6 +125,45 @@ export function serializeSessionRuntimeState(sessionId: string, selectionId: str
     ...(selectionId ? { selection_id: selectionId } : {}),
     bash_mode: getPiSessionBashMode(sessionId),
   };
+}
+
+/** @internal Exported for focused approval eligibility tests. */
+export function isExternalActionApprovalClientEligible(
+  selectionId: string | null,
+  quarantined: boolean,
+): selectionId is string {
+  return !quarantined && typeof selectionId === "string" && selectionId.length > 0;
+}
+
+/** @internal Exported for focused terminal wire-contract tests. */
+export function serializeExternalActionTerminal(
+  event: ApprovalTerminalEvent,
+  selectionId: string,
+) {
+  return {
+    type: "external_action_terminal" as const,
+    requestId: event.requestId,
+    sessionId: event.sessionId,
+    selection_id: selectionId,
+    status: event.status,
+  };
+}
+
+/** @internal Exported for focused terminal-before-snapshot ordering tests. */
+export function sendExternalActionTerminalState(
+  ws: WebSocket,
+  event: ApprovalTerminalEvent,
+  selectionId: string,
+  getRequests: () => ExternalActionRequest[],
+): void {
+  sendSafe(ws, serializeExternalActionTerminal(event, selectionId));
+  sendSafe(ws, {
+    type: "external_action_snapshot",
+    sessionId: event.sessionId,
+    selection_id: selectionId,
+    requests: getRequests(),
+    syncComplete: true,
+  });
 }
 
 // We attach this to the HTTP server in app.ts
@@ -462,12 +508,11 @@ function handleConnection(
       ready = true;
       sendSafe(ws, { type: "session_ready", session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
       wsProfile(nextSessionId, "sent_session_ready", `setup_elapsed=${elapsedMs(setupStart)}`);
-      flushPending();
 
       // External actions bind only to an exact, non-empty selection
       // generation. Legacy/invalid sockets without one can still read chat but
       // are never counted as interactive approvers.
-      if (selectionId) {
+      if (isExternalActionApprovalClientEligible(selectionId, quarantined)) {
         // Register listeners before advertising this browser as interactive,
         // then publish an authoritative snapshot so a request cannot fall into
         // an attach/reconnect race.
@@ -517,13 +562,23 @@ function handleConnection(
         actionApprovalRequestUnsub = actionBridge.onRequest(sendActionRequest);
         actionApprovalTerminalUnsub = actionBridge.onTerminal((event) => {
           if (event.sessionId !== actionSessionId || !isCurrentActionSelection()) return;
-          // Snapshot is the terminal broadcast: every attached tab receives the
-          // same authoritative pending set without adding another protocol type.
-          sendActionSnapshot();
+          // Emit the explicit outcome first; the following snapshot is the
+          // authoritative pending set and can never make timeout/cancellation
+          // look like an approval.
+          sendExternalActionTerminalState(
+            ws,
+            event,
+            actionSelectionId,
+            () => actionBridge.getPendingRequests(actionSessionId),
+          );
         });
         actionApprovalDetach = actionBridge.attachClient(actionSessionId, actionApprovalClientId);
         sendActionSnapshot();
       }
+
+      // Approval listeners must exist before a response queued during session
+      // setup is dispatched, preserving terminal -> snapshot -> ack ordering.
+      flushPending();
 
       // Subscribe to extension UI bridge requests for this session's project cwd.
       // This is cheap and does not require constructing a live AgentSession.
@@ -719,7 +774,7 @@ function handleConnection(
 
     // Route extension UI bridge responses directly to their bridges.
     if (msg.type === "external_action_response") {
-      handleExternalActionResponse(ws, currentSessionId, currentSelectionId, msg);
+      void handleExternalActionResponse(ws, currentSessionId, currentSelectionId, msg);
       return;
     }
 
@@ -1191,19 +1246,24 @@ function handleInterviewCancel(ws: WebSocket, sessionId: string, msg: any): void
  * submitting socket's acknowledgement. Frontends reconcile from that snapshot;
  * the later ack is secondary status confirmation.
  */
-function handleExternalActionResponse(
+/** @internal Exported for focused untrusted transport tests. */
+export async function handleExternalActionResponse(
   ws: WebSocket,
   currentSessionId: string,
   currentSelectionId: string | null,
   msg: any,
-): void {
+  actionBridge: ActionApprovalBridge = getActionApprovalBridge(),
+): Promise<void> {
   const requestId: unknown = msg?.requestId;
   const sessionId: unknown = msg?.sessionId;
   const selectionId: unknown = msg?.selection_id;
   const argumentsHash: unknown = msg?.argumentsHash;
   const approved: unknown = msg?.approved;
 
-  let status: "approved" | "denied" | "stale" | "rejected" = "rejected";
+  let response: ApprovalResponse = {
+    status: "rejected",
+    errorCode: typeof approved === "boolean" ? "request_identity_mismatch" : "invalid_decision",
+  };
   if (
     typeof requestId === "string"
     && typeof sessionId === "string"
@@ -1218,12 +1278,13 @@ function handleExternalActionResponse(
     && sessionId === currentSessionId
     && selectionId === currentSelectionId
   ) {
-    status = getActionApprovalBridge().respondForSession(
+    response = await actionBridge.respondForSession(
       sessionId,
       requestId,
       argumentsHash,
       approved,
-    ).status;
+      msg?.pin,
+    );
   }
 
   sendSafe(ws, {
@@ -1231,7 +1292,9 @@ function handleExternalActionResponse(
     requestId: typeof requestId === "string" && requestId.length > 0 ? requestId : null,
     sessionId: typeof sessionId === "string" ? sessionId : null,
     selection_id: typeof selectionId === "string" ? selectionId : null,
-    status,
+    status: response.status,
+    ...(response.errorCode ? { errorCode: response.errorCode } : {}),
+    ...(response.retryAt === undefined ? {} : { retryAt: response.retryAt }),
   });
 }
 

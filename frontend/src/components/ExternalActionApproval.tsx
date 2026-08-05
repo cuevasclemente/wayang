@@ -1,5 +1,17 @@
 import { useId } from "react";
 
+export type ExternalActionApprovalStatus =
+  | "pending"
+  | "awaiting_ack"
+  | "approved"
+  | "denied"
+  | "timeout"
+  | "cancelled"
+  | "stale"
+  | "unknown"
+  | "rejected"
+  | "uncertain";
+
 export interface ExternalActionApprovalRequest {
   requestId: string;
   sessionId: string;
@@ -13,50 +25,95 @@ export interface ExternalActionApprovalRequest {
   createdAt: number;
   timeoutMs: number;
   submitting: boolean;
+  status: ExternalActionApprovalStatus;
+  live: boolean;
+  lastSentAt?: number;
+  retryAt?: number;
   responseError?: string;
 }
 
 interface ExternalActionApprovalProps {
   request: ExternalActionApprovalRequest;
-  onRespond: (request: ExternalActionApprovalRequest, approved: boolean) => void;
+  onRespond: (request: ExternalActionApprovalRequest, approved: boolean, trigger: HTMLButtonElement) => void;
+  onDismiss: (request: ExternalActionApprovalRequest) => void;
 }
 
-export function ExternalActionApproval({ request, onRespond }: ExternalActionApprovalProps) {
+const STATUS_COPY: Record<ExternalActionApprovalStatus, string> = {
+  pending: "No response has been sent.",
+  awaiting_ack: "Waiting for the server to acknowledge this response…",
+  approved: "Wayang confirmed approval for this exact request and argument hash.",
+  denied: "This action was not approved.",
+  timeout: "This approval request expired without approval.",
+  cancelled: "This action was not approved.",
+  stale: "The server no longer recognizes this exact pending request; approval was not confirmed.",
+  unknown: "The authoritative pending snapshot no longer contains this request, so success cannot be inferred.",
+  rejected: "The server did not accept the response; review the status before trying again.",
+  uncertain: "No acknowledgement arrived; the request may still be live. Review carefully before trying again.",
+};
+
+const STATUS_LABELS: Record<ExternalActionApprovalStatus, string> = {
+  pending: "Pending review",
+  awaiting_ack: "Awaiting acknowledgement",
+  approved: "Approved",
+  denied: "Denied",
+  timeout: "Timed out",
+  cancelled: "Cancelled",
+  stale: "Stale",
+  unknown: "Unknown outcome",
+  rejected: "Rejected",
+  uncertain: "Uncertain outcome",
+};
+
+export function ExternalActionApproval({ request, onRespond, onDismiss }: ExternalActionApprovalProps) {
   const headingId = useId();
+  const statusId = useId();
   const metadata = [
     ["Connector", request.connector],
     ["Workspace", request.workspace],
     ["Tool", request.toolName],
     ["Target", request.target],
+    ["Request ID", request.requestId],
+    ["Argument hash", request.argumentsHash],
   ].filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0);
+  const responseControlsDisabled = request.submitting || !request.live;
+  const approvalDisabled = responseControlsDisabled || request.retryAt !== undefined;
+  const canDismiss = !request.live;
 
   return (
     <article
       data-testid="external-action-approval"
       data-approval-kind="external-action"
+      data-approval-request-id={request.requestId}
+      data-approval-status={request.status}
+      tabIndex={-1}
       aria-labelledby={headingId}
+      aria-describedby={statusId}
       className="rounded-lg border border-amber-700/70 bg-amber-950/35 p-3 text-amber-50 shadow-lg shadow-amber-950/20"
     >
-      <p
-        data-testid="external-action-arrival-announcement"
-        role="alert"
-        aria-live="assertive"
-        aria-atomic="true"
-        className="sr-only"
-      >
-        Review required: an external action approval arrived. No action has been approved.
-      </p>
+      {request.status === "pending" && (
+        <p
+          data-testid="external-action-arrival-announcement"
+          role="alert"
+          aria-live="assertive"
+          aria-atomic="true"
+          className="sr-only"
+        >
+          Review required: an external action approval arrived. No action has been approved.
+        </p>
+      )}
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
           <h2 id={headingId} className="text-[10px] font-semibold uppercase tracking-wider text-amber-300">
-            External action approval required
+            {request.live ? "External action approval required" : "External action outcome"}
           </h2>
           <p className="mt-1 text-xs text-amber-100/80">
-            Review the exact action below. Approval applies only to this request.
+            {request.live
+              ? "Review the connector-provided preview below. Wayang binds approval to this request and argument hash; approval requires your identity PIN."
+              : "This retained card records the outcome visible to this browser. Dismiss it when you have finished reviewing it."}
           </p>
         </div>
         <span className="shrink-0 rounded border border-amber-700/60 bg-amber-900/40 px-2 py-0.5 text-[10px] font-semibold uppercase text-amber-200">
-          Write
+          External action
         </span>
       </div>
 
@@ -71,7 +128,7 @@ export function ExternalActionApproval({ request, onRespond }: ExternalActionApp
 
       <div className="mb-3">
         <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-amber-400/80">
-          Full action summary
+          Connector-provided action summary (unverified by Wayang)
         </div>
         <pre
           data-testid="external-action-summary"
@@ -82,34 +139,45 @@ export function ExternalActionApproval({ request, onRespond }: ExternalActionApp
         </pre>
       </div>
 
-      {request.responseError && (
-        <div className="mb-2 text-xs text-amber-200" role="status" aria-live="polite" aria-atomic="true">
-          {request.responseError}
-        </div>
-      )}
-      {request.submitting && (
-        <div className="mb-2 text-xs text-amber-200" role="status" aria-live="polite" aria-atomic="true">
-          Waiting for acknowledgement…
-        </div>
-      )}
+      <div
+        id={statusId}
+        data-testid="external-action-status"
+        className="mb-2 rounded border border-amber-900/60 bg-neutral-950/35 px-2 py-1.5 text-xs text-amber-100"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        <span className="font-semibold">{STATUS_LABELS[request.status]}.</span>{" "}
+        {STATUS_COPY[request.status]}
+        {request.responseError ? ` ${request.responseError}` : ""}
+      </div>
 
       <div className="flex flex-wrap justify-end gap-2">
         <button
           type="button"
-          disabled={request.submitting}
-          onClick={() => onRespond(request, false)}
+          disabled={responseControlsDisabled}
+          onClick={(event) => onRespond(request, false, event.currentTarget)}
           className="rounded border border-amber-700 bg-neutral-950/60 px-3 py-1.5 text-xs font-semibold text-amber-100 hover:bg-amber-950 disabled:cursor-not-allowed disabled:opacity-50"
         >
           Deny
         </button>
         <button
           type="button"
-          disabled={request.submitting}
-          onClick={() => onRespond(request, true)}
+          disabled={approvalDisabled}
+          onClick={(event) => onRespond(request, true, event.currentTarget)}
           className="rounded border border-amber-500 bg-amber-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-amber-600 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          Approve
+          {request.live && request.status !== "pending" ? "Approve with PIN again" : "Approve"}
         </button>
+        {canDismiss && (
+          <button
+            type="button"
+            onClick={() => onDismiss(request)}
+            className="rounded border border-neutral-700 bg-neutral-950/60 px-3 py-1.5 text-xs font-semibold text-neutral-200 hover:bg-neutral-800"
+          >
+            Dismiss
+          </button>
+        )}
       </div>
     </article>
   );

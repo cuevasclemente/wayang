@@ -33,6 +33,7 @@ import {
 } from "./routes/workspace-capabilities.js";
 import { cleanupCache } from "./tts-cache.js";
 import { attachWs } from "./routes/ws.js";
+import { installActionApprovalPinAttempts } from "./action-approval-bridge.js";
 import { attachBrowserWs } from "./browser/ws.js";
 import { stopAllApps } from "./apps/process-manager.js";
 import { registerBrowserStopHook, stopAllBrowsers } from "./browser/manager.js";
@@ -275,6 +276,7 @@ export function start() {
   console.log(`[db] Store at ${config.dbPath}`);
   const authService = new AuthService(config.auth);
   const workspaceCapabilities = createProductionWorkspaceCapabilityBootstrap(authService, config);
+  installActionApprovalPinAttempts(workspaceCapabilities.pinAttempts);
   const owner = createProductionProtectedBrowserOwner(authService);
   const credentialBroker = new CredentialBroker(config.browser.credentials);
   const protectedBrowser = bootstrapProtectedBrowserProduction({

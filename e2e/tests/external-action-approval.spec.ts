@@ -85,22 +85,31 @@ async function installExternalActionSocketMock(context: BrowserContext): Promise
           && typeof message.sessionId === "string"
           && typeof message.selection_id === "string"
           && typeof message.approved === "boolean"
+          && (!message.approved || typeof message.pin === "string")
         ) {
+          const status = message.approved ? "approved" : "denied";
+          const terminal = {
+            type: "external_action_terminal",
+            requestId: message.requestId,
+            status,
+          };
           const terminalSnapshot = {
             type: "external_action_snapshot",
             requests: [],
             syncComplete: true,
           };
-          // Match the backend contract: the synchronous terminal broadcast
-          // queues the authoritative snapshot before the submitter's ack.
+          // Production sends the explicit outcome before its authoritative
+          // pending snapshot, then acknowledges the submitting client.
+          emitForSession(message.sessionId, terminal);
           emitForSession(message.sessionId, terminalSnapshot);
           this.emit({
             type: "external_action_response_ack",
             requestId: message.requestId,
             sessionId: message.sessionId,
             selection_id: message.selection_id,
-            status: message.approved ? "approved" : "denied",
+            status,
           });
+          serverChannel.postMessage({ sessionId: message.sessionId, payload: terminal });
           serverChannel.postMessage({ sessionId: message.sessionId, payload: terminalSnapshot });
         }
       }
@@ -179,24 +188,33 @@ async function installExternalActionSocketMock(context: BrowserContext): Promise
   });
 }
 
-async function emitCurrentRequest(page: Page, requestId: string, summary: string): Promise<void> {
-  await page.evaluate(({ requestId, summary }) => {
+async function emitCurrent(page: Page, payload: Record<string, unknown>): Promise<void> {
+  await page.evaluate((nextPayload) => {
     const testSocket = (window as unknown as {
       __externalActionSocketTest: { emitCurrent: (payload: Record<string, unknown>) => void };
     }).__externalActionSocketTest;
-    testSocket.emitCurrent({
-      type: "external_action_request",
-      requestId,
-      connector: "Example connector",
-      workspace: "Workspace alpha",
-      toolName: "create_record",
-      target: "Project beta",
-      summary,
-      argumentsHash: "a".repeat(64),
-      createdAt: Date.now(),
-      timeoutMs: 120_000,
-    });
-  }, { requestId, summary });
+    testSocket.emitCurrent(nextPayload);
+  }, payload);
+}
+
+async function emitCurrentRequest(
+  page: Page,
+  requestId: string,
+  summary: string,
+  options: { createdAt?: number; timeoutMs?: number } = {},
+): Promise<void> {
+  await emitCurrent(page, {
+    type: "external_action_request",
+    requestId,
+    connector: "Example connector",
+    workspace: "Workspace alpha",
+    toolName: "create_record",
+    target: "Project beta",
+    summary,
+    argumentsHash: "a".repeat(64),
+    createdAt: options.createdAt ?? Date.now(),
+    timeoutMs: options.timeoutMs ?? 120_000,
+  });
 }
 
 async function emitBroadcastRequest(page: Page, requestId: string, summary: string): Promise<void> {
@@ -229,56 +247,64 @@ async function sentResponses(page: Page, requestId: string): Promise<Array<Recor
 }
 
 async function emitCurrentSnapshot(page: Page, requests: Array<Record<string, unknown>>): Promise<void> {
-  await page.evaluate((nextRequests) => {
-    const testSocket = (window as unknown as {
-      __externalActionSocketTest: { emitCurrent: (payload: Record<string, unknown>) => void };
-    }).__externalActionSocketTest;
-    testSocket.emitCurrent({
-      type: "external_action_snapshot",
-      requests: nextRequests,
-      syncComplete: true,
-    });
-  }, requests);
+  await emitCurrent(page, {
+    type: "external_action_snapshot",
+    requests,
+    syncComplete: true,
+  });
 }
 
-test("external action approval is exact, ephemeral, reconnect-safe, and selection-scoped", async ({ context, page, request }) => {
+async function emitTerminal(
+  page: Page,
+  requestId: string,
+  status: "approved" | "denied" | "timeout" | "cancelled",
+): Promise<void> {
+  await emitCurrent(page, { type: "external_action_terminal", requestId, status });
+}
+
+async function emitAck(
+  page: Page,
+  requestId: string,
+  status: "approved" | "denied" | "stale" | "rejected",
+  extra: Record<string, unknown> = {},
+): Promise<void> {
+  await emitCurrent(page, { type: "external_action_response_ack", requestId, status, ...extra });
+}
+
+function cardFor(page: Page, summary: string) {
+  return page.getByTestId("external-action-approval").filter({ hasText: summary });
+}
+
+test("approval requires a transient PIN while denial remains PIN-free", async ({ context, page, request }) => {
   await installExternalActionSocketMock(context);
-  const firstSession = await createE2eSession(request, "e2e external action first");
-  const secondSession = await createE2eSession(request, "e2e external action second");
-  await openSessionInUi(page, firstSession);
+  const session = await createE2eSession(request, "e2e external action pin boundary");
+  await openSessionInUi(page, session);
   await expect(page.getByTestId("chat-input")).toBeEnabled();
 
-  const summary = "Create a synthetic record with every displayed argument.\nBody: full preview marker e2e-action-summary";
+  const summary = "Create a synthetic record.\nBody: full preview marker e2e-action-summary";
   await emitCurrentRequest(page, "action-approve", summary);
-
-  const card = page.getByTestId("external-action-approval");
-  await expect(card).toHaveCount(1);
+  const card = cardFor(page, summary);
   await expect(card).toHaveAccessibleName("External action approval required");
-  await expect(card.getByRole("heading", { name: "External action approval required", level: 2 })).toBeVisible();
   await expect(page.getByTestId("external-action-approvals")).toHaveAttribute("aria-label", "External action approvals");
   await expect(card.getByTestId("external-action-arrival-announcement")).toHaveAttribute("role", "alert");
   await expect(card.getByTestId("external-action-arrival-announcement")).toHaveAttribute("aria-live", "assertive");
-  await expect(card.getByTestId("external-action-arrival-announcement")).toContainText("Review required");
+  await expect(page.getByTestId("external-action-summary")).toHaveText(summary);
+  await expect(card.getByTestId("external-action-status")).toHaveAttribute("aria-live", "polite");
+  await expect(card).toContainText("Pending review");
   await expect(card).toContainText("Example connector");
   await expect(card).toContainText("Workspace alpha");
   await expect(card).toContainText("create_record");
   await expect(card).toContainText("Project beta");
-  await expect(page.getByTestId("external-action-summary")).toHaveText(summary);
-  await expect(page.getByTestId("chat-input")).toBeVisible();
-  await expect(page.getByTestId("external-action-approvals")).toHaveClass(/max-h-/);
-  await expect(page.getByTestId("external-action-approvals")).toHaveClass(/overflow-y-auto/);
-  await expect(card).toHaveAttribute("data-approval-kind", "external-action");
-  await expect(page.getByTestId("external-action-summary")).toHaveClass(/max-h-/);
+  await expect(card).toContainText("Connector-provided action summary (unverified by Wayang)");
+  await expect(card).toContainText("action-approve");
+  await expect(card).toContainText("a".repeat(64));
   await expect(page.getByTestId("chat-message").filter({ hasText: "e2e-action-summary" })).toHaveCount(0);
-  expect(await page.evaluate(() => {
-    const values = [...Object.values(localStorage), ...Object.values(sessionStorage)];
-    return values.some((value) => value.includes("e2e-action-summary"));
-  })).toBe(false);
 
-  // A request event followed by the authoritative snapshot must not duplicate the card.
+  // Event delivery followed by the authoritative replay must upsert, not
+  // duplicate, the immutable request.
   await emitCurrentSnapshot(page, [{
     requestId: "action-approve",
-    sessionId: firstSession.id,
+    sessionId: session.id,
     connector: "Example connector",
     workspace: "Workspace alpha",
     toolName: "create_record",
@@ -290,85 +316,339 @@ test("external action approval is exact, ephemeral, reconnect-safe, and selectio
   }]);
   await expect(card).toHaveCount(1);
 
-  await card.getByRole("button", { name: "Approve" }).click();
-  await expect(card.getByRole("button", { name: "Approve" })).toBeDisabled();
-  await expect(card.getByRole("button", { name: "Deny" })).toBeDisabled();
-  await expect(card.getByRole("status")).toHaveAttribute("aria-live", "polite");
-  await expect(card.getByRole("status")).toContainText("Waiting for acknowledgement");
+  await card.getByRole("button", { name: "Approve", exact: true }).click();
+  const pinPrompt = page.getByTestId("identity-pin-prompt");
+  await expect(pinPrompt).toHaveAccessibleName("External action identity PIN");
+  await expect(pinPrompt).toContainText("External action identity check");
+  await expect(pinPrompt).toContainText("External action under review");
+  await expect(pinPrompt).toContainText("sent transiently");
+  const pinInput = pinPrompt.getByLabel("8-digit identity PIN");
+  const pinSubmit = pinPrompt.getByRole("button", { name: "Approve with PIN" });
+  await expect(pinInput).toBeFocused();
+  await expect(pinSubmit).toBeDisabled();
+  await pinInput.fill("1234");
+  await expect(pinSubmit).toBeDisabled();
+  await expect.poll(() => sentResponses(page, "action-approve")).toHaveLength(0);
+
+  await pinPrompt.getByRole("button", { name: "Cancel" }).click();
+  await expect(pinPrompt).toHaveCount(0);
+  await expect(card.getByRole("button", { name: "Approve", exact: true })).toBeFocused();
+  await expect(card.getByRole("button", { name: "Approve", exact: true })).toBeEnabled();
+  await expect.poll(() => sentResponses(page, "action-approve")).toHaveLength(0);
+
+  await card.getByRole("button", { name: "Approve", exact: true }).click();
+  await pinPrompt.getByPlaceholder("8-digit PIN").fill("12345678");
+  await pinPrompt.getByRole("button", { name: "Approve with PIN" }).click();
   await expect.poll(() => sentResponses(page, "action-approve")).toHaveLength(1);
   const [approvedResponse] = await sentResponses(page, "action-approve");
   expect(approvedResponse).toMatchObject({
     type: "external_action_response",
     requestId: "action-approve",
-    sessionId: firstSession.id,
+    sessionId: session.id,
     argumentsHash: "a".repeat(64),
     approved: true,
+    pin: "12345678",
   });
   expect(typeof approvedResponse.selection_id).toBe("string");
+  expect(await page.evaluate(() => {
+    const values = [...Object.values(localStorage), ...Object.values(sessionStorage)];
+    return values.some((value) => value.includes("12345678") || value.includes("e2e-action-summary"));
+  })).toBe(false);
 
-  // Simulate an acknowledgement lost with the old socket. The reconnect snapshot
-  // is authoritative and removes the locally disabled card without resubmission.
+  await emitTerminal(page, "action-approve", "approved");
+  await emitCurrentSnapshot(page, []);
+  await expect(card).toHaveAttribute("data-approval-status", "approved");
+  await expect(card).toContainText("Wayang confirmed approval for this exact request and argument hash");
+  await expect(card.getByRole("button", { name: "Dismiss" })).toBeVisible();
+  await card.getByRole("button", { name: "Dismiss" }).click();
+  await expect(card).toHaveCount(0);
+
+  await emitCurrentRequest(page, "action-deny", "Deny without PIN");
+  const denyCard = cardFor(page, "Deny without PIN");
+  await denyCard.getByRole("button", { name: "Deny" }).click();
+  await expect.poll(() => sentResponses(page, "action-deny")).toHaveLength(1);
+  const [deniedResponse] = await sentResponses(page, "action-deny");
+  expect(deniedResponse).toMatchObject({ approved: false });
+  expect(deniedResponse).not.toHaveProperty("pin");
+  await expect(page.getByTestId("identity-pin-prompt")).toHaveCount(0);
+});
+
+test("terminal, stale, rejected, unknown, and expired outcomes remain truthful", async ({ context, page, request }) => {
+  await installExternalActionSocketMock(context);
+  const session = await createE2eSession(request, "e2e external action outcomes");
+  await openSessionInUi(page, session);
+  await expect(page.getByTestId("chat-input")).toBeEnabled();
+
+  await emitCurrentRequest(page, "action-cancelled", "Cancelled outcome marker");
+  const cancelled = cardFor(page, "Cancelled outcome marker");
+  await cancelled.getByRole("button", { name: "Approve", exact: true }).click();
+  await expect(page.getByTestId("identity-pin-prompt")).toBeVisible();
+  await emitTerminal(page, "action-cancelled", "cancelled");
+  await expect(page.getByTestId("identity-pin-prompt")).toHaveCount(0);
+  await expect(cancelled).toBeFocused();
+  await expect(cancelled).toHaveAttribute("data-approval-status", "cancelled");
+  await expect(cancelled.getByRole("button", { name: "Dismiss" })).toBeVisible();
+  await cancelled.getByRole("button", { name: "Dismiss" }).click();
+
+  await emitCurrentRequest(page, "action-stale", "Stale outcome marker");
+  const stale = cardFor(page, "Stale outcome marker");
+  await stale.getByRole("button", { name: "Deny" }).click();
+  await emitAck(page, "action-stale", "stale");
+  await expect(stale).toHaveAttribute("data-approval-status", "stale");
+  await expect(stale).toContainText("approval was not confirmed");
+  await expect(stale.getByRole("button", { name: "Dismiss" })).toBeVisible();
+  await stale.getByRole("button", { name: "Dismiss" }).click();
+
+  await emitCurrentRequest(page, "action-rejected", "Rejected outcome marker");
+  const rejected = cardFor(page, "Rejected outcome marker");
+  await rejected.getByRole("button", { name: "Deny" }).click();
+  await emitAck(page, "action-rejected", "rejected", { errorCode: "realm_busy" });
+  await expect(rejected).toHaveAttribute("data-approval-status", "rejected");
+  await expect(rejected).toContainText("Another identity PIN verification is in progress");
+  await expect(rejected.getByRole("button", { name: "Deny" })).toBeEnabled();
+  await emitCurrentSnapshot(page, []);
+  await expect(rejected).toHaveAttribute("data-approval-status", "unknown");
+  await expect(rejected).toContainText("success cannot be inferred");
+  await expect(rejected.getByRole("button", { name: "Dismiss" })).toBeVisible();
+  await rejected.getByRole("button", { name: "Dismiss" }).click();
+
+  await emitCurrentRequest(page, "action-wrong-pin", "Wrong PIN denial marker");
+  const wrongPin = cardFor(page, "Wrong PIN denial marker");
+  await wrongPin.getByRole("button", { name: "Approve", exact: true }).click();
+  const wrongPinPrompt = page.getByTestId("identity-pin-prompt");
+  await wrongPinPrompt.getByPlaceholder("8-digit PIN").fill("00000000");
+  await wrongPinPrompt.getByRole("button", { name: "Approve with PIN" }).click();
+  await emitTerminal(page, "action-wrong-pin", "denied");
+  await emitAck(page, "action-wrong-pin", "denied", { errorCode: "wrong_pin" });
+  await expect(wrongPin).toHaveAttribute("data-approval-status", "denied");
+  await expect(wrongPin).toContainText("The identity PIN was not accepted. This action was denied and was not approved.");
+  await expect(wrongPin.getByRole("button", { name: "Approve", exact: true })).toBeDisabled();
+  await wrongPin.getByRole("button", { name: "Dismiss" }).click();
+
+  await emitCurrentRequest(page, "action-pin-unavailable", "PIN unavailable denial marker");
+  const pinUnavailable = cardFor(page, "PIN unavailable denial marker");
+  await pinUnavailable.getByRole("button", { name: "Approve", exact: true }).click();
+  const unavailablePrompt = page.getByTestId("identity-pin-prompt");
+  await unavailablePrompt.getByPlaceholder("8-digit PIN").fill("11111111");
+  await unavailablePrompt.getByRole("button", { name: "Approve with PIN" }).click();
+  await emitTerminal(page, "action-pin-unavailable", "denied");
+  await emitAck(page, "action-pin-unavailable", "denied", { errorCode: "pin_unavailable" });
+  await expect(pinUnavailable).toHaveAttribute("data-approval-status", "denied");
+  await expect(pinUnavailable).toContainText("Identity PIN verification is unavailable, so the action cannot be approved.");
+  await pinUnavailable.getByRole("button", { name: "Dismiss" }).click();
+
+  await emitCurrentRequest(page, "action-terminal-wins", "Authoritative terminal marker");
+  const terminalWins = cardFor(page, "Authoritative terminal marker");
+  await emitTerminal(page, "action-terminal-wins", "approved");
+  await emitAck(page, "action-terminal-wins", "stale", { errorCode: "request_not_pending" });
+  await expect(terminalWins).toHaveAttribute("data-approval-status", "approved");
+  await expect(terminalWins).toContainText("Wayang confirmed approval for this exact request and argument hash");
+  await terminalWins.getByRole("button", { name: "Dismiss" }).click();
+
+  await emitCurrentRequest(page, "action-cooldown", "Cooldown denial marker");
+  const cooldown = cardFor(page, "Cooldown denial marker");
+  await cooldown.getByRole("button", { name: "Approve", exact: true }).click();
+  const cooldownPrompt = page.getByTestId("identity-pin-prompt");
+  await cooldownPrompt.getByLabel("8-digit identity PIN").fill("22222222");
+  await cooldownPrompt.getByRole("button", { name: "Approve with PIN" }).click();
+  await emitAck(page, "action-cooldown", "rejected", { errorCode: "cooldown", retryAt: Date.now() + 60_000 });
+  await expect(cooldown.getByRole("button", { name: "Approve with PIN again" })).toBeDisabled();
+  await expect(cooldown.getByRole("button", { name: "Deny" })).toBeEnabled();
+  await cooldown.getByRole("button", { name: "Deny" }).click();
+  await expect.poll(() => sentResponses(page, "action-cooldown")).toHaveLength(2);
+  const cooldownResponses = await sentResponses(page, "action-cooldown");
+  expect(cooldownResponses[1]).toMatchObject({ approved: false });
+  expect(cooldownResponses[1]).not.toHaveProperty("pin");
+  await emitTerminal(page, "action-cooldown", "denied");
+
+  await emitCurrentRequest(page, "action-snapshot-prompt", "Snapshot closes prompt marker");
+  const snapshotPrompt = cardFor(page, "Snapshot closes prompt marker");
+  await snapshotPrompt.getByRole("button", { name: "Approve", exact: true }).click();
+  await expect(page.getByTestId("identity-pin-prompt")).toBeVisible();
+  await emitCurrentSnapshot(page, []);
+  await expect(page.getByTestId("identity-pin-prompt")).toHaveCount(0);
+  await expect(snapshotPrompt).toHaveAttribute("data-approval-status", "unknown");
+  await expect(snapshotPrompt).toBeFocused();
+  await snapshotPrompt.getByRole("button", { name: "Dismiss" }).click();
+
+  await emitCurrentRequest(page, "action-expiring-prompt", "Expiry closes prompt marker", { timeoutMs: 300 });
+  const expiringPrompt = cardFor(page, "Expiry closes prompt marker");
+  await expiringPrompt.getByRole("button", { name: "Approve", exact: true }).click();
+  await expect(page.getByTestId("identity-pin-prompt")).toBeVisible();
+  await expect(expiringPrompt).toHaveAttribute("data-approval-status", "timeout", { timeout: 2_000 });
+  await expect(page.getByTestId("identity-pin-prompt")).toHaveCount(0);
+  await expect(expiringPrompt).toBeFocused();
+  await expiringPrompt.getByRole("button", { name: "Dismiss" }).click();
+
+  await emitCurrentRequest(page, "action-expired", "Expired outcome marker", { timeoutMs: 150 });
+  const expired = cardFor(page, "Expired outcome marker");
+  await expect(expired).toHaveAttribute("data-approval-status", "timeout", { timeout: 2_000 });
+  await expect(expired.getByRole("button", { name: "Dismiss" })).toBeVisible();
+  await expect(expired.getByRole("button", { name: "Approve", exact: true })).toBeDisabled();
+  await expect(expired.getByRole("button", { name: "Deny" })).toBeDisabled();
+
+  // A later authoritative terminal event may refine a locally inferred timeout.
+  await emitTerminal(page, "action-expired", "denied");
+  await expect(expired).toHaveAttribute("data-approval-status", "denied");
+});
+
+test("an identity prompt cannot silently replace another prompt", async ({ context, page, request }) => {
+  await installExternalActionSocketMock(context);
+  const session = await createE2eSession(request, "e2e external action prompt collision");
+  await openSessionInUi(page, session);
+  await expect(page.getByTestId("chat-input")).toBeEnabled();
+
+  await emitCurrentRequest(page, "action-first", "First exact action summary");
+  await emitCurrentRequest(page, "action-second", "Second exact action summary");
+  const first = cardFor(page, "First exact action summary");
+  const second = cardFor(page, "Second exact action summary");
+  await first.getByRole("button", { name: "Approve", exact: true }).click();
+  const prompt = page.getByTestId("identity-pin-prompt");
+  await expect(prompt).toContainText("First exact action summary");
+
+  await second.getByRole("button", { name: "Approve", exact: true }).click();
+  await expect(prompt).toHaveCount(1);
+  await expect(prompt).toContainText("First exact action summary");
+  await expect(prompt).not.toContainText("Second exact action summary");
+  await expect(second).toContainText("Finish or cancel the current identity PIN prompt");
+
+  await emitCurrent(page, {
+    type: "command_guard_pin_request",
+    requestId: "guard-collision",
+    prompt: "A later command guard prompt",
+    command: "must not replace",
+  });
+  await expect(prompt).toContainText("First exact action summary");
+  await expect(prompt).not.toContainText("A later command guard prompt");
+  await expect.poll(() => page.evaluate(() => {
+    const sent = (window as unknown as {
+      __externalActionSocketTest: { sent: Array<Record<string, unknown>> };
+    }).__externalActionSocketTest.sent;
+    return sent.some((message) => (
+      message.type === "command_guard_pin_response"
+      && message.requestId === "guard-collision"
+      && message.cancelled === true
+    ));
+  })).toBe(true);
+});
+
+test("missing acknowledgement becomes retryable uncertainty and snapshots never imply success", async ({ context, page, request }) => {
+  test.setTimeout(25_000);
+  await installExternalActionSocketMock(context);
+  const session = await createE2eSession(request, "e2e external action uncertain");
+  await openSessionInUi(page, session);
+  await expect(page.getByTestId("chat-input")).toBeEnabled();
+
+  await emitCurrentRequest(page, "action-uncertain", "Uncertain acknowledgement marker");
+  const card = cardFor(page, "Uncertain acknowledgement marker");
+  await card.getByRole("button", { name: "Deny" }).click();
+  await expect(card).toHaveAttribute("data-approval-status", "awaiting_ack");
+  await expect(card.getByRole("button", { name: "Deny" })).toBeDisabled();
+  await expect(card).toHaveAttribute("data-approval-status", "uncertain", { timeout: 12_000 });
+  await expect(card).toContainText("No acknowledgement or terminal event arrived within 10 seconds");
+  await expect(card.getByRole("button", { name: "Deny" })).toBeEnabled();
+  await expect.poll(() => sentResponses(page, "action-uncertain")).toHaveLength(1);
+
+  await emitCurrentSnapshot(page, []);
+  await expect(card).toHaveAttribute("data-approval-status", "unknown");
+  await expect(card).toContainText("snapshot omitted it without a terminal outcome");
+  await expect(card.getByRole("button", { name: "Dismiss" })).toBeVisible();
+});
+
+test("reconnect, selection changes, and two tabs preserve exact terminal meaning", async ({ context, page, request }) => {
+  await installExternalActionSocketMock(context);
+  const firstSession = await createE2eSession(request, "e2e external action first");
+  const secondSession = await createE2eSession(request, "e2e external action second");
+  await openSessionInUi(page, firstSession);
+  await expect(page.getByTestId("chat-input")).toBeEnabled();
+
+  await emitCurrentRequest(page, "action-reconnect", "Reconnect unknown marker");
+  const reconnectCard = cardFor(page, "Reconnect unknown marker");
+  await reconnectCard.getByRole("button", { name: "Deny" }).click();
   await page.evaluate(() => {
     (window as unknown as { __externalActionSocketTest: { closeLatest: () => void } }).__externalActionSocketTest.closeLatest();
   });
-  await expect(card).toHaveCount(0, { timeout: 10_000 });
-  await expect.poll(() => sentResponses(page, "action-approve")).toHaveLength(1);
+  await expect(reconnectCard).toHaveAttribute("data-approval-status", "uncertain");
+  await expect(reconnectCard).toHaveAttribute("data-approval-status", "unknown", { timeout: 10_000 });
+  await expect.poll(() => sentResponses(page, "action-reconnect")).toHaveLength(1);
 
-  await emitCurrentRequest(page, "action-deny", "Deny this synthetic action");
-  await card.getByRole("button", { name: "Deny" }).click();
-  await expect.poll(() => sentResponses(page, "action-deny")).toHaveLength(1);
-  const [deniedResponse] = await sentResponses(page, "action-deny");
-  expect(deniedResponse).toMatchObject({
-    requestId: "action-deny",
-    sessionId: firstSession.id,
-    argumentsHash: "a".repeat(64),
-    approved: false,
-  });
-  await page.evaluate(() => {
-    const state = (window as unknown as {
-      __externalActionSocketTest: {
-        current: () => { sessionId: string; selectionId: string | null };
-        emit: (payload: Record<string, unknown>) => void;
-      };
-    }).__externalActionSocketTest;
-    const current = state.current();
-    state.emit({
-      type: "external_action_response_ack",
-      requestId: "action-deny",
-      sessionId: current.sessionId,
-      selection_id: current.selectionId,
-      status: "denied",
-    });
-  });
-  await expect(card).toHaveCount(0);
-
-  await emitCurrentRequest(page, "action-old-selection", "Must disappear on switch");
-  const oldIdentity = await page.evaluate(() => (
-    (window as unknown as {
-      __externalActionSocketTest: { current: () => { sessionId: string; selectionId: string | null } };
-    }).__externalActionSocketTest.current()
-  ));
   await page.getByText(secondSession.title, { exact: true }).click();
   await expect(page.getByTestId("chat-input")).toBeEnabled();
-  await expect(card).toHaveCount(0);
-  await page.evaluate(({ oldIdentity }) => {
+  await expect(page.getByTestId("external-action-approval")).toHaveCount(0);
+
+  // A delayed PIN request from the previous session must not collect a PIN in
+  // the new selection.
+  await page.evaluate((oldSessionId) => {
     const state = (window as unknown as {
       __externalActionSocketTest: { emit: (payload: Record<string, unknown>) => void };
     }).__externalActionSocketTest;
     state.emit({
-      type: "external_action_request",
-      requestId: "late-old-selection",
-      sessionId: oldIdentity.sessionId,
-      selection_id: oldIdentity.selectionId,
-      connector: "Stale connector",
-      toolName: "stale_tool",
-      summary: "late stale summary",
-      argumentsHash: "a".repeat(64),
-      createdAt: Date.now(),
-      timeoutMs: 120_000,
+      type: "command_guard_pin_request",
+      requestId: "delayed-old-session-pin",
+      sessionId: oldSessionId,
+      prompt: "Must not render in the new session",
     });
-  }, { oldIdentity });
-  await expect(card).toHaveCount(0);
+  }, firstSession.id);
+  await expect(page.getByTestId("identity-pin-prompt")).toHaveCount(0);
+
+  const secondPage = await context.newPage();
+  await openSessionInUi(page, firstSession);
+  await openSessionInUi(secondPage, firstSession);
+  await expect(page.getByTestId("chat-input")).toBeEnabled();
+  await expect(secondPage.getByTestId("chat-input")).toBeEnabled();
+  await page.evaluate(() => {
+    (window as unknown as {
+      __externalActionSocketTest: { setAutoResolveResponses: (enabled: boolean) => void };
+    }).__externalActionSocketTest.setAutoResolveResponses(true);
+  });
+
+  await emitBroadcastRequest(page, "action-two-tabs", "Visible in both tabs");
+  const firstCard = cardFor(page, "Visible in both tabs");
+  const secondCard = cardFor(secondPage, "Visible in both tabs");
+  await firstCard.getByRole("button", { name: "Approve", exact: true }).click();
+  const prompt = page.getByTestId("identity-pin-prompt");
+  await prompt.getByPlaceholder("8-digit PIN").fill("87654321");
+  await prompt.getByRole("button", { name: "Approve with PIN" }).click();
+  await expect.poll(() => sentResponses(page, "action-two-tabs")).toHaveLength(1);
+  await expect(firstCard).toHaveAttribute("data-approval-status", "approved");
+  await expect(secondCard).toHaveAttribute("data-approval-status", "approved");
+  await expect.poll(() => sentResponses(secondPage, "action-two-tabs")).toHaveLength(0);
+});
+
+test("settled external-action cards have a bounded visible retention policy", async ({ context, page, request }) => {
+  await installExternalActionSocketMock(context);
+  const session = await createE2eSession(request, "e2e bounded external action outcomes");
+  await openSessionInUi(page, session);
+  await expect(page.getByTestId("chat-input")).toBeEnabled();
+
+  for (let index = 0; index < 25; index += 1) {
+    const requestId = `bounded-action-${index}`;
+    await emitCurrentRequest(page, requestId, `Bounded outcome ${index}`);
+    await emitTerminal(page, requestId, "denied");
+  }
+
+  await expect(page.getByTestId("external-action-approval")).toHaveCount(20);
+  await expect(page.getByTestId("external-action-approvals")).toContainText(
+    "older settled action card",
+  );
+  await expect(page.getByTestId("external-action-approvals")).toContainText(
+    "Disappearance is not evidence of approval",
+  );
+
+  // If the focused action becomes terminal and is immediately evicted by the
+  // bounded retention policy, focus falls back to the composer rather than a
+  // detached approval button/card.
+  await emitCurrentRequest(page, "bounded-old-focused", "Evicted focused outcome", {
+    createdAt: Date.now() - 60_000,
+    timeoutMs: 120_000,
+  });
+  const evicted = cardFor(page, "Evicted focused outcome");
+  await evicted.getByRole("button", { name: "Approve", exact: true }).click();
+  await expect(page.getByTestId("identity-pin-prompt")).toBeVisible();
+  await emitTerminal(page, "bounded-old-focused", "denied");
+  await expect(page.getByTestId("identity-pin-prompt")).toHaveCount(0);
+  await expect(evicted).toHaveCount(0);
+  await expect(page.getByTestId("chat-input")).toBeFocused();
 });
 
 test("deselecting the active session closes its approval WebSocket without reconnecting", async ({ context, page, request }) => {
@@ -388,31 +668,4 @@ test("deselecting the active session closes its approval WebSocket without recon
       __externalActionSocketTest: { stats: () => { closeCount: number; socketCount: number; openCount: number } };
     }).__externalActionSocketTest.stats()
   ))).toEqual({ closeCount: 1, socketCount: 1, openCount: 0 });
-});
-
-test("approving in one tab reconciles the same external action in another tab", async ({ context, page, request }) => {
-  await installExternalActionSocketMock(context);
-  const session = await createE2eSession(request, "e2e external action two tabs");
-  const secondPage = await context.newPage();
-  await openSessionInUi(page, session);
-  await openSessionInUi(secondPage, session);
-  await expect(page.getByTestId("chat-input")).toBeEnabled();
-  await expect(secondPage.getByTestId("chat-input")).toBeEnabled();
-  await page.evaluate(() => {
-    (window as unknown as {
-      __externalActionSocketTest: { setAutoResolveResponses: (enabled: boolean) => void };
-    }).__externalActionSocketTest.setAutoResolveResponses(true);
-  });
-
-  await emitBroadcastRequest(page, "action-two-tabs", "Visible in both tabs");
-  const firstCard = page.getByTestId("external-action-approval");
-  const secondCard = secondPage.getByTestId("external-action-approval");
-  await expect(firstCard).toHaveCount(1);
-  await expect(secondCard).toHaveCount(1);
-
-  await firstCard.getByRole("button", { name: "Approve" }).click();
-  await expect.poll(() => sentResponses(page, "action-two-tabs")).toHaveLength(1);
-  await expect(firstCard).toHaveCount(0);
-  await expect(secondCard).toHaveCount(0);
-  await expect.poll(() => sentResponses(secondPage, "action-two-tabs")).toHaveLength(0);
 });
