@@ -64,6 +64,10 @@ import {
   type ProtectedAutomationProductionBootstrap,
   type ProtectedAutomationProductionIntegration,
 } from "./protected-automation/production.js";
+import {
+  bootstrapFileAudioExperimentProduction,
+  type FileAudioExperimentProductionBootstrap,
+} from "./audio-experiment/production.js";
 
 const serverCredentialBrokers = new WeakMap<http.Server, CredentialBroker>();
 const serverProtectedAutomationWsClosers = new WeakMap<http.Server, () => void>();
@@ -77,8 +81,9 @@ function bindProductionBootstraps(
   workspaceCapabilities: ProductionWorkspaceCapabilityBootstrap,
   protectedBrowser: ProtectedBrowserProductionBootstrap,
   protectedAutomation: ProtectedAutomationProductionBootstrap,
+  fileAudioExperiment: FileAudioExperimentProductionBootstrap,
 ): void {
-  serverProductionBootstraps.set(server, [workspaceCapabilities, protectedBrowser, protectedAutomation]);
+  serverProductionBootstraps.set(server, [workspaceCapabilities, protectedBrowser, protectedAutomation, fileAudioExperiment]);
   server.once("close", () => { void closeProductionBootstraps(server); });
 }
 
@@ -289,6 +294,9 @@ export function start() {
     credentialBroker,
     pinAttempts: workspaceCapabilities.pinAttempts,
   });
+  // Installs closures only. Prompt/capsule/key/file/media/DSP/provider work is
+  // impossible until a valid enabled same-turn experiment execute reaches it.
+  const fileAudioExperiment = bootstrapFileAudioExperimentProduction(config.fileAudioExperiment);
 
   if (!config.auth.enabled && !isLoopbackHost(config.host)) {
     console.warn("[wayang] WARNING: built-in authentication is disabled on a non-loopback bind; protect every HTTP and WebSocket path with a trusted network or authenticated reverse proxy.");
@@ -302,7 +310,7 @@ export function start() {
     protectedAutomation: protectedAutomation.integration,
     credentialBroker,
   });
-  bindProductionBootstraps(server, workspaceCapabilities, protectedBrowser, protectedAutomation);
+  bindProductionBootstraps(server, workspaceCapabilities, protectedBrowser, protectedAutomation, fileAudioExperiment);
   protectedAutomation.start();
 
   // Durable submissions survive a backend restart. Delivery failures stay in

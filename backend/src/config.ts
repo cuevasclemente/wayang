@@ -42,6 +42,26 @@ export interface BrowserConfig {
   credentials: BrowserCredentialsConfig;
 }
 
+export interface FileAudioExperimentConfig {
+  /** Inert unless the direct-audio/media/DSP/isolated-Sol composition is explicitly installed. */
+  enabled: boolean;
+  permitTtlMs: number;
+  /** Values are captured at startup but paths/files are validated and opened only after valid execute. */
+  wrenCapsulePath: string;
+  wrenCapsuleSha256: string;
+  sharedTaskPath: string;
+  sharedTaskSha256: string;
+  neutralAdapterPath: string;
+  neutralAdapterSha256: string;
+  responseSchemaPath: string;
+  responseSchemaSha256: string;
+  solSynthesisPromptPath: string;
+  solSynthesisPromptSha256: string;
+  mediaTempRoot: string;
+  ffmpegPath: string;
+  ffprobePath: string;
+}
+
 export interface Config {
   port: number;
   host: string;
@@ -54,6 +74,7 @@ export interface Config {
   tts: TtsConfig;
   auth: AuthConfig;
   browser: BrowserConfig;
+  fileAudioExperiment: FileAudioExperimentConfig;
 }
 
 function getDataDir(): string {
@@ -223,6 +244,23 @@ export function getConfig(overrides?: Partial<Config>): Config {
         maxCliOutputBytes: 4 * 1024 * 1024,
         cliTimeoutMs: 15_000,
       },
+    },
+    fileAudioExperiment: {
+      enabled: envFlag("WAYANG_FILE_AUDIO_EXPERIMENT_ENABLED"),
+      permitTtlMs: getPositiveEnvInt("WAYANG_FILE_AUDIO_EXPERIMENT_PERMIT_TTL_MS", 60_000, 1_000, 120_000),
+      wrenCapsulePath: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_WREN_CAPSULE_PATH || "",
+      wrenCapsuleSha256: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_WREN_CAPSULE_SHA256 || "",
+      sharedTaskPath: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_SHARED_TASK_PATH || "",
+      sharedTaskSha256: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_SHARED_TASK_SHA256 || "",
+      neutralAdapterPath: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_NEUTRAL_ADAPTER_PATH || "",
+      neutralAdapterSha256: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_NEUTRAL_ADAPTER_SHA256 || "",
+      responseSchemaPath: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_RESPONSE_SCHEMA_PATH || "",
+      responseSchemaSha256: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_RESPONSE_SCHEMA_SHA256 || "",
+      solSynthesisPromptPath: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_SOL_SYNTHESIS_PROMPT_PATH || "",
+      solSynthesisPromptSha256: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_SOL_SYNTHESIS_PROMPT_SHA256 || "",
+      mediaTempRoot: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_MEDIA_TEMP_ROOT || path.join(dataDir, "audio-experiment", "tmp"),
+      ffmpegPath: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_FFMPEG_PATH || "/usr/bin/ffmpeg",
+      ffprobePath: process.env.WAYANG_FILE_AUDIO_EXPERIMENT_FFPROBE_PATH || "/usr/bin/ffprobe",
     },
     ...overrides,
   };

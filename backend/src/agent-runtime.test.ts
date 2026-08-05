@@ -28,6 +28,7 @@ import { getSessionAttachmentRoot, LEGACY_ATTACHMENT_ROOT } from "./protected-ar
 import { WREN_AGENT_PROFILE_ID, type AgentProfileRow } from "./workspace-types.js";
 import { WAYANG_RUNTIME_CONTEXT_TOOL_NAME } from "./wayang-runtime-context.js";
 import { RESTRICTED_MCP_TOOL_NAME, type RestrictedMcpRuntime } from "./restricted-mcp/index.js";
+import { FILE_AUDIO_EXPERIMENT_TOOL_NAME, type FileAudioExperimentRuntime } from "./audio-experiment/types.js";
 
 function fixture(name: string): {
   dir: string;
@@ -314,6 +315,77 @@ test("standard-resource runtime fence prevents A → B → A stale wrapper reviv
     oldGenerationCurrent = true;
     await assert.rejects(() => tool.execute("stale-after-return-to-a", {}), /permanently revoked/);
     assert.equal(executions, 1);
+  } finally { f.cleanup(); }
+});
+
+test("file-audio tool-object replacement closes the runtime and never invokes the replacement", async () => {
+  const f = fixture("wayang-runtime-audio-tool-drift-");
+  try {
+    const now = Date.now();
+    commitStoreMutation((draft) => {
+      draft.agentProfiles.push({
+        id: WREN_AGENT_PROFILE_ID,
+        name: "Audio tool drift Wren",
+        description: null,
+        builtin_kind: "wren",
+        deletable: false,
+        enabled: true,
+        resource_mode: "standard",
+        instructions: null,
+        memory_access: "read_write",
+        default_provider: null,
+        default_model: null,
+        allowed_tools: null,
+        allowed_extensions: null,
+        created_at: now,
+        updated_at: now,
+      });
+    });
+    const profile = getAgentProfile(WREN_AGENT_PROFILE_ID)!;
+    const project = createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
+    const row = createSession(f.cwd, { agentProfileId: profile.id });
+    let closes = 0;
+    let replacements = 0;
+    const original: any = { name: FILE_AUDIO_EXPERIMENT_TOOL_NAME, async execute() { return { content: [] }; } };
+    const replacement: any = { name: FILE_AUDIO_EXPERIMENT_TOOL_NAME, async execute() { replacements++; return { content: [] }; } };
+    const runtime = {
+      tool: original,
+      binding: {
+        sourceSessionId: row.id,
+        runtimeGeneration: "synthetic",
+        processBootNonce: "synthetic",
+        projectId: project.id,
+        projectCwd: project.cwd,
+        agentProfileId: profile.id,
+        provider: "synthetic",
+        model: "synthetic",
+      },
+      preflight: () => ({ allowed: true as const }),
+      async close() { closes++; },
+    } satisfies FileAudioExperimentRuntime;
+    let active: string[] = [FILE_AUDIO_EXPERIMENT_TOOL_NAME];
+    const session: any = {
+      _toolDefinitions: new Map([[FILE_AUDIO_EXPERIMENT_TOOL_NAME, { definition: original }]]),
+      _toolRegistry: new Map([[FILE_AUDIO_EXPERIMENT_TOOL_NAME, original]]),
+      getActiveToolNames: () => active,
+      setActiveToolsByName(names: string[]) { active = [...names]; },
+      agent: { state: { tools: [original] }, async beforeToolCall() {} },
+    };
+    installAgentToolPolicyGuard(session, row.id, { fileAudioExperimentRuntime: runtime });
+    assert.deepEqual(active, [FILE_AUDIO_EXPERIMENT_TOOL_NAME]);
+
+    session._toolRegistry.set(FILE_AUDIO_EXPERIMENT_TOOL_NAME, replacement);
+    session.agent.state.tools = [replacement];
+    const decision = await session.agent.beforeToolCall({
+      toolCall: { name: FILE_AUDIO_EXPERIMENT_TOOL_NAME },
+      args: { operation: "execute", permit_id: "forged" },
+    });
+    assert.equal(decision.block, true);
+    assert.match(decision.reason, /tool object is not authorized/);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closes, 1);
+    await assert.rejects(() => replacement.execute("forged", {}), /tool object is not authorized/);
+    assert.equal(replacements, 0);
   } finally { f.cleanup(); }
 });
 

@@ -195,6 +195,44 @@ Compiled major bounds include:
 
 These bounds do **not** bound ordinary files the child writes into the Project. The persistent Chromium job profile also has no compiled byte quota and can retain cookies/cache/site data and grow between runs until an owner purges the tombstoned job. Monitor private data-disk use and treat that profile as bearer-sensitive.
 
+## Comparative file-audio experiment
+
+The comparative file-audio tool is disabled by default and remains absent unless all of these conditions hold: the deployment flag is enabled, a reviewed backend media/adapter/DSP composition is installed, the source is an interactive (not scheduled or replayed) session, the exact migration-seeded Wren profile is active, and the project is Standard. Profile names, lookalikes, Protected projects, scheduled jobs, stale runtimes, and old turns confer no eligibility.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `WAYANG_FILE_AUDIO_EXPERIMENT_ENABLED` | `0` | `1` permits eligible runtimes to receive the experiment tool when its injected implementation is installed. The flag alone performs no provider call and creates no authority. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_PERMIT_TTL_MS` | `60000` | Process-local preview-permit lifetime, integer 1000–120000 ms. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_WREN_CAPSULE_PATH` | empty | Absolute path to the reviewed owner-private Wren capsule. The file is opened no-follow only inside a valid arm-A execute. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_WREN_CAPSULE_SHA256` | empty | Frozen lowercase SHA-256 of the exact reviewed capsule bytes. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_SHARED_TASK_PATH` | empty | Absolute path to the owner-private task shared byte-for-byte by A and B. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_SHARED_TASK_SHA256` | empty | Frozen lowercase SHA-256 of the exact shared-task bytes. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_NEUTRAL_ADAPTER_PATH` | empty | Absolute path to the owner-private neutral adapter used only by B. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_NEUTRAL_ADAPTER_SHA256` | empty | Frozen lowercase SHA-256 of the exact neutral-adapter bytes. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_RESPONSE_SCHEMA_PATH` | empty | Absolute path to the owner-private strict response schema used by A/B and the isolated synthesis adapter; it is never released to the outer session. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_RESPONSE_SCHEMA_SHA256` | empty | Frozen lowercase SHA-256 of the exact response-schema bytes. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_SOL_SYNTHESIS_PROMPT_PATH` | empty | Absolute path to the owner-private isolated-Sol synthesis developer instructions, read only after A, B, and DSP succeed. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_SOL_SYNTHESIS_PROMPT_SHA256` | empty | Frozen lowercase SHA-256 of the exact Sol-synthesis instruction bytes. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_MEDIA_TEMP_ROOT` | `WAYANG_DATA_DIR/audio-experiment/tmp` | Private disposable ffmpeg/ffprobe workspace created only during execute. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_FFMPEG_PATH` | `/usr/bin/ffmpeg` | Canonical absolute Linux ffmpeg executable used only during execute. Relative or symlinked selectors fail closed. |
+| `WAYANG_FILE_AUDIO_EXPERIMENT_FFPROBE_PATH` | `/usr/bin/ffprobe` | Canonical absolute Linux ffprobe executable used only during execute. Relative or symlinked selectors fail closed. |
+
+The built-in media executor is Linux-only and requires canonical `/usr/bin/prlimit` and `/usr/bin/bwrap`. ffmpeg/ffprobe run through a shell-free `prlimit → bwrap` chain with explicit address-space, file-size, CPU, descriptor, core-dump, and task ceilings; unshared network/PID/IPC/user namespaces; dropped capabilities; a minimal environment; read-only system runtime libraries/font data; an isolated `/tmp`; and only the exact owner-private media workspace writable. Home, general `/etc`, the project tree, Wayang data outside that workspace, host `/tmp`, and host loopback are not mounted/reachable. Custom injected test executors do not inherit this containment.
+
+Uploads are addressed only by backend-issued attachment IDs bound to the full source session. Preview accepts only declared MP3 or RIFF/WAVE MIME types and always binds the complete A/B/C topology, exact attachment digest, current persisted browser user entry, runtime generation, project/profile, and provider/model. The tool accepts no arm-selection field. `execute` must atomically claim the short-lived permit in that exact same current user turn; it is single-use, reopens the upload no-follow with inode, size, and SHA-256 checks, structurally validates actual MP3/WAVE bytes, and sanitizes once. `revoke` also requires proof of that exact same current turn before it can cancel an unused or in-flight permit. There is no questionnaire or durable consent record, and permits do not survive runtime teardown or service restart.
+
+All five prompt/schema paths must be absolute, owner-private, and distinct. Before either direct provider use, the Wren capsule, shared task, neutral adapter, and response schema are opened no-follow and checked against frozen hashes. A receives the Wren capsule as developer instructions. B receives the neutral adapter as developer instructions and no capsule. Both receive the exact same shared task, response schema, and sanitized audio as user content, use fixed `gpt-audio-1.5` at the official HTTPS Chat Completions endpoint with text-only output and `store: false`, and must return the strict validated direct-response object rather than free text. The key is resolved only immediately before each provider use and is never returned or logged.
+
+Only after A and B validate does local deterministic DSP analyze the same still-hash-matching sanitized buffer. DSP produces bounded numeric text and exactly three bounded PNG artifacts for synthesis; it is not returned as the outer model's Arm C response. Two distinct cryptographically random 128-bit lowercase-hex labels blind A/B, and candidate order is randomized. After A, B, and DSP all succeed, the backend re-opens and hash-checks the Sol synthesis instructions and response schema, resolves the key immediately before use, and invokes the isolated fixed `gpt-5.6-sol` Chat Completions adapter. The adapter alone receives those private instructions/schema, the two already-validated direct responses under opaque labels, bounded DSP numeric text, and the three PNG byte artifacts. Its response must pass strict synthesis validation for arms A/B/C plus the response module's 64-character contiguous and whitespace-normalized private-prompt echo guard.
+
+The current outer model is **not** the synthesizer. Its ordinary tool result contains the two blind validated candidates under opaque labels, the validated synthesis response, bounded synthesis-provider metadata, and nonbinary DSP metadata/digests only. Candidate response IDs and token usage are withheld because they could become arm-mapping side channels. The result contains no arm-to-label mapping, A/B implementation identifier, private synthesis prompt, response schema, raw audio/base64, configured host path, OpenAI key, or DSP PNG/image block. The echo guard and output checks are defense-in-depth; transformed or deliberately fragmented model output can evade pattern matching, so private prompt confidentiality is not a proved security boundary.
+
+Preview and execute are both model-callable operations. Their same-current-user-turn binding ensures that execution cannot cross to another browser turn, attachment, session, or runtime, but it is not a separate human-click approval. Keep the feature disabled unless agent execution inside an explicit user-requesting turn is an acceptable consent policy; deployments requiring deterministic per-run human approval need an additional UI-owned, model-inaccessible authorization step.
+
+The current implementation intentionally withholds and does not persist the arm-to-label mapping. That is sufficient for fake-transport and fresh synthetic compatibility validation, but it prevents an auditable later reveal. Do **not** use this revision for an interpretable personal blinded pilot until a private mapping commitment, pre-reveal score capture, and controlled reveal mechanism exist.
+
+Startup installs only inert closures. Disabled startup, preview, and invalid/stale/replayed/cross-session/cross-turn execution perform no prompt/capsule/key/file read, ffmpeg/ffprobe/DSP work, or provider transport. Sol artifacts are never read during startup or preview and no partial execution object is released after a failed stage. Enabling the experiment is a deliberate audio disclosure decision for both direct A/B providers.
+
 ## Embedded browser
 
 | Variable | Default | Meaning |
@@ -254,6 +292,7 @@ Treat remote TTS as a data disclosure boundary: assistant text is sent to the co
 | `~/.wayang/auth-sessions.json` | Hashed built-in-login session records when enabled. |
 | `~/.wayang/workspace-capability-approval/pin-attempt-state.json` | Owner-only non-secret capability approval attempt count, cooldown timestamp, and optional reservation metadata; never the PIN. Service startup creates it automatically when safely absent and preserves valid state; `make setup-capability-approval` is optional preflight/migration. |
 | `~/.wayang/attachments/<full-session-id>/` | Private chat uploads for one Wayang source session (`0700` directories, `0600` files); only that session's direct path tools and sandboxed bash can read them. |
+| `~/.wayang/audio-experiment/tmp/` | Disposable owner-private sanitize/DSP workspaces created only during a valid execute and removed by the media modules. |
 | `~/.wayang/tts/` | Ephemeral generated TTS audio cache, private directory/files. |
 | `~/.wayang/browser-workbench/` | Default shared browser profile, downloads, artifacts, and private runtime metadata. |
 | `~/.wayang/browser-credentials/unlock.sock` | Ephemeral private Unix socket for local-terminal Bitwarden unlock handoff. |
