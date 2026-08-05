@@ -3233,7 +3233,8 @@ export function ChatPanel({
           const matching = interviewQueueRef.current.find((item) => item.requestId === requestId && item.sessionId === sessionId);
           if (!matching?.submission) return;
 
-          if (isAcceptedInterviewAck(ack)) {
+          const isTerminalConflict = ack.status === "rejected" && ack.errorCode === "conflict";
+          if (isAcceptedInterviewAck(ack) || isTerminalConflict) {
             clearStoredInterviewSubmission(sessionId, requestId);
             setInterviewQueueSynced((current) => current.filter((item) => !(item.requestId === requestId && item.sessionId === sessionId)));
           } else {
