@@ -163,7 +163,15 @@ test("capture/update/list expose only exact-pair metadata and strict schemas rej
         job_id: captured.job.id,
         expected_revision: captured.job.revision,
       }),
-      /conflict|paused|failed safely/i,
+      /conflict|failed safely/i,
+    );
+    await assert.rejects(
+      () => (runtime.tool.execute as any)("paused-run", {
+        operation: "run_now",
+        job_id: updated.job.id,
+        expected_revision: updated.job.revision,
+      }),
+      /job is paused; enable it before run_now/i,
     );
     await assert.rejects(
       () => (runtime.tool.execute as any)("missing", { operation: "capture_job", name: "incomplete" }),

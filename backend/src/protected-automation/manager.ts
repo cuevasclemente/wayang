@@ -189,9 +189,10 @@ export class ProtectedAutomationManager {
   private requireEffectiveJob(jobId: string, expectedRevision: number): ProtectedAutomationJobRow {
     const job = getProtectedAutomationJob(jobId);
     if (!job) throw new WorkspaceStoreError("Protected automation job not found", 404);
-    if (!job.enabled || job.revision !== expectedRevision || job.deleted_at !== null) {
-      throw new WorkspaceStoreError("Protected automation job revision conflict or job is paused", 409);
+    if (job.revision !== expectedRevision || job.deleted_at !== null) {
+      throw new WorkspaceStoreError("Protected automation job revision conflict", 409);
     }
+    if (!job.enabled) throw new WorkspaceStoreError("Protected automation job is paused", 409);
     return job;
   }
 

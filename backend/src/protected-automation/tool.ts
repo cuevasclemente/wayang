@@ -279,6 +279,10 @@ function reloadScheduledJob(jobId: string): void {
 }
 
 function sanitizedError(error: unknown): Error {
+  if (error instanceof WorkspaceStoreError && error.statusCode === 409
+    && /job is paused$/u.test(error.message)) {
+    return new Error("Protected automation job is paused; enable it before run_now");
+  }
   if (error instanceof WorkspaceStoreError && error.statusCode === 409) {
     return new Error("Protected automation conflict; refresh exact job metadata and retry");
   }
@@ -449,6 +453,7 @@ export function createProtectedAutomationToolRuntime(options: {
       case "run_now": {
         const job = ownedJob(binding, value.job_id as string);
         if (job.revision !== value.expected_revision) throw new WorkspaceStoreError("Protected automation job revision conflict", 409);
+        if (!job.enabled) throw new WorkspaceStoreError("Protected automation job is paused", 409);
         const manager = getProtectedAutomationManager();
         if (!manager) throw new WorkspaceStoreError("Protected automation runner is unavailable", 503);
         return { run: publicRun(manager.runNow(job.id, job.revision)) };
