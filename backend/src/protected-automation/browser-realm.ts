@@ -552,10 +552,17 @@ export class ProtectedAutomationBrowserRealmLease {
         await cdp.send("Target.setDiscoverTargets", { discover: true });
         await Promise.all([...initialBlankTargetIds].map((targetId) => targetClosures.get(targetId)).filter(Boolean));
         await this.assertAuthorized();
-        const verifiedTargets = await cdp.send<any>("Target.getTargets");
-        if (!Array.isArray(verifiedTargets?.targetInfos)
-          || verifiedTargets.targetInfos.some((info: any) => info?.type === "page" && info.targetId !== target.id)) {
-          throw realmError("Browser target normalization did not settle");
+        // Target.closeTarget acknowledgement can precede target destruction,
+        // especially on macOS CI. Re-attest the target set until Chromium
+        // publishes the closure, but keep startup bounded and authority-checked.
+        const normalizationDeadline = Date.now() + 5_000;
+        while (true) {
+          const verifiedTargets = await cdp.send<any>("Target.getTargets");
+          if (Array.isArray(verifiedTargets?.targetInfos)
+            && !verifiedTargets.targetInfos.some((info: any) => info?.type === "page" && info.targetId !== target.id)) break;
+          if (Date.now() >= normalizationDeadline) throw realmError("Browser target normalization did not settle");
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          await this.assertAuthorized();
         }
         await this.assertAuthorized();
       } catch (error) {

@@ -27,6 +27,8 @@ class SyntheticRuntime implements ProtectedAutomationManagedRuntime {
   snapshotPageTargetId: string | null = null;
   discoveryPageTargetId: string | null = null;
   cancelled: string[] = [];
+  private lingerTargetReadsAfterClose = 0;
+  private remainingTargetReadsAfterClose = 0;
   private targetCloseStartedResolve: (() => void) | null = null;
   private targetCloseReleaseResolve: (() => void) | null = null;
   targetCloseStarted: Promise<void> = Promise.resolve();
@@ -47,19 +49,26 @@ class SyntheticRuntime implements ProtectedAutomationManagedRuntime {
         });
       }
       if (method === "Target.getTargets") {
-        return { targetInfos: [
+        const lingeringTargetId = this.snapshotPageTargetId;
+        const result = { targetInfos: [
           { type: "page", targetId: "target-1", url: "about:blank" },
-          ...(this.snapshotPageTargetId
-            ? [{ type: "page", targetId: this.snapshotPageTargetId, url: "about:blank" }]
-            : []),
+          ...(lingeringTargetId ? [{ type: "page", targetId: lingeringTargetId, url: "about:blank" }] : []),
         ] };
+        if (this.remainingTargetReadsAfterClose > 0) {
+          this.remainingTargetReadsAfterClose -= 1;
+          if (this.remainingTargetReadsAfterClose === 0) this.snapshotPageTargetId = null;
+        }
+        return result;
       }
       if (method === "Target.closeTarget") {
         if (this.targetCloseReleaseResolve) {
           this.targetCloseStartedResolve?.();
           await this.targetCloseRelease;
         }
-        if (params.targetId === this.snapshotPageTargetId) this.snapshotPageTargetId = null;
+        if (params.targetId === this.snapshotPageTargetId) {
+          if (this.lingerTargetReadsAfterClose > 0) this.remainingTargetReadsAfterClose = this.lingerTargetReadsAfterClose;
+          else this.snapshotPageTargetId = null;
+        }
         if (params.targetId === this.discoveryPageTargetId) this.discoveryPageTargetId = null;
         return { success: true };
       }
@@ -78,6 +87,7 @@ class SyntheticRuntime implements ProtectedAutomationManagedRuntime {
     id: "target-1", type: "page", url: "about:blank", webSocketDebuggerUrl: "ws://synthetic.invalid",
   } as ChromeTarget;
   constructor(readonly options: ManagedChromiumRuntimeOptions) {}
+  lingerTargetAfterClose(reads: number): void { this.lingerTargetReadsAfterClose = reads; }
   deferTargetClose(): void {
     this.targetCloseStarted = new Promise<void>((resolve) => { this.targetCloseStartedResolve = resolve; });
     this.targetCloseRelease = new Promise<void>((resolve) => { this.targetCloseReleaseResolve = resolve; });
@@ -330,6 +340,31 @@ test("gate installation closes pre-existing extra pages but still denies later p
     });
     assert.equal(lease.isRevoked, true);
     assert.deepEqual(diagnostics, ["unexpected-page-target"]);
+    await lease.close();
+  } finally {
+    await realms.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("target normalization waits boundedly when close acknowledgement precedes destruction", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-automation-realm-delayed-target-close-"));
+  fs.mkdirSync(path.join(root, "project"));
+  let runtime!: SyntheticRuntime;
+  const realms = new ProtectedAutomationBrowserRealmRegistry({
+    dataDir: path.join(root, "data"),
+    runtimeFactory: (options) => {
+      runtime = new SyntheticRuntime(options);
+      runtime.snapshotPageTargetId = "pre-existing-target";
+      runtime.lingerTargetAfterClose(3);
+      return runtime;
+    },
+  });
+  try {
+    const lease = realms.acquire(request(root, () => undefined, "prepare"));
+    await lease.start();
+    assert.equal(lease.isRevoked, false);
+    assert.ok(runtime.commands.filter((command) => command.method === "Target.getTargets").length >= 4);
     await lease.close();
   } finally {
     await realms.close();
