@@ -8,6 +8,8 @@ Fresh installations seed one restricted **Default** profile with a generated sta
 
 Project paths are canonical and immutable. Project name, description, color, defaults, allowed agents, privacy mode, and `AGENTS.md` are editable.
 
+Every interactive Wayang runtime receives a short host-layer communication appendix: acknowledge substantive work before extended tool use and provide concise checkpoints around material findings, decisions, blockers, and useful steering points. It is appended without replacing profile, global, project, or `APPEND_SYSTEM.md` instructions. Scheduled runs do not receive it, and quick mechanical tasks should not add ceremonial updates. This is model guidance rather than a deterministic heartbeat; Wayang does not fabricate assistant messages or inject timer-based steering.
+
 ## Assign privileged capabilities
 
 Privileged authority belongs to a PIN-approved capability association between one immutable Project ID and one stable Agent Profile ID, not to a profile name, seeded identity, provider, or model. Provider/model are fluid runtime choices for that agent. Cloning creates a different Agent Profile ID and copies no associations; renaming or editing the associated stable profile preserves them.
