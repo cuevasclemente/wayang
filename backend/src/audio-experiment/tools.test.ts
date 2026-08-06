@@ -90,7 +90,7 @@ function parsed(result: any): any {
   return JSON.parse(result.content[0].text);
 }
 
-function fixture(name: string, options: { gate?: Promise<void>; now?: () => number } = {}) {
+function fixture(name: string, options: { gate?: Promise<void>; now?: () => number; isRuntimeCurrent?: () => boolean } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), name));
   const previous = process.env.WAYANG_DATA_DIR;
   process.env.WAYANG_DATA_DIR = path.join(root, "data");
@@ -178,13 +178,14 @@ function fixture(name: string, options: { gate?: Promise<void>; now?: () => numb
     binding,
     dependencies,
     getCurrentTurn: () => currentTurn,
-    isRuntimeCurrent: () => true,
+    isRuntimeCurrent: options.isRuntimeCurrent ?? (() => true),
     permitTtlMs: 1_000,
     now: options.now,
   });
   return {
     attachmentId: upload.attachmentIds[0]!, calls,
     execute: (input: unknown) => (runtime.tool.execute as any)("synthetic-call", input),
+    close: () => runtime.close(),
     get currentTurn() { return currentTurn; },
     setCurrentTurn(value: BrowserTurnProvenance | null) { currentTurn = value; },
     get synthesisInput() { return synthesisInput; },
@@ -214,7 +215,7 @@ test("preview is inert, arm selection is absent, and execute is complete and sin
   try {
     await assert.rejects(
       () => f.execute({ operation: "preview", attachment_id: f.attachmentId, arms: ["A"] }),
-      /unsupported fields/,
+      /unsupported.*fields/,
     );
     assert.deepEqual(f.calls, []);
     const permit = await preview(f);
@@ -223,6 +224,8 @@ test("preview is inert, arm selection is absent, and execute is complete and sin
     const result = parsed(await f.execute({ operation: "execute", permit_id: permit.permit_id }));
     assert.deepEqual(f.calls, ["media", "prompts", "A", "B", "DSP", "Sol"]);
     assert.equal(result.candidates.length, 2);
+    assert.match(result.run_id, /^[a-f0-9]{32}$/);
+    assert.equal(result.scoring_required_before_reveal, true);
     assert.equal(result.synthesis.provider.model, "gpt-5.6-sol");
     assert.equal(result.synthesis.response.mode, "synthesis");
     assert.equal(result.dsp.artifacts.length, 3);
@@ -246,6 +249,8 @@ test("opaque labels are distinct random 128-bit hex and public output has no map
     assert.match(labels[0], /^[a-f0-9]{32}$/);
     assert.match(labels[1], /^[a-f0-9]{32}$/);
     assert.notEqual(labels[0], labels[1]);
+    assert.match(firstValue.run_id, /^[a-f0-9]{32}$/);
+    assert.notEqual(firstValue.run_id, secondValue.run_id);
     assert.equal(secondValue.candidates.some((candidate: any) => labels.includes(candidate.label)), false);
     assert.deepEqual(firstSynthesisLabels!, labels);
 
@@ -254,8 +259,12 @@ test("opaque labels are distinct random 128-bit hex and public output has no map
       "PRIVATE_WREN_IMPLEMENTATION", "PRIVATE_NEUTRAL_IMPLEMENTATION", "PRIVATE_DSP_IMPLEMENTATION",
       "synthesis_context", "response_schema", "raw_audio", "audio_base64", "image_url",
       "direct-one", "direct-two", PNG.toString("base64"),
+      "PRIVATE_WREN_IMPLEMENTATION", "bounded_wren", "neutral_specialist",
     ]) assert.equal(text.includes(forbidden), false, forbidden);
+    assert.equal(Object.hasOwn(firstValue, "mapping"), false);
+    assert.equal(Object.hasOwn(firstValue, "internalLabelToArm"), false);
     assert.equal(Object.hasOwn(firstValue.candidates[0], "arm"), false);
+    assert.equal(Object.hasOwn(firstValue.candidates[0], "provider"), false);
     assert.equal(Object.hasOwn(firstValue.candidates[1], "implementation"), false);
   } finally { second.cleanup(); }
 });
@@ -285,4 +294,205 @@ test("revoke requires the exact same current turn, including for an in-flight pe
     release();
     await assert.rejects(running, /revoked/);
   } finally { release(); f.cleanup(); }
+});
+
+function scoreInput(result: any) {
+  const [first, second] = result.candidates.map((candidate: any) => candidate.label);
+  return {
+    operation: "score",
+    run_id: result.run_id,
+    candidates: [{
+      label: second,
+      temporal_grounding: 2,
+      perceptual_specificity: 2,
+      structural_coherence: 2,
+      affective_usefulness: 2,
+      evidence_uncertainty_calibration: 2,
+      source_honesty: 2,
+      rationale: "Second synthetic candidate rationale.",
+    }, {
+      label: first,
+      temporal_grounding: 4,
+      perceptual_specificity: 4,
+      structural_coherence: 4,
+      affective_usefulness: 4,
+      evidence_uncertainty_calibration: 4,
+      source_honesty: 4,
+      rationale: "First synthetic candidate rationale.",
+    }],
+    preferred_label: first,
+    condition_guesses: [
+      { label: second, condition: "neutral" },
+      { label: first, condition: "wren" },
+    ],
+  };
+}
+
+async function completedRun(f: ReturnType<typeof fixture>): Promise<any> {
+  return parsed(await f.execute({ operation: "execute", permit_id: (await preview(f)).permit_id }));
+}
+
+test("reveal fails closed before score and score rejects wrong labels, duplicates, ranges, and unknown fields", async () => {
+  const f = fixture("wayang-audio-score-validation-");
+  try {
+    const result = await completedRun(f);
+    await assert.rejects(() => f.execute({ operation: "reveal", run_id: result.run_id }), /requires an immutable score first/);
+    const unknown = scoreInput(result);
+    unknown.run_id = result.run_id === "0".repeat(32) ? "1".repeat(32) : "0".repeat(32);
+    await assert.rejects(() => f.execute(unknown), /unavailable in this live runtime/);
+
+    const wrong = scoreInput(result);
+    wrong.candidates[0]!.label = "0".repeat(32);
+    await assert.rejects(() => f.execute(wrong), /cover each exact run label once/);
+
+    const duplicate = scoreInput(result);
+    duplicate.candidates[0]!.label = duplicate.candidates[1]!.label;
+    await assert.rejects(() => f.execute(duplicate), /cover each exact run label once/);
+
+    const range = scoreInput(result);
+    range.candidates[0]!.source_honesty = 5;
+    await assert.rejects(() => f.execute(range), /integer from 0 through 4/);
+
+    await assert.rejects(
+      () => f.execute({ ...scoreInput(result), unexpected: true }),
+      /unsupported or unsafe fields/,
+    );
+    const nestedUnknown: any = scoreInput(result);
+    nestedUnknown.candidates[0].arm = "A";
+    await assert.rejects(() => f.execute(nestedUnknown), /unsupported or unsafe fields/);
+
+    let getterCalled = false;
+    const getterInput: any = scoreInput(result);
+    Object.defineProperty(getterInput.candidates[0], "rationale", {
+      enumerable: true,
+      get() { getterCalled = true; return "unsafe"; },
+    });
+    await assert.rejects(() => f.execute(getterInput), /unsupported or unsafe fields/);
+    assert.equal(getterCalled, false);
+  } finally { f.cleanup(); }
+});
+
+test("score is canonical, immutable, one-shot, and has an exact stable SHA-256 commitment", async () => {
+  const f = fixture("wayang-audio-score-commitment-");
+  try {
+    const result = await completedRun(f);
+    const input = scoreInput(result);
+    const scoreResult = parsed(await f.execute(input));
+    const [first, second] = result.candidates.map((candidate: any) => candidate.label);
+    const canonical = {
+      run_id: result.run_id,
+      candidates: [{
+        label: first,
+        temporal_grounding: 4,
+        perceptual_specificity: 4,
+        structural_coherence: 4,
+        affective_usefulness: 4,
+        evidence_uncertainty_calibration: 4,
+        source_honesty: 4,
+        rationale: "First synthetic candidate rationale.",
+      }, {
+        label: second,
+        temporal_grounding: 2,
+        perceptual_specificity: 2,
+        structural_coherence: 2,
+        affective_usefulness: 2,
+        evidence_uncertainty_calibration: 2,
+        source_honesty: 2,
+        rationale: "Second synthetic candidate rationale.",
+      }],
+      preferred_label: first,
+      condition_guesses: [
+        { label: first, condition: "wren" },
+        { label: second, condition: "neutral" },
+      ],
+      blind_breaks: [],
+    };
+    const expected = createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
+    assert.deepEqual(scoreResult, { run_id: result.run_id, commitment: expected, reveal_ready: true });
+
+    input.preferred_label = "tie";
+    input.candidates[0]!.rationale = "Mutated after submission.";
+    await assert.rejects(() => f.execute(scoreInput(result)), /immutable and may be submitted only once/);
+    const reveal = parsed(await f.execute({ operation: "reveal", run_id: result.run_id }));
+    assert.equal(reveal.commitment, expected);
+    assert.equal(reveal.preferred_label, first);
+  } finally { f.cleanup(); }
+});
+
+test("reveal returns the correct public condition mapping and is idempotent", async () => {
+  const f = fixture("wayang-audio-reveal-");
+  try {
+    const result = await completedRun(f);
+    const score = scoreInput(result);
+    const committed = parsed(await f.execute(score));
+    const firstReveal = parsed(await f.execute({ operation: "reveal", run_id: result.run_id }));
+    const expectedMapping = Object.fromEntries(f.synthesisInput!.candidates.map((candidate) => [
+      candidate.label,
+      candidate.result.arm === "A" ? "bounded_wren" : "neutral_specialist",
+    ]));
+    assert.deepEqual(firstReveal, {
+      run_id: result.run_id,
+      commitment: committed.commitment,
+      mapping: expectedMapping,
+      preferred_label: score.preferred_label,
+      condition_guesses: [
+        { label: result.candidates[0].label, condition: "wren" },
+        { label: result.candidates[1].label, condition: "neutral" },
+      ],
+      revealed: true,
+    });
+    assert.deepEqual(parsed(await f.execute({ operation: "reveal", run_id: result.run_id })), firstReveal);
+  } finally { f.cleanup(); }
+});
+
+test("score and reveal may occur in a later persisted turn of the same live runtime", async () => {
+  const f = fixture("wayang-audio-later-turn-");
+  try {
+    const result = await completedRun(f);
+    const original = f.currentTurn!;
+    f.setCurrentTurn(Object.freeze({
+      ...original,
+      token: "later-browser-turn",
+      piUserEntryId: "entry-later",
+      acceptedAt: original.acceptedAt + 1,
+      contentSha256: "a".repeat(64),
+      acceptedEntryCount: original.acceptedEntryCount + 1,
+    }));
+    const committed = parsed(await f.execute(scoreInput(result)));
+    assert.equal(committed.reveal_ready, true);
+    assert.equal(parsed(await f.execute({ operation: "reveal", run_id: result.run_id })).revealed, true);
+  } finally { f.cleanup(); }
+});
+
+test("runtime close, expiry, stale runtime, and deterministic oldest eviction fail closed", async () => {
+  let timestamp = 10_000;
+  const expired = fixture("wayang-audio-expiry-", { now: () => timestamp });
+  try {
+    const result = await completedRun(expired);
+    timestamp += 60 * 60 * 1000;
+    await assert.rejects(() => expired.execute(scoreInput(result)), /unavailable in this live runtime/);
+  } finally { expired.cleanup(); }
+
+  const closed = fixture("wayang-audio-close-");
+  try {
+    const result = await completedRun(closed);
+    await closed.close();
+    await assert.rejects(() => closed.execute(scoreInput(result)), /runtime is revoked/);
+  } finally { closed.cleanup(); }
+
+  let current = true;
+  const stale = fixture("wayang-audio-stale-", { isRuntimeCurrent: () => current });
+  try {
+    const result = await completedRun(stale);
+    current = false;
+    await assert.rejects(() => stale.execute(scoreInput(result)), /generation is stale/);
+  } finally { stale.cleanup(); }
+
+  const evicted = fixture("wayang-audio-eviction-");
+  try {
+    const runs: Array<{ run_id: string; candidates: Array<{ label: string }> }> = [];
+    for (let index = 0; index < 9; index += 1) runs.push(await completedRun(evicted));
+    await assert.rejects(() => evicted.execute(scoreInput(runs[0])), /unavailable in this live runtime/);
+    assert.equal(parsed(await evicted.execute(scoreInput(runs[8]))).reveal_ready, true);
+  } finally { evicted.cleanup(); }
 });

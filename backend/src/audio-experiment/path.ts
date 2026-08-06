@@ -292,9 +292,14 @@ export async function executeFileAudioExperimentPath(options: {
       sha256: image.sha256,
     }))),
   });
+  const internalLabelToArm = Object.freeze(candidates.map((candidate) => Object.freeze({
+    label: candidate.label,
+    arm: candidate.result.arm,
+  }))) as unknown as FileAudioExecutedAnalysis["internalLabelToArm"];
   return Object.freeze({
     candidates: Object.freeze(publicCandidates) as FileAudioExecutedAnalysis["candidates"],
     synthesis: Object.freeze({ response: synthesisResponse, provider: boundedProvider(synthesis.provider) }),
     dsp: publicDsp,
+    internalLabelToArm,
   });
 }

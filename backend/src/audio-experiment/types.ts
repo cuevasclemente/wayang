@@ -182,10 +182,43 @@ export interface FileAudioPublicDsp {
   }[];
 }
 
+export interface FileAudioInternalLabelArm {
+  readonly label: string;
+  readonly arm: "A" | "B";
+}
+
+/** Internal-only mapping retained by the process-local score/reveal ledger. Public
+ * serializers must select fields explicitly and never release this property. */
 export interface FileAudioExecutedAnalysis {
   readonly candidates: readonly [FileAudioPublicCandidate, FileAudioPublicCandidate];
   readonly synthesis: FileAudioSynthesisResult;
   readonly dsp: FileAudioPublicDsp;
+  readonly internalLabelToArm: readonly [FileAudioInternalLabelArm, FileAudioInternalLabelArm];
+}
+
+export type FileAudioPublicCondition = "bounded_wren" | "neutral_specialist";
+export type FileAudioConditionGuess = "wren" | "neutral" | "unsure";
+
+export interface FileAudioCandidateScore {
+  readonly label: string;
+  readonly temporal_grounding: number;
+  readonly perceptual_specificity: number;
+  readonly structural_coherence: number;
+  readonly affective_usefulness: number;
+  readonly evidence_uncertainty_calibration: number;
+  readonly source_honesty: number;
+  readonly rationale: string;
+}
+
+export interface FileAudioScoreSubmission {
+  readonly run_id: string;
+  readonly candidates: readonly [FileAudioCandidateScore, FileAudioCandidateScore];
+  readonly preferred_label: string | "tie";
+  readonly condition_guesses: readonly [
+    Readonly<{ label: string; condition: FileAudioConditionGuess }>,
+    Readonly<{ label: string; condition: FileAudioConditionGuess }>,
+  ];
+  readonly blind_breaks?: readonly string[];
 }
 
 export interface FileAudioExperimentRuntime {
