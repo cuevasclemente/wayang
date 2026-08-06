@@ -19,6 +19,7 @@ function automationJob(overrides: Overrides = {}) {
     entrypoint: "automation.mjs",
     argv_count: 2,
     uses_browser_profile: false,
+    browser_profile: { supported: false, saved: false, last_saved_at: null as number | null },
     allowed_https_origins: [] as string[],
     cron_expr: "15 4 * * 1",
     timeout_ms: 12 * 60_000,
@@ -376,6 +377,7 @@ test("uses only backend-issued source-bound preparation HTTP and viewer routes",
     enabled: false,
     blocked_reason: "paused",
     uses_browser_profile: true,
+    browser_profile: { supported: true, saved: true, last_saved_at: NOW - 60_000 },
     allowed_https_origins: ["https://synthetic.example.test"],
   });
   const state = await installMocks(page, {
@@ -391,12 +393,17 @@ test("uses only backend-issued source-bound preparation HTTP and viewer routes",
       if (typeof message !== "string") return;
       try { viewerMessages.push(JSON.parse(message) as Record<string, unknown>); } catch { /* exact client parser owns rejection */ }
     });
-    setTimeout(() => socket.send(JSON.stringify({
-      type: "frame",
-      dataUrl: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
-      metadata: { deviceWidth: 1, deviceHeight: 1 },
-      sessionId: 1,
-    })), 10);
+    setTimeout(() => {
+      socket.send(JSON.stringify({ type: "ready" }));
+      for (const sessionId of [1, 2, 3]) {
+        socket.send(JSON.stringify({
+          type: "frame",
+          dataUrl: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
+          metadata: { deviceWidth: 1, deviceHeight: 1 },
+          sessionId,
+        }));
+      }
+    }, 10);
   });
 
   await openAutomation(page, JOB_ID);
@@ -406,8 +413,13 @@ test("uses only backend-issued source-bound preparation HTTP and viewer routes",
 
   await expect(page.getByTestId("protected-automation-preparation-state")).toContainText("state: ready");
   await expect(page.getByTestId("protected-automation-viewer")).toBeVisible();
+  await expect(page.getByTestId("protected-automation-browser-profile-state")).toContainText("saved");
+  await expect(page.getByTestId("protected-automation-browser-profile-state")).toContainText("Last saved");
   await expect(page.getByTestId("protected-automation-preparation-close")).toHaveText("Save & close preparation");
   await expect(page.getByText("Preparation viewer connected")).toBeVisible();
+  await expect.poll(() => viewerMessages
+    .filter((message) => message.type === "frame-ack")
+    .map((message) => Number(message.sessionId)).sort()).toEqual([1, 2, 3]);
   await page.getByTestId("protected-automation-preparation-open-0").click();
   await page.getByTestId("protected-automation-viewer-paste-open").click();
   await page.getByTestId("protected-automation-viewer-paste-capture").evaluate((element) => {

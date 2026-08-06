@@ -15,6 +15,7 @@ import { createProtectedAutomationServices, type ProtectedAutomationServices } f
 import {
   ProtectedAutomationBrowserRealmRegistry,
   protectedAutomationBrowserRealmRoot,
+  type ProtectedAutomationBrowserProfileState,
 } from "./browser-realm.js";
 import { ProtectedAutomationBrowserRpc } from "./browser-rpc.js";
 import {
@@ -46,6 +47,7 @@ const PREPARATION_PASTE_MAX_CHARS = 4_096;
 const PREPARATION_PASTE_MAX_BYTES = 16_384;
 
 export interface ProtectedAutomationViewerTransport {
+  start(): Promise<void>;
   dispatch(message: Buffer, isBinary: boolean): Promise<void>;
   close(): Promise<void>;
   onMessage(listener: (message: Buffer, isBinary: boolean) => void): () => void;
@@ -152,7 +154,10 @@ function publicRun(row: ProtectedAutomationRunRow) {
   };
 }
 
-function publicJob(row: ProtectedAutomationJobRow) {
+function publicJob(
+  row: ProtectedAutomationJobRow,
+  profileState: ProtectedAutomationBrowserProfileState = { saved: false, lastSavedAt: null },
+) {
   const latestAttention = listProtectedAutomationRuns(row.id, 1)[0];
   return {
     id: row.id,
@@ -166,6 +171,11 @@ function publicJob(row: ProtectedAutomationJobRow) {
     entrypoint: row.entrypoint,
     argv_count: row.argv.length,
     uses_browser_profile: row.uses_browser_profile,
+    browser_profile: {
+      supported: row.uses_browser_profile,
+      saved: row.uses_browser_profile && profileState.saved,
+      last_saved_at: row.uses_browser_profile ? profileState.lastSavedAt : null,
+    },
     allowed_https_origins: [...row.allowed_https_origins],
     cron_expr: row.cron_expr,
     timeout_ms: row.timeout_ms,
@@ -298,18 +308,28 @@ async function createPreparationViewer(context: ProtectedAutomationPreparationVi
   catch { attachment.close(); throw diagnosticError("viewer-page-enable"); }
   try { await guardedSend(attachment.cdp, context.assertAuthorized, "Runtime.enable"); }
   catch { attachment.close(); throw diagnosticError("viewer-runtime-enable"); }
-  try {
-    await guardedSend(attachment.cdp, context.assertAuthorized, "Page.startScreencast", { format: "jpeg", quality: 70, everyNthFrame: 1 });
-  } catch { attachment.close(); throw diagnosticError("viewer-screencast-start"); }
+  let startPromise: Promise<void> | null = null;
+  let started = false;
+  const start = () => {
+    if (closed) return Promise.reject(error("Preparation viewer is closed", 409));
+    startPromise ??= guardedSend(attachment.cdp, context.assertAuthorized, "Page.startScreencast", {
+      format: "jpeg", quality: 70, everyNthFrame: 1,
+    }).then(() => { started = true; }, () => {
+      void close();
+      throw diagnosticError("viewer-screencast-start");
+    });
+    return startPromise;
+  };
   const close = async () => {
     if (closed) return;
     closed = true;
     offFrame();
-    try { await guardedSend(attachment.cdp, context.assertAuthorized, "Page.stopScreencast"); } catch {}
+    if (started) try { await guardedSend(attachment.cdp, context.assertAuthorized, "Page.stopScreencast"); } catch {}
     listeners.clear();
     attachment.close();
   };
   const transport: ProtectedAutomationViewerTransport = {
+    start,
     dispatch(raw, isBinary) {
       return context.handleMessage(async () => {
         if (closed || isBinary) throw error("Preparation viewer message is invalid", 400);
@@ -321,6 +341,7 @@ async function createPreparationViewer(context: ProtectedAutomationPreparationVi
           await guardedSend(attachment.cdp, context.assertAuthorized, "Page.screencastFrameAck", { sessionId });
           return;
         }
+        if (!started) throw error("Preparation viewer is not ready", 409);
         if (message.type === "mouse") {
           const x = Number(message.x); const y = Number(message.y);
           if (!Number.isFinite(x) || !Number.isFinite(y)) throw error("Preparation mouse input is invalid", 400);
@@ -557,7 +578,7 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     return actual.length === expected.length && timingSafeEqual(actual, expected);
   };
 
-  const closeRecord = async (record: PreparationRecord): Promise<void> => {
+  const closeRecord = async (record: PreparationRecord, savePreparedProfile = false): Promise<void> => {
     if (record.closed) return;
     record.closed = true;
     preparations.delete(record.id);
@@ -565,7 +586,8 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     record.expiryTimer = undefined;
     preparationRuntimeContexts.delete(record);
     options.credentialBroker.revokeChoicesForAutomationPreparation(record.lease.binding);
-    await record.lease.close();
+    if (savePreparedProfile) await record.lease.saveAndClose(now());
+    else await record.lease.close();
   };
 
   const currentRecord = (owner: SettingsRequestOwner, selection: ProtectedAutomationPreparationSelection): PreparationRecord => {
@@ -696,12 +718,17 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     purgeRequests.delete(request.requestId);
   };
 
+  const projectJob = (job: ProtectedAutomationJobRow) => publicJob(
+    job,
+    realms.profileState(job.project_id, job.agent_profile_id, job.id),
+  );
+
   const integration: ProtectedAutomationProductionIntegration = {
-    listJobs: () => listProtectedAutomationJobs().map(publicJob),
+    listJobs: () => listProtectedAutomationJobs().map(projectJob),
     getJob(jobId) {
       const job = getProtectedAutomationJob(jobId);
       if (!job) throw error("Protected automation job not found", 404);
-      return publicJob(job);
+      return projectJob(job);
     },
     listRuns(jobId) {
       if (!getProtectedAutomationJob(jobId)) throw error("Protected automation job not found", 404);
@@ -719,7 +746,7 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
         && candidate.project_id === paused.project_id && candidate.agent_profile_id === paused.agent_profile_id);
       preparationPort.jobChanged(paused.id);
       try { services.scheduler.reload(paused.id); } catch { /* durable pause remains authoritative */ }
-      return publicJob(paused);
+      return projectJob(paused);
     },
     cancelRun(owner, jobId, runId) {
       exactOwner(owner);
@@ -737,7 +764,7 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
       return publicRun(cancelled);
     },
     getPreparation(owner, selection) { return preparationState(currentRecord(owner, selection), options.credentialBroker.status().available); },
-    async closePreparation(owner, selection) { await closeRecord(currentRecord(owner, selection)); },
+    async closePreparation(owner, selection) { await closeRecord(currentRecord(owner, selection), true); },
     async openPreparationViewer(owner, selection) {
       const record = currentRecord(owner, selection);
       let opened: Awaited<ReturnType<typeof createPreparationViewer>> | undefined;
@@ -791,6 +818,7 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
       };
       let transportClosed = false;
       return {
+        start: () => transport.start(),
         dispatch: (message, isBinary) => transport.dispatch(message, isBinary),
         onMessage: (listener) => transport.onMessage(listener),
         async close() {
@@ -996,7 +1024,7 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
       unsubscribePolicy(); uninstallPreparation();
       for (const request of [...purgeRequests.values()]) await terminatePurgeRequest(request, "backend_failure").catch(() => undefined);
       await Promise.allSettled([
-        ...[...preparations.values()].map(closeRecord),
+        ...[...preparations.values()].map((record) => closeRecord(record)),
         services.stop(),
         realms.close(),
       ]);

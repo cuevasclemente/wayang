@@ -43,12 +43,20 @@ class SyntheticViewerCdp {
   readonly methods: string[] = [];
   readonly commands: Array<{ method: string; params: Record<string, unknown> }> = [];
   failMethod: string | null = null;
+  frameDuringStart = false;
   url = "about:blank";
 
   async send(method: string, params: Record<string, unknown> = {}): Promise<any> {
     this.methods.push(method);
     this.commands.push({ method, params: { ...params } });
     if (method === this.failMethod) throw new Error("synthetic private failure detail must not escape");
+    if (method === "Page.startScreencast" && this.frameDuringStart) {
+      this.emit("Page.screencastFrame", {
+        data: Buffer.from("synchronous-start-frame").toString("base64"),
+        metadata: { timestamp: 1 },
+        sessionId: 51,
+      });
+    }
     if (method === "Page.getFrameTree") {
       return { frameTree: { frame: { id: "synthetic-main-frame", loaderId: "synthetic-loader", url: this.url } } };
     }
@@ -296,6 +304,47 @@ test("authenticated owner pause and cancel use canonical exact job/run ownership
   }
 });
 
+test("a frame emitted synchronously during screencast start is subscribed and acknowledged", async () => {
+  const fixture = jobFixture(false);
+  const credentialBroker = broker();
+  const pinAttempts = new SyntheticPinAttempts();
+  let runtime!: SyntheticViewerRuntime;
+  const realms = new ProtectedAutomationBrowserRealmRegistry({
+    dataDir: process.env.WAYANG_DATA_DIR!,
+    runtimeFactory: (options) => { runtime = new SyntheticViewerRuntime(options); return runtime; },
+  });
+  const production = bootstrapProtectedAutomationProduction({
+    dataDir: process.env.WAYANG_DATA_DIR!, credentialBroker, pinAttempts, realms,
+  });
+  production.start();
+  const owner = { sessionId: "synchronous-frame-owner", origin: "http://127.0.0.1:8787" };
+  let transport: Awaited<ReturnType<typeof production.integration.openPreparationViewer>> | undefined;
+  try {
+    const prepared = await prepareFixture(fixture);
+    const selection = {
+      sourceSessionId: prepared.source_session_id,
+      jobId: prepared.job_id,
+      preparationId: prepared.preparation_id,
+    };
+    transport = await production.integration.openPreparationViewer(owner, selection);
+    const released: Array<{ type?: string; sessionId?: number }> = [];
+    transport.onMessage((message) => released.push(JSON.parse(message.toString("utf8"))));
+    runtime.cdp.frameDuringStart = true;
+    await transport.start();
+    assert.deepEqual(released.map((message) => ({ type: message.type, sessionId: message.sessionId })), [
+      { type: "frame", sessionId: 51 },
+    ]);
+    await transport.dispatch(Buffer.from(JSON.stringify({ type: "frame-ack", sessionId: 51 }), "utf8"), false);
+    assert.deepEqual(runtime.cdp.commands.filter((command) => command.method === "Page.screencastFrameAck").at(-1), {
+      method: "Page.screencastFrameAck", params: { sessionId: 51 },
+    });
+  } finally {
+    await transport?.close().catch(() => undefined);
+    await production.close();
+    await credentialBroker.shutdown();
+  }
+});
+
 test("a late screencast frame is reauthorized and suppressed after job revision drift", async () => {
   const fixture = jobFixture(false);
   const credentialBroker = broker();
@@ -319,6 +368,7 @@ test("a late screencast frame is reauthorized and suppressed after job revision 
       preparationId: prepared.preparation_id,
     };
     transport = await production.integration.openPreparationViewer(owner, selection);
+    await transport.start();
     const released: Array<{ type?: string; sessionId?: number }> = [];
     transport.onMessage((message) => released.push(JSON.parse(message.toString("utf8"))));
 
@@ -361,10 +411,12 @@ test("viewer initialization failures expose only a bounded diagnostic stage code
       preparationId: prepared.preparation_id,
     };
     runtime.cdp.failMethod = "Page.startScreencast";
-    const failure = await production.integration.openPreparationViewer(
+    const failedTransport = await production.integration.openPreparationViewer(
       { sessionId: "diagnostic-owner", origin: "http://127.0.0.1:8787" },
       selection,
-    ).then(() => undefined, (error) => error);
+    );
+    const failure = await failedTransport.start().then(() => undefined, (error) => error);
+    await failedTransport.close();
     assert.equal(protectedAutomationDiagnosticCode(failure), "viewer-screencast-start");
     assert.equal(String(failure).includes("synthetic private failure detail"), false);
     await assert.rejects(
@@ -403,6 +455,7 @@ test("closing the last viewer removes preparation navigation and credential cont
       preparationId: prepared.preparation_id,
     };
     const transport = await production.integration.openPreparationViewer(owner, selection);
+    await transport.start();
     await transport.dispatch(Buffer.from(JSON.stringify({ type: "paste", text: "synthetic-human-paste" }), "utf8"), false);
     assert.deepEqual(
       runtime.cdp.commands.filter((command) => command.method === "Input.insertText").at(-1),
@@ -426,6 +479,16 @@ test("closing the last viewer removes preparation navigation and credential cont
       production.integration.credentialMatches(owner, selection),
       /viewer must be attached/i,
     );
+    assert.deepEqual(production.integration.getJob(fixture.job.id).browser_profile, {
+      supported: true,
+      saved: false,
+      last_saved_at: null,
+    });
+    await production.integration.closePreparation(owner, selection);
+    const savedProfile = production.integration.getJob(fixture.job.id).browser_profile;
+    assert.equal(savedProfile.supported, true);
+    assert.equal(savedProfile.saved, true);
+    assert.equal(typeof savedProfile.last_saved_at, "number");
   } finally {
     await production.close();
     await credentialBroker.shutdown();
@@ -470,6 +533,7 @@ test("credential matches are suppressed and revoked when the last viewer closes 
       preparationId: prepared.preparation_id,
     };
     transport = await production.integration.openPreparationViewer(owner, selection);
+    await transport.start();
     runtime.cdp.url = "https://example.test/";
     const pending = production.integration.credentialMatches(owner, selection);
     await matchesStarted;

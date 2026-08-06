@@ -33,6 +33,13 @@ export interface ProtectedAutomationBrowserRealmStorage {
   runtimeDir: string;
 }
 
+export interface ProtectedAutomationBrowserProfileState {
+  saved: boolean;
+  lastSavedAt: number | null;
+}
+
+const PREPARATION_STATE_FILE = "preparation-state.json";
+
 export interface ProtectedAutomationManagedRuntime {
   readonly running: boolean;
   start(assertAuthorizedBeforeBrowserCdp?: () => Promise<void>): Promise<void>;
@@ -133,6 +140,73 @@ export function protectedAutomationBrowserRealmRoot(
     idSegment("project", projectId), idSegment("profile", agentProfileId), idSegment("job", jobId));
 }
 
+export function readProtectedAutomationBrowserProfileState(
+  dataDir: string,
+  projectId: string,
+  agentProfileId: string,
+  jobId: string,
+): ProtectedAutomationBrowserProfileState {
+  const rootDir = protectedAutomationBrowserRealmRoot(dataDir, projectId, agentProfileId, jobId);
+  let rootMetadata: fs.Stats;
+  try { rootMetadata = fs.lstatSync(rootDir); }
+  catch (error: any) {
+    if (error?.code === "ENOENT") return { saved: false, lastSavedAt: null };
+    throw error;
+  }
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()
+    || (typeof process.getuid === "function" && rootMetadata.uid !== process.getuid())) {
+    throw realmError("Protected automation browser preparation storage is unsafe");
+  }
+  const statePath = path.join(rootDir, PREPARATION_STATE_FILE);
+  let metadata: fs.Stats;
+  try { metadata = fs.lstatSync(statePath); }
+  catch (error: any) {
+    if (error?.code === "ENOENT") return { saved: false, lastSavedAt: null };
+    throw error;
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1
+    || metadata.size < 2 || metadata.size > 1_024 || (metadata.mode & 0o777) !== 0o600
+    || (typeof process.getuid === "function" && metadata.uid !== process.getuid())) {
+    throw realmError("Protected automation browser preparation state is unsafe");
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(fs.readFileSync(statePath, "utf8")); }
+  catch { throw realmError("Protected automation browser preparation state is invalid"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+    || Object.keys(parsed).sort().join("\0") !== "last_saved_at\0version"
+    || (parsed as any).version !== 1
+    || !Number.isSafeInteger((parsed as any).last_saved_at) || (parsed as any).last_saved_at < 0) {
+    throw realmError("Protected automation browser preparation state is invalid");
+  }
+  return { saved: true, lastSavedAt: (parsed as any).last_saved_at };
+}
+
+function writeProtectedAutomationBrowserProfileState(
+  storage: ProtectedAutomationBrowserRealmStorage,
+  lastSavedAt: number,
+): void {
+  if (!Number.isSafeInteger(lastSavedAt) || lastSavedAt < 0) throw realmError("Preparation save timestamp is invalid", 400);
+  const statePath = path.join(storage.rootDir, PREPARATION_STATE_FILE);
+  const temporary = path.join(storage.rootDir, `.preparation-state-${randomBytes(12).toString("hex")}.tmp`);
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(temporary, "wx", 0o600);
+    fs.writeFileSync(descriptor, `${JSON.stringify({ version: 1, last_saved_at: lastSavedAt })}\n`, "utf8");
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    fs.renameSync(temporary, statePath);
+    try {
+      const directory = fs.openSync(storage.rootDir, "r");
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    } catch { /* directory fsync is not portable; the file rename remains atomic */ }
+  } catch (error) {
+    if (descriptor !== undefined) try { fs.closeSync(descriptor); } catch {}
+    try { fs.unlinkSync(temporary); } catch {}
+    throw error;
+  }
+}
+
 export function ensureProtectedAutomationBrowserRealmStorage(
   dataDir: string,
   projectCwd: string,
@@ -191,6 +265,9 @@ export class ProtectedAutomationBrowserRealmLease {
   private revoked = false;
   private denialGeneration = 0;
   private cleanupPromise: Promise<void> | null = null;
+  private cleanupFailure: Error | null = null;
+  private releaseAfterCleanup = true;
+  private released = false;
   private pendingDownloadsAtDenial: string[] = [];
   private removeAbortListener: (() => void) | undefined;
   private navigationGatePromise: Promise<void> | null = null;
@@ -538,7 +615,10 @@ export class ProtectedAutomationBrowserRealmLease {
       const downloadCancellations = pendingDownloads.map((guid) => this.runtime.cancelDownload(guid));
       // Chromium termination is the containment fallback if a target-close
       // acknowledgement stalls. Managed runtime stop is itself bounded.
-      const runtimeStop = this.runtime.stop();
+      const runtimeStop = this.runtime.stop().then(
+        () => ({ ok: true as const }),
+        () => ({ ok: false as const }),
+      );
       await Promise.race([targetContainment, runtimeStop]);
       for (const remove of this.navigationGateListeners.splice(0)) remove();
       this.navigationChains.clear();
@@ -553,14 +633,38 @@ export class ProtectedAutomationBrowserRealmLease {
         runtimeStop,
         this.queueTail.catch(() => undefined),
       ]);
-      this.releaseActive(this);
+      if (!(await runtimeStop).ok) this.cleanupFailure = realmError("Managed Chromium did not stop cleanly", 503);
+      if (this.releaseAfterCleanup) this.releaseLease();
     })();
     return this.cleanupPromise;
+  }
+
+  private releaseLease(): void {
+    if (this.released) return;
+    this.released = true;
+    this.releaseActive(this);
   }
 
   async close(): Promise<void> {
     this.deny("lease-closed");
     await this.cleanup();
+    if (this.cleanupFailure) throw this.cleanupFailure;
+  }
+
+  async saveAndClosePreparation(lastSavedAt: number): Promise<void> {
+    if (this.binding.kind !== "prepare") throw realmError("Only preparation leases may save browser profile state", 409);
+    await this.assertAuthorized();
+    if (!this.latchDenial("lease-closed")) throw realmError("Browser preparation is already closing", 409);
+    this.releaseAfterCleanup = false;
+    try {
+      await this.cleanup();
+      if (this.cleanupFailure) throw this.cleanupFailure;
+      try { await this.authority(this.binding); }
+      catch { throw realmError("Browser preparation authority changed before save", 409); }
+      writeProtectedAutomationBrowserProfileState(this.storage, lastSavedAt);
+    } finally {
+      this.releaseLease();
+    }
   }
 }
 
@@ -610,6 +714,10 @@ export class ProtectedAutomationBrowserRealmRegistry {
     }, (code) => this.diagnostic({ component: "browser-realm", code }));
     slot.active = lease;
     return lease;
+  }
+
+  profileState(projectId: string, agentProfileId: string, jobId: string): ProtectedAutomationBrowserProfileState {
+    return readProtectedAutomationBrowserProfileState(this.options.dataDir, projectId, agentProfileId, jobId);
   }
 
   /** Synchronous denial latch used immediately after durable policy publication. */

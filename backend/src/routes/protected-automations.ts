@@ -259,9 +259,15 @@ export function attachProtectedAutomationWs(
             }
           });
           transport = opened;
-        } catch {
+          await opened.start();
+          if (socketEnded || closed || ws.readyState !== WebSocket.OPEN) {
+            await cleanup();
+            return;
+          }
+          ws.send(JSON.stringify({ type: "ready" }));
+        } catch (failure) {
           await opened.close().catch(() => undefined);
-          ws.close(1008, "Preparation transport denied");
+          throw failure;
         }
       }).catch((failure) => {
         if (socketEnded) return;

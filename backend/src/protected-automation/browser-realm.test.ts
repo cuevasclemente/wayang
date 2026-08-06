@@ -8,6 +8,7 @@ import { ManagedChromiumRuntime, type ManagedChromiumRuntimeOptions } from "../b
 import {
   ProtectedAutomationBrowserRealmRegistry,
   ensureProtectedAutomationBrowserRealmStorage,
+  readProtectedAutomationBrowserProfileState,
   type ProtectedAutomationManagedRuntime,
 } from "./browser-realm.js";
 import {
@@ -29,6 +30,11 @@ class SyntheticRuntime implements ProtectedAutomationManagedRuntime {
   private targetCloseReleaseResolve: (() => void) | null = null;
   targetCloseStarted: Promise<void> = Promise.resolve();
   private targetCloseRelease: Promise<void> = Promise.resolve();
+  private runtimeStopStartedResolve: (() => void) | null = null;
+  private runtimeStopReleaseResolve: (() => void) | null = null;
+  runtimeStopStarted: Promise<void> = Promise.resolve();
+  private runtimeStopRelease: Promise<void> = Promise.resolve();
+  private rejectRuntimeStop = false;
   readonly commands: Array<{ method: string; params: Record<string, unknown> }> = [];
   private readonly listeners = new Map<string, Set<(event: any) => void>>();
   private readonly cdp = {
@@ -79,8 +85,23 @@ class SyntheticRuntime implements ProtectedAutomationManagedRuntime {
     this.targetCloseReleaseResolve?.();
     this.targetCloseReleaseResolve = null;
   }
+  deferStop(reject = false): void {
+    this.rejectRuntimeStop = reject;
+    this.runtimeStopStarted = new Promise<void>((resolve) => { this.runtimeStopStartedResolve = resolve; });
+    this.runtimeStopRelease = new Promise<void>((resolve) => { this.runtimeStopReleaseResolve = resolve; });
+  }
+  releaseStop(): void {
+    this.runtimeStopReleaseResolve?.();
+    this.runtimeStopReleaseResolve = null;
+  }
   async start(check?: () => Promise<void>): Promise<void> { await check?.(); this.running = true; }
-  async stop(): Promise<void> { this.running = false; this.stops += 1; }
+  async stop(): Promise<void> {
+    this.runtimeStopStartedResolve?.();
+    await this.runtimeStopRelease;
+    this.running = false;
+    this.stops += 1;
+    if (this.rejectRuntimeStop) throw new Error("synthetic runtime stop failed");
+  }
   emit(event: string, params: any): void {
     for (const listener of [...(this.listeners.get(event) ?? [])]) listener(params);
   }
@@ -142,6 +163,74 @@ test("Project/Profile/Job browser profiles are private, stable, and outside the 
       /outside the project root/i,
     );
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a clean preparation close durably marks the private browser profile as saved", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-automation-realm-prepared-state-"));
+  fs.mkdirSync(path.join(root, "project"));
+  const realms = new ProtectedAutomationBrowserRealmRegistry({
+    dataDir: path.join(root, "data"),
+    runtimeFactory: (options) => new SyntheticRuntime(options),
+  });
+  try {
+    const lease = realms.acquire(request(root, () => undefined, "prepare"));
+    assert.deepEqual(
+      readProtectedAutomationBrowserProfileState(path.join(root, "data"), "synthetic-project", "synthetic-profile", "synthetic-job"),
+      { saved: false, lastSavedAt: null },
+    );
+    await lease.saveAndClosePreparation(1_786_000_000_000);
+    assert.deepEqual(realms.profileState("synthetic-project", "synthetic-profile", "synthetic-job"), {
+      saved: true,
+      lastSavedAt: 1_786_000_000_000,
+    });
+    const statePath = path.join(lease.storage.rootDir, "preparation-state.json");
+    assert.equal(fs.lstatSync(statePath).isFile(), true);
+    assert.equal(fs.lstatSync(statePath).mode & 0o777, 0o600);
+    fs.writeFileSync(statePath, "{\"version\":1,\"last_saved_at\":\"invalid\"}\n", { mode: 0o600 });
+    assert.throws(
+      () => realms.profileState("synthetic-project", "synthetic-profile", "synthetic-job"),
+      /preparation state is invalid/i,
+    );
+  } finally {
+    await realms.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed Chromium stop writes no saved marker and retains exclusivity until failure settles", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-automation-realm-save-failure-"));
+  fs.mkdirSync(path.join(root, "project"));
+  let runtime!: SyntheticRuntime;
+  const realms = new ProtectedAutomationBrowserRealmRegistry({
+    dataDir: path.join(root, "data"),
+    runtimeFactory: (options) => {
+      runtime = new SyntheticRuntime(options);
+      runtime.deferStop(true);
+      return runtime;
+    },
+  });
+  try {
+    const lease = realms.acquire(request(root, () => undefined, "prepare"));
+    const saving = lease.saveAndClosePreparation(1_786_000_000_000);
+    await runtime.runtimeStopStarted;
+    assert.equal(realms.hasActiveLease("synthetic-project", "synthetic-profile", "synthetic-job"), true);
+    assert.throws(() => realms.acquire(request(root, () => undefined, "prepare")), /exclusive/i);
+    assert.deepEqual(realms.profileState("synthetic-project", "synthetic-profile", "synthetic-job"), {
+      saved: false,
+      lastSavedAt: null,
+    });
+    runtime.releaseStop();
+    await assert.rejects(() => saving, /did not stop cleanly/i);
+    assert.equal(realms.hasActiveLease("synthetic-project", "synthetic-profile", "synthetic-job"), false);
+    assert.deepEqual(realms.profileState("synthetic-project", "synthetic-profile", "synthetic-job"), {
+      saved: false,
+      lastSavedAt: null,
+    });
+  } finally {
+    runtime?.releaseStop();
+    await realms.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

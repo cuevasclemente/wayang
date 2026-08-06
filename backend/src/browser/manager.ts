@@ -1866,14 +1866,16 @@ export class ManagedChromiumRuntime {
       this.child = null;
       this.cdpPort = null;
       if (!child) return;
+      const exited = new Promise<void>((resolve) => {
+        if (child.exitCode !== null) resolve();
+        else child.once("exit", () => resolve());
+      });
       terminateChild(child);
-      await Promise.race([
-        new Promise<void>((resolve) => {
-          if (child.exitCode !== null) resolve();
-          else child.once("exit", () => resolve());
-        }),
-        sleep(3_000).then(() => killChild(child)),
-      ]);
+      const graceful = await Promise.race([exited.then(() => true), sleep(3_000).then(() => false)]);
+      if (graceful) return;
+      killChild(child);
+      const killed = await Promise.race([exited.then(() => true), sleep(3_000).then(() => false)]);
+      if (!killed) throw new Error("Managed Chromium did not exit after forced termination");
     });
   }
 

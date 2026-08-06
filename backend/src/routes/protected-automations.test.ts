@@ -165,6 +165,7 @@ test("a viewer transport resolving after socket shutdown is still closed exactly
     viewerRequestedResolve();
     await viewerRelease;
     return {
+      async start() {},
       async dispatch() {},
       async close() { viewerCloseCount += 1; viewerClosedResolve(); },
       onMessage() { return () => undefined; },
@@ -217,6 +218,7 @@ test("closeWayangServer terminates an upgraded preparation socket and closes its
     let closed = false;
     viewerOpenedResolve();
     return {
+      async start() {},
       async dispatch() {},
       async close() {
         if (closed) return;

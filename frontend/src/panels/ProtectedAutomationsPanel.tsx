@@ -236,13 +236,14 @@ export function ProtectedAutomationsPanel({
       setPreparationSelection(null);
       setPreparationInput("");
       setCredentialsOpen(false);
+      await refresh(true);
       setNotice("Preparation saved to the protected browser profile and closed. Future runs will reuse it.");
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
       setBusyAction(null);
     }
-  }, [busyAction, preparationSelection]);
+  }, [busyAction, preparationSelection, refresh]);
 
   const navigatePreparation = useCallback(async (origin: string) => {
     if (!preparationSelection || busyAction) return;
@@ -434,6 +435,16 @@ export function ProtectedAutomationsPanel({
                     )}
                   </div>
 
+                  <div data-testid="protected-automation-browser-profile-state" className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-400">
+                    <span>Protected browser profile:</span>
+                    <strong className={job.browser_profile?.saved ? "text-emerald-300" : "text-neutral-300"}>
+                      {job.browser_profile?.saved ? "saved" : "not yet saved"}
+                    </strong>
+                    {job.browser_profile?.saved && job.browser_profile.last_saved_at !== null && (
+                      <span>Last saved {formatTimestamp(job.browser_profile.last_saved_at)}</span>
+                    )}
+                  </div>
+
                   {!preparation && (
                     <form className="mt-4 grid gap-2 sm:grid-cols-[1fr_1fr_auto]" onSubmit={(event) => { event.preventDefault(); void attachPreparation(); }}>
                       <label className="text-[11px] text-neutral-400">Source session ID
@@ -457,7 +468,7 @@ export function ProtectedAutomationsPanel({
 
                 <div className="h-[22rem] min-h-[16rem] sm:h-[30rem]">
                   {preparation?.state === "ready" && preparation.websocket_path ? (
-                    <CdpScreencastViewer websocketUrl={preparation.websocket_path} running pasteThroughViewer connectionLabel="Preparation viewer" imageAlt="Protected automation preparation browser" testId="protected-automation-viewer" onStatus={handlePreparationViewerStatus} />
+                    <CdpScreencastViewer websocketUrl={preparation.websocket_path} running pasteThroughViewer requireReadyHandshake connectionLabel="Preparation viewer" imageAlt="Protected automation preparation browser" testId="protected-automation-viewer" onStatus={handlePreparationViewerStatus} />
                   ) : (
                     <div className="flex h-full items-center justify-center p-6 text-center text-sm text-neutral-500">{preparation ? `Preparation is ${humanize(preparation.state)}.` : "No exact preparation attached."}</div>
                   )}

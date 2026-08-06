@@ -58,6 +58,8 @@ export interface CdpScreencastViewerProps {
   onPasteText?: (text: string) => void;
   /** Human-only clipboard path for a focused protected viewer. */
   pasteThroughViewer?: boolean;
+  /** Wait for the backend viewer-ready message before enabling human input. */
+  requireReadyHandshake?: boolean;
   connectionLabel?: string;
   imageAlt?: string;
   testId?: string;
@@ -144,6 +146,7 @@ export function CdpScreencastViewer({
   onPageChange,
   onPasteText,
   pasteThroughViewer = false,
+  requireReadyHandshake = false,
   connectionLabel = "Fast page",
   imageAlt = "Chromium fast page",
   testId,
@@ -151,6 +154,7 @@ export function CdpScreencastViewer({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const readyRef = useRef(false);
   const metadataRef = useRef<ScreencastMetadata | null>(null);
   const pendingEnvelopeRef = useRef<FrameEnvelope | null>(null);
   const queuedFrameRef = useRef<PresentableFrame | null>(null);
@@ -179,7 +183,8 @@ export function CdpScreencastViewer({
 
   const send = useCallback((payload: Record<string, unknown>): boolean => {
     const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    if (!ws || ws.readyState !== WebSocket.OPEN
+      || (!readyRef.current && payload.type !== "frame-ack")) return false;
     ws.send(JSON.stringify(payload));
     return true;
   }, []);
@@ -216,13 +221,18 @@ export function CdpScreencastViewer({
   }, [submitCapturedPaste]);
 
   const presentFrame = useCallback((frame: PresentableFrame) => {
+    const acknowledge = (candidate: PresentableFrame) => {
+      if (candidate.sessionId !== undefined) send({ type: "frame-ack", sessionId: candidate.sessionId });
+    };
     const img = imgRef.current;
     if (!img) {
+      acknowledge(frame);
       if (frame.revoke) URL.revokeObjectURL(frame.src);
       return;
     }
     if (presentingRef.current) {
       const replaced = queuedFrameRef.current;
+      if (replaced) acknowledge(replaced);
       if (replaced?.revoke) URL.revokeObjectURL(replaced.src);
       queuedFrameRef.current = frame;
       return;
@@ -230,11 +240,14 @@ export function CdpScreencastViewer({
 
     presentingRef.current = true;
     metadataRef.current = frame.metadata;
+    let finished = false;
     const finish = (presented: boolean) => {
+      if (finished) return;
+      finished = true;
+      acknowledge(frame);
       window.requestAnimationFrame(() => {
         if (presented) {
           setHasFrame(true);
-          if (frame.sessionId !== undefined) send({ type: "frame-ack", sessionId: frame.sessionId });
           const previousUrl = displayedObjectUrlRef.current;
           displayedObjectUrlRef.current = frame.revoke ? frame.src : null;
           if (previousUrl && previousUrl !== frame.src) URL.revokeObjectURL(previousUrl);
@@ -258,16 +271,21 @@ export function CdpScreencastViewer({
     const ws = new WebSocket(websocketUrl);
     ws.binaryType = "blob";
     wsRef.current = ws;
+    readyRef.current = false;
     setError(null);
     setConnected(false);
     setHasFrame(false);
 
     ws.onopen = () => {
       if (wsRef.current !== ws) return;
-      setConnected(true);
+      if (!requireReadyHandshake) {
+        readyRef.current = true;
+        setConnected(true);
+      }
     };
     ws.onclose = () => {
       if (wsRef.current !== ws) return;
+      readyRef.current = false;
       setConnected(false);
       void canRetryAuthenticatedTransport();
     };
@@ -296,7 +314,10 @@ export function CdpScreencastViewer({
       } catch {
         return;
       }
-      if (msg.type === "frame" || msg.type === "frame-metadata") {
+      if (msg.type === "ready") {
+        readyRef.current = true;
+        setConnected(true);
+      } else if (msg.type === "frame" || msg.type === "frame-metadata") {
         const envelope = {
           metadata: msg.metadata && typeof msg.metadata === "object" ? msg.metadata as ScreencastMetadata : null,
           sessionId: typeof msg.sessionId === "number" ? msg.sessionId : undefined,
@@ -322,6 +343,7 @@ export function CdpScreencastViewer({
 
     return () => {
       if (wsRef.current === ws) wsRef.current = null;
+      readyRef.current = false;
       ws.onopen = null;
       ws.onclose = null;
       ws.onerror = null;
@@ -340,7 +362,7 @@ export function CdpScreencastViewer({
       }
       presentingRef.current = false;
     };
-  }, [websocketUrl, running, presentFrame, connectionLabel]);
+  }, [websocketUrl, running, presentFrame, connectionLabel, requireReadyHandshake]);
 
   useEffect(() => () => {
     if (moveAnimationRef.current !== null) window.cancelAnimationFrame(moveAnimationRef.current);
@@ -474,6 +496,7 @@ export function CdpScreencastViewer({
             <button
               type="button"
               data-testid={testId ? `${testId}-paste-open` : undefined}
+              disabled={!connected}
               onClick={() => { setPasteNotice(null); setPasteCaptureOpen(true); }}
               className="shrink-0 rounded border border-neutral-700 px-2 py-1 text-[11px] text-neutral-200 hover:bg-neutral-800"
             >Paste text</button>
