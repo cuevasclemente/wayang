@@ -24,7 +24,12 @@ import { close, commitStoreMutation, init } from "./db.js";
 import { createProject } from "./projects.js";
 import { commitWorkspaceCapabilityActivation, revokeWorkspaceCapabilityAssociation } from "./workspace-capabilities.js";
 import { createSession, updatePiSessionFile } from "./sessions.js";
-import { getSessionAttachmentRoot, LEGACY_ATTACHMENT_ROOT } from "./protected-artifacts.js";
+import {
+  getProtectedArtifactReadRoots,
+  getSessionAttachmentRoot,
+  getWayangCheckoutSecretPaths,
+  LEGACY_ATTACHMENT_ROOT,
+} from "./protected-artifacts.js";
 import { WREN_AGENT_PROFILE_ID, type AgentProfileRow } from "./workspace-types.js";
 import { WAYANG_RUNTIME_CONTEXT_TOOL_NAME } from "./wayang-runtime-context.js";
 import { RESTRICTED_MCP_TOOL_NAME, type RestrictedMcpRuntime } from "./restricted-mcp/index.js";
@@ -63,6 +68,18 @@ function fixture(name: string): {
     },
   };
 }
+
+test("Wayang checkout secrets stay protected without project registration", () => {
+  const f = fixture("wayang-runtime-checkout-secrets-");
+  try {
+    const protectedRoots = new Set(getProtectedArtifactReadRoots());
+    for (const secretPath of getWayangCheckoutSecretPaths()) {
+      assert.equal(protectedRoots.has(secretPath), true, secretPath);
+    }
+  } finally {
+    f.cleanup();
+  }
+});
 
 test("restricted resource loader uses pre-load exclusions and exact root AGENTS only", async () => {
   const f = fixture("wayang-runtime-resources-");
@@ -444,9 +461,15 @@ test("Protected restricted agents read ordinary and Standard paths but write onl
     const ordinaryFile = path.join(ordinaryRoot, "ordinary.txt");
     const standardFile = path.join(standardRoot, "standard.txt");
     const otherProtectedFile = path.join(otherProtectedRoot, "protected.txt");
+    const projectPiRoot = path.join(f.cwd, ".pi");
+    const projectPiSettings = path.join(projectPiRoot, "settings.json");
+    const projectPiAlias = path.join(f.cwd, "pi-control-alias");
     fs.writeFileSync(ordinaryFile, "ordinary");
     fs.writeFileSync(standardFile, "standard");
     fs.writeFileSync(otherProtectedFile, "protected");
+    fs.mkdirSync(projectPiRoot);
+    fs.writeFileSync(projectPiSettings, "{}\n");
+    fs.symlinkSync(projectPiRoot, projectPiAlias, "dir");
 
     const sourceProfile = createAgentProfile({ name: "Protected reader" });
     const standardProfile = createAgentProfile({ name: "Standard owner" });
@@ -480,6 +503,9 @@ test("Protected restricted agents read ordinary and Standard paths but write onl
     assert.equal(decide("read", standardFile).allowed, true, "Standard project run allowlists do not block Protected reads");
     assert.equal(decide("edit", ordinaryFile).allowed, false);
     assert.equal(decide("write", standardFile).allowed, false);
+    assert.equal(decide("read", projectPiSettings).allowed, true);
+    assert.equal(decide("edit", projectPiSettings).allowed, false);
+    assert.equal(decide("write", path.join(projectPiAlias, "extension.ts")).allowed, false);
     assert.equal(decide("read", otherProtectedFile).allowed, false);
     assert.equal(decide("find", f.dir).allowed, false, "broad scans intersecting another Protected project fail closed");
   } finally {

@@ -274,6 +274,11 @@ export function authorizeAgentToolCall(options: {
     return { allowed: false, reason: "Restricted agents cannot access global Pi or control-plane storage", canonicalPath };
   }
 
+  const projectPiRoot = canonicalMemoryRoot(path.join(project.cwd, ".pi"));
+  if (restricted && isMutation && pathIsWithin(canonicalPath, projectPiRoot)) {
+    return { allowed: false, reason: "Restricted agents cannot modify project-local Pi control-plane files", canonicalPath };
+  }
+
   const memoryRoots = (options.memoryRoots ?? getRegisteredMemoryRoots()).map(canonicalMemoryRoot);
   const memoryRoot = memoryRoots.find(intersects);
   if (memoryRoot) {

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { commandGuardIdentityPinPath } from "./command-guard-pin.js";
 import { getConfig } from "./config.js";
 import { getStore } from "./db.js";
@@ -37,6 +38,20 @@ function uniqueCanonicalPaths(paths: Iterable<string>): string[] {
 
 export function getWayangDataRoot(): string {
   return canonicalExistingOrResolved(getConfig().dataDir);
+}
+
+/** Source and built layouts both place this module two levels below checkout root. */
+export function getWayangCheckoutRoot(): string {
+  return canonicalExistingOrResolved(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."));
+}
+
+/** Launcher configuration is sensitive even when the checkout is not a registered project. */
+export function getWayangCheckoutSecretPaths(): string[] {
+  const root = getWayangCheckoutRoot();
+  return uniqueCanonicalPaths([
+    path.join(root, ".env"),
+    path.join(root, ".env.backup"),
+  ]);
 }
 
 export function getAttachmentsRoot(): string {
@@ -116,6 +131,7 @@ export function getProtectedArtifactReadRoots(): string[] {
     ...getKnownPiTranscriptPaths(),
     ...getCommandGuardIdentityPinProtectedPaths(),
     ...getPiSecretBearingPaths(),
+    ...getWayangCheckoutSecretPaths(),
     ...getRegisteredProjectSecretPaths(),
     ...getRegisteredProjectBrowserRoots(),
     ...PSEUDO_CONTROL_ROOTS,

@@ -277,6 +277,10 @@ test("per-exec bash sandbox denies protected files and capabilities while allowi
     `(test -z \"\${PI_COMMAND_GUARD_IDENTITY_PIN-}\") || { echo legacy-pin-env-visible; exit 27; }`,
     `(test -z \"\${WAYANG_COMMAND_GUARD_RECOVERY_PIN-}\") || { echo related-pin-env-visible; exit 28; }`,
     `(test -z \"\${COMMAND_GUARD_IDENTITY_PIN-}\") || { echo unprefixed-pin-env-visible; exit 29; }`,
+    `(test -z \"\${OPENAI_API_KEY-}\") || { echo provider-key-env-visible; exit 30; }`,
+    `(test -z \"\${AWS_SECRET_ACCESS_KEY-}\") || { echo aws-key-env-visible; exit 31; }`,
+    `(test -z \"\${GOOGLE_APPLICATION_CREDENTIALS-}\") || { echo credential-path-env-visible; exit 32; }`,
+    `(test -z \"\${SYNTHETIC_UNLISTED_SECRET-}\") || { echo arbitrary-secret-env-visible; exit 33; }`,
   ].join("; ");
   const result = await run(source.id, command, {
     ...process.env,
@@ -284,6 +288,10 @@ test("per-exec bash sandbox denies protected files and capabilities while allowi
     PI_COMMAND_GUARD_IDENTITY_PIN: "synthetic-legacy-pin",
     WAYANG_COMMAND_GUARD_RECOVERY_PIN: "synthetic-related-pin",
     COMMAND_GUARD_IDENTITY_PIN: "synthetic-unprefixed-pin",
+    OPENAI_API_KEY: "synthetic-provider-key",
+    AWS_SECRET_ACCESS_KEY: "synthetic-aws-key",
+    GOOGLE_APPLICATION_CREDENTIALS: "/synthetic/credential/path",
+    SYNTHETIC_UNLISTED_SECRET: "synthetic-arbitrary-secret",
   });
   assert.equal(result.code, 0, result.output);
   assert.equal(fs.readFileSync(protectedFile, "utf8"), "b");
@@ -314,6 +322,9 @@ test("actual concurrent sandboxes isolate an allowed Standard project from an un
   fs.mkdirSync(projectB);
   fs.writeFileSync(path.join(projectA, "only-a.txt"), "a");
   fs.writeFileSync(path.join(projectB, "only-b.txt"), "b");
+  const standardEnv = path.join(projectA, ".env");
+  const missingStandardEnvBackup = path.join(projectA, ".env.backup");
+  fs.writeFileSync(standardEnv, "SYNTHETIC_STANDARD_SECRET\n");
   const previousData = process.env.WAYANG_DATA_DIR;
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   const previousSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR;
@@ -358,6 +369,8 @@ test("actual concurrent sandboxes isolate an allowed Standard project from an un
   assert.ok(standardPolicy.deniedReadRoots.includes(fs.realpathSync(projectB)));
   assert.ok(standardPolicy.deniedWriteRoots.includes(fs.realpathSync(projectB)));
   assert.equal(protectedPolicy.deniedReadRoots.includes(fs.realpathSync(projectA)), false);
+  assert.ok(protectedPolicy.deniedReadRoots.includes(fs.realpathSync(standardEnv)));
+  assert.equal(protectedPolicy.deniedReadRoots.includes(missingStandardEnvBackup), false);
   assert.ok(protectedPolicy.deniedWriteRoots.includes(fs.realpathSync(projectA)));
   assert.equal(protectedPolicy.deniedReadRoots.includes(fs.realpathSync(projectB)), false);
   assert.equal(protectedPolicy.deniedWriteRoots.includes(fs.realpathSync(projectB)), false);
@@ -365,14 +378,23 @@ test("actual concurrent sandboxes isolate an allowed Standard project from an un
 
   const aOwn = path.join(projectA, "only-a.txt");
   const bOwn = path.join(projectB, "only-b.txt");
-  const [a, b] = await Promise.all([
-    run(sourceA.id, `cat ${quote(aOwn)} && test ! -e ${quote(bOwn)} && printf ok > ${quote(path.join(projectA, "a-write.txt"))}`),
-    run(sourceB.id, `cat ${quote(bOwn)} && cat ${quote(aOwn)} && (! printf blocked > ${quote(path.join(projectA, "blocked-by-protected.txt"))}) && (/usr/bin/curl --silent --show-error --max-time 5 http://127.0.0.1:${loopback.port}/ | grep -q '^ok$') && printf ok > ${quote(path.join(projectB, "b-write.txt"))}`),
-  ]);
+  const standardCommand = `cat ${quote(aOwn)} && test ! -e ${quote(bOwn)} && ${process.platform === "linux" ? "/usr/bin/sleep 3 && " : ""}printf ok > ${quote(path.join(projectA, "a-write.txt"))}`;
+  const protectedCommand = `cat ${quote(bOwn)} && cat ${quote(aOwn)} && test ! -s ${quote(standardEnv)} && (! printf blocked > ${quote(path.join(projectA, "blocked-by-protected.txt"))}) && (/usr/bin/curl --silent --show-error --max-time 5 http://127.0.0.1:${loopback.port}/ | grep -q '^ok$') && printf ok > ${quote(path.join(projectB, "b-write.txt"))}`;
+  const standardRun = run(sourceA.id, standardCommand);
+  if (process.platform === "linux") {
+    for (let attempt = 0; attempt < 200 && !fs.existsSync(missingStandardEnvBackup); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(fs.existsSync(missingStandardEnvBackup), true, "Standard SRT helper should hold its synthetic denyWrite mountpoint");
+  }
+  const protectedRun = run(sourceB.id, protectedCommand);
+  const [a, b] = await Promise.all([standardRun, protectedRun]);
   assert.equal(a.code, 0, a.output);
   assert.equal(b.code, 0, b.output);
   assert.equal(fs.readFileSync(path.join(projectA, "a-write.txt"), "utf8"), "ok");
   assert.equal(fs.existsSync(path.join(projectA, "blocked-by-protected.txt")), false);
+  assert.equal(fs.readFileSync(standardEnv, "utf8"), "SYNTHETIC_STANDARD_SECRET\n");
+  assert.equal(fs.existsSync(missingStandardEnvBackup), false);
   assert.equal(fs.readFileSync(path.join(projectB, "b-write.txt"), "utf8"), "ok");
 });
 

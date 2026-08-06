@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
-import { stripInternalCapabilityEnv } from "./child-env.js";
+import { buildRestrictedSandboxEnv } from "./child-env.js";
 import type { SandboxExecRequest } from "./sandbox-exec-protocol.js";
 
 let started = false;
@@ -45,7 +45,7 @@ async function run(request: SandboxExecRequest): Promise<number> {
     const wrapped = await SandboxManager.wrapWithSandboxArgv(command, "/bin/bash", undefined, undefined, request.cwd);
     const child = spawn(wrapped.argv[0], wrapped.argv.slice(1), {
       cwd: request.cwd,
-      env: stripInternalCapabilityEnv(wrapped.env),
+      env: buildRestrictedSandboxEnv(wrapped.env),
       shell: false,
       stdio: ["ignore", "inherit", "inherit"],
     });

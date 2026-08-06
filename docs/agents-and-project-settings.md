@@ -35,7 +35,7 @@ Agent profiles support:
 - **Read only:** can read registered memory files but cannot edit/write them.
 - **Read and write:** normal authorized memory access.
 
-Memory path checks are canonical and symlink-aware. Restricted profiles in Standard projects are confined by participating path tools and sandboxed filesystem access to their project, permitted memory roots, and their own read-only attachment subtree. A restricted profile running inside its authorized Protected project may additionally read ordinary/unregistered host paths and Standard projects—even when a Standard project's run allowlist does not include that profile—but writes remain confined to its own project and permitted memory roots. Other Protected projects, protected backing artifacts, global Pi/control-plane storage, documented secret files, and disallowed memory roots remain unreadable. Broad recursive scans that intersect a denied root fail closed. This is not a network egress restriction.
+Memory path checks are canonical and symlink-aware. Restricted profiles in Standard projects are confined by participating path tools and sandboxed filesystem access to their project, permitted memory roots, and their own read-only attachment subtree. A restricted profile running inside its authorized Protected project may additionally read ordinary/unregistered host paths and Standard projects—even when a Standard project's run allowlist does not include that profile—but writes remain confined to its own project and permitted memory roots. Project-local `.pi` control-plane files remain mutation-denied. Other Protected projects, protected backing artifacts, global Pi/control-plane storage, the Wayang checkout's launcher configuration, documented project secret files, and disallowed memory roots remain unreadable. Broad recursive scans that intersect a denied root fail closed. This is not a network egress restriction.
 
 An eligible Protected restricted profile may also receive Wayang's backend-owned restricted `mcp` proxy when an administrator installs an exact private grant. This does not load Pi's global MCP extension or configuration. The compiled reviewed ceiling exposes only explicitly granted read/query tools; mutations, Report Publisher, scheduled/subagent use, and unreviewed future servers remain unavailable. See [Configuration](configuration.md#restricted-profile-mcp-grants).
 
@@ -50,7 +50,7 @@ Restricted profiles and scheduled/background sessions receive neither tool. Appr
 
 Runtime streaming conflicts remain strict: a tool call cannot mutate its own affected active project/profile. A separate Standard management session can manage other projects/restricted profiles; updating the active profile itself remains an authenticated Settings/UI operation for now.
 
-Deleting a project registration through the authenticated API or approved agent tool deletes only Wayang's registration. It is refused while sessions (including archived sessions), scheduled jobs/runs, apps/state/events, or active runtime impact still reference the project, and it never deletes project files or other user data.
+Deleting a project registration through the authenticated API or approved agent tool deletes only Wayang's registration. It is refused while sessions (including archived sessions), scheduled jobs/runs, apps/state/events, active runtime impact, or project-local managed browser profile data still exist, and it never deletes project files or other user data.
 
 ## Project instruction editing
 
@@ -139,7 +139,7 @@ Wayang sessions replace Pi's bash backend with a fresh per-command OS sandbox un
 - masks unauthorized projects plus Pi sessions/transcripts, Wayang data, attachments from other sessions, browser profiles, and the command-guard identity PIN; exact Wren Standard compatibility masks every Protected project regardless of allowlist;
 - enforces memory write mode for ordinary restricted profiles;
 - permits ordinary Standard restricted writes inside the current project and shared host temporary storage; Protected runtimes persist writes only inside their current project; exact Wren Standard compatibility permits ordinary host writes while protected host backing remains hidden and unmodifiable;
-- strips internal capabilities and PIN-like environment variables;
+- gives sandboxed shells a strict non-secret process environment rather than forwarding provider keys, OAuth/AWS credentials, proxy credentials, loader hooks, or arbitrary deployment variables;
 - blocks Unix-domain sockets for ordinary restricted profiles, permits them for exact eligible Wren Standard-project compatibility, and blocks raw `sudo` for all profiles;
 - allows every outbound TCP destination through sandbox-runtime's HTTP/SOCKS proxies, including public Internet, loopback, LAN, and VPN services.
 

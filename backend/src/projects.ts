@@ -248,6 +248,17 @@ export function ensureProjectForCwdDraft(store: StoreData, cwd: string): { proje
   return ensureProjectInStore(store, cwd);
 }
 
+export function projectRegistrationHasBrowserData(id: string): boolean {
+  const project = getStore().projects.find((candidate) => candidate.id === id);
+  if (!project) throw new WorkspaceStoreError("Project not found", 404);
+  try {
+    fs.lstatSync(path.join(project.cwd, ".pi", "browser-workbench"));
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+}
+
 export function getProjectRegistrationReferences(id: string): ProjectRegistrationReferences {
   const store = getStore();
   const project = store.projects.find((candidate) => candidate.id === id);
@@ -277,6 +288,9 @@ export function getProjectRegistrationReferences(id: string): ProjectRegistratio
 }
 
 export function deleteProjectRegistration(id: string): void {
+  if (projectRegistrationHasBrowserData(id)) {
+    throw new WorkspaceStoreError("Project registration retains managed browser profile data", 409);
+  }
   const references = getProjectRegistrationReferences(id);
   const blocking = Object.entries(references).filter(([, ids]) => ids.length > 0).map(([kind]) => kind);
   if (blocking.length > 0) {
