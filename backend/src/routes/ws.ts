@@ -56,6 +56,7 @@ import {
   getQueuedBrowserMessages,
   subscribeToSession,
   getMessageHistory,
+  getLiveMessageHistory,
   getSessionFileTodoState,
   getSessionFileSnapshot,
   getTodoState,
@@ -427,7 +428,11 @@ function handleConnection(
       if (msg.type === "turn_end" || msg.type === "agent_end" || msg.type === "agent_settled") {
         touchSession(nextSessionId);
       }
-      sendSafe(ws, msg);
+      sendSafe(ws, {
+        ...msg,
+        session_id: nextSessionId,
+        ...(selectionId ? { selection_id: selectionId } : {}),
+      });
       if (msg.type === "turn_end" || msg.type === "agent_end" || msg.type === "agent_settled") {
         sendSafe(ws, { ...getTodoState(nextSessionId), session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
       }
@@ -437,12 +442,14 @@ function handleConnection(
       // compaction has no agent_settled event, so a successful compaction_end
       // is also an authoritative reconciliation point.
       if (shouldReconcileLiveSessionState(msg)) {
-        const reconciled = getMessageHistory(nextSessionId);
+        const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
+        const reconciled = getLiveMessageHistory(nextSessionId);
         sendSafe(ws, {
           type: "history",
           session_id: nextSessionId,
           ...(selectionId ? { selection_id: selectionId } : {}),
           reason: msg.type === "agent_settled" ? "agent_settled_reconciliation" : "compaction_end_reconciliation",
+          streaming_at_snapshot: streamingAtSnapshot,
           message_count: reconciled.length,
           payload_bytes: Buffer.byteLength(JSON.stringify(reconciled)),
           messages: reconciled,
@@ -469,7 +476,12 @@ function handleConnection(
       // drain events observed after capture. Events queued before capture are
       // represented by the snapshot and are discarded to prevent duplicates.
       const liveHistoryStart = nowMs();
-      const liveHistory = getMessageHistory(nextSessionId);
+      // Capture runtime state with the synchronous history snapshot. The
+      // snapshot is the attach boundary: earlier events are represented by
+      // history and later events are drained below. A synthetic agent_start
+      // after that drain would clear valid post-snapshot deltas in the client.
+      const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
+      const liveHistory = getLiveMessageHistory(nextSessionId);
       bufferedEvents.length = 0;
       wsProfile(nextSessionId, "attach_live_history", `duration=${elapsedMs(liveHistoryStart)} messages=${liveHistory.length}`);
       sendSafe(ws, {
@@ -477,6 +489,7 @@ function handleConnection(
         session_id: nextSessionId,
         ...(selectionId ? { selection_id: selectionId } : {}),
         reason: "initial",
+        streaming_at_snapshot: streamingAtSnapshot,
         message_count: liveHistory.length,
         payload_bytes: Buffer.byteLength(JSON.stringify(liveHistory)),
         messages: liveHistory,
@@ -491,12 +504,14 @@ function handleConnection(
     }
     bufferLiveEvents = false;
     if (bufferOverflow) {
-      const retryHistory = getMessageHistory(nextSessionId);
+      const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
+      const retryHistory = getLiveMessageHistory(nextSessionId);
       sendSafe(ws, {
         type: "history",
         session_id: nextSessionId,
         ...(selectionId ? { selection_id: selectionId } : {}),
         reason: "event_buffer_overflow_resnapshot",
+        streaming_at_snapshot: streamingAtSnapshot,
         message_count: retryHistory.length,
         payload_bytes: Buffer.byteLength(JSON.stringify(retryHistory)),
         messages: retryHistory,
@@ -504,12 +519,13 @@ function handleConnection(
     } else {
       for (const msg of bufferedEvents) deliverLiveEvent(msg);
     }
-    sendSafe(ws, { type: "command_guard_state", ...getCommandGuardState(nextSessionId) });
-    sendContextUsage(ws, nextSessionId);
-
-    if (liveHandle.session.isStreaming && !alreadySubscribedToLiveHandle) {
-      sendSafe(ws, { type: "agent_start" });
-    }
+    sendSafe(ws, {
+      type: "command_guard_state",
+      session_id: nextSessionId,
+      ...(selectionId ? { selection_id: selectionId } : {}),
+      ...getCommandGuardState(nextSessionId),
+    });
+    sendContextUsage(ws, nextSessionId, selectionId);
 
     wsProfile(nextSessionId, "attach_live_done", `duration=${elapsedMs(attachStart)}`);
     return true;
@@ -861,7 +877,7 @@ function handleConnection(
       return;
     }
 
-    handleClientMessage(ws, currentSessionId, msg, async () => {
+    handleClientMessage(ws, currentSessionId, currentSelectionId, msg, async () => {
       await attachLiveSession(currentSessionId, setupVersion, true, currentSelectionId, false);
     });
   };
@@ -1084,6 +1100,7 @@ function queuedAttachmentNames(value: unknown): string[] {
 async function handleClientMessage(
   ws: WebSocket,
   sessionId: string,
+  selectionId: string | null,
   msg: any,
   ensureLiveSession: () => Promise<void>,
 ): Promise<void> {
@@ -1179,7 +1196,7 @@ async function handleClientMessage(
               error,
             });
           }
-          sendSafe(ws, { type: "error", error });
+          sendSafe(ws, { type: "error", session_id: sessionId, ...(selectionId ? { selection_id: selectionId } : {}), error });
         });
         break;
       }
@@ -1221,19 +1238,23 @@ async function handleClientMessage(
         touchSession(sessionId);
         sendSafe(ws, {
           type: "history",
+          session_id: sessionId,
+          ...(selectionId ? { selection_id: selectionId } : {}),
           messages: result.messages,
         });
-        sendSafe(ws, getTodoState(sessionId));
-        sendContextUsage(ws, sessionId);
+        sendSafe(ws, { ...getTodoState(sessionId), session_id: sessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
+        sendContextUsage(ws, sessionId, selectionId);
 
         result.turn.then(() => {
           updateSessionError(sessionId, null);
         }).catch((err) => {
           const error = safeSessionError(sessionId, err, "Agent turn failed: ");
           updateSessionError(sessionId, error);
-          sendSafe(ws, { type: "error", error });
+          sendSafe(ws, { type: "error", session_id: sessionId, ...(selectionId ? { selection_id: selectionId } : {}), error });
           sendSafe(ws, {
             type: "history",
+            session_id: sessionId,
+            ...(selectionId ? { selection_id: selectionId } : {}),
             messages: getMessageHistory(sessionId),
           });
         });
@@ -1256,6 +1277,8 @@ async function handleClientMessage(
         updateGoal(sessionId, goal ?? null, status ?? null);
         sendSafe(ws, {
           type: "goal_update",
+          session_id: sessionId,
+          ...(selectionId ? { selection_id: selectionId } : {}),
           goal,
           status: status || "pending",
         });
@@ -1268,7 +1291,7 @@ async function handleClientMessage(
         const state = mode
           ? setCommandGuardMode(sessionId, mode, { announce: msg.announce !== false, pin: typeof msg.pin === "string" ? msg.pin : undefined })
           : getCommandGuardState(sessionId);
-        sendSafe(ws, { type: "command_guard_state", ...state });
+        sendSafe(ws, { type: "command_guard_state", session_id: sessionId, ...(selectionId ? { selection_id: selectionId } : {}), ...state });
         break;
       }
 
@@ -1314,7 +1337,7 @@ async function handleClientMessage(
       });
     }
     updateSessionError(sessionId, error);
-    sendSafe(ws, { type: "error", error });
+    sendSafe(ws, { type: "error", session_id: sessionId, ...(selectionId ? { selection_id: selectionId } : {}), error });
   }
 }
 
@@ -1521,13 +1544,15 @@ export function shouldReconcileLiveSessionState(msg: SerializedMessage): boolean
     || (msg.type === "compaction_end" && msg.succeeded === true);
 }
 
-function sendContextUsage(ws: WebSocket, sessionId: string): void {
+function sendContextUsage(ws: WebSocket, sessionId: string, selectionId?: string | null): void {
   const handle = getPiSession(sessionId);
   if (!handle) return;
   const usage = handle.session.getContextUsage();
   if (!usage) return;
   sendSafe(ws, {
     type: "context_usage",
+    session_id: sessionId,
+    ...(selectionId ? { selection_id: selectionId } : {}),
     tokens: usage.tokens,
     contextWindow: usage.contextWindow,
     percent: usage.percent,
