@@ -14,6 +14,7 @@ import {
   cleanupPiSessionCapabilityDenial,
   closePiSessionAuthorities,
   createPiSession,
+  fileAudioExperimentRuntimeIsEligible,
   getPiSession,
   getPiSessionBashMode,
   getPiSessionRuntimeState,
@@ -60,6 +61,36 @@ function syntheticProtectedRuntime(
       : { allowed: true as const },
   } as Pick<ProtectedBrowserToolRuntime, "browser" | "preflight">;
 }
+
+test("file-audio experiment eligibility is disabled-by-default and exact Wren Standard interactive only", () => {
+  const eligible = {
+    session: {
+      agent_profile_id: "00000000-0000-4000-8000-000000000001",
+      pending_agent_switch: null,
+      legacy_private_session_quarantine: false,
+      legacy_capability_ineligible: false,
+      scheduled_job_id: null,
+      scheduled_run_id: null,
+    },
+    profile: {
+      id: "00000000-0000-4000-8000-000000000001",
+      builtin_kind: "wren",
+      enabled: true,
+    },
+    project: { access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: null } },
+  } as any;
+  assert.equal(fileAudioExperimentRuntimeIsEligible({ enabled: false, ...eligible }), false);
+  assert.equal(fileAudioExperimentRuntimeIsEligible({ enabled: true, ...eligible }), true);
+  assert.equal(fileAudioExperimentRuntimeIsEligible({
+    enabled: true, ...eligible, profile: { ...eligible.profile, id: "lookalike" },
+  }), false);
+  assert.equal(fileAudioExperimentRuntimeIsEligible({
+    enabled: true, ...eligible, project: { access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: null } },
+  }), false);
+  assert.equal(fileAudioExperimentRuntimeIsEligible({
+    enabled: true, ...eligible, session: { ...eligible.session, scheduled_job_id: "scheduled" },
+  }), false);
+});
 
 test("automatic idle cleanup retains live protected human control", () => {
   assert.equal(protectedBrowserIdleRetentionIsRequired(syntheticProtectedRuntime("user")), true);
@@ -156,13 +187,14 @@ test("Pi bridge capability denial latches tools and aborts active runtime author
   let agentAborts = 0;
   const hostTool = { name: "bash" };
   const protectedTool = { name: "protected_browser" };
+  const audioTool = { name: "file_audio_experiment" };
   const fakeSession: any = {
     clearQueue() { queueClears++; return { steering: ["queued"], followUp: [] }; },
     setActiveToolsByName(names: string[]) { this.agent.state.tools = names; },
     abort() { agentAborts++; order.push("agent-aborted"); return Promise.resolve(); },
-    _toolRegistry: new Map([["bash", hostTool], ["protected_browser", protectedTool]]),
-    _toolDefinitions: new Map([["bash", {}], ["protected_browser", {}]]),
-    agent: { state: { tools: [hostTool, protectedTool] }, async beforeToolCall() { return undefined; } },
+    _toolRegistry: new Map([["bash", hostTool], ["protected_browser", protectedTool], ["file_audio_experiment", audioTool]]),
+    _toolDefinitions: new Map([["bash", {}], ["protected_browser", {}], ["file_audio_experiment", {}]]),
+    agent: { state: { tools: [hostTool, protectedTool, audioTool] }, async beforeToolCall() { return undefined; } },
   };
   const handle = {
     id: "synthetic-denial-session",
@@ -178,6 +210,9 @@ test("Pi bridge capability denial latches tools and aborts active runtime author
     },
     restrictedMcpRuntime: {
       close() { order.push("restricted-latched"); return cleanupRelease.promise; },
+    },
+    fileAudioExperimentRuntime: {
+      close() { order.push("audio-latched"); return cleanupRelease.promise; },
     },
     activeInteractiveTurn: { token: "stale" },
   } as unknown as PiSessionHandle;
@@ -200,15 +235,17 @@ test("Pi bridge capability denial latches tools and aborts active runtime author
   assert.equal(handle.bashMode, "unavailable");
   assert.equal(handle.trustedHostBashTool, undefined);
   assert.equal(handle.protectedBrowserRuntime, undefined);
+  assert.equal(handle.fileAudioExperimentRuntime, undefined);
   assert.equal(handle.activeInteractiveTurn, null);
   assert.equal(queueClears, 1);
   assert.equal(agentAborts, 1, "Pi abort starts synchronously after authority denial");
   assert.deepEqual(fakeSession.agent.state.tools, []);
   assert.equal(fakeSession._toolRegistry.has("bash"), false);
   assert.equal(fakeSession._toolRegistry.has("protected_browser"), false);
+  assert.equal(fakeSession._toolRegistry.has("file_audio_experiment"), false);
   assert.deepEqual(
     order.sort(),
-    ["agent-aborted", "host-terminated", "protected-latched", "restricted-latched"],
+    ["agent-aborted", "audio-latched", "host-terminated", "protected-latched", "restricted-latched"],
     "host, agent, and companion teardown prefixes run before cleanup awaits",
   );
   assert.deepEqual(await fakeSession.agent.beforeToolCall(), {

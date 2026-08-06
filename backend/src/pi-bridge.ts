@@ -98,6 +98,14 @@ import {
   snapshotQueuedChatMessages,
   type QueuedChatMessageCapture,
 } from "./queued-chat-messages.js";
+import { getConfig } from "./config.js";
+import {
+  FILE_AUDIO_EXPERIMENT_TOOL_NAME,
+  type FileAudioExperimentBinding,
+  type FileAudioExperimentDependencies,
+  type FileAudioExperimentRuntime,
+} from "./audio-experiment/types.js";
+import { createFileAudioExperimentRuntime } from "./audio-experiment/tools.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -125,6 +133,8 @@ export interface PiSessionHandle {
   protectedBrowserFactory?: CreatePiSessionRuntimeOptions["protectedBrowserFactory"];
   protectedAutomationRuntime?: ProtectedAutomationToolRuntime;
   protectedAutomationFactory?: CreatePiSessionRuntimeOptions["protectedAutomationFactory"];
+  fileAudioExperimentRuntime?: FileAudioExperimentRuntime;
+  fileAudioExperimentFactory?: CreatePiSessionRuntimeOptions["fileAudioExperimentFactory"];
   activeInteractiveTurn?: BrowserTurnProvenance | null;
   /** Browser-local IDs bound to exact pending pi steering message objects. */
   queuedBrowserMessages: Map<string, QueuedBrowserMessageRecord>;
@@ -1600,6 +1610,24 @@ export type ProtectedAutomationFactory = (options: {
   binding: ProtectedAutomationBinding;
   isRuntimeCurrent(): boolean;
 }) => ProtectedAutomationToolRuntime | Promise<ProtectedAutomationToolRuntime>;
+export type FileAudioExperimentFactory = (options: {
+  binding: FileAudioExperimentBinding;
+  getCurrentTurn(): BrowserTurnProvenance | null;
+  isRuntimeCurrent(): boolean;
+  permitTtlMs: number;
+}) => FileAudioExperimentRuntime | Promise<FileAudioExperimentRuntime>;
+
+export function fileAudioExperimentRuntimeIsEligible(input: {
+  enabled: boolean;
+  session: SessionRow;
+  profile: AgentProfileRow;
+  project: ProjectRow;
+}): boolean {
+  return input.enabled
+    && input.session.scheduled_job_id === null
+    && input.session.scheduled_run_id === null
+    && isLegacyWrenStandardRuntime(input);
+}
 
 export type PiSessionCreationPrivilegedEffect =
   | "extension_provider_load"
@@ -1607,6 +1635,7 @@ export type PiSessionCreationPrivilegedEffect =
   | "restricted_mcp_runtime"
   | "protected_browser_runtime"
   | "protected_automation_runtime"
+  | "file_audio_experiment_runtime"
   | "agent_session"
   | "extension_lifecycle"
   | "handle_publication";
@@ -1620,6 +1649,8 @@ export interface CreatePiSessionRuntimeOptions {
   protectedBrowserFactory?: ProtectedBrowserFactory;
   /** Synthetic/internal exact-return factory seam. Production uses the inert built-in factory. */
   protectedAutomationFactory?: ProtectedAutomationFactory;
+  /** Synthetic/internal seam. Production remains inert until dependencies are installed. */
+  fileAudioExperimentFactory?: FileAudioExperimentFactory;
   /** Deterministic regression seam. Production callers must leave this unset. */
   testHooks?: {
     afterStandardResourcesResolution?: (authorized: boolean) => Promise<void>;
@@ -1628,6 +1659,28 @@ export interface CreatePiSessionRuntimeOptions {
 }
 
 let productionProtectedBrowserFactory: ProtectedBrowserFactory | undefined;
+let productionFileAudioExperimentDependencies: FileAudioExperimentDependencies | undefined;
+
+/** Adapter/media/DSP integration seam. Installation performs no file read,
+ * DSP work, or provider call; an eligible enabled runtime still must preview
+ * and execute a valid same-current-turn permit. */
+export function installProductionFileAudioExperimentDependencies(
+  dependencies: FileAudioExperimentDependencies,
+): () => void {
+  if (!dependencies || typeof dependencies.media?.inspect !== "function"
+    || typeof dependencies.wrenAdapter?.analyze !== "function"
+    || typeof dependencies.neutralAdapter?.analyze !== "function"
+    || typeof dependencies.dsp?.analyze !== "function") {
+    throw new WorkspaceStoreError("File-audio experiment dependencies are invalid", 500);
+  }
+  if (productionFileAudioExperimentDependencies && productionFileAudioExperimentDependencies !== dependencies) {
+    throw new WorkspaceStoreError("File-audio experiment production dependencies are already installed", 409);
+  }
+  productionFileAudioExperimentDependencies = dependencies;
+  return () => {
+    if (productionFileAudioExperimentDependencies === dependencies) productionFileAudioExperimentDependencies = undefined;
+  };
+}
 
 /** Install the inert production composition seam. Installing a factory never
  * creates a runtime or starts Chromium; only an eligible interactive session
@@ -1666,7 +1719,7 @@ async function closeUnpublishedAgentSession(session: AgentSession | undefined): 
 }
 
 export function piSessionHandleRequiresFreshRuntime(
-  handle: Pick<PiSessionHandle, "capabilityAuthorityDenied" | "protectedBrowserRuntime" | "protectedAutomationRuntime">,
+  handle: Pick<PiSessionHandle, "capabilityAuthorityDenied" | "protectedBrowserRuntime" | "protectedAutomationRuntime" | "fileAudioExperimentRuntime">,
 ): boolean {
   if (handle.capabilityAuthorityDenied) return true;
   const browser = handle.protectedBrowserRuntime;
@@ -1676,8 +1729,13 @@ export function piSessionHandleRequiresFreshRuntime(
     catch { return true; }
   }
   const automation = handle.protectedAutomationRuntime;
-  if (!automation) return false;
-  try { return !automation.preflight().allowed; }
+  if (automation) {
+    try { if (!automation.preflight().allowed) return true; }
+    catch { return true; }
+  }
+  const audio = handle.fileAudioExperimentRuntime;
+  if (!audio) return false;
+  try { return !audio.preflight().allowed; }
   catch { return true; }
 }
 
@@ -1711,6 +1769,7 @@ export async function createPiSession(
   let pendingRestrictedMcpRuntime: RestrictedMcpRuntime | undefined;
   let pendingProtectedBrowserRuntime: ProtectedBrowserToolRuntime | undefined;
   let pendingProtectedAutomationRuntime: ProtectedAutomationToolRuntime | undefined;
+  let pendingFileAudioExperimentRuntime: FileAudioExperimentRuntime | undefined;
   let pendingAgentSession: AgentSession | undefined;
   const creation = (async () => {
     assertCreationCurrent();
@@ -1816,6 +1875,8 @@ export async function createPiSession(
     let standardResourcesRuntimePublished = false;
     let protectedAutomationRuntimePublished = false;
     let protectedAutomationRuntimeForFence: ProtectedAutomationToolRuntime | undefined;
+    let fileAudioExperimentRuntimePublished = false;
+    let fileAudioExperimentRuntimeForFence: FileAudioExperimentRuntime | undefined;
 
     const getRestrictedMcpLiveContext = (): RestrictedMcpLiveContext | null => {
       const currentRow = getSessionById(id);
@@ -1953,6 +2014,91 @@ export async function createPiSession(
       }
     }
 
+    const audioConfig = getConfig().fileAudioExperiment;
+    const selectedFileAudioExperimentFactory: FileAudioExperimentFactory | undefined = runtimeOptions.fileAudioExperimentFactory
+      ?? (productionFileAudioExperimentDependencies
+        ? ((factoryOptions: Parameters<FileAudioExperimentFactory>[0]) => createFileAudioExperimentRuntime({
+            ...factoryOptions,
+            dependencies: productionFileAudioExperimentDependencies!,
+          }))
+        : undefined);
+    if (selectedFileAudioExperimentFactory && fileAudioExperimentRuntimeIsEligible({
+      enabled: audioConfig.enabled,
+      session: runtimeIdentity.row,
+      profile: runtimeIdentity.agentProfile,
+      project: runtimeIdentity.project,
+    })) {
+      const audioBinding: FileAudioExperimentBinding = {
+        sourceSessionId: id,
+        runtimeGeneration,
+        processBootNonce: PROCESS_BOOT_NONCE,
+        projectId: runtimeIdentity.project.id,
+        projectCwd: runtimeIdentity.project.cwd,
+        agentProfileId: runtimeIdentity.agentProfile.id,
+        provider: String(model.provider),
+        model: model.id,
+      };
+      assertCreationCurrent();
+      runtimeOptions.testHooks?.onPrivilegedEffect?.("file_audio_experiment_runtime");
+      assertCreationCurrent();
+      pendingFileAudioExperimentRuntime = await selectedFileAudioExperimentFactory({
+        binding: audioBinding,
+        permitTtlMs: audioConfig.permitTtlMs,
+        getCurrentTurn: () => {
+          if (!fileAudioExperimentRuntimePublished) return null;
+          const active = sessions.get(id);
+          if (!active || active.capabilityAuthorityDenied
+            || active.runtimeGeneration !== runtimeGeneration
+            || active.fileAudioExperimentRuntime !== fileAudioExperimentRuntimeForFence) return null;
+          return resolveInteractiveTurn(active);
+        },
+        isRuntimeCurrent: () => {
+          if (!fileAudioExperimentRuntimePublished) {
+            try { assertCreationCurrent(); } catch { return false; }
+            return pendingFileAudioExperimentRuntime?.binding.runtimeGeneration === runtimeGeneration;
+          }
+          const active = sessions.get(id);
+          const currentRow = getSessionById(id);
+          const currentProject = currentRow ? getProjectByCwd(currentRow.cwd) : undefined;
+          const currentProfile = currentRow?.agent_profile_id ? getAgentProfile(currentRow.agent_profile_id) : undefined;
+          let currentlyEnabled = false;
+          try { currentlyEnabled = getConfig().fileAudioExperiment.enabled; } catch { return false; }
+          return Boolean(active && currentRow && currentProject && currentProfile
+            && fileAudioExperimentRuntimeIsEligible({
+              enabled: currentlyEnabled,
+              session: currentRow,
+              profile: currentProfile,
+              project: currentProject,
+            })
+            && !active.capabilityAuthorityDenied
+            && currentProject.id === audioBinding.projectId
+            && currentRow.cwd === audioBinding.projectCwd
+            && active.runtimeGeneration === runtimeGeneration
+            && active.agentProfileId === audioBinding.agentProfileId
+            && active.cwd === audioBinding.projectCwd
+            && String(active.session.model?.provider) === audioBinding.provider
+            && active.session.model?.id === audioBinding.model
+            && active.fileAudioExperimentRuntime === fileAudioExperimentRuntimeForFence);
+        },
+      });
+      fileAudioExperimentRuntimeForFence = pendingFileAudioExperimentRuntime;
+      assertCreationCurrent();
+      const returned = pendingFileAudioExperimentRuntime?.binding;
+      if (!returned
+        || returned.sourceSessionId !== audioBinding.sourceSessionId
+        || returned.runtimeGeneration !== audioBinding.runtimeGeneration
+        || returned.processBootNonce !== audioBinding.processBootNonce
+        || returned.projectId !== audioBinding.projectId
+        || returned.projectCwd !== audioBinding.projectCwd
+        || returned.agentProfileId !== audioBinding.agentProfileId
+        || returned.provider !== audioBinding.provider
+        || returned.model !== audioBinding.model) {
+        await pendingFileAudioExperimentRuntime?.close().catch(() => undefined);
+        pendingFileAudioExperimentRuntime = undefined;
+        throw new WorkspaceStoreError("File-audio experiment factory returned a non-exact runtime lease", 409);
+      }
+    }
+
     const transcriptStartedAt = performance.now();
     const sessionManager = sessionFile
       ? SessionManager.open(sessionFile, undefined, cwd)
@@ -2078,11 +2224,12 @@ export async function createPiSession(
       sessionManager,
       settingsManager,
       resourceLoader: runtimeResources.resourceLoader,
-      tools: pendingProtectedBrowserRuntime || pendingProtectedAutomationRuntime
+      tools: pendingProtectedBrowserRuntime || pendingProtectedAutomationRuntime || pendingFileAudioExperimentRuntime
         ? [
             ...(includeRestrictedMcpActiveTool(runtimeResources.tools, pendingRestrictedMcpRuntime) ?? []),
             ...(pendingProtectedBrowserRuntime ? [PROTECTED_BROWSER_TOOL_NAME] : []),
             ...(pendingProtectedAutomationRuntime ? [PROTECTED_AUTOMATION_TOOL_NAME] : []),
+            ...(pendingFileAudioExperimentRuntime ? [FILE_AUDIO_EXPERIMENT_TOOL_NAME] : []),
           ]
         : includeRestrictedMcpActiveTool(runtimeResources.tools, pendingRestrictedMcpRuntime),
       excludeTools: excludeTools.length > 0 ? [...new Set(excludeTools)] : undefined,
@@ -2101,6 +2248,7 @@ export async function createPiSession(
         ...(pendingRestrictedMcpRuntime ? [pendingRestrictedMcpRuntime.tool] : []),
         ...(pendingProtectedBrowserRuntime ? [pendingProtectedBrowserRuntime.tool] : []),
         ...(pendingProtectedAutomationRuntime ? [pendingProtectedAutomationRuntime.tool] : []),
+        ...(pendingFileAudioExperimentRuntime ? [pendingFileAudioExperimentRuntime.tool] : []),
         ...(hostBashTool ? [hostBashTool] : []),
         ...(bashMode === "sandboxed" || bashMode === "sandboxed-wren"
           ? [createPolicySandboxedBashToolDefinition(cwd, id, bashMode)]
@@ -2165,6 +2313,7 @@ export async function createPiSession(
       } : undefined,
       protectedBrowserRuntime: pendingProtectedBrowserRuntime,
       protectedAutomationRuntime: pendingProtectedAutomationRuntime,
+      fileAudioExperimentRuntime: pendingFileAudioExperimentRuntime,
     });
     assertCreationCurrent();
     if (hostBashTool && hostCreationDecision.allowed) {
@@ -2215,6 +2364,10 @@ export async function createPiSession(
         protectedAutomationRuntime: pendingProtectedAutomationRuntime,
         protectedAutomationFactory: selectedProtectedAutomationFactory,
       } : {}),
+      ...(pendingFileAudioExperimentRuntime ? {
+        fileAudioExperimentRuntime: pendingFileAudioExperimentRuntime,
+        fileAudioExperimentFactory: selectedFileAudioExperimentFactory,
+      } : {}),
       activeInteractiveTurn: null,
       queuedBrowserMessages: new Map(),
     };
@@ -2243,10 +2396,12 @@ export async function createPiSession(
     sessions.set(id, handle);
     standardResourcesRuntimePublished = true;
     protectedAutomationRuntimePublished = true;
+    fileAudioExperimentRuntimePublished = true;
     pendingAgentSession = undefined;
     pendingRestrictedMcpRuntime = undefined;
     pendingProtectedBrowserRuntime = undefined;
     pendingProtectedAutomationRuntime = undefined;
+    pendingFileAudioExperimentRuntime = undefined;
     runtimeEvents.emit("event", {
       type: "runtime_state_changed",
       sessionId: id,
@@ -2270,6 +2425,8 @@ export async function createPiSession(
     pendingProtectedBrowserRuntime = undefined;
     await pendingProtectedAutomationRuntime?.close().catch(() => undefined);
     pendingProtectedAutomationRuntime = undefined;
+    await pendingFileAudioExperimentRuntime?.close().catch(() => undefined);
+    pendingFileAudioExperimentRuntime = undefined;
     throw error;
   }).finally(() => {
     recordLatencyMetric("lazy_session_create_ms", performance.now() - creationStartedAt);
@@ -2342,6 +2499,7 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
           forceInMemorySettings: true,
           protectedBrowserFactory: currentHandle?.protectedBrowserFactory,
           protectedAutomationFactory: currentHandle?.protectedAutomationFactory,
+          fileAudioExperimentFactory: currentHandle?.fileAudioExperimentFactory,
         },
       );
       authorityLifecycle.provisionalTargetConstructed({
@@ -2385,6 +2543,7 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
           forceInMemorySettings: true,
           protectedBrowserFactory: currentHandle?.protectedBrowserFactory,
           protectedAutomationFactory: currentHandle?.protectedAutomationFactory,
+          fileAudioExperimentFactory: currentHandle?.fileAudioExperimentFactory,
         },
       );
       const freshRow = getSessionById(id);
@@ -2414,6 +2573,7 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
               forceInMemorySettings: true,
               protectedBrowserFactory: currentHandle?.protectedBrowserFactory,
               protectedAutomationFactory: currentHandle?.protectedAutomationFactory,
+              fileAudioExperimentFactory: currentHandle?.fileAudioExperimentFactory,
             },
           );
         } catch (restoreError) {
@@ -2743,10 +2903,12 @@ function beginPiSessionAuthorityCleanup(handle: PiSessionHandle): Promise<void> 
   const restricted = handle.restrictedMcpRuntime;
   const protectedBrowser = handle.protectedBrowserRuntime;
   const protectedAutomation = handle.protectedAutomationRuntime;
+  const fileAudioExperiment = handle.fileAudioExperimentRuntime;
   const hostBashTeardown = handle.hostBashTeardown;
   handle.restrictedMcpRuntime = undefined;
   handle.protectedBrowserRuntime = undefined;
   handle.protectedAutomationRuntime = undefined;
+  handle.fileAudioExperimentRuntime = undefined;
   handle.hostBashTeardown = undefined;
   const invokeClose = (runtime: { close(): Promise<void> } | undefined): Promise<void> => {
     try { return runtime ? Promise.resolve(runtime.close()) : Promise.resolve(); }
@@ -2764,6 +2926,7 @@ function beginPiSessionAuthorityCleanup(handle: PiSessionHandle): Promise<void> 
     invokeClose(restricted),
     invokeClose(protectedBrowser),
     invokeClose(protectedAutomation),
+    invokeClose(fileAudioExperiment),
   ]).then(() => undefined);
   capabilityAuthorityCleanup.set(handle, cleanup);
   return cleanup;
@@ -2810,9 +2973,11 @@ function latchPiSessionHandleCapabilityDenial(handle: PiSessionHandle): void {
     session._toolRegistry?.delete?.("bash");
     session._toolRegistry?.delete?.(PROTECTED_BROWSER_TOOL_NAME);
     session._toolRegistry?.delete?.(PROTECTED_AUTOMATION_TOOL_NAME);
+    session._toolRegistry?.delete?.(FILE_AUDIO_EXPERIMENT_TOOL_NAME);
     session._toolDefinitions?.delete?.("bash");
     session._toolDefinitions?.delete?.(PROTECTED_BROWSER_TOOL_NAME);
     session._toolDefinitions?.delete?.(PROTECTED_AUTOMATION_TOOL_NAME);
+    session._toolDefinitions?.delete?.(FILE_AUDIO_EXPERIMENT_TOOL_NAME);
   }
 
   // Calling these async closers starts their synchronous denial prefixes now.
