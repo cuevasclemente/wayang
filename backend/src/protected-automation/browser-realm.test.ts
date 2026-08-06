@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import type { CdpConnection, ChromeTarget } from "../browser/cdp.js";
-import type { ManagedChromiumRuntimeOptions } from "../browser/manager.js";
+import { ManagedChromiumRuntime, type ManagedChromiumRuntimeOptions } from "../browser/manager.js";
 import {
   ProtectedAutomationBrowserRealmRegistry,
   ensureProtectedAutomationBrowserRealmStorage,
@@ -15,17 +15,47 @@ import {
   type ProtectedAutomationPreparationViewerContext,
 } from "./browser-preparation.js";
 
+const browserIntegrationTest = process.env.WAYANG_BROWSER_INTEGRATION === "1" ? test : test.skip;
+
 class SyntheticRuntime implements ProtectedAutomationManagedRuntime {
   running = false;
   stops = 0;
   gateAttachmentCloses = 0;
   rejectDownloadCancellation = false;
+  snapshotPageTargetId: string | null = null;
+  discoveryPageTargetId: string | null = null;
   cancelled: string[] = [];
+  private targetCloseStartedResolve: (() => void) | null = null;
+  private targetCloseReleaseResolve: (() => void) | null = null;
+  targetCloseStarted: Promise<void> = Promise.resolve();
+  private targetCloseRelease: Promise<void> = Promise.resolve();
   readonly commands: Array<{ method: string; params: Record<string, unknown> }> = [];
   private readonly listeners = new Map<string, Set<(event: any) => void>>();
   private readonly cdp = {
     send: async (method: string, params: Record<string, unknown> = {}) => {
       this.commands.push({ method, params: { ...params } });
+      if (method === "Target.setDiscoverTargets" && this.discoveryPageTargetId) {
+        this.emit("Target.targetCreated", {
+          targetInfo: { type: "page", targetId: this.discoveryPageTargetId, url: "about:blank" },
+        });
+      }
+      if (method === "Target.getTargets") {
+        return { targetInfos: [
+          { type: "page", targetId: "target-1", url: "about:blank" },
+          ...(this.snapshotPageTargetId
+            ? [{ type: "page", targetId: this.snapshotPageTargetId, url: "about:blank" }]
+            : []),
+        ] };
+      }
+      if (method === "Target.closeTarget") {
+        if (this.targetCloseReleaseResolve) {
+          this.targetCloseStartedResolve?.();
+          await this.targetCloseRelease;
+        }
+        if (params.targetId === this.snapshotPageTargetId) this.snapshotPageTargetId = null;
+        if (params.targetId === this.discoveryPageTargetId) this.discoveryPageTargetId = null;
+        return { success: true };
+      }
       return method === "Page.getFrameTree"
         ? { frameTree: { frame: { id: "frame-1", loaderId: "loader-1", url: "about:blank" } } }
         : {};
@@ -41,8 +71,19 @@ class SyntheticRuntime implements ProtectedAutomationManagedRuntime {
     id: "target-1", type: "page", url: "about:blank", webSocketDebuggerUrl: "ws://synthetic.invalid",
   } as ChromeTarget;
   constructor(readonly options: ManagedChromiumRuntimeOptions) {}
+  deferTargetClose(): void {
+    this.targetCloseStarted = new Promise<void>((resolve) => { this.targetCloseStartedResolve = resolve; });
+    this.targetCloseRelease = new Promise<void>((resolve) => { this.targetCloseReleaseResolve = resolve; });
+  }
+  releaseTargetClose(): void {
+    this.targetCloseReleaseResolve?.();
+    this.targetCloseReleaseResolve = null;
+  }
   async start(check?: () => Promise<void>): Promise<void> { await check?.(); this.running = true; }
   async stop(): Promise<void> { this.running = false; this.stops += 1; }
+  emit(event: string, params: any): void {
+    for (const listener of [...(this.listeners.get(event) ?? [])]) listener(params);
+  }
   async cancelDownload(guid: string, check?: () => Promise<void>): Promise<void> {
     await check?.();
     this.cancelled.push(guid);
@@ -137,6 +178,175 @@ test("a realm grants exactly one run or prepare lease and teardown permits a fre
     assert.notEqual(second.binding.generation, firstGeneration);
     await second.close();
   } finally {
+    await realms.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("gate installation closes pre-existing extra pages but still denies later page creation", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-automation-realm-targets-"));
+  fs.mkdirSync(path.join(root, "project"));
+  let runtime!: SyntheticRuntime;
+  const diagnostics: string[] = [];
+  const realms = new ProtectedAutomationBrowserRealmRegistry({
+    dataDir: path.join(root, "data"),
+    runtimeFactory: (options) => {
+      runtime = new SyntheticRuntime(options);
+      runtime.snapshotPageTargetId = "pre-existing-target";
+      runtime.discoveryPageTargetId = "pre-existing-target";
+      return runtime;
+    },
+    onDiagnostic: (event) => diagnostics.push(event.code),
+  });
+  try {
+    const lease = realms.acquire(request(root, () => undefined, "prepare"));
+    await lease.start();
+    assert.equal(lease.isRevoked, false);
+    assert.deepEqual(
+      runtime.commands.filter((command) => command.method === "Target.closeTarget").map((command) => command.params),
+      [{ targetId: "pre-existing-target" }],
+    );
+    assert.deepEqual(diagnostics, []);
+
+    runtime.emit("Target.targetCreated", {
+      targetInfo: { type: "page", targetId: "later-target", url: "about:blank" },
+    });
+    assert.equal(lease.isRevoked, true);
+    assert.deepEqual(diagnostics, ["unexpected-page-target"]);
+    await lease.close();
+  } finally {
+    await realms.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a page first observed during discovery is never accepted as a startup target", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-automation-realm-discovery-race-"));
+  fs.mkdirSync(path.join(root, "project"));
+  let runtime!: SyntheticRuntime;
+  const diagnostics: string[] = [];
+  const realms = new ProtectedAutomationBrowserRealmRegistry({
+    dataDir: path.join(root, "data"),
+    runtimeFactory: (options) => {
+      runtime = new SyntheticRuntime(options);
+      runtime.discoveryPageTargetId = "raced-target";
+      return runtime;
+    },
+    onDiagnostic: (event) => diagnostics.push(event.code),
+  });
+  try {
+    const lease = realms.acquire(request(root, () => undefined, "prepare"));
+    await assert.rejects(() => lease.start(), /revoked/i);
+    assert.equal(lease.isRevoked, true);
+    assert.deepEqual(diagnostics, ["unexpected-page-target"]);
+    assert.deepEqual(
+      runtime.commands.filter((command) => command.method === "Target.closeTarget").map((command) => command.params),
+      [{ targetId: "raced-target" }],
+    );
+    await lease.close();
+  } finally {
+    await realms.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a popup created while an initial blank target is closing denial-latches the realm", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-automation-realm-close-race-"));
+  fs.mkdirSync(path.join(root, "project"));
+  let runtime!: SyntheticRuntime;
+  const diagnostics: string[] = [];
+  const realms = new ProtectedAutomationBrowserRealmRegistry({
+    dataDir: path.join(root, "data"),
+    runtimeFactory: (options) => {
+      runtime = new SyntheticRuntime(options);
+      runtime.snapshotPageTargetId = "pre-existing-target";
+      runtime.discoveryPageTargetId = "pre-existing-target";
+      runtime.deferTargetClose();
+      return runtime;
+    },
+    onDiagnostic: (event) => diagnostics.push(event.code),
+  });
+  try {
+    const lease = realms.acquire(request(root, () => undefined, "prepare"));
+    const starting = lease.start();
+    await runtime.targetCloseStarted;
+    runtime.emit("Target.targetCreated", {
+      targetInfo: { type: "page", targetId: "raced-target", url: "about:blank" },
+    });
+    runtime.releaseTargetClose();
+    await assert.rejects(() => starting, /revoked/i);
+    assert.equal(lease.isRevoked, true);
+    assert.deepEqual(diagnostics, ["unexpected-page-target"]);
+    await lease.close();
+  } finally {
+    runtime?.releaseTargetClose();
+    await realms.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+browserIntegrationTest("real Chromium normalizes a pre-existing blank target and retains one authorized page", { timeout: 45_000 }, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-automation-realm-real-targets-"));
+  fs.mkdirSync(path.join(root, "project"));
+  let runtime!: ManagedChromiumRuntime;
+  class ExtraBlankRuntime extends ManagedChromiumRuntime {
+    override async start(check?: () => Promise<void>): Promise<void> {
+      await super.start(check);
+      await this.withPageCdp(async (cdp) => {
+        await cdp.send("Target.createTarget", { url: "about:blank" });
+      });
+    }
+  }
+  const realms = new ProtectedAutomationBrowserRealmRegistry({
+    dataDir: path.join(root, "data"),
+    runtimeFactory: (options) => { runtime = new ExtraBlankRuntime(options); return runtime; },
+  });
+  try {
+    const lease = realms.acquire(request(root, () => undefined, "prepare"));
+    await lease.start();
+    assert.equal(lease.isRevoked, false);
+    const pageCount = await runtime.withPageCdp(async (cdp) => {
+      const targets = await cdp.send<any>("Target.getTargets");
+      return targets.targetInfos.filter((info: any) => info.type === "page").length;
+    });
+    assert.equal(pageCount, 1);
+    await lease.close();
+  } finally {
+    await realms.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a snapshotted blank target changing URL before close acknowledgement is denied", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-automation-realm-target-mutation-"));
+  fs.mkdirSync(path.join(root, "project"));
+  let runtime!: SyntheticRuntime;
+  const diagnostics: string[] = [];
+  const realms = new ProtectedAutomationBrowserRealmRegistry({
+    dataDir: path.join(root, "data"),
+    runtimeFactory: (options) => {
+      runtime = new SyntheticRuntime(options);
+      runtime.snapshotPageTargetId = "pre-existing-target";
+      runtime.discoveryPageTargetId = "pre-existing-target";
+      runtime.deferTargetClose();
+      return runtime;
+    },
+    onDiagnostic: (event) => diagnostics.push(event.code),
+  });
+  try {
+    const lease = realms.acquire(request(root, () => undefined, "prepare"));
+    const starting = lease.start();
+    await runtime.targetCloseStarted;
+    runtime.emit("Target.targetInfoChanged", {
+      targetInfo: { type: "page", targetId: "pre-existing-target", url: "https://allowed.example.test/" },
+    });
+    runtime.releaseTargetClose();
+    await assert.rejects(() => starting, /revoked/i);
+    assert.equal(lease.isRevoked, true);
+    assert.deepEqual(diagnostics, ["unexpected-page-target"]);
+    await lease.close();
+  } finally {
+    runtime?.releaseTargetClose();
     await realms.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -263,6 +473,29 @@ test("owner cancellation synchronously denies the lease before asynchronous clea
     assert.equal(lease.isRevoked, true);
     await assert.rejects(() => lease.assertAuthorized(), /revoked/i);
     await lease.close();
+  } finally {
+    await realms.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("realm denial diagnostics emit one bounded reason code without binding metadata", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-automation-realm-diagnostic-"));
+  fs.mkdirSync(path.join(root, "project"));
+  const diagnostics: unknown[] = [];
+  const realms = new ProtectedAutomationBrowserRealmRegistry({
+    dataDir: path.join(root, "data"),
+    runtimeFactory: (options) => new SyntheticRuntime(options),
+    onDiagnostic: (event) => diagnostics.push(event),
+  });
+  try {
+    const lease = realms.acquire(request(root, () => undefined));
+    lease.deny("unexpected-page-target");
+    lease.deny("must-not-repeat");
+    await lease.close();
+    assert.deepEqual(diagnostics, [{ component: "browser-realm", code: "unexpected-page-target" }]);
+    assert.equal(JSON.stringify(diagnostics).includes("synthetic-project"), false);
+    assert.equal(JSON.stringify(diagnostics).includes(root), false);
   } finally {
     await realms.close();
     fs.rmSync(root, { recursive: true, force: true });

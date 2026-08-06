@@ -55,6 +55,9 @@ class SyntheticCdp {
     if (method === "Page.getFrameTree") {
       return { frameTree: { frame: { id: "frame-1", loaderId: this.loader, url: this.url } } };
     }
+    if (method === "Target.getTargets") {
+      return { targetInfos: [{ type: "page", targetId: "target-1", url: "about:blank" }] };
+    }
     if (method === "Target.setAutoAttach") {
       this.autoAttachParams = { ...params };
       return {};

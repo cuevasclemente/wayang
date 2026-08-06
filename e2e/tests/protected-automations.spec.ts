@@ -146,6 +146,26 @@ async function installMocks(page: Page, options: {
       return fulfillJson(route, { jobs: state.catalogJobs });
     }
 
+    const preparationNavigation = /^\/api\/protected-automations\/sources\/([^/]+)\/jobs\/([^/]+)\/preparations\/([^/]+)\/navigate$/u.exec(pathname);
+    if (request.method() === "POST" && preparationNavigation && state.preparation) {
+      const [sourceSessionId, selectedJobId, preparationId] = preparationNavigation.slice(1).map(decodeURIComponent);
+      const selectedJob = state.detailJobs.get(selectedJobId)!;
+      return fulfillJson(route, {
+        preparation_id: preparationId,
+        source_session_id: sourceSessionId,
+        job_id: selectedJobId,
+        job_revision: selectedJob.revision,
+        state: "ready",
+        websocket_path: state.preparation.websocketPath,
+        project_id: selectedJob.project_id,
+        agent_profile_id: selectedJob.agent_profile_id,
+        capability_revision: selectedJob.capability_revision,
+        source_revision: selectedJob.source_revision,
+        allowed_https_origins: selectedJob.allowed_https_origins,
+        credential_broker: { supported: false, guarded: true },
+      });
+    }
+
     const preparation = /^\/api\/protected-automations\/sources\/([^/]+)\/jobs\/([^/]+)\/preparations\/([^/]+)$/u.exec(pathname);
     if (request.method() === "GET" && preparation && state.preparation) {
       const [sourceSessionId, selectedJobId, preparationId] = preparation.slice(1).map(decodeURIComponent);
@@ -363,9 +383,14 @@ test("uses only backend-issued source-bound preparation HTTP and viewer routes",
     detailJobs: [browserJob],
     preparation: { sourceSessionId, jobId: JOB_ID, preparationId, websocketPath },
   });
-  let openedViewerUrl: string | null = null;
+  const openedViewerUrls: string[] = [];
+  const viewerMessages: Array<Record<string, unknown>> = [];
   await page.routeWebSocket("**/ws/protected-automations/preparations/**", (socket) => {
-    openedViewerUrl = socket.url();
+    openedViewerUrls.push(socket.url());
+    socket.onMessage((message) => {
+      if (typeof message !== "string") return;
+      try { viewerMessages.push(JSON.parse(message) as Record<string, unknown>); } catch { /* exact client parser owns rejection */ }
+    });
     setTimeout(() => socket.send(JSON.stringify({
       type: "frame",
       dataUrl: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
@@ -381,8 +406,36 @@ test("uses only backend-issued source-bound preparation HTTP and viewer routes",
 
   await expect(page.getByTestId("protected-automation-preparation-state")).toContainText("state: ready");
   await expect(page.getByTestId("protected-automation-viewer")).toBeVisible();
+  await expect(page.getByTestId("protected-automation-preparation-close")).toHaveText("Save & close preparation");
+  await expect(page.getByText("Preparation viewer connected")).toBeVisible();
+  await page.getByTestId("protected-automation-preparation-open-0").click();
+  await page.getByTestId("protected-automation-viewer-paste-open").click();
+  await page.getByTestId("protected-automation-viewer-paste-capture").evaluate((element) => {
+    const clipboard = new DataTransfer();
+    clipboard.setData("text/plain", "synthetic-human-paste");
+    element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, clipboardData: clipboard }));
+  });
+  await expect(page.getByTestId("protected-automation-viewer-paste-capture")).toHaveCount(0);
+  await expect(page.getByText("Clipboard text was sent to the focused browser field.")).toBeVisible();
+  await expect.poll(() => viewerMessages.find((message) => message.type === "paste")).toEqual({
+    type: "paste",
+    text: "synthetic-human-paste",
+  });
+  await expect.poll(() => state.requests.find((candidate) => candidate.pathname.endsWith("/navigate"))?.body).toEqual({
+    url: "https://synthetic.example.test/",
+  });
   const frontendOrigin = `http://127.0.0.1:${process.env.WAYANG_E2E_FRONTEND_PORT || "15173"}`;
-  await expect.poll(() => openedViewerUrl).toBe(`${frontendOrigin.replace(/^http/u, "ws")}${websocketPath}`);
+  await expect.poll(() => openedViewerUrls[0]).toBe(`${frontendOrigin.replace(/^http/u, "ws")}${websocketPath}`);
+
+  // React's development StrictMode may perform one immediate mount probe. Once
+  // that settles, the panel's four-second refresh must not reconnect the viewer
+  // or let a stale probe socket taint the active connection's state.
+  await page.waitForTimeout(500);
+  const settledConnectionCount = openedViewerUrls.length;
+  expect(settledConnectionCount).toBeGreaterThanOrEqual(1);
+  await page.waitForTimeout(4_500);
+  expect(openedViewerUrls).toHaveLength(settledConnectionCount);
+  await expect(page.getByText("Preparation viewer websocket error")).toHaveCount(0);
 
   const preparationRequest = state.requests.find((candidate) => candidate.pathname.includes("/preparations/"));
   expect(preparationRequest?.pathname).toBe(

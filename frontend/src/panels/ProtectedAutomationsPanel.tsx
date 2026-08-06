@@ -21,6 +21,7 @@ import {
   getProtectedAutomation,
   getProtectedAutomationPreparation,
   listProtectedAutomations,
+  navigateProtectedAutomationPreparation,
   pauseProtectedAutomation,
   requestProtectedAutomationPurge,
   type ProtectedAutomationDetail,
@@ -44,6 +45,11 @@ interface ProtectedAutomationsPanelProps {
 }
 
 type LoadState = "loading" | "ready" | "unavailable" | "stale" | "error";
+
+function allowedOriginLabel(origin: string): string {
+  try { return new URL(origin).hostname; }
+  catch { return "allowed site"; }
+}
 
 export function ProtectedAutomationsPanel({
   selectedJobId,
@@ -104,6 +110,10 @@ export function ProtectedAutomationsPanel({
       setError(errorMessage(caught));
     }
   }, [preparationSelection]);
+
+  const handlePreparationViewerStatus = useCallback(() => {
+    void refreshPreparation(true);
+  }, [refreshPreparation]);
 
   const refresh = useCallback(async (quiet = false) => {
     if (!quiet) setLoadState("loading");
@@ -226,7 +236,25 @@ export function ProtectedAutomationsPanel({
       setPreparationSelection(null);
       setPreparationInput("");
       setCredentialsOpen(false);
-      setNotice("Preparation closed.");
+      setNotice("Preparation saved to the protected browser profile and closed. Future runs will reuse it.");
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusyAction(null);
+    }
+  }, [busyAction, preparationSelection]);
+
+  const navigatePreparation = useCallback(async (origin: string) => {
+    if (!preparationSelection || busyAction) return;
+    let url: string;
+    try { url = new URL("/", origin).toString(); }
+    catch { setError("The configured preparation origin is invalid."); return; }
+    setBusyAction("navigate-preparation");
+    setError(null);
+    try {
+      const next = await navigateProtectedAutomationPreparation(preparationSelection, url);
+      setPreparation(next);
+      setNotice(`Preparation opened ${allowedOriginLabel(origin)}.`);
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
@@ -386,12 +414,22 @@ export function ProtectedAutomationsPanel({
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
                       <h3 className="text-sm font-semibold">Human preparation</h3>
-                      <p className="mt-1 text-xs text-neutral-500">Attach only with IDs returned by the source-bound agent preparation tool. The backend-issued WebSocket path is used unchanged.</p>
+                      <p className="mt-1 text-xs text-neutral-500">Attach only with IDs returned by the source-bound agent preparation tool. Login state is stored in the protected browser profile; Save &amp; close stops Chromium cleanly for later runs.</p>
                     </div>
                     {preparation && preparationSelection && (
                       <div className="flex flex-wrap gap-2">
+                        {preparation.state === "ready" && preparation.allowed_https_origins.map((origin, index) => (
+                          <ActionButton
+                            key={origin}
+                            testId={`protected-automation-preparation-open-${index}`}
+                            busy={busyAction === "navigate-preparation"}
+                            disabled={Boolean(busyAction)}
+                            onClick={() => void navigatePreparation(origin)}
+                            icon={<Link2 size={13} />}
+                          >Open {allowedOriginLabel(origin)}</ActionButton>
+                        ))}
                         {preparation.state === "ready" && preparation.credential_broker?.supported === true && <ActionButton testId="protected-automation-credentials" disabled={Boolean(busyAction)} onClick={() => setCredentialsOpen(true)} icon={<KeyRound size={13} />}>Credentials</ActionButton>}
-                        <ActionButton testId="protected-automation-preparation-close" busy={busyAction === "close-preparation"} disabled={Boolean(busyAction)} onClick={() => void closePreparation()} icon={<Square size={13} />}>Close preparation</ActionButton>
+                        <ActionButton testId="protected-automation-preparation-close" busy={busyAction === "close-preparation"} disabled={Boolean(busyAction)} onClick={() => void closePreparation()} icon={<Square size={13} />}>Save &amp; close preparation</ActionButton>
                       </div>
                     )}
                   </div>
@@ -419,7 +457,7 @@ export function ProtectedAutomationsPanel({
 
                 <div className="h-[22rem] min-h-[16rem] sm:h-[30rem]">
                   {preparation?.state === "ready" && preparation.websocket_path ? (
-                    <CdpScreencastViewer websocketUrl={preparation.websocket_path} running connectionLabel="Preparation viewer" imageAlt="Protected automation preparation browser" testId="protected-automation-viewer" onStatus={() => void refreshPreparation(true)} />
+                    <CdpScreencastViewer websocketUrl={preparation.websocket_path} running pasteThroughViewer connectionLabel="Preparation viewer" imageAlt="Protected automation preparation browser" testId="protected-automation-viewer" onStatus={handlePreparationViewerStatus} />
                   ) : (
                     <div className="flex h-full items-center justify-center p-6 text-center text-sm text-neutral-500">{preparation ? `Preparation is ${humanize(preparation.state)}.` : "No exact preparation attached."}</div>
                   )}

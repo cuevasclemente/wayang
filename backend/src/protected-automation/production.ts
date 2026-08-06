@@ -42,6 +42,8 @@ const PURGE_TTL_MS = 2 * 60 * 1_000;
 const PURGE_REALM = "wayang.protected-automation-purge.v1";
 const SETTLE_TIMEOUT_MS = 10_000;
 const SETTLE_INTERVAL_MS = 50;
+const PREPARATION_PASTE_MAX_CHARS = 4_096;
+const PREPARATION_PASTE_MAX_BYTES = 16_384;
 
 export interface ProtectedAutomationViewerTransport {
   dispatch(message: Buffer, isBinary: boolean): Promise<void>;
@@ -112,6 +114,23 @@ export interface ProtectedAutomationProductionBootstrap {
 
 function error(message: string, statusCode = 403): Error {
   return Object.assign(new Error(message), { statusCode });
+}
+
+const DIAGNOSTIC_CODE_PATTERN = /^[a-z0-9-]{1,64}$/u;
+
+function diagnosticError(code: string): Error {
+  const bounded = DIAGNOSTIC_CODE_PATTERN.test(code) ? code : "unclassified";
+  return Object.assign(error("Preparation viewer transport failed", 503), {
+    protectedAutomationDiagnosticCode: bounded,
+  });
+}
+
+/** Extract only a bounded internal stage code; never release raw error text. */
+export function protectedAutomationDiagnosticCode(value: unknown): string {
+  const code = value && typeof value === "object" && "protectedAutomationDiagnosticCode" in value
+    ? (value as { protectedAutomationDiagnosticCode?: unknown }).protectedAutomationDiagnosticCode
+    : undefined;
+  return typeof code === "string" && DIAGNOSTIC_CODE_PATTERN.test(code) ? code : "unclassified";
 }
 
 function publicRun(row: ProtectedAutomationRunRow) {
@@ -232,14 +251,35 @@ function keyCodeFor(key: string): number | undefined {
     ArrowRight: 39, ArrowDown: 40, Delete: 46 } as Record<string, number>)[key];
 }
 
+function exactPreparationPasteText(value: unknown): string {
+  if (typeof value !== "string" || !value || value.length > PREPARATION_PASTE_MAX_CHARS
+    || Buffer.byteLength(value, "utf8") > PREPARATION_PASTE_MAX_BYTES || value.includes("\0")) {
+    throw error("Preparation paste text is invalid", 400);
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) throw error("Preparation paste text is invalid", 400);
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw error("Preparation paste text is invalid", 400);
+    }
+  }
+  return value;
+}
+
 async function createPreparationViewer(context: ProtectedAutomationPreparationViewerContext): Promise<{
   transport: ProtectedAutomationViewerTransport;
   registration: { id: string; close(): Promise<void> };
 }> {
   const attach = context.runtime.attachPageCdpViewer;
-  if (typeof attach !== "function") throw error("Preparation viewer transport is unavailable", 503);
-  await context.assertAuthorized();
-  const attachment = await attach.call(context.runtime);
+  if (typeof attach !== "function") throw diagnosticError("viewer-attach-unavailable");
+  try { await context.assertAuthorized(); }
+  catch { throw diagnosticError("viewer-authority-check"); }
+  let attachment: Awaited<ReturnType<NonNullable<typeof attach>>>;
+  try { attachment = await attach.call(context.runtime); }
+  catch { throw diagnosticError("viewer-cdp-attach"); }
   const listeners = new Set<(message: Buffer, isBinary: boolean) => void>();
   const id = randomUUID();
   let closed = false;
@@ -254,9 +294,13 @@ async function createPreparationViewer(context: ProtectedAutomationPreparationVi
       if (!closed) emit({ type: "frame", dataUrl: `data:image/jpeg;base64,${params.data}`, metadata: params.metadata, sessionId: params.sessionId });
     }).catch(() => { void close(); });
   });
-  await guardedSend(attachment.cdp, context.assertAuthorized, "Page.enable");
-  await guardedSend(attachment.cdp, context.assertAuthorized, "Runtime.enable");
-  await guardedSend(attachment.cdp, context.assertAuthorized, "Page.startScreencast", { format: "jpeg", quality: 70, everyNthFrame: 1 });
+  try { await guardedSend(attachment.cdp, context.assertAuthorized, "Page.enable"); }
+  catch { attachment.close(); throw diagnosticError("viewer-page-enable"); }
+  try { await guardedSend(attachment.cdp, context.assertAuthorized, "Runtime.enable"); }
+  catch { attachment.close(); throw diagnosticError("viewer-runtime-enable"); }
+  try {
+    await guardedSend(attachment.cdp, context.assertAuthorized, "Page.startScreencast", { format: "jpeg", quality: 70, everyNthFrame: 1 });
+  } catch { attachment.close(); throw diagnosticError("viewer-screencast-start"); }
   const close = async () => {
     if (closed) return;
     closed = true;
@@ -289,6 +333,12 @@ async function createPreparationViewer(context: ProtectedAutomationPreparationVi
           });
           return;
         }
+        if (message.type === "paste") {
+          if (Object.keys(message).sort().join("\0") !== "text\0type") throw error("Preparation paste message is invalid", 400);
+          const text = exactPreparationPasteText(message.text);
+          await guardedSend(attachment.cdp, context.assertAuthorized, "Input.insertText", { text });
+          return;
+        }
         if (message.type === "key") {
           const key = typeof message.key === "string" ? message.key : "";
           if (!key) throw error("Preparation key input is invalid", 400);
@@ -314,8 +364,8 @@ async function createPreparationViewer(context: ProtectedAutomationPreparationVi
 
 async function credentialContext(record: PreparationRecord): Promise<BrowserCredentialContext> {
   let result!: BrowserCredentialContext;
-  // Viewer attachment is not required; the lease's runtime is reached through a
-  // short-lived transport context installed below by `withPreparationRuntime`.
+  // Credential inspection/fill remains available only while at least one
+  // owner-bound viewer is actively registered for this preparation.
   const holder = preparationRuntimeContexts.get(record);
   if (!holder) throw error("Preparation browser is not running", 409);
   await holder.runtime.withPageCdp(async (cdp, target) => {
@@ -336,10 +386,13 @@ async function credentialContext(record: PreparationRecord): Promise<BrowserCred
   return result;
 }
 
-const preparationRuntimeContexts = new WeakMap<PreparationRecord, {
+interface PreparationRuntimeContext {
   runtime: ProtectedAutomationPreparationViewerContext["runtime"];
   assertAuthorized(): Promise<void>;
-}>();
+  activeViewers: number;
+}
+
+const preparationRuntimeContexts = new WeakMap<PreparationRecord, PreparationRuntimeContext>();
 
 async function fillPreparationCredential(
   record: PreparationRecord,
@@ -535,6 +588,19 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     return record;
   };
 
+  const assertActiveViewerContext = async (
+    record: PreparationRecord,
+    holder: PreparationRuntimeContext,
+  ): Promise<void> => {
+    try {
+      await holder.assertAuthorized();
+      if (holder.activeViewers < 1 || preparationRuntimeContexts.get(record) !== holder) throw new Error("viewer context changed");
+    } catch {
+      options.credentialBroker.revokeChoicesForAutomationPreparation(record.lease.binding);
+      throw error("Preparation viewer authority changed", 409);
+    }
+  };
+
   const preparationPort: ProtectedAutomationPreparationPort = {
     jobChanged(jobId) {
       realms.denyWhere((binding) => binding.jobId === jobId);
@@ -675,19 +741,63 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     async openPreparationViewer(owner, selection) {
       const record = currentRecord(owner, selection);
       let opened: Awaited<ReturnType<typeof createPreparationViewer>> | undefined;
-      const registration = await record.lease.attachViewer({
-        async open(context) {
-          preparationRuntimeContexts.set(record, { runtime: context.runtime, assertAuthorized: context.assertAuthorized });
-          opened = await createPreparationViewer(context);
-          return opened.registration;
-        },
-      });
-      if (!opened) { await registration.close(); throw error("Preparation viewer is unavailable", 503); }
+      let viewerContext: ProtectedAutomationPreparationViewerContext | undefined;
+      let registrationClosed = false;
+      let releaseRuntimeContext: () => void = () => undefined;
+      let registration: Awaited<ReturnType<typeof record.lease.attachViewer>>;
+      try {
+        registration = await record.lease.attachViewer({
+          async open(context) {
+            const created = await createPreparationViewer(context);
+            opened = created;
+            viewerContext = context;
+            return {
+              id: created.registration.id,
+              async close() {
+                registrationClosed = true;
+                try { await created.registration.close(); }
+                finally { releaseRuntimeContext(); }
+              },
+            };
+          },
+        });
+      } catch (failure) {
+        if (protectedAutomationDiagnosticCode(failure) !== "unclassified") throw failure;
+        throw diagnosticError("viewer-lease-attach");
+      }
+      if (!opened || !viewerContext || registrationClosed) {
+        await registration.close();
+        throw diagnosticError("viewer-registration-closed");
+      }
       const transport = opened.transport;
+      let holder = preparationRuntimeContexts.get(record);
+      if (!holder) {
+        holder = {
+          runtime: viewerContext.runtime,
+          assertAuthorized: viewerContext.assertAuthorized,
+          activeViewers: 0,
+        };
+        preparationRuntimeContexts.set(record, holder);
+      }
+      holder.activeViewers += 1;
+      let contextReleased = false;
+      releaseRuntimeContext = () => {
+        if (contextReleased) return;
+        contextReleased = true;
+        holder!.activeViewers -= 1;
+        if (holder!.activeViewers === 0 && preparationRuntimeContexts.get(record) === holder) {
+          preparationRuntimeContexts.delete(record);
+        }
+      };
+      let transportClosed = false;
       return {
         dispatch: (message, isBinary) => transport.dispatch(message, isBinary),
         onMessage: (listener) => transport.onMessage(listener),
-        async close() { await Promise.allSettled([registration.close(), transport.close()]); },
+        async close() {
+          if (transportClosed) return;
+          transportClosed = true;
+          await Promise.allSettled([registration.close(), transport.close()]);
+        },
       };
     },
     async navigatePreparation(owner, selection, requestedUrl) {
@@ -712,18 +822,35 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     async credentialStatus(owner, selection) {
       const record = currentRecord(owner, selection);
       const status = options.credentialBroker.status();
+      const holder = preparationRuntimeContexts.get(record);
+      if (!holder) return { ...status, origin: null };
       let origin: string | null = null;
-      try { origin = (await credentialContext(record)).origin; } catch {}
+      try { origin = (await credentialContext(record)).origin; }
+      catch {
+        await assertActiveViewerContext(record, holder);
+        return { ...status, origin };
+      }
+      await assertActiveViewerContext(record, holder);
       return { ...status, origin };
     },
     async credentialMatches(owner, selection) {
-      return options.credentialBroker.matches(await credentialContext(currentRecord(owner, selection)));
+      const record = currentRecord(owner, selection);
+      const holder = preparationRuntimeContexts.get(record);
+      if (!holder) throw error("Preparation viewer must be attached before credential inspection", 409);
+      const context = await credentialContext(record);
+      const result = await options.credentialBroker.matches(context);
+      await assertActiveViewerContext(record, holder);
+      return result;
     },
     async credentialFill(owner, selection, token, operation) {
       if (typeof token !== "string" || !token) throw error("choiceToken is required", 400);
       const record = currentRecord(owner, selection);
+      const holder = preparationRuntimeContexts.get(record);
+      if (!holder) throw error("Preparation viewer must be attached before credential fill", 409);
       const context = await credentialContext(record);
-      return options.credentialBroker.fill(token, operation, context, (values) => fillPreparationCredential(record, context, values));
+      const result = await options.credentialBroker.fill(token, operation, context, (values) => fillPreparationCredential(record, context, values));
+      await assertActiveViewerContext(record, holder);
+      return result;
     },
     async credentialLock(owner, selection) {
       currentRecord(owner, selection);

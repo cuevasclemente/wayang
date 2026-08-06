@@ -56,6 +56,8 @@ export interface CdpScreencastViewerProps {
   onStatus?: () => void;
   onPageChange?: (page: { url?: string; title?: string }) => void;
   onPasteText?: (text: string) => void;
+  /** Human-only clipboard path for a focused protected viewer. */
+  pasteThroughViewer?: boolean;
   connectionLabel?: string;
   imageAlt?: string;
   testId?: string;
@@ -141,6 +143,7 @@ export function CdpScreencastViewer({
   onStatus,
   onPageChange,
   onPasteText,
+  pasteThroughViewer = false,
   connectionLabel = "Fast page",
   imageAlt = "Chromium fast page",
   testId,
@@ -157,15 +160,60 @@ export function CdpScreencastViewer({
   const moveAnimationRef = useRef<number | null>(null);
   const wheelRef = useRef<(Record<string, unknown> & { deltaX: number; deltaY: number }) | null>(null);
   const wheelAnimationRef = useRef<number | null>(null);
+  const onStatusRef = useRef(onStatus);
+  const onPageChangeRef = useRef(onPageChange);
+  const pasteCaptureRef = useRef<HTMLTextAreaElement | null>(null);
   const [hasFrame, setHasFrame] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pasteCaptureOpen, setPasteCaptureOpen] = useState(false);
+  const [pasteNotice, setPasteNotice] = useState<string | null>(null);
 
-  const send = useCallback((payload: Record<string, unknown>) => {
+  useEffect(() => { onStatusRef.current = onStatus; }, [onStatus]);
+  useEffect(() => { onPageChangeRef.current = onPageChange; }, [onPageChange]);
+  useEffect(() => {
+    if (!pasteCaptureOpen) return;
+    const timeout = window.setTimeout(() => pasteCaptureRef.current?.focus(), 0);
+    return () => window.clearTimeout(timeout);
+  }, [pasteCaptureOpen]);
+
+  const send = useCallback((payload: Record<string, unknown>): boolean => {
     const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     ws.send(JSON.stringify(payload));
+    return true;
   }, []);
+
+  const handlePasteText = useCallback((text: string) => {
+    if (onPasteText) { onPasteText(text); return; }
+    if (pasteThroughViewer) send({ type: "paste", text });
+  }, [onPasteText, pasteThroughViewer, send]);
+
+  const submitCapturedPaste = useCallback((text: string) => {
+    if (!text) return;
+    setPasteCaptureOpen(false);
+    if (text.length > 4_096 || new TextEncoder().encode(text).byteLength > 16_384 || text.includes("\0")) {
+      setPasteNotice("Clipboard text exceeds the protected preparation paste limit.");
+      return;
+    }
+    setPasteNotice(send({ type: "paste", text })
+      ? "Clipboard text was sent to the focused browser field."
+      : "The preparation viewer is not connected.");
+  }, [send]);
+
+  const readSystemClipboard = useCallback(async () => {
+    if (!navigator.clipboard?.readText) {
+      setPasteNotice("This browser cannot read the system clipboard. Paste into the capture target instead.");
+      return;
+    }
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) throw new Error("empty clipboard");
+      submitCapturedPaste(text);
+    } catch {
+      setPasteNotice("Clipboard access was denied or the clipboard did not contain text.");
+    }
+  }, [submitCapturedPaste]);
 
   const presentFrame = useCallback((frame: PresentableFrame) => {
     const img = imgRef.current;
@@ -214,13 +262,21 @@ export function CdpScreencastViewer({
     setConnected(false);
     setHasFrame(false);
 
-    ws.onopen = () => setConnected(true);
+    ws.onopen = () => {
+      if (wsRef.current !== ws) return;
+      setConnected(true);
+    };
     ws.onclose = () => {
+      if (wsRef.current !== ws) return;
       setConnected(false);
       void canRetryAuthenticatedTransport();
     };
-    ws.onerror = () => setError(`${connectionLabel} websocket error`);
+    ws.onerror = () => {
+      if (wsRef.current !== ws) return;
+      setError(`${connectionLabel} websocket error`);
+    };
     ws.onmessage = (event) => {
+      if (wsRef.current !== ws) return;
       if (typeof event.data !== "string") {
         const blob = event.data instanceof Blob ? event.data : new Blob([event.data], { type: "image/jpeg" });
         const envelope = pendingEnvelopeRef.current;
@@ -253,9 +309,9 @@ export function CdpScreencastViewer({
           pendingEnvelopeRef.current = envelope;
         }
       } else if (msg.type === "status") {
-        onStatus?.();
+        onStatusRef.current?.();
       } else if (msg.type === "page") {
-        onPageChange?.({
+        onPageChangeRef.current?.({
           url: typeof msg.url === "string" ? msg.url : undefined,
           title: typeof msg.title === "string" ? msg.title : undefined,
         });
@@ -265,8 +321,12 @@ export function CdpScreencastViewer({
     };
 
     return () => {
-      ws.close();
       if (wsRef.current === ws) wsRef.current = null;
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
+      ws.close();
       pendingEnvelopeRef.current = null;
       const queued = queuedFrameRef.current;
       if (queued?.revoke) URL.revokeObjectURL(queued.src);
@@ -280,7 +340,7 @@ export function CdpScreencastViewer({
       }
       presentingRef.current = false;
     };
-  }, [websocketUrl, running, onStatus, onPageChange, presentFrame, connectionLabel]);
+  }, [websocketUrl, running, presentFrame, connectionLabel]);
 
   useEffect(() => () => {
     if (moveAnimationRef.current !== null) window.cancelAnimationFrame(moveAnimationRef.current);
@@ -408,8 +468,47 @@ export function CdpScreencastViewer({
     <div data-testid={testId} className="flex h-full min-h-0 flex-col bg-black">
       <div className="flex shrink-0 items-center justify-between gap-3 border-b border-neutral-800 px-3 py-1.5 text-[11px] text-neutral-400">
         <span>{connected ? `${connectionLabel} connected` : `${connectionLabel} connecting…`}</span>
-        <span className="hidden truncate sm:block">Interactive CDP page view. Click inside to focus.</span>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="hidden truncate sm:block">Interactive CDP page view. Click inside to focus.</span>
+          {pasteThroughViewer && (
+            <button
+              type="button"
+              data-testid={testId ? `${testId}-paste-open` : undefined}
+              onClick={() => { setPasteNotice(null); setPasteCaptureOpen(true); }}
+              className="shrink-0 rounded border border-neutral-700 px-2 py-1 text-[11px] text-neutral-200 hover:bg-neutral-800"
+            >Paste text</button>
+          )}
+        </div>
       </div>
+      {pasteCaptureOpen && (
+        <div className="shrink-0 border-b border-neutral-800 bg-neutral-950 px-3 py-3 text-xs text-neutral-300">
+          <label className="mb-2 block font-medium text-neutral-200">Direct paste target</label>
+          <textarea
+            ref={pasteCaptureRef}
+            data-testid={testId ? `${testId}-paste-capture` : undefined}
+            defaultValue=""
+            onPaste={(event) => {
+              const text = event.clipboardData.getData("text/plain");
+              if (!text) return;
+              event.preventDefault();
+              event.currentTarget.value = "";
+              submitCapturedPaste(text);
+            }}
+            onInput={(event) => {
+              const text = event.currentTarget.value;
+              event.currentTarget.value = "";
+              if (text) submitCapturedPaste(text);
+            }}
+            placeholder="Ctrl+V or middle-click here. Text is sent immediately and not displayed or retained."
+            className="mb-2 h-16 w-full resize-none rounded border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-sky-500 focus:outline-none"
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            <button type="button" onClick={() => void readSystemClipboard()} className="rounded border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-xs font-medium text-neutral-200 hover:bg-neutral-800">Read and paste system clipboard</button>
+            <button type="button" onClick={() => setPasteCaptureOpen(false)} className="rounded border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-xs font-medium text-neutral-200 hover:bg-neutral-800">Cancel</button>
+          </div>
+        </div>
+      )}
+      {pasteNotice && <div className="shrink-0 border-b border-sky-900/50 bg-sky-950/30 px-3 py-2 text-xs text-sky-100">{pasteNotice}</div>}
       {error && <div className="shrink-0 border-b border-red-900/50 bg-red-950/40 px-3 py-2 text-xs text-red-200">{error}</div>}
       <div
         ref={containerRef}
@@ -421,7 +520,7 @@ export function CdpScreencastViewer({
         onWheel={handleWheel}
         onKeyDown={handleKeyDown}
         onKeyUp={handleKeyUp}
-        onPaste={(event) => directPaste(event, onPasteText)}
+        onPaste={(event) => directPaste(event, onPasteText || pasteThroughViewer ? handlePasteText : undefined)}
         onContextMenu={(event) => event.preventDefault()}
       >
         <img
