@@ -75,10 +75,17 @@ test("automation metadata/control routes require an exact allowed Origin and ret
     trustProxy: false, proxyIdentityHeader: "", cookieSecure: "never", allowedOrigins: [origin],
   };
   const auth = new AuthService(authConfig);
+  const bridge = integration();
+  bridge.commitPurge = async () => {
+    throw Object.assign(new Error("Purge committed, but private cleanup is pending and will retry at startup"), {
+      statusCode: 503,
+      publicCode: "purge_committed_cleanup_pending",
+    });
+  };
   const { server } = createApp({
     config: { port, host: "127.0.0.1", auth: authConfig },
     authService: auth,
-    protectedAutomation: integration(),
+    protectedAutomation: bridge,
   });
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(port, "127.0.0.1", resolve); });
   try {
@@ -128,6 +135,16 @@ test("automation metadata/control routes require an exact allowed Origin and ret
       method: "POST", headers: { Origin: origin, "Content-Type": "application/json" }, body: "{}",
     });
     assert.equal(ownerEnable.status, 404);
+
+    const committedPending = await fetch(`${origin}/api/protected-automations/jobs/job-a/purge-requests/request-a/commit`, {
+      method: "POST", headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ pin: "12345678" }),
+    });
+    assert.equal(committedPending.status, 503);
+    assert.deepEqual(await committedPending.json(), {
+      error: "Purge committed, but private cleanup is pending and will retry at startup",
+      code: "purge_committed_cleanup_pending",
+    });
 
     const navigate = await fetch(`${exactPath}/navigate`, {
       method: "POST", headers: { Origin: origin, "Content-Type": "application/json" },

@@ -15,9 +15,11 @@ import type { ProtectedAutomationBinding } from "./authority.js";
 import { getProtectedAutomationPreparationPort } from "./browser-preparation.js";
 import {
   ProtectedAutomationBrowserRealmRegistry,
+  ensureProtectedAutomationBrowserRealmStorage,
   type ProtectedAutomationManagedRuntime,
 } from "./browser-realm.js";
 import { bootstrapProtectedAutomationProduction, protectedAutomationDiagnosticCode } from "./production.js";
+import { getProtectedAutomationPurgeIntentPort } from "./purge-intent.js";
 import { captureProtectedAutomationSnapshot, finalizeProtectedAutomationSnapshotCapture } from "./snapshots.js";
 import {
   createProtectedAutomationJob,
@@ -216,10 +218,51 @@ function broker() {
   }, new UnavailableVault());
 }
 
+test("agent purge intent is exact, bounded, projected, and still requires owner PIN review", async () => {
+  const fixture = tombstonedFixture();
+  const credentialBroker = broker();
+  const pinAttempts = new SyntheticPinAttempts();
+  const production = bootstrapProtectedAutomationProduction({
+    dataDir: process.env.WAYANG_DATA_DIR!, credentialBroker, pinAttempts,
+  });
+  production.start();
+  (production.services.manager as any).hasActiveJob = () => false;
+  const port = getProtectedAutomationPurgeIntentPort();
+  if (!port) throw new Error("production purge-intent port was not installed");
+  const owner = { sessionId: "purge-intent-owner", origin: "http://127.0.0.1:8787" };
+  try {
+    const intent = await port.request({
+      binding: bindingFor(fixture),
+      job: fixture.job,
+      assertAuthorized() {},
+    });
+    assert.equal(intent.job_id, fixture.job.id);
+    assert.equal(intent.state, "awaiting_owner_pin");
+    assert.ok(intent.expires_at > intent.requested_at);
+    assert.deepEqual(await port.request({
+      binding: bindingFor(fixture), job: fixture.job, assertAuthorized() {},
+    }), intent, "same-revision requests are idempotent");
+    assert.deepEqual(production.integration.getJob(fixture.job.id).purge_request, intent);
+
+    const challenge = await production.integration.requestPurge(owner, fixture.job.id, fixture.job.revision);
+    assert.equal(production.integration.getJob(fixture.job.id).purge_request, null,
+      "owner PIN review consumes only the agent intent, not the tombstoned job");
+    assert.ok(getProtectedAutomationJob(fixture.job.id));
+    await production.integration.cancelPurge(owner, fixture.job.id, challenge.request_id);
+  } finally {
+    await production.close();
+    await credentialBroker.shutdown();
+  }
+});
+
 test("PIN purge is one-use owner/Origin/revision bound and never removes project outputs", async () => {
   const fixture = tombstonedFixture();
   const output = path.join(projectRoot, "retained-output.txt");
   fs.writeFileSync(output, "project output must survive\n");
+  const browserStorage = ensureProtectedAutomationBrowserRealmStorage(
+    process.env.WAYANG_DATA_DIR!, projectRoot, fixture.project.id, fixture.profile.id, fixture.job.id,
+  );
+  fs.writeFileSync(path.join(browserStorage.profileDir, "synthetic-cookie-state"), "synthetic\n", { mode: 0o600 });
   const credentialBroker = broker();
   const pinAttempts = new SyntheticPinAttempts();
   const production = bootstrapProtectedAutomationProduction({
@@ -242,10 +285,40 @@ test("PIN purge is one-use owner/Origin/revision bound and never removes project
     assert.equal(getStore().protectedAutomationRuns.some((run) => run.job_id === fixture.job.id), false);
     assert.equal(fs.readFileSync(output, "utf8"), "project output must survive\n");
     assert.equal(fs.existsSync(path.join(process.env.WAYANG_DATA_DIR!, "protected-automation", "jobs")), false);
+    assert.equal(fs.existsSync(browserStorage.rootDir), false, "successful purge verifies the browser realm is absent");
+    assert.equal(fs.readdirSync(path.dirname(browserStorage.rootDir)).some((name) => name.includes(".purge-")), false);
     await assert.rejects(
       production.integration.commitPurge(owner, fixture.job.id, challenge.request_id, "12345678"),
       /not found/i,
     );
+  } finally {
+    await production.close();
+    await credentialBroker.shutdown();
+  }
+});
+
+test("purge reports committed cleanup pending when runtime retirement cannot be verified", async () => {
+  const fixture = tombstonedFixture();
+  const output = path.join(projectRoot, "retained-output-pending.txt");
+  fs.writeFileSync(output, "project output remains\n");
+  const credentialBroker = broker();
+  const pinAttempts = new SyntheticPinAttempts();
+  const production = bootstrapProtectedAutomationProduction({
+    dataDir: process.env.WAYANG_DATA_DIR!, credentialBroker, pinAttempts,
+  });
+  production.start();
+  (production.services.manager as any).hasActiveJob = () => false;
+  (production.services.manager as any).retireJobStorage = () => false;
+  const owner = { sessionId: "cleanup-pending-owner", origin: "http://127.0.0.1:8787" };
+  try {
+    const challenge = await production.integration.requestPurge(owner, fixture.job.id, fixture.job.revision);
+    await assert.rejects(
+      production.integration.commitPurge(owner, fixture.job.id, challenge.request_id, "12345678"),
+      /purge committed.*cleanup is pending/i,
+    );
+    assert.equal(getProtectedAutomationJob(fixture.job.id), undefined,
+      "the durable row absence remains the cleanup receipt and is never rolled back");
+    assert.equal(fs.readFileSync(output, "utf8"), "project output remains\n");
   } finally {
     await production.close();
     await credentialBroker.shutdown();

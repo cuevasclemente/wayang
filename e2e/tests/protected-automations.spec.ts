@@ -20,6 +20,7 @@ function automationJob(overrides: Overrides = {}) {
     argv_count: 2,
     uses_browser_profile: false,
     browser_profile: { supported: false, saved: false, last_saved_at: null as number | null },
+    purge_request: null as null | { request_id: string; job_id: string; state: "awaiting_owner_pin"; requested_at: number; expires_at: number },
     allowed_https_origins: [] as string[],
     cron_expr: "15 4 * * 1",
     timeout_ms: 12 * 60_000,
@@ -121,6 +122,7 @@ async function installMocks(page: Page, options: {
   detailJobs?: AutomationJob[];
   runs?: AutomationRun[];
   preparation?: MockState["preparation"];
+  purgeCommitCleanupPending?: boolean;
 } = {}): Promise<MockState> {
   const catalogJobs = options.catalogJobs ?? [];
   const details = options.detailJobs ?? catalogJobs;
@@ -241,6 +243,12 @@ async function installMocks(page: Page, options: {
       state.catalogJobs = state.catalogJobs.filter((candidate) => candidate.id !== selectedJobId);
       state.detailJobs.delete(selectedJobId);
       state.runs.delete(selectedJobId);
+      if (options.purgeCommitCleanupPending) {
+        return fulfillJson(route, {
+          error: "Purge committed, but private cleanup is pending and will retry at startup",
+          code: "purge_committed_cleanup_pending",
+        }, 503);
+      }
       return fulfillJson(route, { purged_job_id: selectedJobId, purged_run_ids: purgedRunIds });
     }
     if (request.method() === "DELETE" && pathname.includes("/purge-requests/")) {
@@ -465,6 +473,13 @@ test("requires request then one-use PIN commit before purging a tombstoned job",
     blocked_reason: "tombstoned",
     deleted_at: NOW - 1_000,
     next_run_at: null,
+    purge_request: {
+      request_id: "synthetic-agent-purge-intent",
+      job_id: JOB_ID,
+      state: "awaiting_owner_pin",
+      requested_at: NOW - 500,
+      expires_at: NOW + 30 * 60_000,
+    },
   });
   const state = await installMocks(page, {
     catalogJobs: [tombstoned],
@@ -473,6 +488,8 @@ test("requires request then one-use PIN commit before purging a tombstoned job",
   });
   await openAutomation(page, JOB_ID);
 
+  await expect(page.getByTestId("protected-automation-agent-purge-request")).toContainText("awaits your identity PIN");
+  await expect(page.getByTestId("protected-automation-purge-request")).toHaveText("Review purge request");
   await page.getByTestId("protected-automation-purge-request").click();
   const dialog = page.getByTestId("protected-automation-purge-dialog");
   await expect(dialog).toBeVisible();
@@ -491,6 +508,35 @@ test("requires request then one-use PIN commit before purging a tombstoned job",
     expect.objectContaining({ method: "POST", body: { pin: "12345678" } }),
   );
   expect(state.scheduledRequests.filter((candidate) => candidate.method !== "GET")).toEqual([]);
+});
+
+test("truthfully reports a committed purge whose private cleanup is pending", async ({ page }) => {
+  const tombstoned = automationJob({
+    name: "Synthetic pending-cleanup purge",
+    revision: 20,
+    enabled: false,
+    blocked_reason: "tombstoned",
+    deleted_at: NOW - 1_000,
+    next_run_at: null,
+  });
+  await installMocks(page, {
+    catalogJobs: [tombstoned],
+    detailJobs: [tombstoned],
+    runs: [automationRun({ status: "completed", finished_at: NOW - 2_000, outcome_code: "completed", exit_code: 0 })],
+    purgeCommitCleanupPending: true,
+  });
+  await openAutomation(page, JOB_ID);
+  await page.getByTestId("protected-automation-purge-request").click();
+  const dialog = page.getByTestId("protected-automation-purge-dialog");
+  await dialog.getByTestId("protected-automation-purge-pin").fill("12345678");
+  await dialog.getByTestId("protected-automation-purge-commit").click();
+
+  await expect(dialog).toBeHidden();
+  await expect(page.getByTestId("protected-automation-purge-cleanup-pending")).toContainText(
+    "Purge committed. Private cleanup is pending",
+  );
+  await expect(page.getByText(/Purge was not completed/i)).toHaveCount(0);
+  await expect(page.getByTestId("protected-automations-empty")).toBeVisible();
 });
 
 test("keeps protected controls usable without horizontal overflow on mobile", async ({ page }) => {

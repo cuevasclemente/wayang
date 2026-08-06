@@ -154,8 +154,14 @@ export function createProtectedAutomationsRouter(
     if (resolvedStatus === 429 && Number.isFinite(retryAt)) {
       response.setHeader("Retry-After", Math.max(1, Math.ceil((retryAt - Date.now()) / 1_000)));
     }
+    const publicCode = failure && typeof failure === "object" && "publicCode" in failure
+      && (failure as { publicCode?: unknown }).publicCode === "purge_committed_cleanup_pending"
+      ? "purge_committed_cleanup_pending" : null;
     response.status(resolvedStatus).json({
-      error: resolvedStatus >= 500 ? "Protected automation operation failed" : failure instanceof Error ? failure.message : "Protected automation operation failed",
+      error: publicCode && failure instanceof Error
+        ? failure.message
+        : resolvedStatus >= 500 ? "Protected automation operation failed" : failure instanceof Error ? failure.message : "Protected automation operation failed",
+      ...(publicCode ? { code: publicCode } : {}),
     });
   });
   return router;

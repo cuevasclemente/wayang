@@ -76,6 +76,7 @@ export function ProtectedAutomationsPanel({
   const purgeChallengeRef = useRef<{ jobId: string; requestId: string } | null>(null);
   const [purgePin, setPurgePin] = useState("");
   const [purgeError, setPurgeError] = useState<string | null>(null);
+  const [purgeCleanupNotice, setPurgeCleanupNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (sourceSessionId) setSourceInput(sourceSessionId);
@@ -305,6 +306,7 @@ export function ProtectedAutomationsPanel({
     setPurgePin("");
     setBusyAction("commit-purge");
     setPurgeError(null);
+    setPurgeCleanupNotice(null);
     try {
       await commitProtectedAutomationPurge(job.id, challenge.request_id, pin);
       setPurgeChallenge(null);
@@ -316,8 +318,20 @@ export function ProtectedAutomationsPanel({
     } catch (caught) {
       // Commit consumes the one-use challenge even when the PIN is rejected or
       // the final tombstone check conflicts. Never retain a reusable-looking
-      // dialog or PIN field after a commit attempt.
-      setError(`Purge was not completed: ${errorMessage(caught)}`);
+      // dialog or PIN field after a commit attempt. A committed-cleanup-pending
+      // receipt is different: canonical rows are already irreversibly absent.
+      const body = caught instanceof ApiError && caught.body && typeof caught.body === "object"
+        ? caught.body as Record<string, unknown> : null;
+      if (body?.code === "purge_committed_cleanup_pending") {
+        setPurgeCleanupNotice("Purge committed. Private cleanup is pending and will retry when Wayang starts; Project outputs were preserved.");
+        setPreparation(null);
+        setPreparationSelection(null);
+        setCredentialsOpen(false);
+        onChanged?.();
+        onSelectJob(null);
+      } else {
+        setError(`Purge was not completed: ${errorMessage(caught)}`);
+      }
       setPurgeChallenge(null);
       setPurgeError(null);
     } finally {
@@ -364,6 +378,11 @@ export function ProtectedAutomationsPanel({
             Activation is held. This owner surface cannot create, enable, rebind, or run jobs. Existing metadata is read-only except for emergency pause/cancel, exact human preparation handoff, and PIN-approved purge of an already tombstoned job.
           </div>
         )}
+        {purgeCleanupNotice && (
+          <div role="status" data-testid="protected-automation-purge-cleanup-pending" className="mx-auto mb-4 max-w-5xl rounded border border-amber-900/60 bg-amber-950/20 p-3 text-xs leading-relaxed text-amber-100">
+            {purgeCleanupNotice}
+          </div>
+        )}
 
         {loadState === "loading" && <StatusLine><Loader2 size={16} className="animate-spin" /> Loading backend status…</StatusLine>}
         {loadState === "unavailable" && <UnavailableState onRetry={() => void refresh()} />}
@@ -393,13 +412,14 @@ export function ProtectedAutomationsPanel({
                     <ActionButton testId="protected-automation-pause" busy={busyAction === "pause"} disabled={Boolean(busyAction)} onClick={() => void pause()} icon={<Pause size={13} />}>Emergency pause</ActionButton>
                   )}
                   {job.deleted_at !== null && (
-                    <ActionButton danger testId="protected-automation-purge-request" busy={busyAction === "request-purge"} disabled={Boolean(busyAction) || activeRuns.length > 0} onClick={() => void requestPurge()} icon={<Trash2 size={13} />}>Request purge</ActionButton>
+                    <ActionButton danger testId="protected-automation-purge-request" busy={busyAction === "request-purge"} disabled={Boolean(busyAction) || activeRuns.length > 0} onClick={() => void requestPurge()} icon={<Trash2 size={13} />}>{job.purge_request ? "Review purge request" : "Request purge"}</ActionButton>
                   )}
                 </div>
               </div>
 
               {job.blocked_reason && <div data-testid="protected-automation-blocked" className="mt-4 flex items-start gap-2 rounded border border-amber-900/60 bg-amber-950/25 p-3 text-xs text-amber-100"><ShieldAlert size={15} className="mt-0.5 shrink-0" /><span><strong>Backend block:</strong> {humanize(job.blocked_reason)}</span></div>}
               {job.attention && <div data-testid="protected-automation-attention" className="mt-4 flex items-start gap-2 rounded border border-sky-900/60 bg-sky-950/30 p-3 text-xs text-sky-100"><AlertTriangle size={15} className="mt-0.5 shrink-0" /><span><strong>Human attention:</strong> {humanize(job.attention.reason)}. Ask the source agent to issue a preparation, then attach it below.</span></div>}
+              {job.purge_request && <div data-testid="protected-automation-agent-purge-request" className="mt-4 flex items-start gap-2 rounded border border-red-900/60 bg-red-950/25 p-3 text-xs text-red-100"><Trash2 size={15} className="mt-0.5 shrink-0" /><span><strong>Agent-requested purge:</strong> permanent private-state deletion awaits your identity PIN. Project outputs will be retained. Request expires {formatTimestamp(job.purge_request.expires_at)}.</span></div>}
 
               <div className="mt-4 grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
                 <Info label="Next run" value={formatTimestamp(job.next_run_at)} />

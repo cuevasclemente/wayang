@@ -39,6 +39,10 @@ export interface ProtectedAutomationBrowserProfileState {
 }
 
 const PREPARATION_STATE_FILE = "preparation-state.json";
+const PROJECT_SEGMENT_PATTERN = /^project-[A-Za-z0-9_-]{43}$/u;
+const PROFILE_SEGMENT_PATTERN = /^profile-[A-Za-z0-9_-]{43}$/u;
+const JOB_SEGMENT_PATTERN = /^job-[A-Za-z0-9_-]{43}$/u;
+const STAGED_PURGE_PATTERN = /^(job-[A-Za-z0-9_-]{43})\.purge-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 export interface ProtectedAutomationManagedRuntime {
   readonly running: boolean;
@@ -138,6 +142,75 @@ export function protectedAutomationBrowserRealmRoot(
 ): string {
   return path.join(path.resolve(dataDir), "protected-automation", "browser-realms", "v1",
     idSegment("project", projectId), idSegment("profile", agentProfileId), idSegment("job", jobId));
+}
+
+function validateBrowserRealmTree(root: string): void {
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const visit = (target: string): void => {
+    const metadata = fs.lstatSync(target);
+    if (uid !== undefined && metadata.uid !== uid) throw realmError("Protected automation browser purge artifact has the wrong owner");
+    if (metadata.isSymbolicLink()) return;
+    if (metadata.isDirectory()) {
+      if ((metadata.mode & 0o077) !== 0) throw realmError("Protected automation browser purge artifact is not private");
+      for (const name of fs.readdirSync(target)) visit(path.join(target, name));
+      return;
+    }
+    if (!metadata.isFile() || metadata.nlink !== 1) throw realmError("Protected automation browser purge artifact is unsafe");
+  };
+  visit(root);
+}
+
+function syncDirectory(directory: string): void {
+  try {
+    const descriptor = fs.openSync(directory, "r");
+    try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+  } catch { /* directory fsync is not available on every supported host */ }
+}
+
+export function reconcileProtectedAutomationBrowserRealmPurges(
+  dataDir: string,
+  durableJobs: readonly { id: string; project_id: string; agent_profile_id: string }[],
+): void {
+  const realmsRoot = path.join(path.resolve(dataDir), "protected-automation", "browser-realms", "v1");
+  let rootMetadata: fs.Stats;
+  try { rootMetadata = fs.lstatSync(realmsRoot); }
+  catch (failure: any) { if (failure?.code === "ENOENT") return; throw failure; }
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink() || (rootMetadata.mode & 0o077) !== 0
+    || (typeof process.getuid === "function" && rootMetadata.uid !== process.getuid())) {
+    throw realmError("Protected automation browser realm root is unsafe");
+  }
+  const durableRoots = new Set(durableJobs.map((job) => protectedAutomationBrowserRealmRoot(
+    dataDir, job.project_id, job.agent_profile_id, job.id,
+  )));
+  for (const projectName of fs.readdirSync(realmsRoot).sort()) {
+    if (!PROJECT_SEGMENT_PATTERN.test(projectName)) throw realmError("Protected automation browser project storage is invalid");
+    const projectRoot = path.join(realmsRoot, projectName);
+    privateDirectory(projectRoot);
+    for (const profileName of fs.readdirSync(projectRoot).sort()) {
+      if (!PROFILE_SEGMENT_PATTERN.test(profileName)) throw realmError("Protected automation browser profile storage is invalid");
+      const profileRoot = path.join(projectRoot, profileName);
+      privateDirectory(profileRoot);
+      for (const entry of fs.readdirSync(profileRoot).sort()) {
+        const staged = STAGED_PURGE_PATTERN.exec(entry);
+        if (!staged) {
+          if (!JOB_SEGMENT_PATTERN.test(entry)) throw realmError("Protected automation browser job storage is invalid");
+          privateDirectory(path.join(profileRoot, entry));
+          continue;
+        }
+        const stagedRoot = path.join(profileRoot, entry);
+        const canonicalRoot = path.join(profileRoot, staged[1]!);
+        validateBrowserRealmTree(stagedRoot);
+        if (durableRoots.has(canonicalRoot)) {
+          if (fs.existsSync(canonicalRoot)) throw realmError("Staged browser purge conflicts with durable storage");
+          fs.renameSync(stagedRoot, canonicalRoot);
+        } else {
+          fs.rmSync(stagedRoot, { recursive: true, force: false });
+          if (fs.existsSync(stagedRoot)) throw realmError("Committed browser purge could not be removed");
+        }
+        syncDirectory(profileRoot);
+      }
+    }
+  }
 }
 
 export function readProtectedAutomationBrowserProfileState(

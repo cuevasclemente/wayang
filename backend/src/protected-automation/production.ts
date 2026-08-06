@@ -15,6 +15,7 @@ import { createProtectedAutomationServices, type ProtectedAutomationServices } f
 import {
   ProtectedAutomationBrowserRealmRegistry,
   protectedAutomationBrowserRealmRoot,
+  reconcileProtectedAutomationBrowserRealmPurges,
   type ProtectedAutomationBrowserProfileState,
 } from "./browser-realm.js";
 import { ProtectedAutomationBrowserRpc } from "./browser-rpc.js";
@@ -28,6 +29,11 @@ import {
 } from "./browser-preparation.js";
 import { protectedAutomationJobAuthorityIsCurrent, type ProtectedAutomationBinding } from "./authority.js";
 import {
+  installProtectedAutomationPurgeIntentPort,
+  type ProtectedAutomationPurgeIntentPublicState,
+  type ProtectedAutomationPurgeIntentPort,
+} from "./purge-intent.js";
+import {
   getProtectedAutomationJob,
   listProtectedAutomationActiveRuns,
   listProtectedAutomationJobs,
@@ -35,11 +41,16 @@ import {
   purgeTombstonedProtectedAutomationJob,
   transitionProtectedAutomationJobLifecycle,
 } from "./store.js";
-import { stageProtectedAutomationSnapshotJobPurge } from "./snapshots.js";
+import {
+  reconcileProtectedAutomationSnapshots,
+  stageProtectedAutomationSnapshotJobPurge,
+} from "./snapshots.js";
 import type { ProtectedAutomationJobRow, ProtectedAutomationRunRow } from "./types.js";
 
 const PREPARATION_TTL_MS = 30 * 60 * 1_000;
 const PURGE_TTL_MS = 2 * 60 * 1_000;
+const PURGE_INTENT_TTL_MS = 30 * 60 * 1_000;
+const MAX_PURGE_INTENTS = 50;
 const PURGE_REALM = "wayang.protected-automation-purge.v1";
 const SETTLE_TIMEOUT_MS = 10_000;
 const SETTLE_INTERVAL_MS = 50;
@@ -157,6 +168,7 @@ function publicRun(row: ProtectedAutomationRunRow) {
 function publicJob(
   row: ProtectedAutomationJobRow,
   profileState: ProtectedAutomationBrowserProfileState = { saved: false, lastSavedAt: null },
+  purgeIntent: ProtectedAutomationPurgeIntentPublicState | null = null,
 ) {
   const latestAttention = listProtectedAutomationRuns(row.id, 1)[0];
   return {
@@ -176,6 +188,7 @@ function publicJob(
       saved: row.uses_browser_profile && profileState.saved,
       last_saved_at: row.uses_browser_profile ? profileState.lastSavedAt : null,
     },
+    purge_request: purgeIntent,
     allowed_https_origins: [...row.allowed_https_origins],
     cron_expr: row.cron_expr,
     timeout_ms: row.timeout_ms,
@@ -461,6 +474,12 @@ async function fillPreparationCredential(
   });
 }
 
+interface PurgeIntentRecord extends ProtectedAutomationPurgeIntentPublicState {
+  projectId: string;
+  agentProfileId: string;
+  jobRevision: number;
+}
+
 interface PurgeRequest {
   requestId: string;
   reservationId: string;
@@ -512,6 +531,7 @@ function stageDirectory(target: string): StagedDirectory {
       if (!active) return;
       validatePrivateTree(staged);
       fs.rmSync(staged, { recursive: true, force: false });
+      if (fs.existsSync(staged)) throw error("Private purge artifact cleanup is incomplete", 503);
       active = false;
     },
   };
@@ -563,12 +583,14 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     },
   });
   const preparations = new Map<string, PreparationRecord>();
+  const purgeIntents = new Map<string, PurgeIntentRecord>();
   const purgeRequests = new Map<string, PurgeRequest>();
   const ownerKey = randomBytes(32);
   let started = false;
   let closed = false;
   let unsubscribePolicy: () => void = () => undefined;
   let uninstallPreparation: () => void = () => undefined;
+  let uninstallPurgeIntent: () => void = () => undefined;
 
   const ownerDigest = (owner: SettingsRequestOwner): Buffer => createHmac("sha256", ownerKey)
     .update("wayang-protected-automation-purge-owner-v1\0").update(owner.sessionId)
@@ -711,6 +733,51 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     return job;
   };
 
+  const publicPurgeIntent = (record: PurgeIntentRecord): ProtectedAutomationPurgeIntentPublicState => ({
+    request_id: record.request_id,
+    job_id: record.job_id,
+    state: "awaiting_owner_pin",
+    requested_at: record.requested_at,
+    expires_at: record.expires_at,
+  });
+  const prunePurgeIntents = () => {
+    const current = now();
+    for (const [jobId, intent] of purgeIntents) if (intent.expires_at <= current) purgeIntents.delete(jobId);
+  };
+  const purgeIntentPort: ProtectedAutomationPurgeIntentPort = {
+    async request(input) {
+      await input.assertAuthorized();
+      const { binding, job } = input;
+      if (job.project_id !== binding.projectId || job.agent_profile_id !== binding.agentProfileId
+        || job.capability_revision !== binding.associationRevision) {
+        throw error("Protected automation purge request ownership changed", 409);
+      }
+      const currentJob = assertPurgeable(job.id, job.revision);
+      await input.assertAuthorized();
+      if (currentJob.project_id !== binding.projectId || currentJob.agent_profile_id !== binding.agentProfileId
+        || currentJob.capability_revision !== binding.associationRevision) {
+        throw error("Protected automation purge request authority changed", 409);
+      }
+      prunePurgeIntents();
+      const existing = purgeIntents.get(job.id);
+      if (existing && existing.jobRevision === job.revision) return publicPurgeIntent(existing);
+      if (purgeIntents.size >= MAX_PURGE_INTENTS) throw error("Protected automation purge request capacity is full", 429);
+      const requestedAt = now();
+      const record: PurgeIntentRecord = {
+        request_id: randomUUID(),
+        job_id: job.id,
+        state: "awaiting_owner_pin",
+        requested_at: requestedAt,
+        expires_at: requestedAt + PURGE_INTENT_TTL_MS,
+        projectId: job.project_id,
+        agentProfileId: job.agent_profile_id,
+        jobRevision: job.revision,
+      };
+      purgeIntents.set(job.id, record);
+      return publicPurgeIntent(record);
+    },
+  };
+
   const terminatePurgeRequest = async (request: PurgeRequest, reason: "cancelled" | "authentication_lost" | "expired" | "conflict" | "backend_failure") => {
     request.phase = "consuming";
     await options.pinAttempts.cancelAndConsume({ realm: PURGE_REALM, reservationId: request.reservationId,
@@ -718,10 +785,15 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     purgeRequests.delete(request.requestId);
   };
 
-  const projectJob = (job: ProtectedAutomationJobRow) => publicJob(
-    job,
-    realms.profileState(job.project_id, job.agent_profile_id, job.id),
-  );
+  const projectJob = (job: ProtectedAutomationJobRow) => {
+    prunePurgeIntents();
+    const intent = purgeIntents.get(job.id);
+    return publicJob(
+      job,
+      realms.profileState(job.project_id, job.agent_profile_id, job.id),
+      intent && intent.jobRevision === job.revision ? publicPurgeIntent(intent) : null,
+    );
+  };
 
   const integration: ProtectedAutomationProductionIntegration = {
     listJobs: () => listProtectedAutomationJobs().map(projectJob),
@@ -906,6 +978,7 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
         projectId: job.project_id, agentProfileId: job.agent_profile_id, expectedRevision: job.revision,
         operationDigest, expiresAt, phase: "pending",
       });
+      purgeIntents.delete(job.id);
       return { request_id: requestId, job_id: job.id, expected_revision: job.revision,
         operation_digest: operationDigest, expires_at: expiresAt,
         summary: `Permanently purge private automation history and browser profile for tombstoned job ${job.id}; project outputs are retained.` };
@@ -953,22 +1026,40 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
         for (const stage of stages.reverse()) { try { stage.rollback(); } catch {} }
         throw failure;
       }
-      // Rows are now durably absent. Artifact deletion is best effort and can
-      // be retried as private orphan cleanup; it must never restore store rows.
-      for (const stage of stages) { try { stage.finalize(); } catch {} }
-      // Canonical rows are durably absent and the manager has no live process.
-      // Retire the exact job's bounded state, scratch, and diagnostics; startup
-      // reconciliation retries any best-effort filesystem failure.
+      // Rows are now durably absent and therefore form the crash-recovery
+      // receipt: staged artifacts restore only while that exact row exists and
+      // are removed once it is absent. Never report success while cleanup is
+      // merely pending.
+      let cleanupPending = false;
+      for (const stage of stages) {
+        try { stage.finalize(); } catch { cleanupPending = true; }
+      }
+      const storageIdentity = {
+        projectId: job.project_id,
+        agentProfileId: job.agent_profile_id,
+        jobId: job.id,
+      };
+      // Reconcile every private purge domain against the now-durable store even
+      // after apparently successful finalization. Runtime reconciliation is
+      // intentionally global within its bounded private root so an unreadable
+      // historical artifact cannot be mistaken for successful exact cleanup.
       try {
-        services.manager.retireJobStorage({
-          projectId: job.project_id,
-          agentProfileId: job.agent_profile_id,
-          jobId: job.id,
-        });
-      } catch { /* private orphan cleanup is restart-recoverable */ }
+        reconcileProtectedAutomationSnapshots();
+        reconcileProtectedAutomationBrowserRealmPurges(dataDir, listProtectedAutomationJobs());
+        services.manager.reconcileRuntimeStorage();
+        if (!services.manager.retireJobStorage(storageIdentity, runIds)) throw new Error("runtime storage remains active");
+        cleanupPending = false;
+      } catch { cleanupPending = true; }
       const protectionKey = credentialRealmKey(job.project_id, job.agent_profile_id, job.id);
       credentialProtections.get(protectionKey)?.reset();
       credentialProtections.delete(protectionKey);
+      purgeIntents.delete(job.id);
+      if (cleanupPending) {
+        throw Object.assign(
+          error("Purge committed, but private cleanup is pending and will retry at startup", 503),
+          { publicCode: "purge_committed_cleanup_pending" },
+        );
+      }
       return { purged_job_id: result.purgedJobId, purged_run_ids: result.purgedRunIds };
     },
     async cancelPurge(owner, jobId, requestId, authenticationLost = false) {
@@ -997,6 +1088,13 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     for (const record of [...preparations.values()]) {
       if (!exactJobCurrent(record.job, record.sourceBinding)) void closeRecord(record);
     }
+    for (const [jobId, intent] of purgeIntents) {
+      const job = getProtectedAutomationJob(jobId);
+      if (!job || job.revision !== intent.jobRevision || job.project_id !== intent.projectId
+        || job.agent_profile_id !== intent.agentProfileId || !protectedAutomationJobAuthorityIsCurrent(job)) {
+        purgeIntents.delete(jobId);
+      }
+    }
   };
 
   return {
@@ -1006,14 +1104,18 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
       if (closed) throw new Error("Protected automation production bootstrap is closed");
       started = true;
       try {
+        reconcileProtectedAutomationSnapshots();
+        reconcileProtectedAutomationBrowserRealmPurges(dataDir, listProtectedAutomationJobs());
         services.start();
         uninstallPreparation = installProtectedAutomationPreparationPort(preparationPort);
+        uninstallPurgeIntent = installProtectedAutomationPurgeIntentPort(purgeIntentPort);
         unsubscribePolicy = (options.subscribePolicy ?? onPolicyChanged)(latchPolicy);
         latchPolicy();
       } catch (failure) {
         started = false;
         try { unsubscribePolicy(); } catch {}
         try { uninstallPreparation(); } catch {}
+        try { uninstallPurgeIntent(); } catch {}
         void Promise.allSettled([services.stop(), realms.close()]);
         throw failure;
       }
@@ -1021,14 +1123,14 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     async close() {
       if (closed) return;
       closed = true; started = false;
-      unsubscribePolicy(); uninstallPreparation();
+      unsubscribePolicy(); uninstallPreparation(); uninstallPurgeIntent();
       for (const request of [...purgeRequests.values()]) await terminatePurgeRequest(request, "backend_failure").catch(() => undefined);
       await Promise.allSettled([
         ...[...preparations.values()].map((record) => closeRecord(record)),
         services.stop(),
         realms.close(),
       ]);
-      preparations.clear(); purgeRequests.clear();
+      preparations.clear(); purgeIntents.clear(); purgeRequests.clear();
       for (const protection of credentialProtections.values()) protection.reset();
       credentialProtections.clear();
     },

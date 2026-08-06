@@ -225,6 +225,23 @@ function copyStateTree(source: string, destination: string): void {
   usageOf(destination, true);
 }
 
+function strictRemove(target: string): void {
+  const unlock = (entry: string): void => {
+    let metadata: fs.Stats;
+    try { metadata = fs.lstatSync(entry); } catch (failure: any) {
+      if (failure?.code === "ENOENT") return;
+      throw failure;
+    }
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) return;
+    fs.chmodSync(entry, 0o700);
+    for (const name of fs.readdirSync(entry)) unlock(path.join(entry, name));
+  };
+  if (!fs.existsSync(target)) return;
+  unlock(target);
+  fs.rmSync(target, { recursive: true, force: false });
+  if (fs.existsSync(target)) throw storageError("private artifact cleanup is incomplete");
+}
+
 function safeRemove(target: string): void {
   const unlock = (entry: string): void => {
     let metadata: fs.Stats;
@@ -257,6 +274,13 @@ function removeExactOwned(directory: string, marker: OwnerMarker): void {
     requireExactJsonFile(path.join(directory, OWNER_NAME), marker);
     safeRemove(directory);
   } catch { /* owner mismatch is never deleted through an attributed cleanup */ }
+}
+
+function removeExactOwnedStrict(directory: string, marker: OwnerMarker): void {
+  if (!fs.existsSync(directory)) return;
+  requireExactJsonFile(path.join(directory, OWNER_NAME), marker);
+  strictRemove(directory);
+  if (fs.existsSync(directory)) throw storageError("exact private artifact remains after retirement");
 }
 
 function identityFor(job: ProtectedAutomationJobRow, run: ProtectedAutomationRunRow): ProtectedAutomationRunStorageIdentity {
@@ -438,34 +462,45 @@ export class ProtectedAutomationRuntimeStorage {
     if (current !== generation) removeExactOwned(generation, exactOwner("state-generation", identity));
   }
 
-  retireJob(identity: Omit<ProtectedAutomationRunStorageIdentity, "runId">, activeRunIds: ReadonlySet<string>): boolean {
+  retireJob(
+    identity: Omit<ProtectedAutomationRunStorageIdentity, "runId">,
+    activeRunIds: ReadonlySet<string>,
+    knownRunIds: readonly string[] = [],
+  ): boolean {
     if (activeRunIds.size > 0) {
       this.deferredJobs.set(identity.jobId, identity);
       return false;
     }
     const jobState = this.jobStateDirectory(identity);
-    if (fs.existsSync(jobState)) {
-      const marker = readOwner(jobState);
-      const expected = {
-        version: 1, kind: "job-state", projectId: identity.projectId,
-        agentProfileId: identity.agentProfileId, jobId: identity.jobId, runId: null,
-      };
-      if (!exactObject(marker, expected)) throw storageError("job retirement owner mismatch");
-      safeRemove(jobState);
+    removeExactOwnedStrict(jobState, {
+      version: 1, kind: "job-state", projectId: identity.projectId,
+      agentProfileId: identity.agentProfileId, jobId: identity.jobId, runId: null,
+    });
+    for (const runId of new Set(knownRunIds)) {
+      const runIdentity = { ...identity, runId };
+      removeExactOwnedStrict(this.runDirectory(runIdentity), exactOwner("run-scratch", runIdentity));
+      removeExactOwnedStrict(this.diagnosticsDirectory(runIdentity), exactOwner("run-diagnostics", runIdentity));
     }
+    // Normal retention paths may not carry historical run IDs. Remove any
+    // additional correctly attributed artifacts, but never swallow a failure
+    // after an exact owner match.
     for (const category of ["runs", "diagnostics"] as const) {
       const root = path.join(this.root, category);
       if (!fs.existsSync(root)) continue;
       for (const name of fs.readdirSync(root)) {
         const directory = path.join(root, name);
-        try {
-          const marker = readOwner(directory);
-          const expectedKind = category === "runs" ? "run-scratch" : "run-diagnostics";
-          if (marker.kind === expectedKind && typeof marker.runId === "string" && name === opaque("run-v1", marker.runId)
-            && marker.jobId === identity.jobId && marker.projectId === identity.projectId
-            && marker.agentProfileId === identity.agentProfileId) safeRemove(directory);
-        } catch { /* malformed runtime artifacts are handled by reconciliation */ }
+        let marker: OwnerMarker;
+        try { marker = readOwner(directory); } catch {
+          throw storageError("runtime artifact owner is unreadable during retirement");
+        }
+        const expectedKind = category === "runs" ? "run-scratch" : "run-diagnostics";
+        if (marker.kind === expectedKind && typeof marker.runId === "string" && name === opaque("run-v1", marker.runId)
+          && marker.jobId === identity.jobId && marker.projectId === identity.projectId
+          && marker.agentProfileId === identity.agentProfileId) strictRemove(directory);
       }
+    }
+    if (fs.existsSync(jobState) || knownRunIds.some((runId) => this.hasRunStorage(runId))) {
+      throw storageError("job retirement left residual private artifacts");
     }
     this.deferredJobs.delete(identity.jobId);
     return true;
@@ -508,8 +543,8 @@ export class ProtectedAutomationRuntimeStorage {
         const job = row ? jobsById.get(row.job_id) : undefined;
         const expected = row && job ? exactOwner(category === "runs" ? "run-scratch" : "run-diagnostics", identityFor(job, row)) : null;
         try { if (!expected || !marker || !exactObject(marker, expected)) throw storageError("orphan artifact"); }
-        catch { safeRemove(directory); continue; }
-        if (category === "runs" || row!.status === "queued" || row!.status === "running") safeRemove(directory);
+        catch { strictRemove(directory); continue; }
+        if (category === "runs" || row!.status === "queued" || row!.status === "running") strictRemove(directory);
       }
     }
     const stateRoot = path.join(this.root, "state");
@@ -522,9 +557,9 @@ export class ProtectedAutomationRuntimeStorage {
         projectId: job.project_id, agentProfileId: job.agent_profile_id, jobId: job.id, runId: "unused",
       }) : null;
       if (!marker || !job || !expectedJobOwner || !exactObject(marker, expectedJobOwner)
-        || name !== opaque("job-v1", job.id)) { safeRemove(state); continue; }
+        || name !== opaque("job-v1", job.id)) { strictRemove(state); continue; }
       for (const entryName of fs.readdirSync(state)) {
-        if (entryName.startsWith(".CURRENT.")) safeRemove(path.join(state, entryName));
+        if (entryName.startsWith(".CURRENT.")) strictRemove(path.join(state, entryName));
       }
       const stages = path.join(state, "stages");
       if (fs.existsSync(stages)) for (const stageName of fs.readdirSync(stages)) {
@@ -534,11 +569,11 @@ export class ProtectedAutomationRuntimeStorage {
         const run = stageMarker && typeof stageMarker.runId === "string" ? runsById.get(stageMarker.runId) : undefined;
         const expectedStage = run ? exactOwner("state-generation", identityFor(job, run)) : null;
         if (!stageMarker || !run || run.job_id !== job.id || !expectedStage || !exactObject(stageMarker, expectedStage)
-          || stageName !== opaque("run-v1", run.id)) { safeRemove(stage); continue; }
+          || stageName !== opaque("run-v1", run.id)) { strictRemove(stage); continue; }
         const identity = identityFor(job, run);
         if (runIntentionallyPublishesState(run) && canPublish(job, run)) {
           try { this.publishState(identity, run.status); } catch { /* sealed stage remains retryable */ }
-        } else safeRemove(stage);
+        } else strictRemove(stage);
       }
       const generations = path.join(state, "generations");
       if (!fs.existsSync(generations)) continue;
@@ -566,7 +601,7 @@ export class ProtectedAutomationRuntimeStorage {
         }
       }
       if (currentName) for (const generationName of fs.readdirSync(generations)) {
-        if (generationName !== currentName) safeRemove(path.join(generations, generationName));
+        if (generationName !== currentName) strictRemove(path.join(generations, generationName));
       }
     }
   }

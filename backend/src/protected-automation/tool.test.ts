@@ -11,6 +11,7 @@ import { commitWorkspaceCapabilityActivation, revokeWorkspaceCapabilityAssociati
 import type { ProtectedAutomationBinding } from "./authority.js";
 import { ProtectedAutomationManager, setProtectedAutomationManager } from "./manager.js";
 import { installProtectedAutomationPreparationPort } from "./browser-preparation.js";
+import { installProtectedAutomationPurgeIntentPort } from "./purge-intent.js";
 import { captureProtectedAutomationSnapshot, verifyProtectedAutomationSnapshot } from "./snapshots.js";
 import { createProtectedAutomationToolRuntime } from "./tool.js";
 
@@ -233,6 +234,50 @@ test("enable, run_now, cancel, and pause require strict effective revisions", as
   } finally {
     await runtime.close();
     await manager.stop();
+  }
+});
+
+test("request_purge creates an owner-PIN intent without accepting PIN material", async () => {
+  const f = fixture();
+  let observed: any;
+  const uninstall = installProtectedAutomationPurgeIntentPort({
+    async request(input) {
+      observed = input;
+      await input.assertAuthorized();
+      return {
+        request_id: "synthetic-purge-intent",
+        job_id: input.job.id,
+        state: "awaiting_owner_pin" as const,
+        requested_at: 100,
+        expires_at: 200,
+      };
+    },
+  });
+  const runtime = createProtectedAutomationToolRuntime({ binding: f.binding, isRuntimeCurrent: () => true });
+  try {
+    const captured = jsonResult(await (runtime.tool.execute as any)("capture", {
+      operation: "capture_job", ...configuration,
+    }));
+    const tombstoned = jsonResult(await (runtime.tool.execute as any)("tombstone", {
+      operation: "tombstone_job", job_id: captured.job.id, expected_revision: captured.job.revision,
+    }));
+    const requested = jsonResult(await (runtime.tool.execute as any)("request-purge", {
+      operation: "request_purge", job_id: captured.job.id, expected_revision: tombstoned.job.revision,
+    }));
+    assert.equal(requested.purge_request.state, "awaiting_owner_pin");
+    assert.equal(observed.binding.projectId, f.project.id);
+    assert.equal(observed.binding.agentProfileId, f.profile.id);
+    assert.equal(observed.job.deleted_at !== null, true);
+    await assert.rejects(
+      () => (runtime.tool.execute as any)("smuggled-pin", {
+        operation: "request_purge", job_id: captured.job.id,
+        expected_revision: tombstoned.job.revision, pin: "synthetic-must-not-enter-tool",
+      }),
+      /validation|schema|additional|failed safely/i,
+    );
+  } finally {
+    await runtime.close();
+    uninstall();
   }
 });
 

@@ -9,6 +9,7 @@ import {
   ProtectedAutomationBrowserRealmRegistry,
   ensureProtectedAutomationBrowserRealmStorage,
   readProtectedAutomationBrowserProfileState,
+  reconcileProtectedAutomationBrowserRealmPurges,
   type ProtectedAutomationManagedRuntime,
 } from "./browser-realm.js";
 import {
@@ -195,6 +196,33 @@ test("a clean preparation close durably marks the private browser profile as sav
     );
   } finally {
     await realms.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("browser purge reconciliation restores before commit and removes after durable row deletion", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-automation-realm-purge-recovery-"));
+  const project = path.join(root, "project");
+  const dataDir = path.join(root, "data");
+  fs.mkdirSync(project);
+  try {
+    const storage = ensureProtectedAutomationBrowserRealmStorage(
+      dataDir, project, "synthetic-project", "synthetic-profile", "synthetic-job",
+    );
+    fs.writeFileSync(path.join(storage.profileDir, "synthetic-profile-state"), "synthetic\n", { mode: 0o600 });
+    const staged = `${storage.rootDir}.purge-00000000-0000-4000-8000-000000000001`;
+    fs.renameSync(storage.rootDir, staged);
+    reconcileProtectedAutomationBrowserRealmPurges(dataDir, [{
+      id: "synthetic-job", project_id: "synthetic-project", agent_profile_id: "synthetic-profile",
+    }]);
+    assert.equal(fs.existsSync(storage.rootDir), true, "a pre-commit crash restores the durable job realm");
+    assert.equal(fs.existsSync(staged), false);
+
+    fs.renameSync(storage.rootDir, staged);
+    reconcileProtectedAutomationBrowserRealmPurges(dataDir, []);
+    assert.equal(fs.existsSync(staged), false, "a post-commit crash removes the staged private realm");
+    assert.equal(fs.existsSync(storage.rootDir), false);
+  } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

@@ -8,6 +8,7 @@ import type { ProtectedAutomationBinding } from "./authority.js";
 import { getProtectedAutomationPreparationPort } from "./browser-preparation.js";
 import { protectedAutomationAttentionMetadata } from "./attention.js";
 import { ProtectedAutomationAuthority } from "./interactive-authority.js";
+import { getProtectedAutomationPurgeIntentPort } from "./purge-intent.js";
 import {
   captureProtectedAutomationSnapshot,
   discardProtectedAutomationSnapshot,
@@ -84,6 +85,7 @@ const Parameters = Type.Union([
     job_id: JobId,
     expected_revision: ExpectedRevision,
   }, { additionalProperties: false }),
+  Type.Object({ operation: Type.Literal("request_purge"), job_id: JobId, expected_revision: ExpectedRevision }, { additionalProperties: false }),
   Type.Object({ operation: Type.Literal("rebind_job"), job_id: JobId, expected_revision: ExpectedRevision }, { additionalProperties: false }),
   Type.Object({ operation: Type.Literal("enable"), job_id: JobId, expected_revision: ExpectedRevision }, { additionalProperties: false }),
   Type.Object({ operation: Type.Literal("pause"), job_id: JobId, expected_revision: ExpectedRevision }, { additionalProperties: false }),
@@ -126,6 +128,7 @@ const OPERATION_KEYS: Readonly<Record<string, { required: readonly string[]; opt
   capture_job: Object.freeze({ required: Object.freeze(["operation", ...CONFIGURATION_KEYS]) }),
   update_job: Object.freeze({ required: Object.freeze(["operation", "job_id", "expected_revision", ...CONFIGURATION_KEYS]) }),
   tombstone_job: Object.freeze({ required: Object.freeze(["operation", "job_id", "expected_revision"]) }),
+  request_purge: Object.freeze({ required: Object.freeze(["operation", "job_id", "expected_revision"]) }),
   rebind_job: Object.freeze({ required: Object.freeze(["operation", "job_id", "expected_revision"]) }),
   enable: Object.freeze({ required: Object.freeze(["operation", "job_id", "expected_revision"]) }),
   pause: Object.freeze({ required: Object.freeze(["operation", "job_id", "expected_revision"]) }),
@@ -316,7 +319,7 @@ export function createProtectedAutomationToolRuntime(options: {
           milestone: 5,
           inert: false,
           activationAvailable: true,
-          actions: ["status", "list_jobs", "get_job", "capture_job", "update_job", "tombstone_job", "rebind_job", "enable", "pause", "run_now", "prepare_browser_profile", "cancel", "list_runs"],
+          actions: ["status", "list_jobs", "get_job", "capture_job", "update_job", "tombstone_job", "request_purge", "rebind_job", "enable", "pause", "run_now", "prepare_browser_profile", "cancel", "list_runs"],
           job_count: jobs.length,
         };
       }
@@ -423,6 +426,18 @@ export function createProtectedAutomationToolRuntime(options: {
         getProtectedAutomationPreparationPort()?.jobChanged(jobId);
         reloadScheduledJob(deleted.id);
         return { job: publicJob(deleted) };
+      }
+      case "request_purge": {
+        const job = ownedJob(binding, value.job_id as string);
+        if (job.revision !== value.expected_revision) throw new WorkspaceStoreError("Protected automation job revision conflict", 409);
+        if (job.deleted_at === null) throw new WorkspaceStoreError("Protected automation job must be tombstoned before purge request", 409);
+        const purgeIntent = getProtectedAutomationPurgeIntentPort();
+        if (!purgeIntent) throw new WorkspaceStoreError("Protected automation purge request is unavailable", 503);
+        return { purge_request: await purgeIntent.request({
+          binding,
+          job,
+          assertAuthorized: () => authority.assertAuthorized("preoperation"),
+        }) };
       }
       case "rebind_job": {
         const job = ownedJob(binding, value.job_id as string);
