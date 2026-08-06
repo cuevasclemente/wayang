@@ -90,6 +90,14 @@ import {
   type BrowserTurnProvenance,
 } from "./interactive-turn-provenance.js";
 import { getActionApprovalBridge } from "./action-approval-bridge.js";
+import {
+  cancelCapturedQueuedChatMessage,
+  captureQueuedChatMessage,
+  isQueuedChatMessagePending,
+  queuedChatMessageState,
+  snapshotQueuedChatMessages,
+  type QueuedChatMessageCapture,
+} from "./queued-chat-messages.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -118,6 +126,8 @@ export interface PiSessionHandle {
   protectedAutomationRuntime?: ProtectedAutomationToolRuntime;
   protectedAutomationFactory?: CreatePiSessionRuntimeOptions["protectedAutomationFactory"];
   activeInteractiveTurn?: BrowserTurnProvenance | null;
+  /** Browser-local IDs bound to exact pending pi steering message objects. */
+  queuedBrowserMessages: Map<string, QueuedBrowserMessageRecord>;
   /** Permanent process-local denial latch; only a fresh handle may regain authority. */
   capabilityAuthorityDenied?: boolean;
 }
@@ -2203,6 +2213,7 @@ export async function createPiSession(
         protectedAutomationFactory: selectedProtectedAutomationFactory,
       } : {}),
       activeInteractiveTurn: null,
+      queuedBrowserMessages: new Map(),
     };
 
     // No await is permitted between this final fence and publication.
@@ -2991,18 +3002,57 @@ export async function deliverInterviewSubmission(
   throw new Error("Interview submission was queued but not persisted before delivery timeout");
 }
 
+export interface BrowserMessageTurnResult {
+  queued: boolean;
+  cancellable: boolean;
+}
+
+export interface QueuedBrowserMessageProjection {
+  client_message_id: string;
+  content: string;
+  attachment_names: string[];
+}
+
+interface QueuedBrowserMessageRecord {
+  capture: QueuedChatMessageCapture;
+  content: string;
+  attachmentNames: string[];
+}
+
 export async function sendBrowserMessageTurn(
   handle: PiSessionHandle,
   content: string,
   images?: ImageContent[],
-): Promise<void> {
+  clientMessageId?: string,
+  queuedDisplay?: { content: string; attachmentNames?: string[] },
+): Promise<BrowserMessageTurnResult> {
   assertCapabilityAuthorityAvailable(handle);
   const turn = beginInteractiveTurn(handle, content);
   const isStreaming = handle.session.isStreaming;
   if (isStreaming) {
     try {
-      await handle.session.steer(content, images);
+      if (clientMessageId && handle.queuedBrowserMessages.has(clientMessageId)) {
+        throw new Error("Duplicate queued browser message ID");
+      }
+      const queueBefore = clientMessageId ? snapshotQueuedChatMessages(handle.session) : undefined;
+      // In pi 0.80.6 steer() mutates the queue synchronously before returning
+      // its promise. Capture in this same event-loop turn so concurrent browser
+      // messages cannot collapse two registrations into one ambiguous delta.
+      const steering = handle.session.steer(content, images);
+      const capture = clientMessageId ? captureQueuedChatMessage(handle.session, queueBefore) : undefined;
+      if (clientMessageId && capture) {
+        handle.queuedBrowserMessages.set(clientMessageId, {
+          capture,
+          content: queuedDisplay?.content ?? content,
+          attachmentNames: [...(queuedDisplay?.attachmentNames ?? [])],
+        });
+      }
+      await steering;
       clearInteractiveTurnWhenIdle(handle, turn.token);
+      return {
+        queued: capture ? isQueuedChatMessagePending(capture) : handle.session.getSteeringMessages().includes(content),
+        cancellable: Boolean(capture && isQueuedChatMessagePending(capture)),
+      };
     } catch (error) {
       clearInteractiveTurn(handle, turn.token);
       throw error;
@@ -3013,6 +3063,7 @@ export async function sendBrowserMessageTurn(
         expandPromptTemplates: true,
         images,
       });
+      return { queued: false, cancellable: false };
     } finally {
       clearInteractiveTurn(handle, turn.token);
     }
@@ -3023,13 +3074,55 @@ export async function sendMessage(
   id: string,
   content: string,
   images?: ImageContent[],
-): Promise<void> {
+  clientMessageId?: string,
+  queuedDisplay?: { content: string; attachmentNames?: string[] },
+): Promise<BrowserMessageTurnResult> {
   assertRuntimeMutationUnlocked(id);
   const handle = sessions.get(id);
   if (!handle) throw new Error(`Session ${id} not found`);
   assertCapabilityAuthorityAvailable(handle);
   markSessionActivity(id);
-  await sendBrowserMessageTurn(handle, content, images);
+  return sendBrowserMessageTurn(handle, content, images, clientMessageId, queuedDisplay);
+}
+
+export function getQueuedBrowserMessages(id: string): QueuedBrowserMessageProjection[] {
+  const handle = sessions.get(id);
+  if (!handle) return [];
+  const messages: QueuedBrowserMessageProjection[] = [];
+  for (const [clientMessageId, record] of handle.queuedBrowserMessages) {
+    const state = queuedChatMessageState(record.capture);
+    if (state === "claimed") {
+      handle.queuedBrowserMessages.delete(clientMessageId);
+      continue;
+    }
+    messages.push({
+      client_message_id: clientMessageId,
+      content: record.content,
+      attachment_names: [...record.attachmentNames],
+    });
+  }
+  return messages;
+}
+
+export function cancelQueuedBrowserMessage(id: string, clientMessageId: string): boolean {
+  assertRuntimeMutationUnlocked(id);
+  const handle = sessions.get(id);
+  if (!handle) throw new Error(`Session ${id} not found`);
+  assertCapabilityAuthorityAvailable(handle);
+  const record = handle.queuedBrowserMessages.get(clientMessageId);
+  if (!record) return false;
+  const cancelled = cancelCapturedQueuedChatMessage(record.capture);
+  if (cancelled) {
+    handle.queuedBrowserMessages.delete(clientMessageId);
+    markSessionActivity(id);
+    return true;
+  }
+  const state = queuedChatMessageState(record.capture);
+  if (state === "claimed") {
+    handle.queuedBrowserMessages.delete(clientMessageId);
+    return false;
+  }
+  throw new Error("The pi queued-message layout changed; cancellation was refused without changing the queue");
 }
 
 function extractReplayPayloadFromUserContent(content: unknown): { text: string; images: ImageContent[] } {
@@ -3246,6 +3339,11 @@ export function subscribeToSession(
     // No queued or future result is released from a denied handle. A fresh
     // runtime/handle is required after cleanup.
     if (handle.capabilityAuthorityDenied) return;
+    if (event.type === "queue_update" && handle.queuedBrowserMessages.size > 0) {
+      for (const [clientMessageId, record] of handle.queuedBrowserMessages) {
+        if (queuedChatMessageState(record.capture) === "claimed") handle.queuedBrowserMessages.delete(clientMessageId);
+      }
+    }
     const serialized = serializeEvent(event);
     if (serialized) {
       markSessionActivity(id);

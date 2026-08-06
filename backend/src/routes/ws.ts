@@ -3,7 +3,8 @@
  *
  * Protocol:
  *   Client → Server:
- *     { type: "message", content: string, attachments?: {name?: string, mimeType?: string, data: string, size?: number}[] }
+ *     { type: "message", content: string, client_message_id?: string, attachments?: {name?: string, mimeType?: string, data: string, size?: number}[] }
+ *     { type: "cancel_queued_message", client_message_id: string }
  *     { type: "resend", message_id: string }
  *     { type: "interrupt", clear_queue?: boolean }
  *     { type: "set_permission", mode: string }
@@ -28,6 +29,9 @@
  *     { type: "compaction_end", reason, succeeded, aborted, will_retry, error? }
  *     { type: "agent_settled" }
  *     { type: "queue_update", steering: string[], followUp: string[] }
+ *     { type: "queued_message_snapshot", session_id, selection_id, messages: [...] }
+ *     { type: "queued_message_ack", session_id, client_message_id, status: "queued"|"accepted"|"rejected", cancellable?, error? }
+ *     { type: "queued_message_cancel_ack", session_id, client_message_id, status: "cancelled"|"not_found"|"error", error? }
  *     { type: "external_action_request", requestId, sessionId, selection_id, argumentsHash, ...displayMetadata }
  *     { type: "external_action_response_ack", requestId, sessionId, selection_id, status, errorCode?, retryAt? }
  *     { type: "external_action_terminal", requestId, sessionId, selection_id, status }
@@ -46,6 +50,8 @@ import {
   sendMessage,
   resendMessage,
   abortSession,
+  cancelQueuedBrowserMessage,
+  getQueuedBrowserMessages,
   subscribeToSession,
   getMessageHistory,
   getSessionFileTodoState,
@@ -258,6 +264,34 @@ function handleConnection(
   let runtimeEventUnsub: (() => void) | null = null;
   const pendingMessages: any[] = [];
 
+  const sendCorrelatedClientFailure = (targetSessionId: string, msg: any, error: string): boolean => {
+    let clientMessageId: string | undefined;
+    try { clientMessageId = optionalClientMessageId(msg?.client_message_id); }
+    catch { return false; }
+    if (!clientMessageId) return false;
+    if (msg?.type === "message") {
+      sendSafe(ws, {
+        type: "queued_message_ack",
+        session_id: targetSessionId,
+        client_message_id: clientMessageId,
+        status: "rejected",
+        error,
+      });
+      return true;
+    }
+    if (msg?.type === "cancel_queued_message") {
+      sendSafe(ws, {
+        type: "queued_message_cancel_ack",
+        session_id: targetSessionId,
+        client_message_id: clientMessageId,
+        status: "error",
+        error,
+      });
+      return true;
+    }
+    return false;
+  };
+
   const stopFilePoll = () => {
     if (filePollTimer) {
       clearInterval(filePollTimer);
@@ -446,6 +480,12 @@ function handleConnection(
         messages: liveHistory,
       });
       sendSafe(ws, { ...getTodoState(nextSessionId), session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
+      sendSafe(ws, {
+        type: "queued_message_snapshot",
+        session_id: nextSessionId,
+        ...(selectionId ? { selection_id: selectionId } : {}),
+        messages: getQueuedBrowserMessages(nextSessionId),
+      });
     }
     bufferLiveEvents = false;
     if (bufferOverflow) {
@@ -698,6 +738,12 @@ function handleConnection(
               messages,
             });
             sendSafe(ws, { ...(snapshot?.todoState ?? getSessionFileTodoState(sessionInfo.pi_session_file, sessionInfo.cwd)), session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
+            sendSafe(ws, {
+              type: "queued_message_snapshot",
+              session_id: nextSessionId,
+              ...(selectionId ? { selection_id: selectionId } : {}),
+              messages: [],
+            });
             wsProfile(nextSessionId, "sent_history", `duration=${elapsedMs(sendHistoryStart)} messages=${messages.length}`);
             startFilePoll(nextSessionId, sessionInfo.pi_session_file, sessionInfo.cwd, version, selectionId, !quarantined);
           }
@@ -717,7 +763,10 @@ function handleConnection(
       if (!alive || version !== setupVersion) return;
       readyError = err?.message || String(err);
       wsProfile(nextSessionId, "setup_error", `duration=${elapsedMs(setupStart)} error=${readyError}`);
-      pendingMessages.splice(0);
+      const dropped = pendingMessages.splice(0);
+      for (const pendingMessage of dropped) {
+        sendCorrelatedClientFailure(nextSessionId, pendingMessage, `Session setup failed: ${readyError}`);
+      }
       sendSafe(ws, {
         type: "session_error",
         session_id: nextSessionId,
@@ -750,15 +799,16 @@ function handleConnection(
 
     const durable = getSessionById(currentSessionId);
     if (durable && isLegacyPrivateSessionQuarantined(durable)) {
-      sendSafe(ws, { type: "error", error: "Quarantined legacy sessions are view-only" });
+      const error = "Quarantined legacy sessions are view-only";
+      sendCorrelatedClientFailure(currentSessionId, msg, error);
+      sendSafe(ws, { type: "error", error });
       return;
     }
 
     if (readyError) {
-      sendSafe(ws, {
-        type: "error",
-        error: `Session is not ready: ${readyError}`,
-      });
+      const error = `Session is not ready: ${readyError}`;
+      sendCorrelatedClientFailure(currentSessionId, msg, error);
+      sendSafe(ws, { type: "error", error });
       return;
     }
 
@@ -995,6 +1045,29 @@ function safeSessionError(sessionId: string, error: unknown, prefix = ""): strin
   return `${prefix}${message}`;
 }
 
+function optionalClientMessageId(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(value)) {
+    throw new Error("client_message_id is invalid");
+  }
+  return value;
+}
+
+function requiredClientMessageId(value: unknown): string {
+  const clientMessageId = optionalClientMessageId(value);
+  if (!clientMessageId) throw new Error("cancel_queued_message requires client_message_id");
+  return clientMessageId;
+}
+
+function queuedAttachmentNames(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((attachment) => (
+    attachment && typeof attachment === "object" && typeof attachment.name === "string"
+      ? attachment.name.trim().slice(0, 120) || "attachment"
+      : "attachment"
+  ));
+}
+
 async function handleClientMessage(
   ws: WebSocket,
   sessionId: string,
@@ -1018,6 +1091,7 @@ async function handleClientMessage(
       case "message": {
         const rawContent = typeof msg.content === "string" ? msg.content : "";
         const trimmedContent = rawContent.trim();
+        const clientMessageId = optionalClientMessageId(msg.client_message_id);
         const preparedAttachments = prepareAttachments(sessionId, msg.attachments);
         if (!trimmedContent && preparedAttachments.count === 0) return;
 
@@ -1035,6 +1109,15 @@ async function handleClientMessage(
         }
 
         if (trimmedContent && await handleBuiltinSlashCommand(ws, sessionId, trimmedContent)) {
+          if (clientMessageId) {
+            sendSafe(ws, {
+              type: "queued_message_ack",
+              session_id: sessionId,
+              client_message_id: clientMessageId,
+              status: "accepted",
+              cancellable: false,
+            });
+          }
           break;
         }
 
@@ -1058,13 +1141,55 @@ async function handleClientMessage(
           sessionId,
           fullContent,
           preparedAttachments.images.length > 0 ? preparedAttachments.images : undefined,
-        ).then(() => {
+          clientMessageId,
+          { content: trimmedContent, attachmentNames: queuedAttachmentNames(msg.attachments) },
+        ).then((result) => {
           updateSessionError(sessionId, null);
+          if (clientMessageId) {
+            sendSafe(ws, {
+              type: "queued_message_ack",
+              session_id: sessionId,
+              client_message_id: clientMessageId,
+              status: result.queued ? "queued" : "accepted",
+              cancellable: result.cancellable,
+            });
+          }
         }).catch((err) => {
           const error = safeSessionError(sessionId, err, "Agent turn failed: ");
           updateSessionError(sessionId, error);
+          if (clientMessageId) {
+            sendSafe(ws, {
+              type: "queued_message_ack",
+              session_id: sessionId,
+              client_message_id: clientMessageId,
+              status: "rejected",
+              error,
+            });
+          }
           sendSafe(ws, { type: "error", error });
         });
+        break;
+      }
+
+      case "cancel_queued_message": {
+        const clientMessageId = requiredClientMessageId(msg.client_message_id);
+        try {
+          const cancelled = cancelQueuedBrowserMessage(sessionId, clientMessageId);
+          sendSafe(ws, {
+            type: "queued_message_cancel_ack",
+            session_id: sessionId,
+            client_message_id: clientMessageId,
+            status: cancelled ? "cancelled" : "not_found",
+          });
+        } catch (error) {
+          sendSafe(ws, {
+            type: "queued_message_cancel_ack",
+            session_id: sessionId,
+            client_message_id: clientMessageId,
+            status: "error",
+            error: safeSessionError(sessionId, error, "Could not cancel queued message: "),
+          });
+        }
         break;
       }
 
@@ -1146,6 +1271,35 @@ async function handleClientMessage(
     }
   } catch (err: any) {
     const error = safeSessionError(sessionId, err);
+    let cancellationId: string | undefined;
+    if (msg?.type === "cancel_queued_message") {
+      try { cancellationId = optionalClientMessageId(msg.client_message_id); }
+      catch { /* malformed IDs cannot receive a correlated acknowledgement */ }
+    }
+    if (cancellationId) {
+      sendSafe(ws, {
+        type: "queued_message_cancel_ack",
+        session_id: sessionId,
+        client_message_id: cancellationId,
+        status: "error",
+        error: `Could not cancel queued message: ${error}`,
+      });
+      return;
+    }
+    let messageId: string | undefined;
+    if (msg?.type === "message") {
+      try { messageId = optionalClientMessageId(msg.client_message_id); }
+      catch { /* malformed IDs receive only the generic protocol error */ }
+    }
+    if (messageId) {
+      sendSafe(ws, {
+        type: "queued_message_ack",
+        session_id: sessionId,
+        client_message_id: messageId,
+        status: "rejected",
+        error,
+      });
+    }
     updateSessionError(sessionId, error);
     sendSafe(ws, { type: "error", error });
   }
