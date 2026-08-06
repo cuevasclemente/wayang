@@ -11,7 +11,7 @@ import {
   createBashToolDefinition,
   type BashOperations,
 } from "@earendil-works/pi-coding-agent";
-import { stripInternalCapabilityEnv } from "./child-env.js";
+import { buildRestrictedSandboxEnv } from "./child-env.js";
 import { getSessionById } from "./sessions.js";
 import { getAgentProfile } from "./agent-profiles.js";
 import { getWorkspaceCapabilityStoreProjectionPath } from "./db.js";
@@ -40,6 +40,31 @@ export interface BashSandboxPolicy {
   networkMode: SandboxNetworkMode;
   deniedReadRoots: string[];
   deniedWriteRoots: string[];
+}
+
+/** Missing denyWrite targets temporarily created by active SRT helpers. */
+const activeSyntheticDenyWriteMounts = new Map<string, number>();
+
+function activeSyntheticMount(target: string): boolean {
+  return activeSyntheticDenyWriteMounts.has(path.resolve(target))
+    || activeSyntheticDenyWriteMounts.has(canonicalExistingOrResolved(target));
+}
+
+function registerSyntheticDenyWriteMounts(policy: BashSandboxPolicy): () => void {
+  const candidates = policy.deniedWriteRoots.filter((root) => (
+    !fs.existsSync(root)
+    && policy.config.filesystem.allowWrite.some((allowedRoot) => pathIsWithin(root, allowedRoot))
+  )).map((root) => path.resolve(root));
+  for (const root of candidates) {
+    activeSyntheticDenyWriteMounts.set(root, (activeSyntheticDenyWriteMounts.get(root) ?? 0) + 1);
+  }
+  return () => {
+    for (const root of candidates) {
+      const remaining = (activeSyntheticDenyWriteMounts.get(root) ?? 1) - 1;
+      if (remaining > 0) activeSyntheticDenyWriteMounts.set(root, remaining);
+      else activeSyntheticDenyWriteMounts.delete(root);
+    }
+  };
 }
 
 /** Host eligibility is independent of sandbox availability; every ineligible
@@ -124,14 +149,13 @@ export function buildBashSandboxPolicy(
     : false;
   const deniedRead = new Set<string>();
   const deniedWrite = new Set<string>();
+  const sourceProtected = sourceAuthorization.project?.access_policy.privacy_mode === "protected";
   for (const project of projects) {
     const otherProtectedProject = project.access_policy.privacy_mode === "protected"
       && project.id !== sourceAuthorization.project?.id;
-    const deniedProject = otherProtectedProject || !projectAllowsAgentProfile(project, profile.id);
-    if (deniedProject) {
-      deniedRead.add(project.cwd);
-      deniedWrite.add(project.cwd);
-    }
+    const excludedByAllowlist = !projectAllowsAgentProfile(project, profile.id);
+    if (otherProtectedProject || (excludedByAllowlist && !sourceProtected)) deniedRead.add(project.cwd);
+    if (otherProtectedProject || excludedByAllowlist) deniedWrite.add(project.cwd);
   }
 
   for (const root of getProtectedArtifactReadRoots()) deniedRead.add(root);
@@ -188,7 +212,16 @@ export function buildBashSandboxPolicy(
   // intentionally retains its pre-policy ability to maintain Pi projects.
   if (!legacyWrenStandard) deniedWrite.add(path.join(session.cwd, ".pi"));
 
-  const deniedReadRoots = outermostCanonicalPaths(deniedRead);
+  // Snapshot only currently existing genuine read-deny targets. SRT evaluates
+  // this policy in a forked helper and temporarily creates missing denyWrite
+  // mountpoints on the host. A concurrent helper must not mistake one for a real
+  // file: binding it races cleanup and can make Bubblewrap fail before startup.
+  // Missing targets cannot be read, and every denyWrite remains present so this
+  // sandbox cannot create them itself. Concurrent unrelated same-UID mutation
+  // remains outside this cooperative boundary, as documented for the policy.
+  const deniedReadRoots = outermostCanonicalPaths(
+    [...deniedRead].filter((root) => fs.existsSync(root) && !activeSyntheticMount(root)),
+  );
   const deniedWriteRoots = outermostCanonicalPaths(deniedWrite);
   const canonicalCwd = canonicalExistingOrResolved(session.cwd);
   const overlappingDeny = deniedWriteRoots.find((root) => pathIsWithin(canonicalCwd, root));
@@ -261,50 +294,60 @@ export function createPolicySandboxedBashOperations(
       const availability = getBashSandboxAvailability();
       if (!availability.available) throw new Error(`Wayang bash sandbox unavailable: ${availability.reason ?? "unknown reason"}`);
       const policy = buildBashSandboxPolicy(sessionId, options.networkMode);
-      const child = fork(helperModulePath(), [], {
-        cwd,
-        detached: process.platform !== "win32",
-        env: stripInternalCapabilityEnv(env ?? process.env),
-        stdio: ["ignore", "pipe", "pipe", "ipc"],
-      });
+      const releaseSyntheticMounts = registerSyntheticDenyWriteMounts(policy);
+      let child: ChildProcess;
+      try {
+        child = fork(helperModulePath(), [], {
+          cwd,
+          detached: process.platform !== "win32",
+          env: buildRestrictedSandboxEnv(env ?? process.env),
+          stdio: ["ignore", "pipe", "pipe", "ipc"],
+        });
+      } catch (error) {
+        releaseSyntheticMounts();
+        throw error;
+      }
       child.stdout?.on("data", onData);
       child.stderr?.on("data", onData);
 
       const request: SandboxExecRequest = { command, cwd, config: policy.config, networkMode: policy.networkMode };
-      child.send(request);
-
-      return await new Promise<{ exitCode: number | null }>((resolve, reject) => {
-        let settled = false;
-        let timedOut = false;
-        let timer: NodeJS.Timeout | undefined;
-        const finish = (operation: () => void) => {
-          if (settled) return;
-          settled = true;
-          if (timer) clearTimeout(timer);
-          signal?.removeEventListener("abort", onAbort);
-          operation();
-        };
-        const onAbort = () => {
-          killProcessGroup(child);
-          finish(() => reject(new Error("aborted")));
-        };
-        if (signal?.aborted) {
-          onAbort();
-          return;
-        }
-        signal?.addEventListener("abort", onAbort, { once: true });
-        if (timeout !== undefined && timeout > 0) {
-          timer = setTimeout(() => {
-            timedOut = true;
+      try {
+        child.send(request);
+        return await new Promise<{ exitCode: number | null }>((resolve, reject) => {
+          let settled = false;
+          let timedOut = false;
+          let timer: NodeJS.Timeout | undefined;
+          const finish = (operation: () => void) => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
+            signal?.removeEventListener("abort", onAbort);
+            operation();
+          };
+          const onAbort = () => {
             killProcessGroup(child);
-          }, timeout * 1000);
-        }
-        child.once("error", (error) => finish(() => reject(error)));
-        child.once("close", (code) => {
-          if (timedOut) finish(() => reject(new Error(`timeout:${timeout}`)));
-          else finish(() => resolve({ exitCode: code }));
+            finish(() => reject(new Error("aborted")));
+          };
+          if (signal?.aborted) {
+            onAbort();
+            return;
+          }
+          signal?.addEventListener("abort", onAbort, { once: true });
+          if (timeout !== undefined && timeout > 0) {
+            timer = setTimeout(() => {
+              timedOut = true;
+              killProcessGroup(child);
+            }, timeout * 1000);
+          }
+          child.once("error", (error) => finish(() => reject(error)));
+          child.once("close", (code) => {
+            if (timedOut) finish(() => reject(new Error(`timeout:${timeout}`)));
+            else finish(() => resolve({ exitCode: code }));
+          });
         });
-      });
+      } finally {
+        releaseSyntheticMounts();
+      }
     },
   };
 }

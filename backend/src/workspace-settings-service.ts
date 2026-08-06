@@ -18,6 +18,7 @@ import {
   getProject,
   getProjectRegistrationReferences,
   listProjects,
+  projectRegistrationHasBrowserData,
   updateProject,
   type ProjectCreateInput,
   type ProjectUpdateInput,
@@ -314,6 +315,9 @@ function prepareMutation(raw: unknown): PreparedMutation {
     case "project_delete_registration": {
       const current = getProject(canonical.mutation.id);
       if (!current) throw new WorkspaceStoreError("Project not found", 404);
+      if (projectRegistrationHasBrowserData(current.id)) {
+        throw new WorkspaceStoreError("Project registration retains managed browser profile data", 409);
+      }
       const references = getProjectRegistrationReferences(current.id);
       const blockers = Object.values(references).reduce((sum, ids) => sum + ids.length, 0);
       if (blockers > 0) throw new WorkspaceStoreError("Project registration still has central references", 409);

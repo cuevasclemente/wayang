@@ -669,6 +669,21 @@ test("project registration deletion checks every central reference class and nev
     store.apps = store.apps.filter((row) => row.id !== "app-ref");
     store.appStates = store.appStates.filter((row) => row.app_id !== "state-ref");
     store.appEvents = store.appEvents.filter((row) => row.id !== "event-ref");
+
+    const browserRoot = path.join(targetCwd, ".pi", "browser-workbench");
+    fs.mkdirSync(path.join(browserRoot, "profiles", "synthetic"), { recursive: true });
+    fs.writeFileSync(path.join(browserRoot, "profiles", "synthetic", "Cookies"), "SYNTHETIC_BROWSER_DATA\n");
+    assert.throws(() => deleteProjectRegistration(target.id), /managed browser profile data/);
+    assert.throws(
+      () => new WorkspaceSettingsService().previewAgentMutation(f.source.id, {
+        mutation_type: "project_delete_registration",
+        mutation: { id: target.id },
+      }),
+      /managed browser profile data/,
+    );
+    assert.ok(getProject(target.id));
+    fs.rmSync(browserRoot, { recursive: true });
+
     deleteProjectRegistration(target.id);
     assert.equal(getProject(target.id), undefined);
     assert.equal(fs.readFileSync(canary, "utf8"), "SYNTHETIC_KEEP\n");
