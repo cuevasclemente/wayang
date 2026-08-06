@@ -30,10 +30,15 @@ export interface ExternalActionApprovalRequest {
   lastSentAt?: number;
   retryAt?: number;
   responseError?: string;
+  /** Internal-only fail-closed marker; never accepted from WebSocket data. */
+  immutableCollision?: true;
+  /** Internal-only retention recency; never accepted from WebSocket data. */
+  retentionTouchedAt?: number;
 }
 
 interface ExternalActionApprovalProps {
   request: ExternalActionApprovalRequest;
+  interactionEnabled: boolean;
   onRespond: (request: ExternalActionApprovalRequest, approved: boolean, trigger: HTMLButtonElement) => void;
   onDismiss: (request: ExternalActionApprovalRequest) => void;
 }
@@ -64,7 +69,7 @@ const STATUS_LABELS: Record<ExternalActionApprovalStatus, string> = {
   uncertain: "Uncertain outcome",
 };
 
-export function ExternalActionApproval({ request, onRespond, onDismiss }: ExternalActionApprovalProps) {
+export function ExternalActionApproval({ request, interactionEnabled, onRespond, onDismiss }: ExternalActionApprovalProps) {
   const headingId = useId();
   const statusId = useId();
   const metadata = [
@@ -75,7 +80,7 @@ export function ExternalActionApproval({ request, onRespond, onDismiss }: Extern
     ["Request ID", request.requestId],
     ["Argument hash", request.argumentsHash],
   ].filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].length > 0);
-  const responseControlsDisabled = request.submitting || !request.live;
+  const responseControlsDisabled = !interactionEnabled || request.submitting || !request.live;
   const approvalDisabled = responseControlsDisabled || request.retryAt !== undefined;
   const canDismiss = !request.live;
 
@@ -108,7 +113,9 @@ export function ExternalActionApproval({ request, onRespond, onDismiss }: Extern
           </h2>
           <p className="mt-1 text-xs text-amber-100/80">
             {request.live
-              ? "Review the connector-provided preview below. Wayang binds approval to this request and argument hash; approval requires your identity PIN."
+              ? interactionEnabled
+                ? "Review the connector-provided preview below. Wayang binds approval to every displayed immutable request field; approval requires your identity PIN."
+                : "This preview is retained for review, but responses are disabled until this exact session selection is connected, loaded, and authoritatively synchronized."
               : "This retained card records the outcome visible to this browser. Dismiss it when you have finished reviewing it."}
           </p>
         </div>

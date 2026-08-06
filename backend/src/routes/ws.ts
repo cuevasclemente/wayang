@@ -11,6 +11,7 @@
  *     { type: "set_goal", goal: string }
  *     { type: "subagent_spawn", agent: string, task: string, mode: "single"|"parallel"|"chain" }
  *     { type: "external_action_response", requestId, sessionId, selection_id, argumentsHash, approved, pin? }
+ *     { type: "command_guard_pin_response", requestId, sessionId, selection_id, pin? | cancelled }
  *
  *   Server → Client:
  *     { type: "history", messages: [...] }
@@ -36,6 +37,7 @@
  *     { type: "external_action_response_ack", requestId, sessionId, selection_id, status, errorCode?, retryAt? }
  *     { type: "external_action_terminal", requestId, sessionId, selection_id, status }
  *     { type: "external_action_snapshot", sessionId, selection_id, requests, syncComplete: true }
+ *     { type: "command_guard_pin_request", requestId, sessionId, selection_id, ...displayMetadata }
  */
 
 import * as fs from "node:fs";
@@ -686,12 +688,23 @@ function handleConnection(
 
         const deliveredCommandGuardIdentityRequestIds = new Set<string>();
         const sendCommandGuardIdentityRequest = (req: CommandGuardIdentityRequest) => {
-          if (req.sessionId !== currentSessionId || deliveredCommandGuardIdentityRequestIds.has(req.requestId)) return;
+          // Shared identity challenges are valid only for the exact active
+          // browser selection. Selectionless and stale setup generations must
+          // never receive a challenge or later resolve its in-memory waiter.
+          if (
+            !selectionId
+            || !alive
+            || version !== setupVersion
+            || req.sessionId !== currentSessionId
+            || currentSelectionId !== selectionId
+            || deliveredCommandGuardIdentityRequestIds.has(req.requestId)
+          ) return;
           deliveredCommandGuardIdentityRequestIds.add(req.requestId);
           sendSafe(ws, {
             type: "command_guard_pin_request",
             requestId: req.requestId,
             sessionId: req.sessionId,
+            selection_id: selectionId,
             prompt: req.prompt,
             command: req.command,
             reason: req.reason,
@@ -844,7 +857,7 @@ function handleConnection(
     }
 
     if (msg.type === "command_guard_pin_response") {
-      handleCommandGuardPinResponse(currentSessionId, msg);
+      handleCommandGuardPinResponse(currentSessionId, currentSelectionId, msg);
       return;
     }
 
@@ -1475,10 +1488,25 @@ function handleSudoResponse(sessionId: string, msg: any): void {
 }
 
 /** Handle command_guard_pin_response without logging or persisting PIN values. */
-function handleCommandGuardPinResponse(sessionId: string, msg: any): void {
-  const { requestId } = msg;
-  if (!requestId || typeof requestId !== "string") return;
+function handleCommandGuardPinResponse(
+  sessionId: string,
+  currentSelectionId: string | null,
+  msg: any,
+): void {
+  const requestId = typeof msg?.requestId === "string" ? msg.requestId : "";
+  const responseSessionId = typeof msg?.sessionId === "string" ? msg.sessionId : "";
+  const responseSelectionId = typeof msg?.selection_id === "string" ? msg.selection_id : "";
+  if (
+    !requestId
+    || !responseSessionId
+    || !responseSelectionId
+    || !currentSelectionId
+    || responseSessionId !== sessionId
+    || responseSelectionId !== currentSelectionId
+  ) return;
 
+  // Validate the complete wire binding before obtaining or touching the
+  // in-memory bridge. Missing/stale responses cannot consume a live waiter.
   const bridge = getCommandGuardIdentityBridge();
   if (msg.cancelled) {
     bridge.resolveForSession(sessionId, requestId, null);
