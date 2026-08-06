@@ -283,6 +283,151 @@ test("settled history replaces residual mobile streaming content without duplica
   await expect(settledAssistants.first()).toContainText(markers.conclusion);
 });
 
+test("reattaches to an active stream without dropping or splitting the snapshot continuation", async ({ page, request }) => {
+  const firstSession = await createE2eSession(request, "e2e active stream reattach");
+  const otherSession = await createE2eSession(request, "e2e active stream other");
+
+  await page.addInitScript(({ opening, conclusion }) => {
+    type Handler<T> = ((event: T) => void) | null;
+
+    class ReattachWebSocket {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static readonly CLOSED = 3;
+      readyState = ReattachWebSocket.CONNECTING;
+      onopen: Handler<Event> = null;
+      onclose: Handler<CloseEvent> = null;
+      onerror: Handler<Event> = null;
+      onmessage: Handler<MessageEvent> = null;
+      private sessionId: string;
+      private selectionId: string | null;
+      private readonly activeSessionId: string;
+      private readonly activeSelectionId: string | null;
+      private prompt = "";
+
+      constructor(url: string) {
+        const parsed = new URL(url, window.location.href);
+        this.sessionId = parsed.searchParams.get("session_id") ?? "";
+        this.activeSessionId = this.sessionId;
+        this.selectionId = parsed.searchParams.get("selection_id");
+        this.activeSelectionId = this.selectionId;
+        (window as unknown as { finishReattachedStream: () => void }).finishReattachedStream = () => {
+          const messages = this.activeHistory(`${opening}${conclusion}`);
+          this.emit({ type: "agent_end", messages: [], will_retry: false });
+          this.emit({ type: "agent_settled" });
+          this.emit({
+            type: "history",
+            session_id: this.sessionId,
+            selection_id: this.selectionId,
+            reason: "agent_settled_reconciliation",
+            streaming_at_snapshot: false,
+            messages,
+          });
+        };
+        window.setTimeout(() => {
+          this.readyState = ReattachWebSocket.OPEN;
+          this.onopen?.(new Event("open"));
+          this.sendSelectionHistory(false);
+        }, 0);
+      }
+
+      send(raw: string): void {
+        const message = JSON.parse(raw) as { type?: string; session_id?: string; selection_id?: string; content?: string };
+        if (message.type === "switch_session" && typeof message.session_id === "string") {
+          this.sessionId = message.session_id;
+          this.selectionId = typeof message.selection_id === "string" ? message.selection_id : null;
+          this.sendSelectionHistory(this.sessionId === this.activeSessionId && this.prompt.length > 0);
+          return;
+        }
+        if (message.type !== "message" || typeof message.content !== "string" || this.sessionId !== this.activeSessionId) return;
+        this.prompt = message.content;
+        this.emit({ type: "message_start", message: { id: "reattach-user", role: "user", content: this.prompt } });
+        this.emit({ type: "agent_start" });
+        this.emit({ type: "text_delta", delta: opening });
+      }
+
+      close(): void {
+        this.readyState = ReattachWebSocket.CLOSED;
+      }
+
+      private activeHistory(text: string): unknown[] {
+        return [
+          {
+            type: "user",
+            id: "reattach-user",
+            message: { role: "user", content: this.prompt },
+          },
+          {
+            type: "assistant",
+            id: "reattach-assistant",
+            message: { role: "assistant", content: [{ type: "text", text }] },
+          },
+        ];
+      }
+
+      private sendSelectionHistory(active: boolean): void {
+        this.emit({ type: "session_loading", session_id: this.sessionId, selection_id: this.selectionId });
+        this.emit({ type: "session_ready", session_id: this.sessionId, selection_id: this.selectionId });
+        if (!active && this.prompt.length > 0) {
+          // Simulate an A delta that was already queued in the browser when the
+          // user selected B. Correlation must keep it out of B's transcript.
+          this.emit({
+            type: "text_delta",
+            session_id: this.activeSessionId,
+            selection_id: this.activeSelectionId,
+            delta: "STALE_CROSS_SESSION_DELTA",
+          });
+        }
+        this.emit({
+          type: "history",
+          session_id: this.sessionId,
+          selection_id: this.selectionId,
+          reason: "initial",
+          ...(active ? { streaming_at_snapshot: true } : {}),
+          messages: active ? this.activeHistory(opening) : [],
+        });
+        // This delta is newer than the history snapshot and must survive the
+        // attach boundary rather than being cleared by a late synthetic start.
+        if (active) this.emit({ type: "text_delta", delta: conclusion });
+      }
+
+      private emit(payload: Record<string, unknown>): void {
+        this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(payload) }));
+      }
+    }
+
+    (window as unknown as { WebSocket: typeof ReattachWebSocket }).WebSocket = ReattachWebSocket;
+  }, { opening: markers.opening, conclusion: markers.conclusion });
+
+  await openSessionInUi(page, firstSession);
+  await sendPrompt(page, "Exercise active stream reattachment.");
+  await expect(page.getByTestId("chat-streaming")).toContainText(markers.opening);
+
+  await page.getByText(otherSession.title, { exact: true }).click();
+  await expect(page.getByTestId("chat-message-list")).toHaveAttribute("data-transcript-state", "ready");
+  await expect(page.getByTestId("chat-streaming")).toHaveCount(0);
+  await expect(page.locator("body")).not.toContainText("STALE_CROSS_SESSION_DELTA");
+  await page.getByText(firstSession.title, { exact: true }).click();
+
+  const reattachedStream = page.getByTestId("chat-streaming");
+  await expect(reattachedStream).toContainText(markers.opening);
+  await expect(reattachedStream).toContainText(markers.conclusion);
+  await expectMarkerOrder(reattachedStream, [markers.opening, markers.conclusion]);
+  const reattachedText = await reattachedStream.innerText();
+  expect(reattachedText.split(markers.opening).length - 1).toBe(1);
+  expect(reattachedText.split(markers.conclusion).length - 1).toBe(1);
+  await expect(page.locator('[data-testid="chat-message"][data-role="assistant"]')).toHaveCount(0);
+
+  await page.evaluate(() => {
+    (window as unknown as { finishReattachedStream: () => void }).finishReattachedStream();
+  });
+  await expect(reattachedStream).toHaveCount(0);
+  const settledAssistant = page.locator('[data-testid="chat-message"][data-role="assistant"]');
+  await expect(settledAssistant).toHaveCount(1);
+  await expectMarkerOrder(settledAssistant.first(), [markers.opening, markers.conclusion]);
+});
+
 test("preserves chronology when normalizing stored assistant and tool-result messages", async ({ page, request }) => {
   const history = [
     {

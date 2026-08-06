@@ -7,6 +7,7 @@ import { EventEmitter } from "node:events";
 import { AuthStorage, SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   abortInteractiveTurn,
+  appendStreamingMessageToHistory,
   beginInteractiveTurn,
   beginNonBrowserTurn,
   classifyScheduledPromptResult,
@@ -727,6 +728,27 @@ test("action approvals expose only exact pi session identity mappings", () => {
   assert.ok(scope.__pi_action_pi_sessions instanceof Map);
   assert.ok(scope.__pi_action_session_files instanceof Map);
   assert.equal(scope.__pi_action_cwd_sessions, undefined);
+});
+
+test("live history snapshot appends Pi's unpersisted streaming message exactly once", () => {
+  const durable = [{
+    type: "user",
+    id: "synthetic-user",
+    message: { role: "user", content: "Synthetic prompt" },
+  }];
+  const streaming = {
+    role: "assistant",
+    content: [{ type: "text", text: "Partial synthetic response" }],
+    provider: "offline",
+    model: "fixture",
+  };
+
+  const snapshot = appendStreamingMessageToHistory(durable, streaming);
+  assert.equal(snapshot.length, 2);
+  assert.equal(snapshot[0], durable[0], "durable history remains unchanged");
+  assert.equal(snapshot[1]?.type, "assistant");
+  assert.deepEqual((snapshot[1]?.message as any)?.content, streaming.content);
+  assert.equal(appendStreamingMessageToHistory(snapshot, undefined), snapshot);
 });
 
 test("stopped session snapshot parses once for messages and todos and invalidates on fingerprint change", () => {

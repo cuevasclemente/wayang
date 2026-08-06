@@ -128,6 +128,9 @@ export interface PiSessionHandle {
   activeInteractiveTurn?: BrowserTurnProvenance | null;
   /** Browser-local IDs bound to exact pending pi steering message objects. */
   queuedBrowserMessages: Map<string, QueuedBrowserMessageRecord>;
+  /** Latest in-progress Pi message, retained across the pre-persistence message_end gap. */
+  liveStreamingMessage?: any;
+  liveStreamingMessageUnsubscribe?: () => void;
   /** Permanent process-local denial latch; only a fresh handle may regain authority. */
   capabilityAuthorityDenied?: boolean;
 }
@@ -2215,6 +2218,23 @@ export async function createPiSession(
       activeInteractiveTurn: null,
       queuedBrowserMessages: new Map(),
     };
+    handle.liveStreamingMessageUnsubscribe = session.subscribe((event: AgentSessionEvent) => {
+      if (event.type === "message_start" || event.type === "message_update") {
+        handle.liveStreamingMessage = event.message;
+        return;
+      }
+      if (event.type !== "message_end") return;
+      const completedMessage = event.message;
+      handle.liveStreamingMessage = completedMessage;
+      // AgentSession persists message_end immediately after notifying all
+      // listeners. Clear only afterward, and only if a newer message has not
+      // already replaced this one.
+      queueMicrotask(() => {
+        if (handle.liveStreamingMessage === completedMessage) {
+          handle.liveStreamingMessage = undefined;
+        }
+      });
+    });
 
     // No await is permitted between this final fence and publication.
     assertCreationCurrent();
@@ -2858,6 +2878,7 @@ export async function destroyPiSession(id: string): Promise<void> {
     // ignore
   }
   try {
+    handle.liveStreamingMessageUnsubscribe?.();
     handle.session.dispose();
   } catch {
     // ignore
@@ -3701,6 +3722,35 @@ export function getMessageHistory(id: string): SerializedMessage[] {
   if (!handle) return [];
 
   return getSessionManagerTranscript(handle.session.sessionManager);
+}
+
+export function appendStreamingMessageToHistory(
+  history: SerializedMessage[],
+  streamingMessage: any,
+): SerializedMessage[] {
+  const role = typeof streamingMessage?.role === "string" ? streamingMessage.role : undefined;
+  if (!role || !["user", "assistant", "toolResult", "custom"].includes(role)) return history;
+  return [
+    ...history,
+    {
+      type: messageRoleToHistoryType(role),
+      message: serializeMessageValue(streamingMessage),
+    },
+  ];
+}
+
+/**
+ * Capture live transcript state, including the in-progress message that Pi
+ * intentionally has not persisted to SessionManager until message_end.
+ */
+export function getLiveMessageHistory(id: string): SerializedMessage[] {
+  const handle = sessions.get(id);
+  if (!handle) return [];
+  const history = getSessionManagerTranscript(handle.session.sessionManager);
+  return appendStreamingMessageToHistory(
+    history,
+    handle.liveStreamingMessage ?? handle.session.state.streamingMessage,
+  );
 }
 
 export function getTodoState(id: string): SerializedTodoState {

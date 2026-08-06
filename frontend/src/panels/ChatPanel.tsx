@@ -1735,6 +1735,20 @@ function appendStreamingBlock(
   return { content: [...blocks.content, block] };
 }
 
+function combineStreamingBlocks(prefix: StreamingBlocks, continuation: StreamingBlocks): StreamingBlocks {
+  let combined: StreamingBlocks = { content: [...prefix.content] };
+  for (const block of continuation.content) {
+    if (block.type === "text") {
+      combined = appendStreamingDelta(combined, "text", block.text);
+    } else if (block.type === "thinking") {
+      combined = appendStreamingDelta(combined, "thinking", block.thinking);
+    } else {
+      combined = appendStreamingBlock(combined, block);
+    }
+  }
+  return combined;
+}
+
 function streamingBlocksToAssistantMessage(blocks: StreamingBlocks): ChatMessage | null {
   if (blocks.content.length === 0) return null;
   return {
@@ -1744,6 +1758,33 @@ function streamingBlocksToAssistantMessage(blocks: StreamingBlocks): ChatMessage
       content: [...blocks.content],
     },
   };
+}
+
+function trailingActiveStreamPrefix(messages: ChatMessage[]): StreamingBlocks {
+  let suffixStart = messages.length;
+  while (suffixStart > 0) {
+    const type = messages[suffixStart - 1]?.type;
+    if (type !== "assistant" && type !== "toolResult" && type !== "tool_result") break;
+    suffixStart -= 1;
+  }
+  if (suffixStart === messages.length) return { content: [] };
+
+  // An interactive stream follows its accepted user turn. Requiring that
+  // boundary avoids presenting an unrelated historical assistant as live when
+  // a newly-started run has not produced any assistant content yet.
+  let lastUserIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.type !== "user") continue;
+    lastUserIndex = index;
+    break;
+  }
+  if (lastUserIndex < 0 || lastUserIndex >= suffixStart) return { content: [] };
+
+  const assistant = buildDisplayAssistantMessage(messages.slice(suffixStart));
+  const content = assistant?.message?.content;
+  return Array.isArray(content)
+    ? { content: content as StreamingContentBlock[] }
+    : { content: [] };
 }
 
 function makeLocalPendingUserMessage(
@@ -2614,6 +2655,7 @@ export function ChatPanel({
   const [deferredUserMessages, setDeferredUserMessages] = useState<ChatMessage[]>([]);
   const [queuedUserMessages, setQueuedUserMessages] = useState<QueuedUserMessage[]>([]);
   const [streamingBlocks, setStreamingBlocks] = useState<StreamingBlocks>({ content: [] });
+  const [streamingHistoryPrefix, setStreamingHistoryPrefix] = useState<StreamingBlocks>({ content: [] });
   const [inputText, setInputText] = useState("");
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState("");
@@ -2686,10 +2728,14 @@ export function ChatPanel({
   const currentGoalStatus = activeSession?.goal_status ?? null;
   const effectiveAgentProfileId = activeSession?.agent_profile_id ?? activeProject?.default_agent_profile_id ?? null;
   const transcriptOwnedBySelection = Boolean(activeSessionId && messagesOwnerSessionId === activeSessionId);
-  const normalizedOwnedMessages = useMemo(
-    () => transcriptOwnedBySelection ? normalizeMessagesForDisplay(messages) : [],
-    [messages, transcriptOwnedBySelection],
-  );
+  const normalizedOwnedMessages = useMemo(() => {
+    const normalized = transcriptOwnedBySelection ? normalizeMessagesForDisplay(messages) : [];
+    if (streamingHistoryPrefix.content.length === 0 || normalized.at(-1)?.type !== "assistant") return normalized;
+    // The durable snapshot remains intact in messages. Hide only its trailing
+    // assistant presentation while that same content is rendered as the prefix
+    // of the live continuation below.
+    return normalized.slice(0, -1);
+  }, [messages, streamingHistoryPrefix, transcriptOwnedBySelection]);
   const displayMessages = useMemo(
     () => normalizedOwnedMessages.slice(visibleMessageStart),
     [normalizedOwnedMessages, visibleMessageStart],
@@ -2816,6 +2862,7 @@ export function ChatPanel({
   }>());
   const deferredUserMessagesRef = useRef<ChatMessage[]>([]);
   const streamingBlocksRef = useRef<StreamingBlocks>({ content: [] });
+  const streamingHistoryPrefixRef = useRef<StreamingBlocks>({ content: [] });
   const interviewQueueRef = useRef<QueuedInterview[]>([]);
   const externalActionApprovalsRef = useRef<ExternalActionApprovalRequest[]>([]);
   const poisonedExternalActionKeysRef = useRef<Set<string>>(new Set());
@@ -2889,6 +2936,11 @@ export function ChatPanel({
       : updater;
     streamingBlocksRef.current = next;
     setStreamingBlocks(next);
+  }, []);
+
+  const setStreamingHistoryPrefixSynced = useCallback((next: StreamingBlocks) => {
+    streamingHistoryPrefixRef.current = next;
+    setStreamingHistoryPrefix(next);
   }, []);
 
   const setQueuedMessagesSynced = useCallback((updater: (prev: QueuedUserMessage[]) => QueuedUserMessage[]) => {
@@ -2968,7 +3020,8 @@ export function ChatPanel({
 
   const hasActiveAssistantOutput = useCallback(() => {
     const blocks = streamingBlocksRef.current;
-    return isStreamingRef.current || blocks.content.length > 0;
+    const prefix = streamingHistoryPrefixRef.current;
+    return isStreamingRef.current || prefix.content.length > 0 || blocks.content.length > 0;
   }, []);
 
   const insertAcceptedUsersAfterActiveStreaming = useCallback((userMessages: ChatMessage[]) => {
@@ -2983,20 +3036,24 @@ export function ChatPanel({
     });
     // Keep the agent running flag intact, but start a fresh live accumulator so
     // post-steering thinking/text/tool deltas render below the accepted user
-    // message instead of continuing the pre-message content above it.
+    // message instead of continuing the pre-message content above it. The
+    // snapshot prefix is already durable in messages, so stop rendering its
+    // live presentation before inserting the accepted user.
+    setStreamingHistoryPrefixSynced({ content: [] });
     setStreamingBlocksSynced({ content: [] });
-  }, [setStreamingBlocksSynced]);
+  }, [setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
 
   const appendRuntimeError = useCallback((message: string) => {
     const trimmed = message.trim() || "Unknown error";
     setRuntimeError({ message: trimmed, timestamp: Date.now() });
+    setStreamingHistoryPrefixSynced({ content: [] });
     setMessages((prev) => {
       const last = prev[prev.length - 1];
       if (last?.type === "error" && last.error === trimmed) return prev;
       return [...prev, { type: "error", error: trimmed }];
     });
     onSessionChange?.();
-  }, [onSessionChange]);
+  }, [onSessionChange, setStreamingHistoryPrefixSynced]);
 
   const clearRuntimeError = useCallback(() => {
     setRuntimeError(null);
@@ -3120,7 +3177,7 @@ export function ChatPanel({
     if (isScrolledToBottom(container)) {
       scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [messages, deferredUserMessages, streamingBlocks, interviewQueue, externalActionApprovals, activeSudoPrompt, activeCommandGuardPinPrompt, activeTurnScrollAnchorText]);
+  }, [messages, deferredUserMessages, streamingBlocks, streamingHistoryPrefix, interviewQueue, externalActionApprovals, activeSudoPrompt, activeCommandGuardPinPrompt, activeTurnScrollAnchorText]);
 
   // ------------------------------------------------------------------
   // WS connection
@@ -3429,6 +3486,14 @@ export function ChatPanel({
           return;
         }
 
+        // Every live event emitted by the current backend is correlated to the
+        // session selection that subscribed to it. Ignore an A event already
+        // queued in the browser when React has switched the durable socket to B.
+        if (
+          (typeof msg.session_id === "string" && msg.session_id !== activeSessionIdRef.current)
+          || (typeof msg.selection_id === "string" && msg.selection_id !== selectionIdRef.current)
+        ) return;
+
         // Handle history (replace, don't append)
         if (msg.type === "history") {
           if (msg.session_id !== activeSessionIdRef.current || msg.selection_id !== selectionIdRef.current) {
@@ -3440,10 +3505,23 @@ export function ChatPanel({
             // settled snapshot is actually available, then replace it atomically
             // with durable history rather than briefly rendering both copies.
             setStreamingBlocksSynced({ content: [] });
+            setStreamingHistoryPrefixSynced({ content: [] });
           }
           const historyMessages: ChatMessage[] = Array.isArray(msg.messages)
             ? msg.messages
             : [];
+          if (typeof msg.streaming_at_snapshot === "boolean") {
+            // A live-session history payload is an authoritative snapshot
+            // boundary. Reset transient post-snapshot deltas, preserve the raw
+            // history, and present its trailing assistant/tool group as the
+            // prefix of subsequent live events.
+            setStreamingBlocksSynced({ content: [] });
+            setStreamingHistoryPrefixSynced(
+              msg.streaming_at_snapshot ? trailingActiveStreamPrefix(historyMessages) : { content: [] },
+            );
+            isStreamingRef.current = msg.streaming_at_snapshot;
+            setIsStreaming(msg.streaming_at_snapshot);
+          }
           chatWsProfile("message_history", {
             sessionId: msg.session_id,
             selectionId: msg.selection_id,
@@ -3521,12 +3599,19 @@ export function ChatPanel({
 
         // Tool execution
         if (msg.type === "tool_execution_start") {
-          setStreamingBlocksSynced((prev) => appendStreamingBlock(prev, {
-            type: "tool_use",
-            id: typeof msg.tool_call_id === "string" ? msg.tool_call_id : undefined,
-            name: msg.tool_name || "unknown",
-            input: msg.input || {},
-          }));
+          const toolCallId = typeof msg.tool_call_id === "string" ? msg.tool_call_id : undefined;
+          const alreadyInSnapshot = Boolean(toolCallId) && [
+            ...streamingHistoryPrefixRef.current.content,
+            ...streamingBlocksRef.current.content,
+          ].some((block) => block.type === "tool_use" && block.id === toolCallId);
+          if (!alreadyInSnapshot) {
+            setStreamingBlocksSynced((prev) => appendStreamingBlock(prev, {
+              type: "tool_use",
+              id: toolCallId,
+              name: msg.tool_name || "unknown",
+              input: msg.input || {},
+            }));
+          }
           return;
         }
 
@@ -3576,6 +3661,7 @@ export function ChatPanel({
             setRuntimeError({ message: turnError, timestamp: Date.now() });
           }
 
+          setStreamingHistoryPrefixSynced({ content: [] });
           setStreamingBlocksSynced({ content: [] });
           // Pi can retry or compact after agent_end. Keep the top-level run
           // active until agent_settled so a prompt sent in that interval stays
@@ -4046,6 +4132,7 @@ export function ChatPanel({
               if (hasActiveAssistantOutput() && wasQueuedForNextTurn) {
                 insertAcceptedUsersAfterActiveStreaming([userMessage]);
               } else {
+                setStreamingHistoryPrefixSynced({ content: [] });
                 setMessages((prev) => upsertUserMessage(prev, userMessage));
               }
             }
@@ -4065,6 +4152,7 @@ export function ChatPanel({
               }));
             }
             if (msg.type === "message_end" && message.display !== false) {
+              setStreamingHistoryPrefixSynced({ content: [] });
               setMessages((prev) => [
                 ...prev,
                 { type: "custom", message },
@@ -4101,6 +4189,9 @@ export function ChatPanel({
             setResendingMessageId(null);
             appendRuntimeError(String(msg.error || "Unknown error"));
             return;
+          }
+          if (msg.type === "user" || msg.type === "system" || msg.type === "custom") {
+            setStreamingHistoryPrefixSynced({ content: [] });
           }
           setMessages((prev) => msg.type === "user" ? upsertUserMessage(prev, msg) : [...prev, msg]);
           return;
@@ -4285,6 +4376,7 @@ export function ChatPanel({
     setIsCompacting(false);
     setCommandGuardState(null);
     setCommandGuardSaving(false);
+    setStreamingHistoryPrefixSynced({ content: [] });
     setStreamingBlocksSynced({ content: [] });
 
     if (hasOpenSocket) {
@@ -4301,7 +4393,7 @@ export function ChatPanel({
       chatWsProfile("invoke_connect", { activeSessionId });
       connectRef.current();
     }
-  }, [activeSessionId, sendWs, clearExternalActionAuthority, clearQueuedAndDeferredUserMessages, setExternalActionApprovalsSynced, setInterviewQueueSynced, setStreamingBlocksSynced]);
+  }, [activeSessionId, sendWs, clearExternalActionAuthority, clearQueuedAndDeferredUserMessages, setExternalActionApprovalsSynced, setInterviewQueueSynced, setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
 
   // Mark a sent response retryable when a connected socket never returns the
   // required durable acknowledgement. This does not resend in a loop; the
@@ -5204,7 +5296,8 @@ export function ChatPanel({
       : `Command guard: ${commandGuardMode}${commandGuardState?.source ? ` (${commandGuardState.source})` : ""}${commandGuardRoute}`);
 
   // Streaming content for live rendering
-  const hasStreamingContent = streamingBlocks.content.length > 0;
+  const displayedStreamingBlocks = combineStreamingBlocks(streamingHistoryPrefix, streamingBlocks);
+  const hasStreamingContent = displayedStreamingBlocks.content.length > 0;
   const isAgentRunning = isStreaming || hasStreamingContent || isCompacting;
   const isTranscriptLoading = !transcriptOwnedBySelection || isSessionHistoryLoading || wsStatus === "connecting";
   // ------------------------------------------------------------------
@@ -5614,7 +5707,7 @@ export function ChatPanel({
               Streaming...
             </div>
             <div className="space-y-2">
-              {renderAssistantContentBlocks(streamingBlocks.content)}
+              {renderAssistantContentBlocks(displayedStreamingBlocks.content)}
             </div>
           </div>
         )}
