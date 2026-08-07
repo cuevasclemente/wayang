@@ -241,12 +241,15 @@ const cwdToSessionId = new Map<string, string>();
 /** Maps canonical pi SessionManager IDs/files → web sessionId for thread-scoped bridges. */
 const piSessionToWebSessionId = new Map<string, string>();
 const piSessionFileToWebSessionId = new Map<string, string>();
+/** Exact SessionManager-object ownership survives duplicate ID/file collisions. */
+const piSessionManagerToWebSessionId = new WeakMap<object, string>();
 (globalThis as any).__pi_interview_cwd_sessions = cwdToSessionId;
 (globalThis as any).__pi_interview_pi_sessions = piSessionToWebSessionId;
 (globalThis as any).__pi_interview_session_files = piSessionFileToWebSessionId;
 (globalThis as any).__pi_sudo_cwd_sessions = cwdToSessionId;
 (globalThis as any).__pi_sudo_pi_sessions = piSessionToWebSessionId;
 (globalThis as any).__pi_sudo_session_files = piSessionFileToWebSessionId;
+(globalThis as any).__pi_sudo_session_managers = piSessionManagerToWebSessionId;
 (globalThis as any).__pi_command_guard_cwd_sessions = cwdToSessionId;
 (globalThis as any).__pi_command_guard_pi_sessions = piSessionToWebSessionId;
 (globalThis as any).__pi_command_guard_session_files = piSessionFileToWebSessionId;
@@ -2394,6 +2397,15 @@ export async function createPiSession(
     runtimeOptions.testHooks?.onPrivilegedEffect?.("handle_publication");
     assertCreationCurrent();
     sessions.set(id, handle);
+    // Publish exact object ownership before advertising the runtime. The sudo
+    // broker fails closed on an unmapped manager whenever this map exists, so
+    // colliding legacy ID/file keys cannot redirect an approval to another
+    // live Wayang thread.
+    cwdToSessionId.set(cwd, id);
+    piSessionManagerToWebSessionId.set(sessionManager, id);
+    piSessionToWebSessionId.set(sessionManager.getSessionId(), id);
+    const canonicalSessionFile = sessionManager.getSessionFile();
+    if (canonicalSessionFile) piSessionFileToWebSessionId.set(canonicalSessionFile, id);
     standardResourcesRuntimePublished = true;
     protectedAutomationRuntimePublished = true;
     fileAudioExperimentRuntimePublished = true;
@@ -2407,10 +2419,6 @@ export async function createPiSession(
       sessionId: id,
       bashMode: handle.bashMode,
     } satisfies PiSessionRuntimeEvent);
-    cwdToSessionId.set(cwd, id);
-    piSessionToWebSessionId.set(sessionManager.getSessionId(), id);
-    const canonicalSessionFile = sessionManager.getSessionFile();
-    if (canonicalSessionFile) piSessionFileToWebSessionId.set(canonicalSessionFile, id);
     ensureIdleCleanupTimer();
     return handle;
   })().catch(async (error) => {
@@ -3055,7 +3063,10 @@ export async function destroyPiSession(id: string): Promise<void> {
   if (handle.sessionFile) invalidateSessionFileSnapshot(handle.sessionFile);
   sessions.delete(id);
   maybeStopIdleCleanupTimer();
-  // Clean up web-session lookup mappings.
+  // Clean up web-session lookup mappings. Exact object ownership is removed
+  // synchronously so a stale tool context cannot fall through to colliding
+  // legacy ID/file maps during teardown.
+  piSessionManagerToWebSessionId.delete(handle.session.sessionManager);
   for (const [cwd, sid] of cwdToSessionId) {
     if (sid === id) cwdToSessionId.delete(cwd);
   }
