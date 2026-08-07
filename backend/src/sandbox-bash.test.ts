@@ -242,7 +242,8 @@ test("per-exec bash sandbox denies protected files and capabilities while allowi
   assert.ok(policy.deniedReadRoots.includes(fs.realpathSync(identityPinFile)));
   assert.ok(policy.deniedWriteRoots.includes(fs.realpathSync(identityPinFile)));
   assert.ok(policy.deniedReadRoots.includes(fs.realpathSync(path.join(projectA, ".pi", "browser-workbench"))));
-  assert.ok(policy.deniedReadRoots.includes("/proc"));
+  if (fs.existsSync("/proc")) assert.ok(policy.deniedReadRoots.includes(fs.realpathSync("/proc")));
+  else assert.equal(policy.deniedReadRoots.includes("/proc"), false);
   assert.ok(policy.deniedReadRoots.includes(fs.realpathSync(LEGACY_ATTACHMENT_ROOT)));
   assert.ok(policy.deniedWriteRoots.includes(fs.realpathSync(LEGACY_ATTACHMENT_ROOT)));
   assert.deepEqual(new Set(policy.config.filesystem.allowRead), new Set([fs.realpathSync(ownAttachmentRoot)]));

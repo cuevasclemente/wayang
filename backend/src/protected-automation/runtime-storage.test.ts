@@ -169,6 +169,24 @@ test("diagnostics stay outside child mounts and global, pair, and job quotas fai
   } finally { f.cleanup(); }
 });
 
+test("strict purge retirement reports residual failure and startup reconciliation removes it", () => {
+  const f = fixture();
+  try {
+    const owner = job();
+    const row = run(owner, "run-strict-retirement");
+    const roots = f.storage.prepareRun(owner, row);
+    fs.chmodSync(path.join(path.dirname(roots.runRoot), "OWNER.json"), 0o600);
+    const jobIdentity = { projectId: owner.project_id, agentProfileId: owner.agent_profile_id, jobId: owner.id };
+    assert.throws(
+      () => f.storage.retireJob(jobIdentity, new Set(), []),
+      /runtime artifact owner is unreadable/i,
+    );
+    assert.equal(f.storage.hasRunStorage(row.id), true, "failed verified retirement never reports absence");
+    f.storage.reconcile([], []);
+    assert.equal(f.storage.hasRunStorage(row.id), false, "startup orphan reconciliation removes the residual tree");
+  } finally { f.cleanup(); }
+});
+
 test("job retirement defers while active and removes private storage after the active set clears", () => {
   const f = fixture();
   try {

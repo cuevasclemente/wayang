@@ -19,6 +19,8 @@ function automationJob(overrides: Overrides = {}) {
     entrypoint: "automation.mjs",
     argv_count: 2,
     uses_browser_profile: false,
+    browser_profile: { supported: false, saved: false, last_saved_at: null as number | null },
+    purge_request: null as null | { request_id: string; job_id: string; state: "awaiting_owner_pin"; requested_at: number; expires_at: number },
     allowed_https_origins: [] as string[],
     cron_expr: "15 4 * * 1",
     timeout_ms: 12 * 60_000,
@@ -120,6 +122,7 @@ async function installMocks(page: Page, options: {
   detailJobs?: AutomationJob[];
   runs?: AutomationRun[];
   preparation?: MockState["preparation"];
+  purgeCommitCleanupPending?: boolean;
 } = {}): Promise<MockState> {
   const catalogJobs = options.catalogJobs ?? [];
   const details = options.detailJobs ?? catalogJobs;
@@ -144,6 +147,26 @@ async function installMocks(page: Page, options: {
     }
     if (request.method() === "GET" && pathname === "/api/protected-automations/jobs") {
       return fulfillJson(route, { jobs: state.catalogJobs });
+    }
+
+    const preparationNavigation = /^\/api\/protected-automations\/sources\/([^/]+)\/jobs\/([^/]+)\/preparations\/([^/]+)\/navigate$/u.exec(pathname);
+    if (request.method() === "POST" && preparationNavigation && state.preparation) {
+      const [sourceSessionId, selectedJobId, preparationId] = preparationNavigation.slice(1).map(decodeURIComponent);
+      const selectedJob = state.detailJobs.get(selectedJobId)!;
+      return fulfillJson(route, {
+        preparation_id: preparationId,
+        source_session_id: sourceSessionId,
+        job_id: selectedJobId,
+        job_revision: selectedJob.revision,
+        state: "ready",
+        websocket_path: state.preparation.websocketPath,
+        project_id: selectedJob.project_id,
+        agent_profile_id: selectedJob.agent_profile_id,
+        capability_revision: selectedJob.capability_revision,
+        source_revision: selectedJob.source_revision,
+        allowed_https_origins: selectedJob.allowed_https_origins,
+        credential_broker: { supported: false, guarded: true },
+      });
     }
 
     const preparation = /^\/api\/protected-automations\/sources\/([^/]+)\/jobs\/([^/]+)\/preparations\/([^/]+)$/u.exec(pathname);
@@ -220,6 +243,12 @@ async function installMocks(page: Page, options: {
       state.catalogJobs = state.catalogJobs.filter((candidate) => candidate.id !== selectedJobId);
       state.detailJobs.delete(selectedJobId);
       state.runs.delete(selectedJobId);
+      if (options.purgeCommitCleanupPending) {
+        return fulfillJson(route, {
+          error: "Purge committed, but private cleanup is pending and will retry at startup",
+          code: "purge_committed_cleanup_pending",
+        }, 503);
+      }
       return fulfillJson(route, { purged_job_id: selectedJobId, purged_run_ids: purgedRunIds });
     }
     if (request.method() === "DELETE" && pathname.includes("/purge-requests/")) {
@@ -356,6 +385,7 @@ test("uses only backend-issued source-bound preparation HTTP and viewer routes",
     enabled: false,
     blocked_reason: "paused",
     uses_browser_profile: true,
+    browser_profile: { supported: true, saved: true, last_saved_at: NOW - 60_000 },
     allowed_https_origins: ["https://synthetic.example.test"],
   });
   const state = await installMocks(page, {
@@ -363,15 +393,25 @@ test("uses only backend-issued source-bound preparation HTTP and viewer routes",
     detailJobs: [browserJob],
     preparation: { sourceSessionId, jobId: JOB_ID, preparationId, websocketPath },
   });
-  let openedViewerUrl: string | null = null;
+  const openedViewerUrls: string[] = [];
+  const viewerMessages: Array<Record<string, unknown>> = [];
   await page.routeWebSocket("**/ws/protected-automations/preparations/**", (socket) => {
-    openedViewerUrl = socket.url();
-    setTimeout(() => socket.send(JSON.stringify({
-      type: "frame",
-      dataUrl: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
-      metadata: { deviceWidth: 1, deviceHeight: 1 },
-      sessionId: 1,
-    })), 10);
+    openedViewerUrls.push(socket.url());
+    socket.onMessage((message) => {
+      if (typeof message !== "string") return;
+      try { viewerMessages.push(JSON.parse(message) as Record<string, unknown>); } catch { /* exact client parser owns rejection */ }
+    });
+    setTimeout(() => {
+      socket.send(JSON.stringify({ type: "ready" }));
+      for (const sessionId of [1, 2, 3]) {
+        socket.send(JSON.stringify({
+          type: "frame",
+          dataUrl: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
+          metadata: { deviceWidth: 1, deviceHeight: 1 },
+          sessionId,
+        }));
+      }
+    }, 10);
   });
 
   await openAutomation(page, JOB_ID);
@@ -381,8 +421,41 @@ test("uses only backend-issued source-bound preparation HTTP and viewer routes",
 
   await expect(page.getByTestId("protected-automation-preparation-state")).toContainText("state: ready");
   await expect(page.getByTestId("protected-automation-viewer")).toBeVisible();
+  await expect(page.getByTestId("protected-automation-browser-profile-state")).toContainText("saved");
+  await expect(page.getByTestId("protected-automation-browser-profile-state")).toContainText("Last saved");
+  await expect(page.getByTestId("protected-automation-preparation-close")).toHaveText("Save & close preparation");
+  await expect(page.getByText("Preparation viewer connected")).toBeVisible();
+  await expect.poll(() => viewerMessages
+    .filter((message) => message.type === "frame-ack")
+    .map((message) => Number(message.sessionId)).sort()).toEqual([1, 2, 3]);
+  await page.getByTestId("protected-automation-preparation-open-0").click();
+  await page.getByTestId("protected-automation-viewer-paste-open").click();
+  await page.getByTestId("protected-automation-viewer-paste-capture").evaluate((element) => {
+    const clipboard = new DataTransfer();
+    clipboard.setData("text/plain", "synthetic-human-paste");
+    element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, clipboardData: clipboard }));
+  });
+  await expect(page.getByTestId("protected-automation-viewer-paste-capture")).toHaveCount(0);
+  await expect(page.getByText("Clipboard text was sent to the focused browser field.")).toBeVisible();
+  await expect.poll(() => viewerMessages.find((message) => message.type === "paste")).toEqual({
+    type: "paste",
+    text: "synthetic-human-paste",
+  });
+  await expect.poll(() => state.requests.find((candidate) => candidate.pathname.endsWith("/navigate"))?.body).toEqual({
+    url: "https://synthetic.example.test/",
+  });
   const frontendOrigin = `http://127.0.0.1:${process.env.WAYANG_E2E_FRONTEND_PORT || "15173"}`;
-  await expect.poll(() => openedViewerUrl).toBe(`${frontendOrigin.replace(/^http/u, "ws")}${websocketPath}`);
+  await expect.poll(() => openedViewerUrls[0]).toBe(`${frontendOrigin.replace(/^http/u, "ws")}${websocketPath}`);
+
+  // React's development StrictMode may perform one immediate mount probe. Once
+  // that settles, the panel's four-second refresh must not reconnect the viewer
+  // or let a stale probe socket taint the active connection's state.
+  await page.waitForTimeout(500);
+  const settledConnectionCount = openedViewerUrls.length;
+  expect(settledConnectionCount).toBeGreaterThanOrEqual(1);
+  await page.waitForTimeout(4_500);
+  expect(openedViewerUrls).toHaveLength(settledConnectionCount);
+  await expect(page.getByText("Preparation viewer websocket error")).toHaveCount(0);
 
   const preparationRequest = state.requests.find((candidate) => candidate.pathname.includes("/preparations/"));
   expect(preparationRequest?.pathname).toBe(
@@ -400,6 +473,13 @@ test("requires request then one-use PIN commit before purging a tombstoned job",
     blocked_reason: "tombstoned",
     deleted_at: NOW - 1_000,
     next_run_at: null,
+    purge_request: {
+      request_id: "synthetic-agent-purge-intent",
+      job_id: JOB_ID,
+      state: "awaiting_owner_pin",
+      requested_at: NOW - 500,
+      expires_at: NOW + 30 * 60_000,
+    },
   });
   const state = await installMocks(page, {
     catalogJobs: [tombstoned],
@@ -408,6 +488,8 @@ test("requires request then one-use PIN commit before purging a tombstoned job",
   });
   await openAutomation(page, JOB_ID);
 
+  await expect(page.getByTestId("protected-automation-agent-purge-request")).toContainText("awaits your identity PIN");
+  await expect(page.getByTestId("protected-automation-purge-request")).toHaveText("Review purge request");
   await page.getByTestId("protected-automation-purge-request").click();
   const dialog = page.getByTestId("protected-automation-purge-dialog");
   await expect(dialog).toBeVisible();
@@ -426,6 +508,35 @@ test("requires request then one-use PIN commit before purging a tombstoned job",
     expect.objectContaining({ method: "POST", body: { pin: "12345678" } }),
   );
   expect(state.scheduledRequests.filter((candidate) => candidate.method !== "GET")).toEqual([]);
+});
+
+test("truthfully reports a committed purge whose private cleanup is pending", async ({ page }) => {
+  const tombstoned = automationJob({
+    name: "Synthetic pending-cleanup purge",
+    revision: 20,
+    enabled: false,
+    blocked_reason: "tombstoned",
+    deleted_at: NOW - 1_000,
+    next_run_at: null,
+  });
+  await installMocks(page, {
+    catalogJobs: [tombstoned],
+    detailJobs: [tombstoned],
+    runs: [automationRun({ status: "completed", finished_at: NOW - 2_000, outcome_code: "completed", exit_code: 0 })],
+    purgeCommitCleanupPending: true,
+  });
+  await openAutomation(page, JOB_ID);
+  await page.getByTestId("protected-automation-purge-request").click();
+  const dialog = page.getByTestId("protected-automation-purge-dialog");
+  await dialog.getByTestId("protected-automation-purge-pin").fill("12345678");
+  await dialog.getByTestId("protected-automation-purge-commit").click();
+
+  await expect(dialog).toBeHidden();
+  await expect(page.getByTestId("protected-automation-purge-cleanup-pending")).toContainText(
+    "Purge committed. Private cleanup is pending",
+  );
+  await expect(page.getByText(/Purge was not completed/i)).toHaveCount(0);
+  await expect(page.getByTestId("protected-automations-empty")).toBeVisible();
 });
 
 test("keeps protected controls usable without horizontal overflow on mobile", async ({ page }) => {

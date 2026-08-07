@@ -379,7 +379,8 @@ export function enqueueProtectedAutomationRun(input: { jobId: string; expectedRe
   const committed = commitStoreMutation((draft) => {
     const job = draft.protectedAutomationJobs.find((candidate) => candidate.id === input.jobId);
     if (!job) throw new WorkspaceStoreError("Protected automation job not found", 404);
-    if (job.revision !== input.expectedRevision || !job.enabled || job.deleted_at !== null) throw new WorkspaceStoreError("Protected automation job revision conflict or job is paused", 409);
+    if (job.revision !== input.expectedRevision || job.deleted_at !== null) throw new WorkspaceStoreError("Protected automation job revision conflict", 409);
+    if (!job.enabled) throw new WorkspaceStoreError("Protected automation job is paused", 409);
     requireCurrentPair(draft, job.project_id, job.agent_profile_id, job.capability_revision);
     const active = draft.protectedAutomationRuns.some((run) => run.job_id === job.id && (run.status === "queued" || run.status === "running"));
     return cloneRun(createRunDraft(draft, job, { trigger: input.trigger, scheduledFor: input.scheduledFor, occurrenceKey: input.occurrenceKey,

@@ -88,13 +88,7 @@ export class ProtectedAutomationManager {
     this.started = true;
     try {
       const recovered = recoverProtectedAutomationRuns(this.now());
-      const store = getStore();
-      this.runtimeStorage.reconcile(store.protectedAutomationJobs, store.protectedAutomationRuns, (job, run) => (
-        job.project_id === run.project_id && job.agent_profile_id === run.agent_profile_id
-        && job.revision === run.job_revision && job.capability_revision === run.capability_revision
-        && (run.status !== "needs_user" || run.outcome_code?.startsWith("needs_user:") === true)
-        && executionHandleIsCurrent(job)
-      ));
+      this.reconcileRuntimeStorage();
       for (const run of recovered.queued) this.dispatch(run.id);
       return { queued: recovered.queued.length, interrupted: recovered.interrupted };
     } catch (error) {
@@ -182,16 +176,30 @@ export class ProtectedAutomationManager {
 
   hasRunStorage(runId: string): boolean { return this.runtimeStorage.hasRunStorage(runId); }
 
-  retireJobStorage(identity: { projectId: string; agentProfileId: string; jobId: string }): boolean {
-    return this.runtimeStorage.retireJob(identity, this.activeRunIdsForJob(identity.jobId));
+  reconcileRuntimeStorage(): void {
+    const store = getStore();
+    this.runtimeStorage.reconcile(store.protectedAutomationJobs, store.protectedAutomationRuns, (job, run) => (
+      job.project_id === run.project_id && job.agent_profile_id === run.agent_profile_id
+      && job.revision === run.job_revision && job.capability_revision === run.capability_revision
+      && (run.status !== "needs_user" || run.outcome_code?.startsWith("needs_user:") === true)
+      && executionHandleIsCurrent(job)
+    ));
+  }
+
+  retireJobStorage(
+    identity: { projectId: string; agentProfileId: string; jobId: string },
+    knownRunIds: readonly string[] = [],
+  ): boolean {
+    return this.runtimeStorage.retireJob(identity, this.activeRunIdsForJob(identity.jobId), knownRunIds);
   }
 
   private requireEffectiveJob(jobId: string, expectedRevision: number): ProtectedAutomationJobRow {
     const job = getProtectedAutomationJob(jobId);
     if (!job) throw new WorkspaceStoreError("Protected automation job not found", 404);
-    if (!job.enabled || job.revision !== expectedRevision || job.deleted_at !== null) {
-      throw new WorkspaceStoreError("Protected automation job revision conflict or job is paused", 409);
+    if (job.revision !== expectedRevision || job.deleted_at !== null) {
+      throw new WorkspaceStoreError("Protected automation job revision conflict", 409);
     }
+    if (!job.enabled) throw new WorkspaceStoreError("Protected automation job is paused", 409);
     return job;
   }
 

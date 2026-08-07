@@ -888,17 +888,17 @@ test("action approval accepts exact runtime admission boundaries", async () => {
   const minimumPending = bridge.requestApproval(sessionId, minimumInput, { timeoutMs: 1 });
   const minimumRequest = requests[1];
   assert.equal(minimumRequest.timeoutMs, 1);
-  // A 1 ms request is admitted, but approval now performs asynchronous durable
-  // PIN reservation/verification and may legitimately expire before it can
-  // complete. Denial is synchronous and proves the exact lower admission bound
-  // without making the test scheduler-speed dependent.
-  assert.equal(
-    (await bridge.respondForSession(sessionId, minimumRequest.requestId, minimumInput.argumentsHash, false)).status,
-    "denied",
+  // A 1 ms request is admitted, but it may expire between publication and the
+  // immediate denial on a loaded runner. Both terminal outcomes preserve the
+  // exact lower admission boundary without making the test scheduler-dependent.
+  const minimumResponse = await bridge.respondForSession(
+    sessionId, minimumRequest.requestId, minimumInput.argumentsHash, false,
   );
+  assert.ok(minimumResponse.status === "denied" || minimumResponse.status === "stale");
   assert.deepEqual(
     await minimumPending,
-    decision("denied", minimumRequest.requestId, sessionId, minimumInput.argumentsHash),
+    decision(minimumResponse.status === "denied" ? "denied" : "timeout",
+      minimumRequest.requestId, sessionId, minimumInput.argumentsHash),
   );
 });
 

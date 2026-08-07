@@ -15,6 +15,8 @@ import { createProtectedAutomationServices, type ProtectedAutomationServices } f
 import {
   ProtectedAutomationBrowserRealmRegistry,
   protectedAutomationBrowserRealmRoot,
+  reconcileProtectedAutomationBrowserRealmPurges,
+  type ProtectedAutomationBrowserProfileState,
 } from "./browser-realm.js";
 import { ProtectedAutomationBrowserRpc } from "./browser-rpc.js";
 import {
@@ -27,6 +29,11 @@ import {
 } from "./browser-preparation.js";
 import { protectedAutomationJobAuthorityIsCurrent, type ProtectedAutomationBinding } from "./authority.js";
 import {
+  installProtectedAutomationPurgeIntentPort,
+  type ProtectedAutomationPurgeIntentPublicState,
+  type ProtectedAutomationPurgeIntentPort,
+} from "./purge-intent.js";
+import {
   getProtectedAutomationJob,
   listProtectedAutomationActiveRuns,
   listProtectedAutomationJobs,
@@ -34,16 +41,24 @@ import {
   purgeTombstonedProtectedAutomationJob,
   transitionProtectedAutomationJobLifecycle,
 } from "./store.js";
-import { stageProtectedAutomationSnapshotJobPurge } from "./snapshots.js";
+import {
+  reconcileProtectedAutomationSnapshots,
+  stageProtectedAutomationSnapshotJobPurge,
+} from "./snapshots.js";
 import type { ProtectedAutomationJobRow, ProtectedAutomationRunRow } from "./types.js";
 
 const PREPARATION_TTL_MS = 30 * 60 * 1_000;
 const PURGE_TTL_MS = 2 * 60 * 1_000;
+const PURGE_INTENT_TTL_MS = 30 * 60 * 1_000;
+const MAX_PURGE_INTENTS = 50;
 const PURGE_REALM = "wayang.protected-automation-purge.v1";
 const SETTLE_TIMEOUT_MS = 10_000;
 const SETTLE_INTERVAL_MS = 50;
+const PREPARATION_PASTE_MAX_CHARS = 4_096;
+const PREPARATION_PASTE_MAX_BYTES = 16_384;
 
 export interface ProtectedAutomationViewerTransport {
+  start(): Promise<void>;
   dispatch(message: Buffer, isBinary: boolean): Promise<void>;
   close(): Promise<void>;
   onMessage(listener: (message: Buffer, isBinary: boolean) => void): () => void;
@@ -114,6 +129,23 @@ function error(message: string, statusCode = 403): Error {
   return Object.assign(new Error(message), { statusCode });
 }
 
+const DIAGNOSTIC_CODE_PATTERN = /^[a-z0-9-]{1,64}$/u;
+
+function diagnosticError(code: string): Error {
+  const bounded = DIAGNOSTIC_CODE_PATTERN.test(code) ? code : "unclassified";
+  return Object.assign(error("Preparation viewer transport failed", 503), {
+    protectedAutomationDiagnosticCode: bounded,
+  });
+}
+
+/** Extract only a bounded internal stage code; never release raw error text. */
+export function protectedAutomationDiagnosticCode(value: unknown): string {
+  const code = value && typeof value === "object" && "protectedAutomationDiagnosticCode" in value
+    ? (value as { protectedAutomationDiagnosticCode?: unknown }).protectedAutomationDiagnosticCode
+    : undefined;
+  return typeof code === "string" && DIAGNOSTIC_CODE_PATTERN.test(code) ? code : "unclassified";
+}
+
 function publicRun(row: ProtectedAutomationRunRow) {
   return {
     id: row.id,
@@ -133,7 +165,11 @@ function publicRun(row: ProtectedAutomationRunRow) {
   };
 }
 
-function publicJob(row: ProtectedAutomationJobRow) {
+function publicJob(
+  row: ProtectedAutomationJobRow,
+  profileState: ProtectedAutomationBrowserProfileState = { saved: false, lastSavedAt: null },
+  purgeIntent: ProtectedAutomationPurgeIntentPublicState | null = null,
+) {
   const latestAttention = listProtectedAutomationRuns(row.id, 1)[0];
   return {
     id: row.id,
@@ -147,6 +183,12 @@ function publicJob(row: ProtectedAutomationJobRow) {
     entrypoint: row.entrypoint,
     argv_count: row.argv.length,
     uses_browser_profile: row.uses_browser_profile,
+    browser_profile: {
+      supported: row.uses_browser_profile,
+      saved: row.uses_browser_profile && profileState.saved,
+      last_saved_at: row.uses_browser_profile ? profileState.lastSavedAt : null,
+    },
+    purge_request: purgeIntent,
     allowed_https_origins: [...row.allowed_https_origins],
     cron_expr: row.cron_expr,
     timeout_ms: row.timeout_ms,
@@ -232,14 +274,35 @@ function keyCodeFor(key: string): number | undefined {
     ArrowRight: 39, ArrowDown: 40, Delete: 46 } as Record<string, number>)[key];
 }
 
+function exactPreparationPasteText(value: unknown): string {
+  if (typeof value !== "string" || !value || value.length > PREPARATION_PASTE_MAX_CHARS
+    || Buffer.byteLength(value, "utf8") > PREPARATION_PASTE_MAX_BYTES || value.includes("\0")) {
+    throw error("Preparation paste text is invalid", 400);
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) throw error("Preparation paste text is invalid", 400);
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw error("Preparation paste text is invalid", 400);
+    }
+  }
+  return value;
+}
+
 async function createPreparationViewer(context: ProtectedAutomationPreparationViewerContext): Promise<{
   transport: ProtectedAutomationViewerTransport;
   registration: { id: string; close(): Promise<void> };
 }> {
   const attach = context.runtime.attachPageCdpViewer;
-  if (typeof attach !== "function") throw error("Preparation viewer transport is unavailable", 503);
-  await context.assertAuthorized();
-  const attachment = await attach.call(context.runtime);
+  if (typeof attach !== "function") throw diagnosticError("viewer-attach-unavailable");
+  try { await context.assertAuthorized(); }
+  catch { throw diagnosticError("viewer-authority-check"); }
+  let attachment: Awaited<ReturnType<NonNullable<typeof attach>>>;
+  try { attachment = await attach.call(context.runtime); }
+  catch { throw diagnosticError("viewer-cdp-attach"); }
   const listeners = new Set<(message: Buffer, isBinary: boolean) => void>();
   const id = randomUUID();
   let closed = false;
@@ -254,18 +317,32 @@ async function createPreparationViewer(context: ProtectedAutomationPreparationVi
       if (!closed) emit({ type: "frame", dataUrl: `data:image/jpeg;base64,${params.data}`, metadata: params.metadata, sessionId: params.sessionId });
     }).catch(() => { void close(); });
   });
-  await guardedSend(attachment.cdp, context.assertAuthorized, "Page.enable");
-  await guardedSend(attachment.cdp, context.assertAuthorized, "Runtime.enable");
-  await guardedSend(attachment.cdp, context.assertAuthorized, "Page.startScreencast", { format: "jpeg", quality: 70, everyNthFrame: 1 });
+  try { await guardedSend(attachment.cdp, context.assertAuthorized, "Page.enable"); }
+  catch { attachment.close(); throw diagnosticError("viewer-page-enable"); }
+  try { await guardedSend(attachment.cdp, context.assertAuthorized, "Runtime.enable"); }
+  catch { attachment.close(); throw diagnosticError("viewer-runtime-enable"); }
+  let startPromise: Promise<void> | null = null;
+  let started = false;
+  const start = () => {
+    if (closed) return Promise.reject(error("Preparation viewer is closed", 409));
+    startPromise ??= guardedSend(attachment.cdp, context.assertAuthorized, "Page.startScreencast", {
+      format: "jpeg", quality: 70, everyNthFrame: 1,
+    }).then(() => { started = true; }, () => {
+      void close();
+      throw diagnosticError("viewer-screencast-start");
+    });
+    return startPromise;
+  };
   const close = async () => {
     if (closed) return;
     closed = true;
     offFrame();
-    try { await guardedSend(attachment.cdp, context.assertAuthorized, "Page.stopScreencast"); } catch {}
+    if (started) try { await guardedSend(attachment.cdp, context.assertAuthorized, "Page.stopScreencast"); } catch {}
     listeners.clear();
     attachment.close();
   };
   const transport: ProtectedAutomationViewerTransport = {
+    start,
     dispatch(raw, isBinary) {
       return context.handleMessage(async () => {
         if (closed || isBinary) throw error("Preparation viewer message is invalid", 400);
@@ -277,6 +354,7 @@ async function createPreparationViewer(context: ProtectedAutomationPreparationVi
           await guardedSend(attachment.cdp, context.assertAuthorized, "Page.screencastFrameAck", { sessionId });
           return;
         }
+        if (!started) throw error("Preparation viewer is not ready", 409);
         if (message.type === "mouse") {
           const x = Number(message.x); const y = Number(message.y);
           if (!Number.isFinite(x) || !Number.isFinite(y)) throw error("Preparation mouse input is invalid", 400);
@@ -287,6 +365,12 @@ async function createPreparationViewer(context: ProtectedAutomationPreparationVi
             clickCount: type === "mousePressed" || type === "mouseReleased" ? 1 : 0,
             deltaX: Number(message.deltaX) || 0, deltaY: Number(message.deltaY) || 0,
           });
+          return;
+        }
+        if (message.type === "paste") {
+          if (Object.keys(message).sort().join("\0") !== "text\0type") throw error("Preparation paste message is invalid", 400);
+          const text = exactPreparationPasteText(message.text);
+          await guardedSend(attachment.cdp, context.assertAuthorized, "Input.insertText", { text });
           return;
         }
         if (message.type === "key") {
@@ -314,8 +398,8 @@ async function createPreparationViewer(context: ProtectedAutomationPreparationVi
 
 async function credentialContext(record: PreparationRecord): Promise<BrowserCredentialContext> {
   let result!: BrowserCredentialContext;
-  // Viewer attachment is not required; the lease's runtime is reached through a
-  // short-lived transport context installed below by `withPreparationRuntime`.
+  // Credential inspection/fill remains available only while at least one
+  // owner-bound viewer is actively registered for this preparation.
   const holder = preparationRuntimeContexts.get(record);
   if (!holder) throw error("Preparation browser is not running", 409);
   await holder.runtime.withPageCdp(async (cdp, target) => {
@@ -336,10 +420,13 @@ async function credentialContext(record: PreparationRecord): Promise<BrowserCred
   return result;
 }
 
-const preparationRuntimeContexts = new WeakMap<PreparationRecord, {
+interface PreparationRuntimeContext {
   runtime: ProtectedAutomationPreparationViewerContext["runtime"];
   assertAuthorized(): Promise<void>;
-}>();
+  activeViewers: number;
+}
+
+const preparationRuntimeContexts = new WeakMap<PreparationRecord, PreparationRuntimeContext>();
 
 async function fillPreparationCredential(
   record: PreparationRecord,
@@ -385,6 +472,12 @@ async function fillPreparationCredential(
     return (Array.isArray(value.filled) ? value.filled : []).filter((field: unknown): field is "username" | "password" | "totp" =>
       field === "username" || field === "password" || field === "totp");
   });
+}
+
+interface PurgeIntentRecord extends ProtectedAutomationPurgeIntentPublicState {
+  projectId: string;
+  agentProfileId: string;
+  jobRevision: number;
 }
 
 interface PurgeRequest {
@@ -438,6 +531,7 @@ function stageDirectory(target: string): StagedDirectory {
       if (!active) return;
       validatePrivateTree(staged);
       fs.rmSync(staged, { recursive: true, force: false });
+      if (fs.existsSync(staged)) throw error("Private purge artifact cleanup is incomplete", 503);
       active = false;
     },
   };
@@ -489,12 +583,14 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     },
   });
   const preparations = new Map<string, PreparationRecord>();
+  const purgeIntents = new Map<string, PurgeIntentRecord>();
   const purgeRequests = new Map<string, PurgeRequest>();
   const ownerKey = randomBytes(32);
   let started = false;
   let closed = false;
   let unsubscribePolicy: () => void = () => undefined;
   let uninstallPreparation: () => void = () => undefined;
+  let uninstallPurgeIntent: () => void = () => undefined;
 
   const ownerDigest = (owner: SettingsRequestOwner): Buffer => createHmac("sha256", ownerKey)
     .update("wayang-protected-automation-purge-owner-v1\0").update(owner.sessionId)
@@ -504,7 +600,7 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     return actual.length === expected.length && timingSafeEqual(actual, expected);
   };
 
-  const closeRecord = async (record: PreparationRecord): Promise<void> => {
+  const closeRecord = async (record: PreparationRecord, savePreparedProfile = false): Promise<void> => {
     if (record.closed) return;
     record.closed = true;
     preparations.delete(record.id);
@@ -512,7 +608,8 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     record.expiryTimer = undefined;
     preparationRuntimeContexts.delete(record);
     options.credentialBroker.revokeChoicesForAutomationPreparation(record.lease.binding);
-    await record.lease.close();
+    if (savePreparedProfile) await record.lease.saveAndClose(now());
+    else await record.lease.close();
   };
 
   const currentRecord = (owner: SettingsRequestOwner, selection: ProtectedAutomationPreparationSelection): PreparationRecord => {
@@ -533,6 +630,19 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     if (!record.owner) record.owner = { ...owner };
     else if (!ownerEqual(record.owner, owner)) throw error("Automation preparation belongs to another owner or Origin");
     return record;
+  };
+
+  const assertActiveViewerContext = async (
+    record: PreparationRecord,
+    holder: PreparationRuntimeContext,
+  ): Promise<void> => {
+    try {
+      await holder.assertAuthorized();
+      if (holder.activeViewers < 1 || preparationRuntimeContexts.get(record) !== holder) throw new Error("viewer context changed");
+    } catch {
+      options.credentialBroker.revokeChoicesForAutomationPreparation(record.lease.binding);
+      throw error("Preparation viewer authority changed", 409);
+    }
   };
 
   const preparationPort: ProtectedAutomationPreparationPort = {
@@ -623,6 +733,51 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     return job;
   };
 
+  const publicPurgeIntent = (record: PurgeIntentRecord): ProtectedAutomationPurgeIntentPublicState => ({
+    request_id: record.request_id,
+    job_id: record.job_id,
+    state: "awaiting_owner_pin",
+    requested_at: record.requested_at,
+    expires_at: record.expires_at,
+  });
+  const prunePurgeIntents = () => {
+    const current = now();
+    for (const [jobId, intent] of purgeIntents) if (intent.expires_at <= current) purgeIntents.delete(jobId);
+  };
+  const purgeIntentPort: ProtectedAutomationPurgeIntentPort = {
+    async request(input) {
+      await input.assertAuthorized();
+      const { binding, job } = input;
+      if (job.project_id !== binding.projectId || job.agent_profile_id !== binding.agentProfileId
+        || job.capability_revision !== binding.associationRevision) {
+        throw error("Protected automation purge request ownership changed", 409);
+      }
+      const currentJob = assertPurgeable(job.id, job.revision);
+      await input.assertAuthorized();
+      if (currentJob.project_id !== binding.projectId || currentJob.agent_profile_id !== binding.agentProfileId
+        || currentJob.capability_revision !== binding.associationRevision) {
+        throw error("Protected automation purge request authority changed", 409);
+      }
+      prunePurgeIntents();
+      const existing = purgeIntents.get(job.id);
+      if (existing && existing.jobRevision === job.revision) return publicPurgeIntent(existing);
+      if (purgeIntents.size >= MAX_PURGE_INTENTS) throw error("Protected automation purge request capacity is full", 429);
+      const requestedAt = now();
+      const record: PurgeIntentRecord = {
+        request_id: randomUUID(),
+        job_id: job.id,
+        state: "awaiting_owner_pin",
+        requested_at: requestedAt,
+        expires_at: requestedAt + PURGE_INTENT_TTL_MS,
+        projectId: job.project_id,
+        agentProfileId: job.agent_profile_id,
+        jobRevision: job.revision,
+      };
+      purgeIntents.set(job.id, record);
+      return publicPurgeIntent(record);
+    },
+  };
+
   const terminatePurgeRequest = async (request: PurgeRequest, reason: "cancelled" | "authentication_lost" | "expired" | "conflict" | "backend_failure") => {
     request.phase = "consuming";
     await options.pinAttempts.cancelAndConsume({ realm: PURGE_REALM, reservationId: request.reservationId,
@@ -630,12 +785,22 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     purgeRequests.delete(request.requestId);
   };
 
+  const projectJob = (job: ProtectedAutomationJobRow) => {
+    prunePurgeIntents();
+    const intent = purgeIntents.get(job.id);
+    return publicJob(
+      job,
+      realms.profileState(job.project_id, job.agent_profile_id, job.id),
+      intent && intent.jobRevision === job.revision ? publicPurgeIntent(intent) : null,
+    );
+  };
+
   const integration: ProtectedAutomationProductionIntegration = {
-    listJobs: () => listProtectedAutomationJobs().map(publicJob),
+    listJobs: () => listProtectedAutomationJobs().map(projectJob),
     getJob(jobId) {
       const job = getProtectedAutomationJob(jobId);
       if (!job) throw error("Protected automation job not found", 404);
-      return publicJob(job);
+      return projectJob(job);
     },
     listRuns(jobId) {
       if (!getProtectedAutomationJob(jobId)) throw error("Protected automation job not found", 404);
@@ -653,7 +818,7 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
         && candidate.project_id === paused.project_id && candidate.agent_profile_id === paused.agent_profile_id);
       preparationPort.jobChanged(paused.id);
       try { services.scheduler.reload(paused.id); } catch { /* durable pause remains authoritative */ }
-      return publicJob(paused);
+      return projectJob(paused);
     },
     cancelRun(owner, jobId, runId) {
       exactOwner(owner);
@@ -671,23 +836,68 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
       return publicRun(cancelled);
     },
     getPreparation(owner, selection) { return preparationState(currentRecord(owner, selection), options.credentialBroker.status().available); },
-    async closePreparation(owner, selection) { await closeRecord(currentRecord(owner, selection)); },
+    async closePreparation(owner, selection) { await closeRecord(currentRecord(owner, selection), true); },
     async openPreparationViewer(owner, selection) {
       const record = currentRecord(owner, selection);
       let opened: Awaited<ReturnType<typeof createPreparationViewer>> | undefined;
-      const registration = await record.lease.attachViewer({
-        async open(context) {
-          preparationRuntimeContexts.set(record, { runtime: context.runtime, assertAuthorized: context.assertAuthorized });
-          opened = await createPreparationViewer(context);
-          return opened.registration;
-        },
-      });
-      if (!opened) { await registration.close(); throw error("Preparation viewer is unavailable", 503); }
+      let viewerContext: ProtectedAutomationPreparationViewerContext | undefined;
+      let registrationClosed = false;
+      let releaseRuntimeContext: () => void = () => undefined;
+      let registration: Awaited<ReturnType<typeof record.lease.attachViewer>>;
+      try {
+        registration = await record.lease.attachViewer({
+          async open(context) {
+            const created = await createPreparationViewer(context);
+            opened = created;
+            viewerContext = context;
+            return {
+              id: created.registration.id,
+              async close() {
+                registrationClosed = true;
+                try { await created.registration.close(); }
+                finally { releaseRuntimeContext(); }
+              },
+            };
+          },
+        });
+      } catch (failure) {
+        if (protectedAutomationDiagnosticCode(failure) !== "unclassified") throw failure;
+        throw diagnosticError("viewer-lease-attach");
+      }
+      if (!opened || !viewerContext || registrationClosed) {
+        await registration.close();
+        throw diagnosticError("viewer-registration-closed");
+      }
       const transport = opened.transport;
+      let holder = preparationRuntimeContexts.get(record);
+      if (!holder) {
+        holder = {
+          runtime: viewerContext.runtime,
+          assertAuthorized: viewerContext.assertAuthorized,
+          activeViewers: 0,
+        };
+        preparationRuntimeContexts.set(record, holder);
+      }
+      holder.activeViewers += 1;
+      let contextReleased = false;
+      releaseRuntimeContext = () => {
+        if (contextReleased) return;
+        contextReleased = true;
+        holder!.activeViewers -= 1;
+        if (holder!.activeViewers === 0 && preparationRuntimeContexts.get(record) === holder) {
+          preparationRuntimeContexts.delete(record);
+        }
+      };
+      let transportClosed = false;
       return {
+        start: () => transport.start(),
         dispatch: (message, isBinary) => transport.dispatch(message, isBinary),
         onMessage: (listener) => transport.onMessage(listener),
-        async close() { await Promise.allSettled([registration.close(), transport.close()]); },
+        async close() {
+          if (transportClosed) return;
+          transportClosed = true;
+          await Promise.allSettled([registration.close(), transport.close()]);
+        },
       };
     },
     async navigatePreparation(owner, selection, requestedUrl) {
@@ -712,18 +922,35 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     async credentialStatus(owner, selection) {
       const record = currentRecord(owner, selection);
       const status = options.credentialBroker.status();
+      const holder = preparationRuntimeContexts.get(record);
+      if (!holder) return { ...status, origin: null };
       let origin: string | null = null;
-      try { origin = (await credentialContext(record)).origin; } catch {}
+      try { origin = (await credentialContext(record)).origin; }
+      catch {
+        await assertActiveViewerContext(record, holder);
+        return { ...status, origin };
+      }
+      await assertActiveViewerContext(record, holder);
       return { ...status, origin };
     },
     async credentialMatches(owner, selection) {
-      return options.credentialBroker.matches(await credentialContext(currentRecord(owner, selection)));
+      const record = currentRecord(owner, selection);
+      const holder = preparationRuntimeContexts.get(record);
+      if (!holder) throw error("Preparation viewer must be attached before credential inspection", 409);
+      const context = await credentialContext(record);
+      const result = await options.credentialBroker.matches(context);
+      await assertActiveViewerContext(record, holder);
+      return result;
     },
     async credentialFill(owner, selection, token, operation) {
       if (typeof token !== "string" || !token) throw error("choiceToken is required", 400);
       const record = currentRecord(owner, selection);
+      const holder = preparationRuntimeContexts.get(record);
+      if (!holder) throw error("Preparation viewer must be attached before credential fill", 409);
       const context = await credentialContext(record);
-      return options.credentialBroker.fill(token, operation, context, (values) => fillPreparationCredential(record, context, values));
+      const result = await options.credentialBroker.fill(token, operation, context, (values) => fillPreparationCredential(record, context, values));
+      await assertActiveViewerContext(record, holder);
+      return result;
     },
     async credentialLock(owner, selection) {
       currentRecord(owner, selection);
@@ -751,6 +978,7 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
         projectId: job.project_id, agentProfileId: job.agent_profile_id, expectedRevision: job.revision,
         operationDigest, expiresAt, phase: "pending",
       });
+      purgeIntents.delete(job.id);
       return { request_id: requestId, job_id: job.id, expected_revision: job.revision,
         operation_digest: operationDigest, expires_at: expiresAt,
         summary: `Permanently purge private automation history and browser profile for tombstoned job ${job.id}; project outputs are retained.` };
@@ -798,22 +1026,40 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
         for (const stage of stages.reverse()) { try { stage.rollback(); } catch {} }
         throw failure;
       }
-      // Rows are now durably absent. Artifact deletion is best effort and can
-      // be retried as private orphan cleanup; it must never restore store rows.
-      for (const stage of stages) { try { stage.finalize(); } catch {} }
-      // Canonical rows are durably absent and the manager has no live process.
-      // Retire the exact job's bounded state, scratch, and diagnostics; startup
-      // reconciliation retries any best-effort filesystem failure.
+      // Rows are now durably absent and therefore form the crash-recovery
+      // receipt: staged artifacts restore only while that exact row exists and
+      // are removed once it is absent. Never report success while cleanup is
+      // merely pending.
+      let cleanupPending = false;
+      for (const stage of stages) {
+        try { stage.finalize(); } catch { cleanupPending = true; }
+      }
+      const storageIdentity = {
+        projectId: job.project_id,
+        agentProfileId: job.agent_profile_id,
+        jobId: job.id,
+      };
+      // Reconcile every private purge domain against the now-durable store even
+      // after apparently successful finalization. Runtime reconciliation is
+      // intentionally global within its bounded private root so an unreadable
+      // historical artifact cannot be mistaken for successful exact cleanup.
       try {
-        services.manager.retireJobStorage({
-          projectId: job.project_id,
-          agentProfileId: job.agent_profile_id,
-          jobId: job.id,
-        });
-      } catch { /* private orphan cleanup is restart-recoverable */ }
+        reconcileProtectedAutomationSnapshots();
+        reconcileProtectedAutomationBrowserRealmPurges(dataDir, listProtectedAutomationJobs());
+        services.manager.reconcileRuntimeStorage();
+        if (!services.manager.retireJobStorage(storageIdentity, runIds)) throw new Error("runtime storage remains active");
+        cleanupPending = false;
+      } catch { cleanupPending = true; }
       const protectionKey = credentialRealmKey(job.project_id, job.agent_profile_id, job.id);
       credentialProtections.get(protectionKey)?.reset();
       credentialProtections.delete(protectionKey);
+      purgeIntents.delete(job.id);
+      if (cleanupPending) {
+        throw Object.assign(
+          error("Purge committed, but private cleanup is pending and will retry at startup", 503),
+          { publicCode: "purge_committed_cleanup_pending" },
+        );
+      }
       return { purged_job_id: result.purgedJobId, purged_run_ids: result.purgedRunIds };
     },
     async cancelPurge(owner, jobId, requestId, authenticationLost = false) {
@@ -842,6 +1088,13 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     for (const record of [...preparations.values()]) {
       if (!exactJobCurrent(record.job, record.sourceBinding)) void closeRecord(record);
     }
+    for (const [jobId, intent] of purgeIntents) {
+      const job = getProtectedAutomationJob(jobId);
+      if (!job || job.revision !== intent.jobRevision || job.project_id !== intent.projectId
+        || job.agent_profile_id !== intent.agentProfileId || !protectedAutomationJobAuthorityIsCurrent(job)) {
+        purgeIntents.delete(jobId);
+      }
+    }
   };
 
   return {
@@ -851,14 +1104,18 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
       if (closed) throw new Error("Protected automation production bootstrap is closed");
       started = true;
       try {
+        reconcileProtectedAutomationSnapshots();
+        reconcileProtectedAutomationBrowserRealmPurges(dataDir, listProtectedAutomationJobs());
         services.start();
         uninstallPreparation = installProtectedAutomationPreparationPort(preparationPort);
+        uninstallPurgeIntent = installProtectedAutomationPurgeIntentPort(purgeIntentPort);
         unsubscribePolicy = (options.subscribePolicy ?? onPolicyChanged)(latchPolicy);
         latchPolicy();
       } catch (failure) {
         started = false;
         try { unsubscribePolicy(); } catch {}
         try { uninstallPreparation(); } catch {}
+        try { uninstallPurgeIntent(); } catch {}
         void Promise.allSettled([services.stop(), realms.close()]);
         throw failure;
       }
@@ -866,14 +1123,14 @@ export function bootstrapProtectedAutomationProduction(options: ProtectedAutomat
     async close() {
       if (closed) return;
       closed = true; started = false;
-      unsubscribePolicy(); uninstallPreparation();
+      unsubscribePolicy(); uninstallPreparation(); uninstallPurgeIntent();
       for (const request of [...purgeRequests.values()]) await terminatePurgeRequest(request, "backend_failure").catch(() => undefined);
       await Promise.allSettled([
-        ...[...preparations.values()].map(closeRecord),
+        ...[...preparations.values()].map((record) => closeRecord(record)),
         services.stop(),
         realms.close(),
       ]);
-      preparations.clear(); purgeRequests.clear();
+      preparations.clear(); purgeIntents.clear(); purgeRequests.clear();
       for (const protection of credentialProtections.values()) protection.reset();
       credentialProtections.clear();
     },

@@ -21,6 +21,7 @@ import {
   getProtectedAutomation,
   getProtectedAutomationPreparation,
   listProtectedAutomations,
+  navigateProtectedAutomationPreparation,
   pauseProtectedAutomation,
   requestProtectedAutomationPurge,
   type ProtectedAutomationDetail,
@@ -44,6 +45,11 @@ interface ProtectedAutomationsPanelProps {
 }
 
 type LoadState = "loading" | "ready" | "unavailable" | "stale" | "error";
+
+function allowedOriginLabel(origin: string): string {
+  try { return new URL(origin).hostname; }
+  catch { return "allowed site"; }
+}
 
 export function ProtectedAutomationsPanel({
   selectedJobId,
@@ -70,6 +76,7 @@ export function ProtectedAutomationsPanel({
   const purgeChallengeRef = useRef<{ jobId: string; requestId: string } | null>(null);
   const [purgePin, setPurgePin] = useState("");
   const [purgeError, setPurgeError] = useState<string | null>(null);
+  const [purgeCleanupNotice, setPurgeCleanupNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (sourceSessionId) setSourceInput(sourceSessionId);
@@ -104,6 +111,10 @@ export function ProtectedAutomationsPanel({
       setError(errorMessage(caught));
     }
   }, [preparationSelection]);
+
+  const handlePreparationViewerStatus = useCallback(() => {
+    void refreshPreparation(true);
+  }, [refreshPreparation]);
 
   const refresh = useCallback(async (quiet = false) => {
     if (!quiet) setLoadState("loading");
@@ -226,7 +237,26 @@ export function ProtectedAutomationsPanel({
       setPreparationSelection(null);
       setPreparationInput("");
       setCredentialsOpen(false);
-      setNotice("Preparation closed.");
+      await refresh(true);
+      setNotice("Preparation saved to the protected browser profile and closed. Future runs will reuse it.");
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBusyAction(null);
+    }
+  }, [busyAction, preparationSelection, refresh]);
+
+  const navigatePreparation = useCallback(async (origin: string) => {
+    if (!preparationSelection || busyAction) return;
+    let url: string;
+    try { url = new URL("/", origin).toString(); }
+    catch { setError("The configured preparation origin is invalid."); return; }
+    setBusyAction("navigate-preparation");
+    setError(null);
+    try {
+      const next = await navigateProtectedAutomationPreparation(preparationSelection, url);
+      setPreparation(next);
+      setNotice(`Preparation opened ${allowedOriginLabel(origin)}.`);
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
@@ -276,6 +306,7 @@ export function ProtectedAutomationsPanel({
     setPurgePin("");
     setBusyAction("commit-purge");
     setPurgeError(null);
+    setPurgeCleanupNotice(null);
     try {
       await commitProtectedAutomationPurge(job.id, challenge.request_id, pin);
       setPurgeChallenge(null);
@@ -287,8 +318,20 @@ export function ProtectedAutomationsPanel({
     } catch (caught) {
       // Commit consumes the one-use challenge even when the PIN is rejected or
       // the final tombstone check conflicts. Never retain a reusable-looking
-      // dialog or PIN field after a commit attempt.
-      setError(`Purge was not completed: ${errorMessage(caught)}`);
+      // dialog or PIN field after a commit attempt. A committed-cleanup-pending
+      // receipt is different: canonical rows are already irreversibly absent.
+      const body = caught instanceof ApiError && caught.body && typeof caught.body === "object"
+        ? caught.body as Record<string, unknown> : null;
+      if (body?.code === "purge_committed_cleanup_pending") {
+        setPurgeCleanupNotice("Purge committed. Private cleanup is pending and will retry when Wayang starts; Project outputs were preserved.");
+        setPreparation(null);
+        setPreparationSelection(null);
+        setCredentialsOpen(false);
+        onChanged?.();
+        onSelectJob(null);
+      } else {
+        setError(`Purge was not completed: ${errorMessage(caught)}`);
+      }
       setPurgeChallenge(null);
       setPurgeError(null);
     } finally {
@@ -335,6 +378,11 @@ export function ProtectedAutomationsPanel({
             Activation is held. This owner surface cannot create, enable, rebind, or run jobs. Existing metadata is read-only except for emergency pause/cancel, exact human preparation handoff, and PIN-approved purge of an already tombstoned job.
           </div>
         )}
+        {purgeCleanupNotice && (
+          <div role="status" data-testid="protected-automation-purge-cleanup-pending" className="mx-auto mb-4 max-w-5xl rounded border border-amber-900/60 bg-amber-950/20 p-3 text-xs leading-relaxed text-amber-100">
+            {purgeCleanupNotice}
+          </div>
+        )}
 
         {loadState === "loading" && <StatusLine><Loader2 size={16} className="animate-spin" /> Loading backend status…</StatusLine>}
         {loadState === "unavailable" && <UnavailableState onRetry={() => void refresh()} />}
@@ -364,13 +412,14 @@ export function ProtectedAutomationsPanel({
                     <ActionButton testId="protected-automation-pause" busy={busyAction === "pause"} disabled={Boolean(busyAction)} onClick={() => void pause()} icon={<Pause size={13} />}>Emergency pause</ActionButton>
                   )}
                   {job.deleted_at !== null && (
-                    <ActionButton danger testId="protected-automation-purge-request" busy={busyAction === "request-purge"} disabled={Boolean(busyAction) || activeRuns.length > 0} onClick={() => void requestPurge()} icon={<Trash2 size={13} />}>Request purge</ActionButton>
+                    <ActionButton danger testId="protected-automation-purge-request" busy={busyAction === "request-purge"} disabled={Boolean(busyAction) || activeRuns.length > 0} onClick={() => void requestPurge()} icon={<Trash2 size={13} />}>{job.purge_request ? "Review purge request" : "Request purge"}</ActionButton>
                   )}
                 </div>
               </div>
 
               {job.blocked_reason && <div data-testid="protected-automation-blocked" className="mt-4 flex items-start gap-2 rounded border border-amber-900/60 bg-amber-950/25 p-3 text-xs text-amber-100"><ShieldAlert size={15} className="mt-0.5 shrink-0" /><span><strong>Backend block:</strong> {humanize(job.blocked_reason)}</span></div>}
               {job.attention && <div data-testid="protected-automation-attention" className="mt-4 flex items-start gap-2 rounded border border-sky-900/60 bg-sky-950/30 p-3 text-xs text-sky-100"><AlertTriangle size={15} className="mt-0.5 shrink-0" /><span><strong>Human attention:</strong> {humanize(job.attention.reason)}. Ask the source agent to issue a preparation, then attach it below.</span></div>}
+              {job.purge_request && <div data-testid="protected-automation-agent-purge-request" className="mt-4 flex items-start gap-2 rounded border border-red-900/60 bg-red-950/25 p-3 text-xs text-red-100"><Trash2 size={15} className="mt-0.5 shrink-0" /><span><strong>Agent-requested purge:</strong> permanent private-state deletion awaits your identity PIN. Project outputs will be retained. Request expires {formatTimestamp(job.purge_request.expires_at)}.</span></div>}
 
               <div className="mt-4 grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
                 <Info label="Next run" value={formatTimestamp(job.next_run_at)} />
@@ -386,13 +435,33 @@ export function ProtectedAutomationsPanel({
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
                       <h3 className="text-sm font-semibold">Human preparation</h3>
-                      <p className="mt-1 text-xs text-neutral-500">Attach only with IDs returned by the source-bound agent preparation tool. The backend-issued WebSocket path is used unchanged.</p>
+                      <p className="mt-1 text-xs text-neutral-500">Attach only with IDs returned by the source-bound agent preparation tool. Login state is stored in the protected browser profile; Save &amp; close stops Chromium cleanly for later runs.</p>
                     </div>
                     {preparation && preparationSelection && (
                       <div className="flex flex-wrap gap-2">
+                        {preparation.state === "ready" && preparation.allowed_https_origins.map((origin, index) => (
+                          <ActionButton
+                            key={origin}
+                            testId={`protected-automation-preparation-open-${index}`}
+                            busy={busyAction === "navigate-preparation"}
+                            disabled={Boolean(busyAction)}
+                            onClick={() => void navigatePreparation(origin)}
+                            icon={<Link2 size={13} />}
+                          >Open {allowedOriginLabel(origin)}</ActionButton>
+                        ))}
                         {preparation.state === "ready" && preparation.credential_broker?.supported === true && <ActionButton testId="protected-automation-credentials" disabled={Boolean(busyAction)} onClick={() => setCredentialsOpen(true)} icon={<KeyRound size={13} />}>Credentials</ActionButton>}
-                        <ActionButton testId="protected-automation-preparation-close" busy={busyAction === "close-preparation"} disabled={Boolean(busyAction)} onClick={() => void closePreparation()} icon={<Square size={13} />}>Close preparation</ActionButton>
+                        <ActionButton testId="protected-automation-preparation-close" busy={busyAction === "close-preparation"} disabled={Boolean(busyAction)} onClick={() => void closePreparation()} icon={<Square size={13} />}>Save &amp; close preparation</ActionButton>
                       </div>
+                    )}
+                  </div>
+
+                  <div data-testid="protected-automation-browser-profile-state" className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-400">
+                    <span>Protected browser profile:</span>
+                    <strong className={job.browser_profile?.saved ? "text-emerald-300" : "text-neutral-300"}>
+                      {job.browser_profile?.saved ? "saved" : "not yet saved"}
+                    </strong>
+                    {job.browser_profile?.saved && job.browser_profile.last_saved_at !== null && (
+                      <span>Last saved {formatTimestamp(job.browser_profile.last_saved_at)}</span>
                     )}
                   </div>
 
@@ -419,7 +488,7 @@ export function ProtectedAutomationsPanel({
 
                 <div className="h-[22rem] min-h-[16rem] sm:h-[30rem]">
                   {preparation?.state === "ready" && preparation.websocket_path ? (
-                    <CdpScreencastViewer websocketUrl={preparation.websocket_path} running connectionLabel="Preparation viewer" imageAlt="Protected automation preparation browser" testId="protected-automation-viewer" onStatus={() => void refreshPreparation(true)} />
+                    <CdpScreencastViewer websocketUrl={preparation.websocket_path} running pasteThroughViewer requireReadyHandshake connectionLabel="Preparation viewer" imageAlt="Protected automation preparation browser" testId="protected-automation-viewer" onStatus={handlePreparationViewerStatus} />
                   ) : (
                     <div className="flex h-full items-center justify-center p-6 text-center text-sm text-neutral-500">{preparation ? `Preparation is ${humanize(preparation.state)}.` : "No exact preparation attached."}</div>
                   )}

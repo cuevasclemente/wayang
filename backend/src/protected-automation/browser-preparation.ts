@@ -25,6 +25,7 @@ export interface ProtectedAutomationPreparationLease {
   readonly binding: Readonly<ProtectedAutomationBrowserLeaseBinding>;
   readonly signal: AbortSignal;
   attachViewer(transport: ProtectedAutomationPreparationViewerTransport): Promise<ProtectedAutomationViewerRegistration>;
+  saveAndClose(lastSavedAt: number): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -107,6 +108,7 @@ export class ProtectedAutomationBrowserPreparationCore {
           },
         };
       },
+      saveAndClose: (lastSavedAt) => lease.saveAndClosePreparation(lastSavedAt),
       close: () => lease.close(),
     };
   }

@@ -75,10 +75,17 @@ test("automation metadata/control routes require an exact allowed Origin and ret
     trustProxy: false, proxyIdentityHeader: "", cookieSecure: "never", allowedOrigins: [origin],
   };
   const auth = new AuthService(authConfig);
+  const bridge = integration();
+  bridge.commitPurge = async () => {
+    throw Object.assign(new Error("Purge committed, but private cleanup is pending and will retry at startup"), {
+      statusCode: 503,
+      publicCode: "purge_committed_cleanup_pending",
+    });
+  };
   const { server } = createApp({
     config: { port, host: "127.0.0.1", auth: authConfig },
     authService: auth,
-    protectedAutomation: integration(),
+    protectedAutomation: bridge,
   });
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(port, "127.0.0.1", resolve); });
   try {
@@ -129,6 +136,16 @@ test("automation metadata/control routes require an exact allowed Origin and ret
     });
     assert.equal(ownerEnable.status, 404);
 
+    const committedPending = await fetch(`${origin}/api/protected-automations/jobs/job-a/purge-requests/request-a/commit`, {
+      method: "POST", headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ pin: "12345678" }),
+    });
+    assert.equal(committedPending.status, 503);
+    assert.deepEqual(await committedPending.json(), {
+      error: "Purge committed, but private cleanup is pending and will retry at startup",
+      code: "purge_committed_cleanup_pending",
+    });
+
     const navigate = await fetch(`${exactPath}/navigate`, {
       method: "POST", headers: { Origin: origin, "Content-Type": "application/json" },
       body: JSON.stringify({ url: "https://example.test/login" }),
@@ -141,6 +158,61 @@ test("automation metadata/control routes require an exact allowed Origin and ret
     assert.equal(smuggled.status, 400);
   } finally {
     await closeWayangServer(server as http.Server);
+  }
+});
+
+test("a viewer transport resolving after socket shutdown is still closed exactly once", async () => {
+  const port = await freePort();
+  const origin = `http://127.0.0.1:${port}`;
+  const authConfig: AuthConfig = {
+    enabled: false, passwordHash: "", sessionSecret: "synthetic-session-secret-at-least-32-bytes",
+    sessionDays: 1, sessionStorePath: path.join(os.tmpdir(), `wayang-ws-auth-${port}.json`),
+    trustProxy: false, proxyIdentityHeader: "", cookieSecure: "never", allowedOrigins: [origin],
+  };
+  const auth = new AuthService(authConfig);
+  const bridge = integration();
+  let releaseViewer!: () => void;
+  let viewerRequestedResolve!: () => void;
+  const viewerRelease = new Promise<void>((resolve) => { releaseViewer = resolve; });
+  const viewerRequested = new Promise<void>((resolve) => { viewerRequestedResolve = resolve; });
+  let viewerCloseCount = 0;
+  let viewerClosedResolve!: () => void;
+  const viewerClosed = new Promise<void>((resolve) => { viewerClosedResolve = resolve; });
+  bridge.openPreparationViewer = async () => {
+    viewerRequestedResolve();
+    await viewerRelease;
+    return {
+      async start() {},
+      async dispatch() {},
+      async close() { viewerCloseCount += 1; viewerClosedResolve(); },
+      onMessage() { return () => undefined; },
+    };
+  };
+  const { server } = createApp({
+    config: { port, host: "127.0.0.1", auth: authConfig },
+    authService: auth,
+    protectedAutomation: bridge,
+  });
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(port, "127.0.0.1", resolve); });
+  const socket = new WebSocket(
+    `ws://127.0.0.1:${port}/ws/protected-automations/preparations/preparation-a?source_session_id=source-a&job_id=job-a`,
+    { headers: { Origin: origin } },
+  );
+  const socketOpened = new Promise<void>((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  try {
+    await bounded(socketOpened, "pending preparation WebSocket upgrade");
+    await bounded(viewerRequested, "pending preparation viewer request");
+    await bounded(closeWayangServer(server as http.Server), "shutdown while viewer opening");
+    releaseViewer();
+    await bounded(viewerClosed, "late preparation viewer cleanup");
+    assert.equal(viewerCloseCount, 1);
+  } finally {
+    releaseViewer();
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.terminate();
+    await closeWayangServer(server as http.Server).catch(() => undefined);
   }
 });
 
@@ -163,6 +235,7 @@ test("closeWayangServer terminates an upgraded preparation socket and closes its
     let closed = false;
     viewerOpenedResolve();
     return {
+      async start() {},
       async dispatch() {},
       async close() {
         if (closed) return;

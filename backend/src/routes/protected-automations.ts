@@ -2,9 +2,10 @@ import express, { type NextFunction, type Request, type Response, type Router } 
 import type { Server } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 import type { AuthService, AuthenticatedSettingsOwner } from "../auth/service.js";
-import type {
-  ProtectedAutomationPreparationSelection,
-  ProtectedAutomationProductionIntegration,
+import {
+  protectedAutomationDiagnosticCode,
+  type ProtectedAutomationPreparationSelection,
+  type ProtectedAutomationProductionIntegration,
 } from "../protected-automation/production.js";
 
 function routeError(message: string, statusCode = 400): Error {
@@ -153,8 +154,14 @@ export function createProtectedAutomationsRouter(
     if (resolvedStatus === 429 && Number.isFinite(retryAt)) {
       response.setHeader("Retry-After", Math.max(1, Math.ceil((retryAt - Date.now()) / 1_000)));
     }
+    const publicCode = failure && typeof failure === "object" && "publicCode" in failure
+      && (failure as { publicCode?: unknown }).publicCode === "purge_committed_cleanup_pending"
+      ? "purge_committed_cleanup_pending" : null;
     response.status(resolvedStatus).json({
-      error: resolvedStatus >= 500 ? "Protected automation operation failed" : failure instanceof Error ? failure.message : "Protected automation operation failed",
+      error: publicCode && failure instanceof Error
+        ? failure.message
+        : resolvedStatus >= 500 ? "Protected automation operation failed" : failure instanceof Error ? failure.message : "Protected automation operation failed",
+      ...(publicCode ? { code: publicCode } : {}),
     });
   });
   return router;
@@ -182,35 +189,97 @@ export function attachProtectedAutomationWs(
   const handleUpgrade: Parameters<Server["on"]>[1] = (request: any, socket: any, head: any) => {
     const url = new URL(request.url || "", "http://localhost");
     if (!url.pathname.startsWith("/ws/protected-automations/preparations/")) return;
-    if (closed) { socket.destroy(); return; }
+    const upgradeDiagnostic = (code: string) => {
+      console.warn(`[protected-automation] component=preparation-upgrade code=${code}`);
+    };
+    if (closed) { upgradeDiagnostic("server-closed"); socket.destroy(); return; }
     let selection: ProtectedAutomationPreparationSelection;
     try { selection = exactQuery(url); } catch {
+      upgradeDiagnostic("query-denied");
       auth.rejectWebSocket(socket, { allowed: false, status: 403, message: "Preparation transport denied" });
       return;
     }
     const decision = auth.authorizeWebSocket(request);
-    if (!decision.allowed) { auth.rejectWebSocket(socket, decision); return; }
+    if (!decision.allowed) {
+      upgradeDiagnostic(`transport-auth-denied-${decision.status >= 400 && decision.status <= 599 ? decision.status : "invalid"}`);
+      auth.rejectWebSocket(socket, decision);
+      return;
+    }
     const resolution = auth.resolveSettingsOwner(request);
     if (resolution.status !== "authenticated") {
+      upgradeDiagnostic(resolution.status === "invalid_origin" ? "owner-origin-denied" : "owner-auth-denied");
       auth.rejectWebSocket(socket, { allowed: false, status: resolution.status === "invalid_origin" ? 403 : 401,
         message: resolution.status === "invalid_origin" ? "Origin not allowed" : "Authentication required" });
       return;
     }
     try { integration.getPreparation(resolution.owner, selection); }
-    catch { auth.rejectWebSocket(socket, { allowed: false, status: 403, message: "Preparation transport denied" }); return; }
+    catch { upgradeDiagnostic("selection-denied"); auth.rejectWebSocket(socket, { allowed: false, status: 403, message: "Preparation transport denied" }); return; }
     wss.handleUpgrade(request, socket, head, (ws) => {
-      void integration.openPreparationViewer(resolution.owner, selection).then((transport) => {
-        const unsubscribe = transport.onMessage((message, isBinary) => {
-          if (ws.readyState === WebSocket.OPEN) ws.send(message, { binary: isBinary });
-        });
-        const close = () => { unsubscribe(); void transport.close(); };
-        ws.on("message", (raw, isBinary) => {
-          const message = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as any);
-          void transport.dispatch(message, isBinary).catch(() => ws.close(1008, "Preparation authority ended"));
-        });
-        ws.on("close", close);
-        ws.on("error", close);
-      }).catch(() => ws.close(1008, "Preparation transport denied"));
+      let transport: Awaited<ReturnType<typeof integration.openPreparationViewer>> | null = null;
+      let unsubscribe: () => void = () => undefined;
+      let socketEnded = false;
+      let firstServerMessage = true;
+      const diagnostic = (code: string) => {
+        console.warn(`[protected-automation] component=preparation-socket code=${code}`);
+      };
+      let cleanupPromise: Promise<void> | null = null;
+      const cleanup = () => {
+        if (cleanupPromise) return cleanupPromise;
+        socketEnded = true;
+        const current = transport;
+        transport = null;
+        try { unsubscribe(); } catch { /* local listener cleanup is best effort */ }
+        cleanupPromise = Promise.resolve(current?.close()).then(() => undefined, () => undefined);
+        return cleanupPromise;
+      };
+      ws.once("close", (code) => {
+        if (code !== 1000 && code !== 1005) {
+          diagnostic(`socket-close-${Number.isInteger(code) && code >= 1000 && code <= 4999 ? code : "invalid"}`);
+        }
+        void cleanup();
+      });
+      ws.once("error", () => { diagnostic("socket-error"); void cleanup(); });
+      ws.on("message", (raw, isBinary) => {
+        const current = transport;
+        if (!current) { ws.close(1008, "Preparation transport unavailable"); return; }
+        const message = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as any);
+        void current.dispatch(message, isBinary).catch(() => ws.close(1008, "Preparation authority ended"));
+      });
+      void integration.openPreparationViewer(resolution.owner, selection).then(async (opened) => {
+        if (socketEnded || closed || ws.readyState !== WebSocket.OPEN) {
+          await opened.close().catch(() => undefined);
+          return;
+        }
+        try {
+          unsubscribe = opened.onMessage((message, isBinary) => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            if (!firstServerMessage) { ws.send(message, { binary: isBinary }); return; }
+            firstServerMessage = false;
+            try {
+              ws.send(message, { binary: isBinary }, (failure) => {
+                if (failure) diagnostic("first-server-message-failed");
+              });
+            } catch {
+              diagnostic("first-server-message-failed");
+              ws.close(1011, "Preparation transport failed");
+            }
+          });
+          transport = opened;
+          await opened.start();
+          if (socketEnded || closed || ws.readyState !== WebSocket.OPEN) {
+            await cleanup();
+            return;
+          }
+          ws.send(JSON.stringify({ type: "ready" }));
+        } catch (failure) {
+          await opened.close().catch(() => undefined);
+          throw failure;
+        }
+      }).catch((failure) => {
+        if (socketEnded) return;
+        console.warn(`[protected-automation] component=preparation-viewer code=${protectedAutomationDiagnosticCode(failure)}`);
+        ws.close(1008, "Preparation transport denied");
+      });
     });
   };
   server.on("upgrade", handleUpgrade);

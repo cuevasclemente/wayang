@@ -335,6 +335,8 @@ export interface ProtectedAutomationJob {
   entrypoint: string;
   argv_count: number;
   uses_browser_profile: boolean;
+  browser_profile: { supported: boolean; saved: boolean; last_saved_at: number | null };
+  purge_request: { request_id: string; job_id: string; state: "awaiting_owner_pin"; requested_at: number; expires_at: number } | null;
   allowed_https_origins: string[];
   cron_expr: string;
   timeout_ms: number;
