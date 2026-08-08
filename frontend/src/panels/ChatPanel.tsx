@@ -1208,6 +1208,30 @@ function agentEndErrorMessage(msg: ChatMessage): string | null {
   return null;
 }
 
+function suppressActiveRecoveryErrors(messages: ChatMessage[]): ChatMessage[] {
+  let lastUserIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index].type === "user") {
+      lastUserIndex = index;
+      break;
+    }
+  }
+  if (lastUserIndex < 0) return messages;
+  return messages.filter((message, index) => (
+    index <= lastUserIndex
+    || message.type !== "assistant"
+    || !assistantErrorMessage(message.message)
+  ));
+}
+
+function assistantPartsError(parts: ChatMessage[]): string | null {
+  return [...parts]
+    .reverse()
+    .filter((part) => part.type === "assistant")
+    .map((part) => assistantErrorMessage(part.message))
+    .find((error): error is string => Boolean(error)) ?? null;
+}
+
 function assistantPartTextLength(part: ChatMessage): number {
   let length = 0;
   for (const block of messageContentAsBlocks(part.message?.content)) {
@@ -1223,10 +1247,7 @@ function assistantPartTextLength(part: ChatMessage): number {
 function buildDisplayAssistantMessage(parts: ChatMessage[]): ChatMessage | null {
   const assistantParts = parts.filter((part) => part.type === "assistant" && part.message);
   const template = assistantParts.length > 0 ? assistantParts[assistantParts.length - 1].message : { role: "assistant" };
-  const assistantError = [...assistantParts]
-    .reverse()
-    .map((part) => assistantErrorMessage(part.message))
-    .find((error): error is string => Boolean(error));
+  const assistantError = assistantPartsError(assistantParts);
   const content: any[] = [];
 
   for (const part of parts) {
@@ -1286,6 +1307,10 @@ function normalizeMessagesForDisplay(messages: ChatMessage[]): ChatMessage[] {
     if (assistantBuffer.length === 0) return;
     const message = buildDisplayAssistantMessage(assistantBuffer);
     if (message) normalized.push(message);
+    const partialResponseError = message?.type === "assistant"
+      ? assistantPartsError(assistantBuffer)
+      : null;
+    if (partialResponseError) normalized.push({ type: "error", error: partialResponseError });
     assistantBuffer = [];
   };
 
@@ -2851,6 +2876,8 @@ export function ChatPanel({
   const transportGenerationRef = useRef(0);
   const activeSessionErrorRef = useRef<string | null>(null);
   const activeSessionRuntimeStreamingRef = useRef(false);
+  const activeSessionRuntimeCompactingRef = useRef(false);
+  const pendingLifecycleErrorRef = useRef<string | null>(null);
   const isStreamingRef = useRef(false);
   const pinActiveTurnScrollRef = useRef(false);
   const lastProgrammaticScrollAtRef = useRef(0);
@@ -2875,6 +2902,7 @@ export function ChatPanel({
   const isRestoringDraftRef = useRef(false);
   activeSessionErrorRef.current = activeSession?.error ?? null;
   activeSessionRuntimeStreamingRef.current = Boolean(activeSession?.runtime_is_streaming);
+  activeSessionRuntimeCompactingRef.current = Boolean(activeSession?.runtime_is_compacting);
   activeCommandGuardPinPromptRef.current = activeCommandGuardPinPrompt;
   externalActionAuthorityRef.current = externalActionAuthority;
   wsStatusRef.current = wsStatus;
@@ -3507,9 +3535,12 @@ export function ChatPanel({
             setStreamingBlocksSynced({ content: [] });
             setStreamingHistoryPrefixSynced({ content: [] });
           }
-          const historyMessages: ChatMessage[] = Array.isArray(msg.messages)
+          const rawHistoryMessages: ChatMessage[] = Array.isArray(msg.messages)
             ? msg.messages
             : [];
+          const historyMessages = msg.streaming_at_snapshot === true
+            ? suppressActiveRecoveryErrors(rawHistoryMessages)
+            : rawHistoryMessages;
           if (typeof msg.streaming_at_snapshot === "boolean") {
             // A live-session history payload is an authoritative snapshot
             // boundary. Reset transient post-snapshot deltas, preserve the raw
@@ -3521,6 +3552,9 @@ export function ChatPanel({
             );
             isStreamingRef.current = msg.streaming_at_snapshot;
             setIsStreaming(msg.streaming_at_snapshot);
+          }
+          if (typeof msg.compacting_at_snapshot === "boolean") {
+            setIsCompacting(msg.compacting_at_snapshot);
           }
           chatWsProfile("message_history", {
             sessionId: msg.session_id,
@@ -3628,7 +3662,9 @@ export function ChatPanel({
 
         // Agent lifecycle
         if (msg.type === "agent_start") {
+          pendingLifecycleErrorRef.current = null;
           clearRuntimeError();
+          setIsCompacting(false);
           setResendingMessageId(null);
           isStreamingRef.current = true;
           setIsStreaming(true);
@@ -3655,11 +3691,7 @@ export function ChatPanel({
           }
 
           const turnError = agentEndErrorMessage(msg);
-          if (turnError && !assistantMessage) {
-            appendRuntimeError(turnError);
-          } else if (turnError) {
-            setRuntimeError({ message: turnError, timestamp: Date.now() });
-          }
+          if (turnError) pendingLifecycleErrorRef.current = turnError;
 
           setStreamingHistoryPrefixSynced({ content: [] });
           setStreamingBlocksSynced({ content: [] });
@@ -3671,12 +3703,15 @@ export function ChatPanel({
         }
 
         if (msg.type === "compaction_start") {
+          pendingLifecycleErrorRef.current = null;
+          clearRuntimeError();
           setIsCompacting(true);
           return;
         }
 
         if (msg.type === "compaction_end") {
           setIsCompacting(false);
+          pendingLifecycleErrorRef.current = null;
           if (typeof msg.error === "string" && msg.error.trim()) {
             appendRuntimeError(msg.error);
           }
@@ -3685,6 +3720,9 @@ export function ChatPanel({
 
         if (msg.type === "agent_settled") {
           setIsCompacting(false);
+          const pendingError = pendingLifecycleErrorRef.current;
+          pendingLifecycleErrorRef.current = null;
+          if (pendingError) appendRuntimeError(pendingError);
           isStreamingRef.current = false;
           pinActiveTurnScrollRef.current = false;
           setActiveTurnScrollAnchorText(null);
@@ -4160,12 +4198,13 @@ export function ChatPanel({
             }
             return;
           }
-          // Assistant messages stream via deltas; agent_end flushes them. If the
-          // provider failed before producing visible content (for example an
-          // invalidated OAuth token), surface the assistant error immediately.
+          // Pi may retry or compact after an assistant provider error. Hold it
+          // until agent_settled so a recoverable intermediate overflow is not
+          // rendered as a terminal red error while recovery is still active.
           if (message.role === "assistant" && msg.type === "message_end") {
             const error = assistantErrorMessage(message);
-            if (error) appendRuntimeError(error);
+            if (error) pendingLifecycleErrorRef.current = error;
+            else pendingLifecycleErrorRef.current = null;
           }
           return;
         }
@@ -4361,6 +4400,7 @@ export function ChatPanel({
     const initialStreaming = activeSessionRuntimeStreamingRef.current;
     setIsStreaming(initialStreaming);
     isStreamingRef.current = initialStreaming;
+    setIsCompacting(activeSessionRuntimeCompactingRef.current);
     pinActiveTurnScrollRef.current = false;
     setActiveTurnScrollAnchorText(null);
     // Keep interview queue entries session-scoped rather than singleton UI
@@ -4373,7 +4413,7 @@ export function ChatPanel({
     setTodoState({ todos: [], source: "none" });
     setIsTodoPanelOpen(false);
     setContextUsage(null);
-    setIsCompacting(false);
+    pendingLifecycleErrorRef.current = null;
     setCommandGuardState(null);
     setCommandGuardSaving(false);
     setStreamingHistoryPrefixSynced({ content: [] });

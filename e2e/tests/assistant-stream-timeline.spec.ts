@@ -28,8 +28,13 @@ async function expectMarkerOrder(locator: Locator, orderedMarkers: string[]): Pr
   }
 }
 
-async function installTimelineSocket(page: Page, history: unknown[] = []): Promise<void> {
-  await page.addInitScript(({ initialHistory, timelineMarkers }) => {
+async function installTimelineSocket(
+  page: Page,
+  history: unknown[] = [],
+  compactingAtSnapshot = false,
+  streamingAtSnapshot = compactingAtSnapshot,
+): Promise<void> {
+  await page.addInitScript(({ initialHistory, timelineMarkers, initialCompacting, initialStreaming }) => {
     type Handler<T> = ((event: T) => void) | null;
 
     class TimelineWebSocket {
@@ -64,6 +69,47 @@ async function installTimelineSocket(page: Page, history: unknown[] = []): Promi
         (window as unknown as { emitSyntheticSettlement: () => void }).emitSyntheticSettlement = () => {
           this.emit({ type: "agent_settled" });
         };
+        (window as unknown as { emitSyntheticOverflowRecovery: () => void }).emitSyntheticOverflowRecovery = () => {
+          const overflow = {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.",
+          };
+          this.emit({ type: "message_end", message: overflow });
+          this.emit({ type: "agent_end", messages: [overflow], will_retry: false });
+          this.emit({ type: "compaction_start", reason: "overflow" });
+        };
+        (window as unknown as { completeSyntheticOverflowRecovery: () => void }).completeSyntheticOverflowRecovery = () => {
+          this.emit({
+            type: "compaction_end",
+            reason: "overflow",
+            succeeded: true,
+            aborted: false,
+            will_retry: true,
+          });
+          this.emit({
+            type: "history",
+            session_id: this.sessionId,
+            selection_id: this.selectionId,
+            reason: "compaction_end_reconciliation",
+            streaming_at_snapshot: true,
+            compacting_at_snapshot: false,
+            messages: [],
+          });
+          this.emit({ type: "agent_start" });
+        };
+        (window as unknown as { emitSyntheticTerminalError: () => void }).emitSyntheticTerminalError = () => {
+          const terminalError = {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: "Synthetic terminal provider failure",
+          };
+          this.emit({ type: "message_end", message: terminalError });
+          this.emit({ type: "agent_end", messages: [terminalError], will_retry: false });
+          this.emit({ type: "agent_settled" });
+        };
         (window as unknown as { emitSyntheticSettledHistory: () => void }).emitSyntheticSettledHistory = () => {
           this.emit({
             type: "history",
@@ -96,6 +142,8 @@ async function installTimelineSocket(page: Page, history: unknown[] = []): Promi
             type: "history",
             session_id: this.sessionId,
             selection_id: this.selectionId,
+            streaming_at_snapshot: initialStreaming,
+            compacting_at_snapshot: initialCompacting,
             messages: initialHistory,
           });
         }, 0);
@@ -169,7 +217,12 @@ async function installTimelineSocket(page: Page, history: unknown[] = []): Promi
     }
 
     (window as unknown as { WebSocket: typeof TimelineWebSocket }).WebSocket = TimelineWebSocket;
-  }, { initialHistory: history, timelineMarkers: markers });
+  }, {
+    initialHistory: history,
+    timelineMarkers: markers,
+    initialCompacting: compactingAtSnapshot,
+    initialStreaming: streamingAtSnapshot,
+  });
 }
 
 async function sendPrompt(page: Page, prompt: string): Promise<void> {
@@ -256,6 +309,95 @@ test("keeps retrying runs active until settlement", async ({ page, request }) =>
     (window as unknown as { finishSyntheticTimeline: () => void }).finishSyntheticTimeline();
   });
   await expect(page.getByTestId("chat-send-button")).toContainText("Send");
+});
+
+test("shows context recovery as compaction instead of a terminal error", async ({ page, request }) => {
+  await installTimelineSocket(page);
+  const session = await createE2eSession(request, "e2e overflow recovery lifecycle");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Exercise synthetic overflow recovery.");
+  await page.evaluate(() => {
+    (window as unknown as { emitSyntheticOverflowRecovery: () => void }).emitSyntheticOverflowRecovery();
+  });
+
+  await expect(page.getByTestId("chat-runtime-error")).toHaveCount(0);
+  await expect(page.locator("section > header").first()).toContainText("compacting");
+  await expect(page.getByText("Codex error: Your input exceeds the context window of this model.", { exact: false })).toHaveCount(0);
+
+  await page.evaluate(() => {
+    (window as unknown as { completeSyntheticOverflowRecovery: () => void }).completeSyntheticOverflowRecovery();
+  });
+  await expect(page.locator("section > header").first()).not.toContainText("compacting");
+});
+
+test("restores compacting state and suppresses the active overflow error on reattach", async ({ page, request }) => {
+  const overflow = "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.";
+  await installTimelineSocket(page, [
+    { type: "user", id: "recovery-user", message: { role: "user", content: "Synthetic recovery prompt" } },
+    {
+      type: "assistant",
+      id: "recovery-overflow",
+      message: { role: "assistant", content: [], stopReason: "error", errorMessage: overflow },
+    },
+  ], true);
+  const session = await createE2eSession(request, "e2e compacting reattach lifecycle");
+  await openSessionInUi(page, session);
+
+  await expect(page.locator("section > header").first()).toContainText("compacting");
+  await expect(page.getByText(overflow, { exact: false })).toHaveCount(0);
+});
+
+test("suppresses the overflow during the reattach race before compaction_start", async ({ page, request }) => {
+  const overflow = "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.";
+  await installTimelineSocket(page, [
+    { type: "user", id: "race-user", message: { role: "user", content: "Synthetic recovery race prompt" } },
+    {
+      type: "assistant",
+      id: "race-overflow",
+      message: { role: "assistant", content: [], stopReason: "error", errorMessage: overflow },
+    },
+  ], false, true);
+  const session = await createE2eSession(request, "e2e overflow recovery reattach race");
+  await openSessionInUi(page, session);
+
+  await expect(page.getByTestId("chat-interrupt-button")).toBeVisible();
+  await expect(page.getByText(overflow, { exact: false })).toHaveCount(0);
+});
+
+test("retains terminal errors from stored assistant responses with partial content", async ({ page, request }) => {
+  const terminalError = "Synthetic terminal failure after partial response";
+  await installTimelineSocket(page, [
+    { type: "user", id: "partial-user", message: { role: "user", content: "Synthetic partial response prompt" } },
+    {
+      type: "assistant",
+      id: "partial-assistant",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Partial answer before failure" }],
+        stopReason: "error",
+        errorMessage: terminalError,
+      },
+    },
+  ]);
+  const session = await createE2eSession(request, "e2e partial terminal assistant error");
+  await openSessionInUi(page, session);
+
+  await expect(page.locator('[data-testid="chat-message"][data-role="assistant"]')).toContainText("Partial answer before failure");
+  await expect(page.locator('[data-testid="chat-message"][data-role="error"]')).toContainText(terminalError);
+});
+
+test("surfaces an assistant provider error after the lifecycle settles without recovery", async ({ page, request }) => {
+  await installTimelineSocket(page);
+  const session = await createE2eSession(request, "e2e terminal assistant error lifecycle");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Exercise a synthetic terminal provider failure.");
+  await page.evaluate(() => {
+    (window as unknown as { emitSyntheticTerminalError: () => void }).emitSyntheticTerminalError();
+  });
+
+  await expect(page.getByTestId("chat-runtime-error")).toContainText("Synthetic terminal provider failure");
 });
 
 test("settled history replaces residual mobile streaming content without duplication", async ({ page, request }) => {

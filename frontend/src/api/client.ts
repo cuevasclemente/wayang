@@ -40,6 +40,7 @@ export interface Session {
   error: string | null;
   runtime_status: SessionRuntimeStatus;
   runtime_is_streaming: boolean;
+  runtime_is_compacting: boolean;
   runtime_subscriber_count: number;
   runtime_last_activity_at: number | null;
   bash_mode: BashMode;

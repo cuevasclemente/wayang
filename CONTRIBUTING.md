@@ -55,6 +55,8 @@ Authentication changes need coverage across privileged REST routes, chat WebSock
 
 ## Pull requests
 
+Wayang is distributed across multiple machines. A release-intended change is not complete when it exists only in one checkout: commit it, push it to GitHub, open or update a pull request, and merge it into the canonical default branch after required checks pass. Report merged-source status separately from deployment or service-restart status, and do not leave shipping fixes as unmerged host-local patches unless they are explicitly experimental.
+
 Keep changes focused. Include:
 
 - the problem and approach;

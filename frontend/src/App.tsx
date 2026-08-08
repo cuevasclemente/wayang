@@ -318,6 +318,7 @@ function App({ authEnabled, onLogout }: AppProps) {
         error: null,
         runtime_status: "stopped",
         runtime_is_streaming: false,
+        runtime_is_compacting: false,
         runtime_subscriber_count: 0,
         runtime_last_activity_at: null,
         bash_mode: "unavailable",
