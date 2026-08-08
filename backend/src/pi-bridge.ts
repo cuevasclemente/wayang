@@ -17,7 +17,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { getModel } from "@earendil-works/pi-ai/compat";
+import { getModel, isContextOverflow } from "@earendil-works/pi-ai/compat";
 import type { Api, ImageContent, Model } from "@earendil-works/pi-ai";
 import { EventEmitter } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
@@ -713,6 +713,7 @@ export async function stopPiSessionIfIdle(id: string): Promise<boolean> {
 export interface PiSessionRuntimeState {
   runtime_status: "active" | "starting" | "stopped";
   runtime_is_streaming: boolean;
+  runtime_is_compacting: boolean;
   runtime_subscriber_count: number;
   runtime_last_activity_at: number | null;
 }
@@ -723,6 +724,7 @@ export function getPiSessionRuntimeState(id: string): PiSessionRuntimeState {
     return {
       runtime_status: "active",
       runtime_is_streaming: Boolean(handle.session.isStreaming),
+      runtime_is_compacting: Boolean(handle.session.isCompacting),
       runtime_subscriber_count: handle.subscriberCount,
       runtime_last_activity_at: handle.lastActivityAt,
     };
@@ -731,6 +733,7 @@ export function getPiSessionRuntimeState(id: string): PiSessionRuntimeState {
     return {
       runtime_status: "starting",
       runtime_is_streaming: false,
+      runtime_is_compacting: false,
       runtime_subscriber_count: 0,
       runtime_last_activity_at: null,
     };
@@ -738,6 +741,7 @@ export function getPiSessionRuntimeState(id: string): PiSessionRuntimeState {
   return {
     runtime_status: "stopped",
     runtime_is_streaming: false,
+    runtime_is_compacting: false,
     runtime_subscriber_count: 0,
     runtime_last_activity_at: null,
   };
@@ -3831,12 +3835,27 @@ function customHistoryMessage(customType: string, content: unknown, timestamp?: 
   };
 }
 
-function serializeHistoryEntries(entries: any[]): SerializedMessage[] {
+export function serializeHistoryEntries(entries: any[]): SerializedMessage[] {
   const serialized: SerializedMessage[] = [];
+  // Pi persists the provider's overflow error before appending the successful
+  // recovery compaction. Keep the canonical JSONL audit trail intact, but do
+  // not render that recovered intermediate failure as a terminal chat error.
+  const recoveredOverflowEntryIds = new Set(
+    entries
+      .filter((entry) => entry?.type === "compaction" && typeof entry.parentId === "string")
+      .map((entry) => entry.parentId),
+  );
 
   for (const entry of entries) {
     if (entry.type === "message") {
       const message = entry.message;
+      if (
+        recoveredOverflowEntryIds.has(entry.id)
+        && message?.role === "assistant"
+        && isContextOverflow(message)
+      ) {
+        continue;
+      }
       serialized.push({
         type: messageRoleToHistoryType(message?.role),
         id: entry.id,

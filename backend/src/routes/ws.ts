@@ -26,6 +26,7 @@
  *     { type: "subagent_event", subagent_id, event }
  *     { type: "goal_update", goal_id, status }
  *     { type: "context_usage", tokens: number|null, contextWindow: number, percent: number|null }
+ *     { type: "history", streaming_at_snapshot: boolean, compacting_at_snapshot: boolean, messages: [...] }
  *     { type: "compaction_start", reason: "manual"|"threshold"|"overflow" }
  *     { type: "compaction_end", reason, succeeded, aborted, will_retry, error? }
  *     { type: "agent_settled" }
@@ -443,6 +444,12 @@ function handleConnection(
       // is also an authoritative reconciliation point.
       if (shouldReconcileLiveSessionState(msg)) {
         const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
+        // AgentSession emits compaction_end before clearing its internal abort
+        // controller, so isCompacting is transiently stale during this exact
+        // reconciliation callback. The lifecycle event is authoritative.
+        const compactingAtSnapshot = msg.type === "compaction_end"
+          ? false
+          : Boolean(liveHandle.session.isCompacting);
         const reconciled = getLiveMessageHistory(nextSessionId);
         sendSafe(ws, {
           type: "history",
@@ -450,6 +457,7 @@ function handleConnection(
           ...(selectionId ? { selection_id: selectionId } : {}),
           reason: msg.type === "agent_settled" ? "agent_settled_reconciliation" : "compaction_end_reconciliation",
           streaming_at_snapshot: streamingAtSnapshot,
+          compacting_at_snapshot: compactingAtSnapshot,
           message_count: reconciled.length,
           payload_bytes: Buffer.byteLength(JSON.stringify(reconciled)),
           messages: reconciled,
@@ -481,6 +489,7 @@ function handleConnection(
       // history and later events are drained below. A synthetic agent_start
       // after that drain would clear valid post-snapshot deltas in the client.
       const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
+      const compactingAtSnapshot = Boolean(liveHandle.session.isCompacting);
       const liveHistory = getLiveMessageHistory(nextSessionId);
       bufferedEvents.length = 0;
       wsProfile(nextSessionId, "attach_live_history", `duration=${elapsedMs(liveHistoryStart)} messages=${liveHistory.length}`);
@@ -490,6 +499,7 @@ function handleConnection(
         ...(selectionId ? { selection_id: selectionId } : {}),
         reason: "initial",
         streaming_at_snapshot: streamingAtSnapshot,
+        compacting_at_snapshot: compactingAtSnapshot,
         message_count: liveHistory.length,
         payload_bytes: Buffer.byteLength(JSON.stringify(liveHistory)),
         messages: liveHistory,
@@ -505,6 +515,7 @@ function handleConnection(
     bufferLiveEvents = false;
     if (bufferOverflow) {
       const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
+      const compactingAtSnapshot = Boolean(liveHandle.session.isCompacting);
       const retryHistory = getLiveMessageHistory(nextSessionId);
       sendSafe(ws, {
         type: "history",
@@ -512,6 +523,7 @@ function handleConnection(
         ...(selectionId ? { selection_id: selectionId } : {}),
         reason: "event_buffer_overflow_resnapshot",
         streaming_at_snapshot: streamingAtSnapshot,
+        compacting_at_snapshot: compactingAtSnapshot,
         message_count: retryHistory.length,
         payload_bytes: Buffer.byteLength(JSON.stringify(retryHistory)),
         messages: retryHistory,
