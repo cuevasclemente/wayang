@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { close, getStore, init } from "./db.js";
+import { close, flush, getStore, init } from "./db.js";
 import {
   cancelInterview,
   createOpenInterview,
+  listOpenInterviews,
   markDelivered,
   submitInterview,
 } from "./interviews.js";
@@ -21,6 +22,7 @@ import {
   createSession,
   deleteSession,
   getSessionById,
+  listSessions,
   onSessionCatalogGeneration,
   stopSessionCatalog,
 } from "./sessions.js";
@@ -110,6 +112,65 @@ test("attention is isolated by exact owning session", async () => withStore((pro
   assert.deepEqual(serializeSession(other).humanAttention, []);
 }));
 
+test("projection requires exact tool provenance and rejects Unicode control/format identifiers", async () => withStore(() => {
+  const sessionId = "malformed-projection-session";
+  getStore().interviews.push(
+    {
+      request_id: "valid-questionnaire",
+      session_id: sessionId,
+      origin_tool_name: "questionnaire",
+      questions: QUESTIONS,
+      status: "open",
+      created_at: 1,
+    },
+    {
+      request_id: "wrong-tool",
+      session_id: sessionId,
+      origin_tool_name: "questionnaire-restart" as unknown as "questionnaire",
+      questions: QUESTIONS,
+      status: "open",
+      created_at: 2,
+    },
+    {
+      request_id: "c1\u0085source",
+      session_id: sessionId,
+      origin_tool_name: "interview",
+      questions: QUESTIONS,
+      status: "open",
+      created_at: 3,
+    },
+    {
+      request_id: "bidi\u202Esource",
+      session_id: sessionId,
+      origin_tool_name: "interview",
+      questions: QUESTIONS,
+      status: "open",
+      created_at: 4,
+    },
+  );
+
+  assert.deepEqual(listHumanAttentionForSession(sessionId).map((item) => item.sourceId), ["valid-questionnaire"]);
+  flush();
+  close();
+  init();
+  assert.deepEqual(
+    listHumanAttentionForSession(sessionId).map((item) => item.sourceId),
+    ["valid-questionnaire"],
+    "malformed persisted records remain non-projectable after restart",
+  );
+  assert.deepEqual(
+    listOpenInterviews(sessionId).map((item) => item.request_id),
+    ["valid-questionnaire"],
+    "malformed persisted records are not replayed as forms after restart",
+  );
+  for (const requestId of ["c1\u0085request", "bidi\u202Erequest"]) {
+    assert.throws(
+      () => createOpenInterview({ requestId, sessionId: "admission-session", toolName: "interview", questions: QUESTIONS }),
+      /request ID is invalid or too long/,
+    );
+  }
+}));
+
 test("projection and interview admission are bounded without truncating identifiers", async () => withStore(() => {
   const sessionId = "bounded-session";
   for (let index = 0; index < MAX_HUMAN_ATTENTION_SUMMARIES_PER_SESSION + 5; index++) {
@@ -174,12 +235,37 @@ test("attention lifecycle changes publish through the existing session catalog e
   }
 }));
 
-test("archive retains durable attention while permanent deletion removes it", async () => withStore((projectDir) => {
-  const session = createSession(projectDir, "Cleanup semantics");
-  createOpenInterview({ requestId: "cleanup-pending", sessionId: session.id, toolName: "interview", questions: QUESTIONS });
-  archiveSession(session.id);
-  assert.deepEqual(serializeSession(getSessionById(session.id)!).humanAttention.map((item) => item.sourceId), ["cleanup-pending"]);
+test("archive rejects an open authoritative gate and preserves ordinary archive behavior", async () => withStore((projectDir) => {
+  const gated = createSession(projectDir, "Gated archive");
+  const pending = createOpenInterview({ requestId: "cleanup-pending", sessionId: gated.id, toolName: "interview", questions: QUESTIONS });
+  assert.throws(
+    () => archiveSession(gated.id),
+    (error: unknown) => Boolean(
+      error && typeof error === "object"
+      && (error as { statusCode?: unknown }).statusCode === 409
+      && /Resolve or cancel the pending human-input request/.test((error as Error).message),
+    ),
+  );
+  assert.equal(getSessionById(gated.id)?.archived, 0);
+  assert.deepEqual(listHumanAttentionForSession(gated.id).map((item) => item.sourceId), [pending.request_id]);
 
-  assert.equal(deleteSession(session.id)?.session.id, session.id);
-  assert.deepEqual(listHumanAttentionForSession(session.id), []);
+  // A store written by the earlier behavior may already have both fields.
+  // Keep that authoritative gate visible so restart cannot silently hide it.
+  const legacyArchived = getStore().sessions.find((row) => row.id === gated.id)!;
+  legacyArchived.archived = 1;
+  legacyArchived.archived_at = Date.now();
+  assert.equal(listSessions().some((row) => row.id === gated.id), true);
+
+  assert.equal(cancelInterview(gated.id, pending.request_id)?.status, "cancelled");
+  archiveSession(gated.id);
+  assert.equal(getSessionById(gated.id)?.archived, 1);
+  assert.throws(
+    () => createOpenInterview({ requestId: "post-archive", sessionId: gated.id, toolName: "interview", questions: QUESTIONS }),
+    /session is archived/,
+  );
+
+  const deleting = createSession(projectDir, "Permanent cleanup");
+  createOpenInterview({ requestId: "delete-pending", sessionId: deleting.id, toolName: "questionnaire", questions: QUESTIONS });
+  assert.equal(deleteSession(deleting.id)?.session.id, deleting.id);
+  assert.deepEqual(listHumanAttentionForSession(deleting.id), []);
 }));

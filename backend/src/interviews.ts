@@ -8,8 +8,9 @@ import {
 } from "./interview-provenance.js";
 import {
   isBoundedHumanAttentionId,
+  isProjectableOpenInterview,
   MAX_HUMAN_ATTENTION_SUMMARIES_PER_SESSION,
-} from "./human-attention.js";
+} from "./interview-attention-policy.js";
 import { notifySessionSummaryProjectionChanged } from "./sessions.js";
 
 export type InterviewStatus = "open" | "submitted" | "cancelled" | "delivered";
@@ -162,8 +163,10 @@ export function createOpenInterview(input: CreateOpenInterviewInput): InterviewR
     created_at: Date.now(),
   };
   const created = interviewMutationCommit((draft) => {
+    const ownerSession = draft.sessions.find((candidate) => candidate.id === sessionId);
+    if (ownerSession?.archived) invalid("session is archived");
     if (records(draft).some((candidate) => candidate.request_id === requestId)) throw new Error("Interview request ID already exists");
-    const pendingForSession = records(draft).filter((candidate) => candidate.session_id === sessionId && candidate.status === "open").length;
+    const pendingForSession = records(draft).filter((candidate) => isProjectableOpenInterview(candidate, sessionId)).length;
     if (pendingForSession >= MAX_HUMAN_ATTENTION_SUMMARIES_PER_SESSION) {
       throw new Error("Too many pending interview requests for this session");
     }
@@ -267,7 +270,7 @@ export function verifyInterviewSubmissionEntry(sessionId: string, entry: unknown
 
 export function listOpenInterviews(sessionId: string): InterviewRecord[] {
   return records()
-    .filter((record) => record.session_id === sessionId && record.status === "open")
+    .filter((record) => isProjectableOpenInterview(record, sessionId))
     .sort((a, b) => a.created_at - b.created_at)
     .map(clone);
 }

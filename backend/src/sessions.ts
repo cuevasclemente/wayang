@@ -8,6 +8,7 @@ import { SessionCatalog, type CatalogScanCommit, type CatalogScanResult } from "
 import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
 import { ensureProjectForCwd, ensureProjectForCwdDraft, resolveEffectiveSessionDefaults } from "./projects.js";
 import { WorkspaceStoreError, type PendingAgentSwitch } from "./workspace-types.js";
+import { isProjectableOpenInterview } from "./interview-attention-policy.js";
 
 export type { SessionRow };
 
@@ -132,7 +133,11 @@ export function listSessions(includeArchived = false): SessionRow[] {
   const store = getStore();
   let list = store.sessions;
   if (!includeArchived) {
-    list = list.filter((row: SessionRow) => !row.archived);
+    // Recovery compatibility: an archived row carrying an authoritative open
+    // gate remains visible until that gate is resolved. Current archive writes
+    // reject this state, but older stores may already contain it.
+    list = list.filter((row: SessionRow) => !row.archived
+      || store.interviews.some((record) => isProjectableOpenInterview(record, row.id)));
   }
   // Sort by the most recent human/agent interaction, descending.
   return list.map(cloneSession).sort(
@@ -277,7 +282,9 @@ function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; upda
 
   // Preserve web-only grace and missing-file grace without parsing anything.
   for (const row of store.sessions) {
-    if (row.archived || store.messagingEndpoints.some((endpoint) => endpoint.active_session_id === row.id)) continue;
+    if (row.archived
+      || store.messagingEndpoints.some((endpoint) => endpoint.active_session_id === row.id)
+      || store.interviews.some((record) => isProjectableOpenInterview(record, row.id))) continue;
     if (!row.pi_session_file) {
       if (now - (row.created_at || now) < WEB_ONLY_SESSION_ARCHIVE_GRACE_MS) continue;
       row.archived = 1;
@@ -467,7 +474,9 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
   // rename), creating a brief window where fs.existsSync returns false.
   const now = Date.now();
   for (const row of store.sessions) {
-    if (row.archived || store.messagingEndpoints.some((endpoint) => endpoint.active_session_id === row.id)) continue;
+    if (row.archived
+      || store.messagingEndpoints.some((endpoint) => endpoint.active_session_id === row.id)
+      || store.interviews.some((record) => isProjectableOpenInterview(record, row.id))) continue;
     if (!row.pi_session_file) {
       const ageMs = now - (row.created_at || now);
       if (ageMs < WEB_ONLY_SESSION_ARCHIVE_GRACE_MS) continue;
@@ -906,14 +915,21 @@ export function archiveSession(id: string): void {
   const row = getStore().sessions.find((candidate) => candidate.id === id);
   if (!row || row.archived) return;
   assertSessionNotActivelyMessagingBound(id, "archive");
-  commitStoreMutation((draft) => {
+  const archived = commitStoreMutation((draft) => {
     const target = draft.sessions.find((candidate) => candidate.id === id);
-    if (!target) throw new WorkspaceStoreError("Session disappeared during archive", 409);
+    if (!target) return false;
+    if (draft.interviews.some((record) => isProjectableOpenInterview(record, id))) {
+      throw new WorkspaceStoreError(
+        "Resolve or cancel the pending human-input request before archiving this session.",
+        409,
+      );
+    }
     target.archived = 1;
     target.archived_at = Date.now();
     incrementDirectMutation(target);
+    return true;
   });
-  publishDirectMutation(false);
+  if (archived) publishDirectMutation(false);
 }
 
 export interface DeleteSessionResult {

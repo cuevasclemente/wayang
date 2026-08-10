@@ -187,8 +187,8 @@ router.delete("/sessions/:id", async (req: Request, res: Response) => {
     archiveSession(req.params.id);
     await stopPiSession(req.params.id);
     res.status(204).end();
-  } catch (err) {
-    res.status(500).json({ error: String(err) });
+  } catch (err: any) {
+    res.status(err?.statusCode || 500).json({ error: err?.message || String(err) });
   }
 });
 

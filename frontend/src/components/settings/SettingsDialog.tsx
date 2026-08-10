@@ -131,9 +131,9 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
           <TabButton active={tab === "notifications"} onClick={() => setTab("notifications")} icon={Bell}>Notifications</TabButton>
         </div>
 
-        {loading ? (
+        {tab !== "notifications" && loading ? (
           <div className="flex flex-1 items-center justify-center gap-2 text-sm text-neutral-500"><Loader2 size={16} className="animate-spin" /> Loading settings…</div>
-        ) : error ? (
+        ) : tab !== "notifications" && error ? (
           <div role="alert" className="m-5 rounded border border-red-900/60 bg-red-950/30 px-4 py-3 text-sm text-red-200">{error}</div>
         ) : tab === "projects" ? (
           <div className="flex min-h-0 flex-1 flex-col md:flex-row">

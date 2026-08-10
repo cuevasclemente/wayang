@@ -66,7 +66,10 @@ function rememberSourceIds(sourceIds: string[]): void {
     changed = true;
   }
   if (!changed) return;
-  while (order.length > MAX_SEEN_SOURCE_IDS) order.shift();
+  while (order.length > MAX_SEEN_SOURCE_IDS) {
+    const evicted = order.shift();
+    if (evicted !== undefined) ids.delete(evicted);
+  }
   safeStorageSet(SEEN_SOURCE_IDS_KEY, JSON.stringify(order));
 }
 

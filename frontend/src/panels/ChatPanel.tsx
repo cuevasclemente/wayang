@@ -162,12 +162,19 @@ type InterviewSubmission = {
   message?: string;
 };
 
+type InterviewCancellation = {
+  state: "cancelling" | "retry" | "rejected";
+  lastSentAt?: number;
+  message?: string;
+};
+
 interface QueuedInterview {
   requestId: string;
   sessionId: string;
   questions: InterviewQuestion[];
   createdAt: number;
   submission?: InterviewSubmission;
+  cancellation?: InterviewCancellation;
 }
 
 interface StoredInterviewSubmission {
@@ -180,6 +187,16 @@ interface StoredInterviewSubmission {
 
 interface InterviewResponseAck extends ChatMessage {
   type: "interview_response_ack";
+  requestId?: unknown;
+  sessionId?: unknown;
+  status?: unknown;
+  errorCode?: unknown;
+  error?: unknown;
+  message?: unknown;
+}
+
+interface InterviewCancelAck extends ChatMessage {
+  type: "interview_cancel_ack";
   requestId?: unknown;
   sessionId?: unknown;
   status?: unknown;
@@ -363,13 +380,14 @@ function mergeInterviewQueue(current: QueuedInterview[], incoming: QueuedIntervi
         ...item,
         createdAt: Math.min(merged[index].createdAt, item.createdAt),
         submission: merged[index].submission,
+        cancellation: merged[index].cancellation,
       };
     }
   }
   return merged.sort((a, b) => a.createdAt - b.createdAt);
 }
 
-function interviewAckError(msg: InterviewResponseAck): string | undefined {
+function interviewAckError(msg: { error?: unknown; message?: unknown; errorCode?: unknown }): string | undefined {
   const error = msg.error;
   if (typeof error === "string" && error) return error;
   if (error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string") {
@@ -3279,6 +3297,30 @@ export function ChatPanel({
     }
   }, [sendQueuedInterviewSubmission]);
 
+  const sendQueuedInterviewCancellation = useCallback((requestId: string): boolean => {
+    const sessionId = activeSessionIdRef.current;
+    const interview = interviewQueueRef.current.find((item) => (
+      item.requestId === requestId && item.sessionId === sessionId
+    ));
+    if (!interview || interview.submission || !sessionId) return false;
+
+    const sent = sendWs({ type: "interview_cancel", requestId });
+    const lastSentAt = sent ? Date.now() : undefined;
+    setInterviewQueueSynced((current) => current.map((item) => (
+      item.requestId === requestId && item.sessionId === sessionId
+        ? {
+            ...item,
+            cancellation: {
+              state: sent ? "cancelling" : "retry",
+              ...(lastSentAt === undefined ? {} : { lastSentAt }),
+              ...(sent ? {} : { message: "Reconnect before retrying cancellation. The questionnaire remains available." }),
+            },
+          }
+        : item
+    )));
+    return sent;
+  }, [sendWs, setInterviewQueueSynced]);
+
   useEffect(() => {
     const connect = () => {
       const sessionId = activeSessionIdRef.current;
@@ -4140,6 +4182,32 @@ export function ChatPanel({
           return;
         }
 
+        if (msg.type === "interview_cancel_ack") {
+          const ack = msg as InterviewCancelAck;
+          const requestId = typeof ack.requestId === "string" ? ack.requestId : null;
+          const sessionId = typeof ack.sessionId === "string" ? ack.sessionId : null;
+          if (!requestId || !sessionId) return;
+          const matching = interviewQueueRef.current.find((item) => (
+            item.requestId === requestId && item.sessionId === sessionId
+          ));
+          if (!matching?.cancellation) return;
+
+          if (ack.status === "cancelled" && !interviewAckError(ack)) {
+            clearStoredInterviewSubmission(sessionId, requestId);
+            setInterviewQueueSynced((current) => current.filter((item) => !(
+              item.requestId === requestId && item.sessionId === sessionId
+            )));
+          } else {
+            const message = interviewAckError(ack) ?? "The server did not confirm cancellation. The questionnaire remains available.";
+            setInterviewQueueSynced((current) => current.map((item) => (
+              item.requestId === requestId && item.sessionId === sessionId && item.cancellation
+                ? { ...item, cancellation: { ...item.cancellation, state: "rejected", message } }
+                : item
+            )));
+          }
+          return;
+        }
+
         // Command guard identity PIN requests are session-bound. A delayed
         // request from a prior selection must never collect a PIN in the newly
         // selected session.
@@ -4304,11 +4372,15 @@ export function ChatPanel({
         connectingSessionIdRef.current = null;
         if (closedCurrentTransport) setBashMode("unavailable");
         setWsStatus("disconnected");
-        setInterviewQueueSynced((current) => current.map((item) => (
-          item.submission && item.submission.state === "submitting"
-            ? { ...item, submission: { ...item.submission, state: "retry", message: "Connection closed before acknowledgement; this answer will be resent after reconnect." } }
-            : item
-        )));
+        setInterviewQueueSynced((current) => current.map((item) => {
+          if (item.submission?.state === "submitting") {
+            return { ...item, submission: { ...item.submission, state: "retry", message: "Connection closed before acknowledgement; this answer will be resent after reconnect." } };
+          }
+          if (item.cancellation?.state === "cancelling") {
+            return { ...item, cancellation: { ...item.cancellation, state: "retry", message: "Connection closed before cancellation acknowledgement. The questionnaire remains available." } };
+          }
+          return item;
+        }));
         setExternalActionApprovalsSynced((current) => current.map((request) => (
           request.submitting
             ? {
@@ -4499,20 +4571,37 @@ export function ChatPanel({
   useEffect(() => {
     const interval = window.setInterval(() => {
       const now = Date.now();
-      setInterviewQueueSynced((current) => current.map((item) => (
-        item.submission?.state === "submitting"
+      setInterviewQueueSynced((current) => current.map((item) => {
+        if (
+          item.submission?.state === "submitting"
           && item.submission.lastSentAt
           && now - item.submission.lastSentAt >= INTERVIEW_ACK_TIMEOUT_MS
-          ? {
-              ...item,
-              submission: {
-                ...item.submission,
-                state: "retry",
-                message: "No durable acknowledgement arrived yet. Retry when ready.",
-              },
-            }
-          : item
-      )));
+        ) {
+          return {
+            ...item,
+            submission: {
+              ...item.submission,
+              state: "retry",
+              message: "No durable acknowledgement arrived yet. Retry when ready.",
+            },
+          };
+        }
+        if (
+          item.cancellation?.state === "cancelling"
+          && item.cancellation.lastSentAt
+          && now - item.cancellation.lastSentAt >= INTERVIEW_ACK_TIMEOUT_MS
+        ) {
+          return {
+            ...item,
+            cancellation: {
+              ...item.cancellation,
+              state: "retry",
+              message: "No cancellation acknowledgement arrived. The questionnaire remains available.",
+            },
+          };
+        }
+        return item;
+      }));
     }, 1_000);
     return () => window.clearInterval(interval);
   }, [setInterviewQueueSynced]);
@@ -5057,11 +5146,12 @@ export function ChatPanel({
 
   const handleInterviewSubmit = useCallback(
     (answers: InterviewAnswer[]) => {
-      if (!activeInterview || activeInterview.submission) return;
+      if (!activeInterview || activeInterview.submission || activeInterview.cancellation?.state === "cancelling") return;
       const submittedAt = Date.now();
       const next: QueuedInterview = {
         ...activeInterview,
         submission: { answers, submittedAt, state: "retry" },
+        cancellation: undefined,
       };
       // Write the browser-resilience copy before attempting WebSocket send.
       // It is intentionally per session and request, never a singleton slot.
@@ -5079,18 +5169,11 @@ export function ChatPanel({
   }, [sendQueuedInterviewSubmission]);
 
   const handleInterviewCancel = useCallback(() => {
-    if (!activeInterview || activeInterview.submission) return;
-    // Cancellation has its own terminal protocol message. An empty answer
-    // array is invalid for a durable submission and must never masquerade as
-    // a completed response.
-    sendWs({
-      type: "interview_cancel",
-      requestId: activeInterview.requestId,
-    });
-    setInterviewQueueSynced((current) => current.filter((item) => (
-      !(item.requestId === activeInterview.requestId && item.sessionId === activeInterview.sessionId)
-    )));
-  }, [activeInterview, sendWs, setInterviewQueueSynced]);
+    if (!activeInterview || activeInterview.submission || activeInterview.cancellation?.state === "cancelling") return;
+    // Cancellation is terminal only after the exact backend acknowledgement.
+    // Until then the authoritative form and its browser draft remain visible.
+    sendQueuedInterviewCancellation(activeInterview.requestId);
+  }, [activeInterview, sendQueuedInterviewCancellation]);
 
   const handleSudoSubmit = useCallback(
     (password: string) => {
@@ -5917,6 +6000,8 @@ export function ChatPanel({
             submissionState={activeInterview.submission?.state}
             submissionMessage={activeInterview.submission?.message}
             onRetry={activeInterview.submission ? () => handleInterviewRetry(activeInterview.requestId) : undefined}
+            cancellationState={activeInterview.cancellation?.state}
+            cancellationMessage={activeInterview.cancellation?.message}
             storageKey={interviewDraftStorageKey(activeInterview.requestId)}
           />
         </div>

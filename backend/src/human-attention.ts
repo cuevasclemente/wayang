@@ -1,7 +1,16 @@
-import { getStore, type InterviewRecord } from "./db.js";
+import { getStore } from "./db.js";
+import {
+  isBoundedHumanAttentionId,
+  isProjectableOpenInterview,
+  MAX_HUMAN_ATTENTION_ID_BYTES,
+  MAX_HUMAN_ATTENTION_SUMMARIES_PER_SESSION,
+} from "./interview-attention-policy.js";
 
-export const MAX_HUMAN_ATTENTION_SUMMARIES_PER_SESSION = 100;
-export const MAX_HUMAN_ATTENTION_ID_BYTES = 512;
+export {
+  isBoundedHumanAttentionId,
+  MAX_HUMAN_ATTENTION_ID_BYTES,
+  MAX_HUMAN_ATTENTION_SUMMARIES_PER_SESSION,
+};
 
 export type HumanAttentionKind = "question";
 export type HumanAttentionStatus = "pending";
@@ -13,26 +22,6 @@ export interface HumanAttentionSummary {
   createdAt: number;
   status: HumanAttentionStatus;
   requiresWayang: true;
-}
-
-export function isBoundedHumanAttentionId(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length > 0
-    && value === value.trim()
-    && value === value.normalize("NFC")
-    && !/[\u0000-\u001f\u007f]/u.test(value)
-    && Buffer.byteLength(value, "utf8") <= MAX_HUMAN_ATTENTION_ID_BYTES;
-}
-
-function isProjectableOpenInterview(
-  record: InterviewRecord,
-  sessionId: string,
-): boolean {
-  return record.status === "open"
-    && record.session_id === sessionId
-    && isBoundedHumanAttentionId(record.request_id)
-    && Number.isSafeInteger(record.created_at)
-    && record.created_at >= 0;
 }
 
 type HumanAttentionSource = (sessionId: string) => HumanAttentionSummary[];

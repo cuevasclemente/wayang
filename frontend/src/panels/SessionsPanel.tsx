@@ -523,7 +523,7 @@ export function SessionsPanel({
         }
       } catch (err) {
         window.alert(
-          `Archive failed: ${err instanceof ApiError ? `HTTP ${err.status}` : String(err)}`,
+          `Archive failed: ${err instanceof ApiError ? err.message || `HTTP ${err.status}` : String(err)}`,
         );
       }
     },

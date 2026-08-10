@@ -82,13 +82,17 @@ async function installCatalogEvents(page: Page): Promise<void> {
   });
 }
 
-async function installNotificationMock(page: Page, requestedPermission: "granted" | "denied" = "granted"): Promise<void> {
-  await page.addInitScript((permissionAfterRequest) => {
+async function installNotificationMock(
+  page: Page,
+  requestedPermission: "granted" | "denied" = "granted",
+  initialPermission: NotificationPermission = "default",
+): Promise<void> {
+  await page.addInitScript(({ permissionAfterRequest, permissionAtLoad }) => {
     const records: Array<{ title: string; body: string; notification: MockNotification }> = [];
     let requestCount = 0;
 
     class MockNotification {
-      static permission: NotificationPermission = "default";
+      static permission: NotificationPermission = permissionAtLoad;
       static async requestPermission(): Promise<NotificationPermission> {
         requestCount += 1;
         MockNotification.permission = permissionAfterRequest;
@@ -108,16 +112,22 @@ async function installNotificationMock(page: Page, requestedPermission: "granted
       configurable: true,
       value: (index: number) => records[index]?.notification.onclick?.(new Event("click")),
     });
-  }, requestedPermission);
+  }, { permissionAfterRequest: requestedPermission, permissionAtLoad: initialPermission });
 }
 
 interface SyntheticApi {
   setAttention(value: unknown[]): void;
+  setArchiveConflict(value: boolean): void;
   emitCatalog(): Promise<void>;
 }
 
-async function installSyntheticApi(page: Page, initialAttention: unknown[]): Promise<SyntheticApi> {
+async function installSyntheticApi(
+  page: Page,
+  initialAttention: unknown[],
+  options: { failSettingsLoads?: boolean; archiveConflict?: boolean } = {},
+): Promise<SyntheticApi> {
   let humanAttention = initialAttention;
+  let archiveConflict = options.archiveConflict === true;
   const project = {
     id: "synthetic-attention-project",
     cwd: projectCwd,
@@ -138,10 +148,17 @@ async function installSyntheticApi(page: Page, initialAttention: unknown[]): Pro
     if (path === "/api/auth/status") return route.fulfill({ json: { enabled: false, authenticated: true } });
     if (path === "/api/me") return route.fulfill({ json: { username: "example", provider: "synthetic", version: "test" } });
     if (path === "/api/models") return route.fulfill({ json: { models: [], defaultModel: null } });
-    if (path === "/api/projects") return route.fulfill({ json: [project] });
-    if (path === "/api/agent-profiles") return route.fulfill({ json: [] });
+    if (path === "/api/projects") return options.failSettingsLoads
+      ? route.fulfill({ status: 503, json: { error: "Synthetic project load failure" } })
+      : route.fulfill({ json: [project] });
+    if (path === "/api/agent-profiles") return options.failSettingsLoads
+      ? route.fulfill({ status: 503, json: { error: "Synthetic profile load failure" } })
+      : route.fulfill({ json: [] });
     if (path === "/api/sessions" && request.method() === "GET") return route.fulfill({ json: [syntheticSession(humanAttention)] });
     if (path === `/api/sessions/${sessionId}` && request.method() === "GET") return route.fulfill({ json: syntheticSession(humanAttention) });
+    if (path === `/api/sessions/${sessionId}` && request.method() === "DELETE") return archiveConflict
+      ? route.fulfill({ status: 409, json: { error: "Resolve or cancel the pending human-input request before archiving this session." } })
+      : route.fulfill({ status: 204, body: "" });
     if (path === "/api/scheduled-agent-jobs") return route.fulfill({ json: { jobs: [] } });
     if (path === "/api/protected-automations") return route.fulfill({ json: { milestone: 0, activationAvailable: false, production_services: false } });
     if (path === "/api/protected-automations/jobs") return route.fulfill({ json: { jobs: [] } });
@@ -155,6 +172,7 @@ async function installSyntheticApi(page: Page, initialAttention: unknown[]): Pro
 
   return {
     setAttention(value: unknown[]) { humanAttention = value; },
+    setArchiveConflict(value: boolean) { archiveConflict = value; },
     async emitCatalog() {
       await page.evaluate(() => {
         const emit = (window as unknown as { __emitAttentionCatalog: () => void }).__emitAttentionCatalog;
@@ -196,6 +214,8 @@ test("projects and sessions project valid pending attention without automaticall
     { ...attention(" whitespace-source"), sourceId: " whitespace-source" },
     { ...attention("non-nfc-source"), sourceId: "source-e\u0301" },
     { ...attention("control-source"), sourceId: "control\u0000source" },
+    { ...attention("c1-source"), sourceId: "c1\u0085source" },
+    { ...attention("bidi-source"), sourceId: "bidi\u202Esource" },
     { ...attention("oversized-source"), sourceId: "x".repeat(513) },
     { ...attention("negative-time"), createdAt: -1 },
     { ...attention("fractional-time"), createdAt: 1.5 },
@@ -310,4 +330,68 @@ test("unsupported Web Notifications leave accessible in-app attention and settin
   await expect(page.getByTestId("browser-notification-state")).toHaveText("Unsupported by this browser");
   await expect(page.getByTestId("enable-browser-notifications")).toHaveCount(0);
   await expect(page.getByTestId("global-human-attention-badge")).toBeVisible();
+});
+
+test("notification dedupe evicts from both bounded order and membership", async ({ page }) => {
+  await installCatalogEvents(page);
+  await installNotificationMock(page, "granted", "granted");
+  const oldest = "bounded-source-0000";
+  await page.addInitScript(({ first }) => {
+    const ids = Array.from({ length: 4096 }, (_, index) => `bounded-source-${String(index).padStart(4, "0")}`);
+    if (ids[0] !== first) throw new Error("Synthetic dedupe fixture is malformed");
+    window.localStorage.setItem("wayang:human-attention:browser-notifications-enabled", "1");
+    window.localStorage.setItem("wayang:human-attention:seen-source-ids", JSON.stringify(ids));
+  }, { first: oldest });
+  const api = await installSyntheticApi(page, []);
+
+  await page.goto("/");
+  api.setAttention([attention("bounded-source-new")]);
+  await api.emitCatalog();
+  await expect.poll(async () => (await notificationSnapshot(page)).records.length).toBe(1);
+
+  api.setAttention([attention(oldest)]);
+  await api.emitCatalog();
+  await expect.poll(async () => (await notificationSnapshot(page)).records.length).toBe(2);
+  const stored = await page.evaluate(() => JSON.parse(
+    window.localStorage.getItem("wayang:human-attention:seen-source-ids") ?? "[]",
+  ) as string[]);
+  expect(stored).toHaveLength(4096);
+  expect(stored.at(-1)).toBe(oldest);
+});
+
+test("Notifications Settings remains usable when project and profile loads fail", async ({ page }) => {
+  await installCatalogEvents(page);
+  await installNotificationMock(page);
+  await installSyntheticApi(page, [], { failSettingsLoads: true });
+
+  await page.goto("/");
+  await openNotificationSettings(page);
+  await expect(page.getByRole("heading", { name: "Human-input notifications" })).toBeVisible();
+  await expect(page.getByTestId("browser-notification-state")).toContainText("permission has not been requested");
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("archive conflict keeps gated session visible and explains the resolution", async ({ page }) => {
+  await installCatalogEvents(page);
+  const api = await installSyntheticApi(page, [attention("archive-gate")], { archiveConflict: true });
+  const alerts: string[] = [];
+  page.on("dialog", async (dialog) => {
+    if (dialog.type() === "confirm") await dialog.accept();
+    else {
+      alerts.push(dialog.message());
+      await dialog.dismiss();
+    }
+  });
+
+  await page.goto("/");
+  await page.getByText(projectName, { exact: true }).click();
+  const row = page.getByTestId("session-row").filter({ has: page.getByText(sensitiveSessionTitle, { exact: true }) });
+  await row.hover();
+  await row.getByRole("button", { name: "Archive session" }).click();
+  await expect.poll(() => alerts.at(-1)).toBe(
+    "Archive failed: Resolve or cancel the pending human-input request before archiving this session.",
+  );
+  await expect(row).toBeVisible();
+  await expect(row.getByTestId("session-human-attention-badge")).toBeVisible();
+  api.setArchiveConflict(false);
 });
