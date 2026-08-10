@@ -4,6 +4,7 @@ import { classifyAssistantErrorKind, getPiSession, getPiSessionBashMode, getPiSe
 import { validateCommandGuardIdentityPin } from "../command-guard-pin.js";
 import { removeSession as removeSearchSession } from "../search/indexer.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
+import { listHumanAttentionForSession, type HumanAttentionSummary } from "../human-attention.js";
 
 export const router = Router();
 
@@ -12,6 +13,7 @@ type SessionResponse = SessionRow & ReturnType<typeof getPiSessionRuntimeState> 
   browser_mode: ReturnType<typeof getPiSessionBrowserMode>;
   browser_agent: ReturnType<typeof getPiSessionBrowserAgentDiagnostic>;
   error_kind: ReturnType<typeof classifyAssistantErrorKind>;
+  humanAttention: HumanAttentionSummary[];
 };
 
 /** @internal Exported for focused response-projection tests. */
@@ -23,6 +25,7 @@ export function serializeSession(session: SessionRow): SessionResponse {
     browser_mode: getPiSessionBrowserMode(session.id, session),
     browser_agent: getPiSessionBrowserAgentDiagnostic(session.id, session),
     error_kind: classifyAssistantErrorKind(session.error),
+    humanAttention: listHumanAttentionForSession(session.id),
   };
 }
 

@@ -250,6 +250,11 @@ function publishDirectMutation(triggerScan = false): void {
   if (triggerScan) sessionCatalog?.requestScan("internal-write", 0);
 }
 
+/** Publish a change to a field derived into the existing session summaries. */
+export function notifySessionSummaryProjectionChanged(): void {
+  publishDirectMutation(false);
+}
+
 function markDirectMutation(row: SessionRow, triggerScan = false): void {
   incrementDirectMutation(row);
   publishDirectMutation(triggerScan);
