@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { CdpConnection, ChromeTarget } from "../browser/cdp.js";
 import {
   compileGuardedDomOperation,
@@ -45,7 +46,11 @@ export interface ProtectedAutomationBrowserLeasePort extends ProtectedAutomation
 const SETTLE_TIMEOUT_MS = 10_000;
 const SETTLE_INTERVAL_MS = 50;
 const MAX_SELECTOR_BYTES = 4_096;
+const MAX_EXPECTED_ELEMENT_NAME_BYTES = 2_048;
 const MAX_PUBLIC_TEXT_BYTES = 16 * 1024;
+const MAX_SELECTOR_QUERY_RECEIPTS = 32;
+const SELECTOR_QUERY_RECEIPT_TTL_MS = 30_000;
+const SELECTOR_ISOLATED_WORLD_NAME = "wayang-protected-automation-selector-v1";
 
 function rpcError(message: string): Error {
   return Object.assign(new Error(message), { statusCode: 400 });
@@ -155,12 +160,81 @@ async function guardedDom<T>(
   cdp: CdpConnection,
   lease: ProtectedAutomationBrowserRealmLease,
   operation: GuardedDomOperation,
+  contextId?: number,
 ): Promise<T> {
-  return evaluateGuardedPage<T>(cdp, () => lease.assertAuthorized(), compileGuardedDomOperation(operation));
+  return evaluateGuardedPage<T>(cdp, () => lease.assertAuthorized(), compileGuardedDomOperation(operation), contextId);
+}
+
+async function selectorIsolatedWorld(
+  cdp: CdpConnection,
+  lease: ProtectedAutomationBrowserRealmLease,
+  document: TopLevelDocumentAttestation,
+): Promise<number> {
+  const result = await guardedSend<any>(cdp, () => lease.assertAuthorized(), "Page.createIsolatedWorld", {
+    frameId: document.frameId,
+    worldName: SELECTOR_ISOLATED_WORLD_NAME,
+    grantUniveralAccess: false,
+  });
+  const contextId = result?.executionContextId;
+  if (!Number.isSafeInteger(contextId) || contextId < 1) throw rpcError("Browser RPC selector world is unavailable");
+  return contextId;
+}
+
+interface SelectorQueryElementReceipt {
+  index: number;
+  name: string;
+  visible: true;
+  disabled: boolean;
+}
+
+interface SelectorQueryReceipt {
+  documentIdentity: string;
+  documentNonce: string;
+  selector: string;
+  issuedAt: number;
+  elements: SelectorQueryElementReceipt[];
+}
+
+function selectorQueryElements(value: unknown): SelectorQueryElementReceipt[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw rpcError("Browser RPC query result is malformed");
+  const elements = (value as { elements?: unknown }).elements;
+  if (!Array.isArray(elements) || elements.length > 500) throw rpcError("Browser RPC query result is malformed");
+  return elements.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw rpcError("Browser RPC query result is malformed");
+    const element = item as Record<string, unknown>;
+    if (element.index !== index || typeof element.name !== "string" || element.name.length > 500
+      || element.visible !== true || typeof element.disabled !== "boolean") {
+      throw rpcError("Browser RPC query result is malformed");
+    }
+    return { index, name: element.name, visible: true, disabled: element.disabled };
+  });
 }
 
 export class ProtectedAutomationBrowserRpc implements ProtectedAutomationBrowserLeasePort {
+  private readonly selectorQueryReceipts = new Map<string, SelectorQueryReceipt>();
+
   constructor(private readonly lease: ProtectedAutomationBrowserRealmLease) {}
+
+  private issueSelectorQueryReceipt(receipt: Omit<SelectorQueryReceipt, "issuedAt">): string {
+    while (this.selectorQueryReceipts.size >= MAX_SELECTOR_QUERY_RECEIPTS) {
+      const oldest = this.selectorQueryReceipts.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.selectorQueryReceipts.delete(oldest);
+    }
+    const token = randomUUID();
+    this.selectorQueryReceipts.set(token, { ...receipt, issuedAt: Date.now() });
+    return token;
+  }
+
+  private consumeSelectorQueryReceipt(token: string): SelectorQueryReceipt {
+    const receipt = this.selectorQueryReceipts.get(token);
+    this.selectorQueryReceipts.delete(token);
+    const now = Date.now();
+    if (!receipt || now < receipt.issuedAt || now - receipt.issuedAt > SELECTOR_QUERY_RECEIPT_TTL_MS) {
+      throw rpcError("Browser RPC selector query receipt is unavailable");
+    }
+    return receipt;
+  }
 
   request(input: {
     method: string;
@@ -186,6 +260,7 @@ export class ProtectedAutomationBrowserRpc implements ProtectedAutomationBrowser
       case "browser.navigate": {
         const params = exactObject(rawParams, ["url"]);
         const requested = boundedString(params.url, "URL", 2_048);
+        this.selectorQueryReceipts.clear();
         let parsed: URL;
         try { parsed = new URL(requested); } catch { throw rpcError("Browser RPC navigation requires an absolute HTTPS URL"); }
         if (parsed.protocol !== "https:" || parsed.username || parsed.password || !this.lease.allowedOrigins.has(parsed.origin)) {
@@ -228,29 +303,54 @@ export class ProtectedAutomationBrowserRpc implements ProtectedAutomationBrowser
         const params = exactObject(rawParams, ["selector", "limit"]);
         const selector = boundedString(params.selector, "selector", MAX_SELECTOR_BYTES);
         const limit = optionalBoundedLimit(params.limit);
-        return withoutCoordinates((await withAttestedPage(this.lease, (cdp) => guardedDom(cdp, this.lease, {
-          kind: "query_selector", selector, limit,
-        }))).value);
+        this.selectorQueryReceipts.clear();
+        const documentNonce = randomUUID();
+        const result = await withAttestedPage(this.lease, async (cdp, _target, before) => {
+          const contextId = await selectorIsolatedWorld(cdp, this.lease, before);
+          return guardedDom(cdp, this.lease, {
+            kind: "query_visible_selector", selector, limit, documentNonce,
+          }, contextId);
+        });
+        if (result.before.documentIdentity !== result.document.documentIdentity) {
+          throw rpcError("Browser RPC query crossed a document boundary");
+        }
+        const value = withoutCoordinates(result.value) as Record<string, unknown>;
+        const queryToken = this.issueSelectorQueryReceipt({
+          documentIdentity: result.document.documentIdentity,
+          documentNonce,
+          selector,
+          elements: selectorQueryElements(value),
+        });
+        return { ...value, queryToken };
       }
       case "browser.click_selector": {
-        const params = exactObject(rawParams, ["selector", "index"]);
+        const params = exactObject(rawParams, ["selector", "index", "expectedName", "queryToken"]);
         const selector = boundedString(params.selector, "selector", MAX_SELECTOR_BYTES);
         const index = optionalBoundedIndex(params.index) ?? 0;
-        return (await withAttestedPage(this.lease, async (cdp) => {
-          const point = await guardedDom<{ x: number; y: number }>(cdp, this.lease, { kind: "selector_point", selector, index });
-          if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) throw rpcError("Browser RPC selector is not actionable");
-          await guardedSend(cdp, () => this.lease.assertAuthorized(), "Input.dispatchMouseEvent", {
-            type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1,
-          });
-          await guardedSend(cdp, () => this.lease.assertAuthorized(), "Input.dispatchMouseEvent", {
-            type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1,
-          });
-          return { clicked: true };
+        const expectedName = boundedString(params.expectedName, "expected element name", MAX_EXPECTED_ELEMENT_NAME_BYTES);
+        const queryToken = boundedString(params.queryToken, "selector query receipt", 128);
+        const receipt = this.consumeSelectorQueryReceipt(queryToken);
+        this.selectorQueryReceipts.clear();
+        const observed = receipt.elements[index];
+        const eligible = receipt.elements.filter((element) => element.name === expectedName && element.visible && !element.disabled);
+        if (receipt.selector !== selector || !observed || observed.name !== expectedName || observed.disabled
+          || eligible.length !== 1 || eligible[0] !== observed) {
+          throw rpcError("Browser RPC selector query receipt does not authorize this action");
+        }
+        return (await withAttestedPage(this.lease, async (cdp, _target, before) => {
+          if (before.documentIdentity !== receipt.documentIdentity) {
+            throw rpcError("Browser RPC selector query receipt is stale");
+          }
+          const contextId = await selectorIsolatedWorld(cdp, this.lease, before);
+          return guardedDom(cdp, this.lease, {
+            kind: "activate_selector", selector, index, expectedName, documentNonce: receipt.documentNonce,
+          }, contextId);
         })).value;
       }
       case "browser.fill_selector": {
         const params = exactObject(rawParams, ["selector", "text", "index"]);
         const selector = boundedString(params.selector, "selector", MAX_SELECTOR_BYTES);
+        this.selectorQueryReceipts.clear();
         const text = boundedString(params.text, "public text", MAX_PUBLIC_TEXT_BYTES, true);
         const index = optionalBoundedIndex(params.index) ?? 0;
         return (await withAttestedPage(this.lease, (cdp) => guardedDom(cdp, this.lease, {
@@ -260,6 +360,7 @@ export class ProtectedAutomationBrowserRpc implements ProtectedAutomationBrowser
       case "browser.type_public": {
         const params = exactObject(rawParams, ["text"]);
         const text = boundedString(params.text, "public text", MAX_PUBLIC_TEXT_BYTES, true);
+        this.selectorQueryReceipts.clear();
         return (await withAttestedPage(this.lease, async (cdp) => {
           await guardedDom(cdp, this.lease, { kind: "public_active_target" });
           await guardedSend(cdp, () => this.lease.assertAuthorized(), "Input.insertText", { text });
@@ -296,5 +397,8 @@ export class ProtectedAutomationBrowserRpc implements ProtectedAutomationBrowser
     }
   }
 
-  close(): Promise<void> { return this.lease.close(); }
+  close(): Promise<void> {
+    this.selectorQueryReceipts.clear();
+    return this.lease.close();
+  }
 }

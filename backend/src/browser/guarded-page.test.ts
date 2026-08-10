@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import vm from "node:vm";
 import {
   boundedElementLimit,
   compileGuardedDomOperation,
@@ -113,6 +114,22 @@ test("compiled DOM evaluation preserves sensitive-field redaction helpers and by
   const expression = compileGuardedPageExpression(body);
   assert.match(expression, /function __wayangSensitive/);
   assert.match(expression, /function __wayangRedact/);
+  assert.match(expression, /function __wayangVisible/);
+  assert.match(expression, /!el\.isConnected/);
+  assert.match(expression, /getClientRects/);
+  assert.match(expression, /style\.display === "none"/);
+  assert.match(expression, /style\.visibility === "hidden"/);
+  assert.match(expression, /style\.contentVisibility === "hidden"/);
+  assert.match(expression, /Number\.parseFloat\(style\.opacity\) === 0/);
+  assert.match(expression, /function __wayangDisabled/);
+  assert.match(expression, /el\.matches\(":disabled"\)/);
+  assert.match(expression, /current\.hasAttribute\("inert"\)/);
+  assert.match(expression, /getAttribute\("aria-disabled"\)/);
+  assert.match(expression, /function __wayangActionable/);
+  assert.match(expression, /document\.elementFromPoint/);
+  assert.match(expression, /hit === el \|\| el\.contains\(hit\)/);
+  assert.match(expression, /disabled: __wayangDisabled\(el\)/);
+  assert.match(expression, /visible: __wayangVisible\(el\)/);
   assert.match(expression, /function __wayangInfo/);
   assert.ok(expression.includes(body));
   assert.equal(expression.includes("SYNTHETIC_SECRET_VALUE"), false);
@@ -133,11 +150,141 @@ test("compiled DOM evaluation preserves sensitive-field redaction helpers and by
   assert.equal(parameters?.returnByValue, true);
   assert.equal(parameters?.awaitPromise, true);
 
+  const selectorPoint = compileGuardedDomOperation({ kind: "selector_point", selector: "button", index: 2 });
+  assert.match(selectorPoint, /!__wayangActionable\(el\)/);
+  const activateSelector = compileGuardedDomOperation({
+    kind: "activate_selector", selector: "button", index: 2, expectedName: "Download Transactions",
+    documentNonce: "synthetic-document-nonce",
+  });
+  assert.match(activateSelector, /globalThis\[__wayangSelectorNonceKey\]/);
+  assert.match(activateSelector, /__wayangName\(el\) !== expectedName/);
+  assert.match(activateSelector, /matches\.length !== 1 \|\| matches\[0\] !== el/);
+  assert.match(activateSelector, /el\.click\(\); return \{ clicked: true \}/);
+  assert.equal(activateSelector.includes("Input.dispatchMouseEvent"), false);
+  assert.match(compileGuardedDomOperation({ kind: "fill_selector", selector: "input", text: "public" }), /__wayangDisabled\(el\)/);
+  assert.match(compileGuardedDomOperation({ kind: "public_active_target" }), /__wayangDisabled\(el\)/);
+
   assert.equal(boundedElementLimit(undefined, 80), 80);
   assert.equal(boundedElementLimit(Number.NaN, 80), 80);
   assert.equal(boundedElementLimit(0, 80), 1);
   assert.equal(boundedElementLimit(19.9, 80), 19);
   assert.equal(boundedElementLimit(50_000, 80), 500);
+});
+
+test("compiled visibility and activation helpers fail closed on hidden, disabled, inert, and occluded controls", () => {
+  const style = { display: "block", visibility: "visible", contentVisibility: "visible", opacity: "1" };
+  let clicked = 0;
+  let hit: any;
+  const element: any = {
+    localName: "button",
+    isConnected: true,
+    hidden: false,
+    parentElement: null,
+    textContent: "Download Transactions",
+    innerText: "Download Transactions",
+    getClientRects: () => [{ width: 20, height: 10 }],
+    getBoundingClientRect: () => ({ x: 5, y: 5, left: 5, top: 5, width: 20, height: 10 }),
+    getAttribute: (name: string) => name === "aria-label" ? "Download Transactions" : null,
+    hasAttribute: () => false,
+    matches: () => false,
+    contains: (candidate: unknown) => candidate === element,
+    scrollIntoView: () => undefined,
+    click: () => { clicked += 1; },
+  };
+  hit = element;
+  let candidates: any[] = [element];
+  const sandbox = vm.createContext({
+    location: { href: "https://synthetic.invalid/" },
+    getComputedStyle: (node: any) => node.style ?? style,
+    document: {
+      title: "Synthetic",
+      body: { innerText: "" },
+      activeElement: null,
+      querySelectorAll: (selector: string) => selector === "button" ? candidates : [],
+      elementFromPoint: (x: number, y: number) => typeof hit === "function" ? hit(x, y) : hit,
+    },
+  });
+  const evaluate = (operation: Parameters<typeof compileGuardedDomOperation>[0], nextCandidates: any[] = [element]) => {
+    candidates = nextCandidates;
+    return vm.runInContext(compileGuardedPageExpression(compileGuardedDomOperation(operation)), sandbox);
+  };
+
+  const activate = (expectedName = "Download Transactions", documentNonce = "synthetic-document-nonce") => evaluate({
+    kind: "activate_selector", selector: "button", index: 0, expectedName, documentNonce,
+  });
+  const query = evaluate({
+    kind: "query_visible_selector", selector: "button", limit: 5, documentNonce: "synthetic-document-nonce",
+  });
+  assert.equal(query.elements[0].visible, true);
+  assert.equal(query.elements[0].disabled, false);
+  assert.equal(activate().clicked, true);
+  assert.equal(clicked, 1);
+  assert.throws(() => activate("Different Action"), /not actionable/);
+  assert.throws(() => activate("Download Transactions", "forged-document-nonce"), /document is stale/);
+  assert.equal(clicked, 1, "a changed identity or document nonce is never activated");
+
+  const hiddenAncestor: any = {
+    parentElement: null,
+    hidden: false,
+    style: { ...style, display: "none" },
+    getAttribute: () => null,
+    hasAttribute: () => false,
+  };
+  element.parentElement = hiddenAncestor;
+  element.textContent = "HIDDEN_QUERY_CANARY";
+  element.innerText = "HIDDEN_QUERY_CANARY";
+  assert.equal(evaluate({ kind: "query_selector", selector: "button", limit: 5 }).elements[0].visible, false);
+  const filteredHidden = evaluate({
+    kind: "query_visible_selector", selector: "button", limit: 5, documentNonce: "synthetic-document-nonce",
+  });
+  assert.equal(filteredHidden.elements.length, 0);
+  assert.equal(JSON.stringify(filteredHidden).includes("HIDDEN_QUERY_CANARY"), false);
+  assert.throws(() => activate(), /not actionable/);
+
+  element.parentElement = null;
+  element.textContent = "Download Transactions";
+  element.innerText = "Download Transactions";
+  element.getClientRects = () => [{ width: 0, height: 10 }];
+  assert.equal(evaluate({ kind: "query_selector", selector: "button", limit: 5 }).elements[0].visible, false);
+  element.getClientRects = () => [{ width: 20, height: 10 }];
+
+  element.matches = (selector: string) => selector === ":disabled";
+  assert.equal(evaluate({ kind: "query_selector", selector: "button", limit: 5 }).elements[0].disabled, true);
+  assert.throws(() => activate(), /not actionable/);
+  element.matches = () => false;
+
+  const inertAncestor = { ...hiddenAncestor, style, hasAttribute: (name: string) => name === "inert" };
+  element.parentElement = inertAncestor;
+  assert.equal(evaluate({ kind: "query_selector", selector: "button", limit: 5 }).elements[0].disabled, true);
+  element.parentElement = null;
+
+  const ariaDisabledAncestor = {
+    ...hiddenAncestor,
+    style,
+    getAttribute: (name: string) => name === "aria-disabled" ? " TRUE " : null,
+  };
+  element.parentElement = ariaDisabledAncestor;
+  assert.equal(evaluate({ kind: "query_selector", selector: "button", limit: 5 }).elements[0].disabled, true);
+  element.parentElement = null;
+
+  hit = {};
+  assert.throws(() => activate(), /not actionable/);
+  assert.equal(clicked, 1, "an occluded control is never activated");
+
+  let duplicateClicks = 0;
+  const duplicate = {
+    ...element,
+    getBoundingClientRect: () => ({ x: 50, y: 5, left: 50, top: 5, width: 20, height: 10 }),
+    contains: (candidate: unknown) => candidate === duplicate,
+    click: () => { duplicateClicks += 1; },
+  };
+  hit = (x: number) => x < 40 ? element : duplicate;
+  assert.throws(() => evaluate({
+    kind: "activate_selector", selector: "button", index: 0, expectedName: "Download Transactions",
+    documentNonce: "synthetic-document-nonce",
+  }, [element, duplicate]), /not actionable/);
+  assert.equal(clicked, 1);
+  assert.equal(duplicateClicks, 0, "duplicate actionable semantic matches fail closed");
 });
 
 test("credential protection remains document-bound, one-use, mutation-safe, and redacting", () => {

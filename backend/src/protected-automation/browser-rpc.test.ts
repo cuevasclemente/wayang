@@ -24,6 +24,8 @@ class SyntheticCdp {
   popupClosed = false;
   popupResumed = false;
   autoAttachParams: Record<string, unknown> | null = null;
+  mutateDocumentOnQuery = false;
+  isolatedRuntimeEvaluations = 0;
   private requestSequence = 0;
   private readonly listeners = new Map<string, Set<(event: any) => void>>();
   private readonly paused = new Map<string, (allowed: boolean) => void>();
@@ -54,6 +56,14 @@ class SyntheticCdp {
     this.commands.push({ method, params: { ...params } });
     if (method === "Page.getFrameTree") {
       return { frameTree: { frame: { id: "frame-1", loaderId: this.loader, url: this.url } } };
+    }
+    if (method === "Page.createIsolatedWorld") {
+      assert.deepEqual(params, {
+        frameId: "frame-1",
+        worldName: "wayang-protected-automation-selector-v1",
+        grantUniveralAccess: false,
+      });
+      return { executionContextId: 41 };
     }
     if (method === "Target.getTargets") {
       return { targetInfos: [{ type: "page", targetId: "target-1", url: "about:blank" }] };
@@ -127,6 +137,10 @@ class SyntheticCdp {
     }
     if (method === "Runtime.evaluate") {
       const expression = String(params.expression || "");
+      if (params.contextId !== undefined) {
+        assert.equal(params.contextId, 41);
+        this.isolatedRuntimeEvaluations += 1;
+      }
       if (expression.includes("readyState: document.readyState")) {
         return { result: { value: { url: this.url, title: "Synthetic", readyState: "complete" } } };
       }
@@ -136,8 +150,23 @@ class SyntheticCdp {
       if (expression.includes("document.body.innerText")) {
         return { result: { value: { url: this.url, title: "Synthetic", text: "synthetic page" } } };
       }
+      if (expression.includes("el.click(); return { clicked: true }")) {
+        return { result: { value: { clicked: true } } };
+      }
       if (expression.includes("querySelectorAll(selector)")) {
-        return { result: { value: { url: this.url, title: "Synthetic", selector: "main", elements: [] } } };
+        if (this.mutateDocumentOnQuery) {
+          this.mutateDocumentOnQuery = false;
+          this.loader = `${this.loader}-query-navigation`;
+        }
+        return { result: { value: {
+          url: this.url,
+          title: "Synthetic",
+          selector: "button",
+          elements: [{
+            index: 0, tag: "button", name: "Download Transactions", text: "Download Transactions",
+            disabled: false, visible: true, rect: { x: 1, y: 2, width: 3, height: 4 },
+          }],
+        } } };
       }
       return { result: { value: true } };
     }
@@ -244,9 +273,62 @@ test("navigation and inspection require exact allowed HTTPS origins and settled 
     const dom = await f.request("browser.dom_snapshot", { includeText: false, limit: 10 }) as any;
     assert.equal(dom.elements[0].tag, "button");
     assert.equal("rect" in dom.elements[0], false, "agent-visible coordinates are stripped");
-    assert.ok(f.runtime.cdp.methods.filter((method) => method === "Page.getFrameTree").length >= 12,
+    const buttons = await f.request("browser.query_selector", { selector: "button", limit: 10 }) as any;
+    assert.deepEqual(buttons.elements, [{
+      index: 0,
+      tag: "button",
+      name: "Download Transactions",
+      text: "Download Transactions",
+      disabled: false,
+      visible: true,
+    }]);
+    assert.equal("rect" in buttons.elements[0], false, "visibility does not release coordinates");
+    assert.match(buttons.queryToken, /^[a-f0-9-]{36}$/u);
+    await assert.rejects(
+      () => f.request("browser.click_selector", { selector: "button", index: 0 }),
+      /not exact/i,
+      "protected clicks require exact observed identity and receipt fields",
+    );
+    await assert.rejects(
+      () => f.request("browser.click_selector", {
+        selector: "button", index: 0, expectedName: "Download Transactions",
+        queryToken: "00000000-0000-4000-8000-000000000000",
+      }),
+      /receipt is unavailable/i,
+      "a fabricated receipt cannot activate even a guessed safe label",
+    );
+    const click = {
+      selector: "button", index: 0, expectedName: "Download Transactions", queryToken: buttons.queryToken,
+    };
+    assert.deepEqual(await f.request("browser.click_selector", click), { clicked: true });
+    await assert.rejects(() => f.request("browser.click_selector", click), /receipt is unavailable/i,
+      "the exact receipt is one-use");
+    const stale = await f.request("browser.query_selector", { selector: "button", limit: 10 }) as any;
+    await f.request("browser.navigate", { url: "https://allowed.example.test/after-query" });
+    await assert.rejects(() => f.request("browser.click_selector", {
+      selector: "button", index: 0, expectedName: "Download Transactions", queryToken: stale.queryToken,
+    }), /receipt is unavailable/i, "navigation invalidates prior query receipts");
+    assert.equal(f.runtime.cdp.methods.includes("Input.dispatchMouseEvent"), false,
+      "protected selector activation is validated and dispatched atomically in one guarded page operation");
+    assert.equal(f.runtime.cdp.isolatedRuntimeEvaluations, 3,
+      "protected queries and activation execute only in the document-scoped isolated world");
+    assert.ok(f.runtime.cdp.methods.filter((method) => method === "Page.getFrameTree").length >= 20,
       "each operation observes two consecutive settled identities before releasing a result");
     assert.equal(f.lease.isRevoked, false);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("selector queries never bind a result across a document identity change", async () => {
+  const f = fixture();
+  try {
+    await f.request("browser.navigate", { url: "https://allowed.example.test/export" });
+    f.runtime.cdp.mutateDocumentOnQuery = true;
+    await assert.rejects(
+      () => f.request("browser.query_selector", { selector: "button", limit: 10 }),
+      /crossed a document boundary/i,
+    );
   } finally {
     await f.cleanup();
   }
