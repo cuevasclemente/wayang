@@ -44,7 +44,7 @@ function digest(character = "a"): string {
   return character.repeat(64);
 }
 
-function pair(capability_id: "wayang.host-execution.v1" | "wayang.protected-browser.v1" = "wayang.host-execution.v1") {
+function pair(capability_id: "wayang.host-execution.v1" | "wayang.standard-browser.v1" | "wayang.protected-browser.v1" = "wayang.host-execution.v1") {
   const profile = createAgentProfile({ name: "Arbitrary deployment label", resource_mode: "standard" });
   const project = createProject({
     cwd: projectRoot,

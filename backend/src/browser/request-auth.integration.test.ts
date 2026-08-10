@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { IncomingMessage } from "node:http";
 import { createServer as createNetServer, type AddressInfo } from "node:net";
 import test from "node:test";
 import { createApp } from "../app.js";
@@ -12,6 +13,7 @@ import { createAgentProfile } from "../agent-profiles.js";
 import { close, init } from "../db.js";
 import { createProject } from "../projects.js";
 import { createSession } from "../sessions.js";
+import { selectProtectedBrowserWebSocket, type ProtectedBrowserIntegration } from "../routes/protected-browser.js";
 import {
   browserAgentAuthorizationForSourceSession,
   BROWSER_AGENT_SOURCE_SESSION_HEADER,
@@ -29,7 +31,7 @@ async function availablePort(): Promise<number> {
   return port;
 }
 
-test("session-attributed browser capability is route-scoped and target-authorized", async (t) => {
+test("legacy generic browser agent tokens are route-scoped but cannot bypass exact Standard browser capability tools", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-browser-agent-auth-"));
   const project = path.join(root, "project-a");
   const targetProject = path.join(root, "project-b");
@@ -81,6 +83,17 @@ test("session-attributed browser capability is route-scoped and target-authorize
     [BROWSER_AGENT_TOKEN_HEADER]: authorization.token,
     [BROWSER_AGENT_SOURCE_SESSION_HEADER]: authorization.sourceSessionId,
   };
+  const deniedWebSocketIntegration: ProtectedBrowserIntegration = {
+    select: async () => null,
+    resolve: async () => null,
+  };
+  await assert.rejects(
+    selectProtectedBrowserWebSocket({
+      url: "/api/browser/ws?transport=cdp",
+      headers: { [BROWSER_AGENT_SOURCE_SESSION_HEADER]: authorization.sourceSessionId },
+    } as unknown as IncomingMessage, "cdp", deniedWebSocketIntegration),
+    /Exact interactive browser capability authority is unavailable/,
+  );
   const query = new URLSearchParams({ project_cwd: project, persistence: "project" });
   const login = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
@@ -92,17 +105,20 @@ test("session-attributed browser capability is route-scoped and target-authorize
   assert.ok(cookie);
 
   const status = await fetch(`${baseUrl}/api/browser/status?${query}`, { headers: agentHeaders });
-  assert.equal(status.status, 200);
+  assert.equal(status.status, 403);
   const matchingSessionQuery = new URLSearchParams({
     session_id: source.id,
     project_cwd: project,
     persistence: "session",
   });
   const matchingSessionTarget = await fetch(`${baseUrl}/api/browser/status?${matchingSessionQuery}`, { headers: agentHeaders });
-  assert.equal(matchingSessionTarget.status, 200);
-  assert.equal((await matchingSessionTarget.json() as { projectCwd?: string }).projectCwd, fs.realpathSync(project));
+  assert.equal(matchingSessionTarget.status, 403);
 
-  const publicState = await status.json() as Record<string, unknown>;
+  const uiStateResponse = await fetch(`${baseUrl}/api/browser/status?${query}`, {
+    headers: { Origin: baseUrl, Cookie: cookie },
+  });
+  assert.equal(uiStateResponse.status, 200);
+  const publicState = await uiStateResponse.json() as Record<string, unknown>;
   const serialized = JSON.stringify(publicState);
   for (const privateField of ["profileDir", "runtimePath", "cdpPort", "vncPort", "display", "logs", "controlGeneration", "activeTargetId"]) {
     assert.equal(serialized.includes(privateField), false, privateField);
@@ -114,7 +130,7 @@ test("session-attributed browser capability is route-scoped and target-authorize
       [BROWSER_AGENT_SOURCE_SESSION_HEADER]: source.id,
     },
   });
-  assert.equal(forged.status, 401);
+  assert.equal(forged.status, 403, "generic browser authority is denied before bearer recognition");
 
   const nonBrowserBypass = await fetch(`${baseUrl}/api/me`, { headers: agentHeaders });
   assert.equal(nonBrowserBypass.status, 401, "browser capability must not bypass non-browser API auth");
@@ -126,10 +142,7 @@ test("session-attributed browser capability is route-scoped and target-authorize
     persistence: "session",
   });
   const mismatchedAgentTarget = await fetch(`${baseUrl}/api/browser/status?${mismatchedSessionQuery}`, { headers: agentHeaders });
-  assert.equal(mismatchedAgentTarget.status, 409, "session/project mismatch must win before project authorization");
-  assert.deepEqual(await mismatchedAgentTarget.json(), {
-    error: "Browser session project does not match the durable session cwd",
-  });
+  assert.equal(mismatchedAgentTarget.status, 403, "legacy agent tokens fail before generic target selection");
   const mismatchedUiTarget = await fetch(`${baseUrl}/api/browser/status?${mismatchedSessionQuery}`, {
     headers: { Origin: baseUrl, Cookie: cookie },
   });
@@ -146,7 +159,7 @@ test("session-attributed browser capability is route-scoped and target-authorize
       [BROWSER_AGENT_SOURCE_SESSION_HEADER]: targetAuthorization.sourceSessionId,
     },
   });
-  assert.equal(authorizedTarget.status, 200);
+  assert.equal(authorizedTarget.status, 403, "project allowlisting alone is not browser capability authority");
 
   const handoff = await fetch(`${baseUrl}/api/browser/control-mode`, {
     method: "POST",
@@ -160,8 +173,7 @@ test("session-attributed browser capability is route-scoped and target-authorize
     headers: { ...agentHeaders, "Content-Type": "application/json" },
     body: JSON.stringify({ projectCwd: project, persistence: "project", url: "https://example.test" }),
   });
-  assert.equal(blocked.status, 409);
-  assert.deepEqual(await blocked.json(), { error: "Browser agent control is paused" });
+  assert.equal(blocked.status, 403);
 
   const credentialAgent = await fetch(`${baseUrl}/api/browser/credentials/status?${query}`, {
     method: "POST",

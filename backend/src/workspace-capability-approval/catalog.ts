@@ -21,6 +21,19 @@ const CAPABILITIES: Readonly<Record<WorkspaceCapabilityId, CompiledWorkspaceCapa
       "The association applies across runtime implementation changes and only to fresh authorized runtime handles.",
     ]),
   }),
+  "wayang.standard-browser.v1": Object.freeze({
+    id: "wayang.standard-browser.v1",
+    compatiblePrivacyMode: "standard",
+    activationAvailable: true,
+    title: "Standard browser",
+    riskSummary: "Allows broad agent-controlled browsing in a managed browser for this exact Standard Project-Agent association.",
+    consequences: Object.freeze([
+      "The agent may navigate, inspect pages, click, type public non-secret text, download files, and cause remote mutations or network egress.",
+      "Authenticated cookies can enable purchases, deletions, settings changes, exports, logout, or browser-mediated passkey flows.",
+      "Passwords, MFA, CAPTCHA, payments, recovery, and other sensitive input remain human-controlled, but later agent actions are not read-only.",
+      "Completed bounded downloads become ordinary untrusted project files governed by normal project/profile policy.",
+    ]),
+  }),
   "wayang.host-execution.v1": Object.freeze({
     id: "wayang.host-execution.v1",
     compatiblePrivacyMode: "standard",

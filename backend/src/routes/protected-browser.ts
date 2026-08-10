@@ -16,6 +16,7 @@ import {
 } from "../browser/request-auth.js";
 import {
   PROTECTED_BROWSER_CAPABILITY_ID,
+  STANDARD_BROWSER_CAPABILITY_ID,
   type BrowserSessionLookup,
   type ProtectedBrowserBinding,
   type ProtectedBrowserOperation,
@@ -67,6 +68,7 @@ export interface ProtectedBrowserPublicState {
     suggestedFilename: string;
     relativePath?: string;
     bytes?: number;
+    reason?: "count_quota" | "file_quota" | "aggregate_quota" | "unsafe_source" | "publication_failed";
     updatedAt: number;
   };
 }
@@ -159,8 +161,11 @@ export function validateProtectedBrowserSelection(
   input: ProtectedBrowserSelectionInput,
 ): ProtectedBrowserRouteSelection {
   const binding = selection?.binding;
-  if (!binding || binding.capabilityId !== PROTECTED_BROWSER_CAPABILITY_ID) {
-    throw protectedError("Exact protected browser capability authority is unavailable");
+  const expectedCapabilityId = selectedDurableClass(input) === "standard"
+    ? STANDARD_BROWSER_CAPABILITY_ID
+    : PROTECTED_BROWSER_CAPABILITY_ID;
+  if (!binding || binding.capabilityId !== expectedCapabilityId) {
+    throw protectedError("Exact interactive browser capability authority is unavailable");
   }
   try { assertProtectedBrowserBinding(binding); }
   catch { throw protectedError("Exact protected browser capability authority is invalid"); }
@@ -200,27 +205,41 @@ export function createProtectedBrowserSelectionMiddleware(integration?: Protecte
       res.status(403).json({ error: "Browser target classification is unavailable" });
       return;
     }
-    if (classification !== "protected") {
-      if (classification === "quarantined") {
+    if (classification === "quarantined") {
+      res.setHeader("Cache-Control", "no-store");
+      res.status(403).json({ error: "Browser target is quarantined" });
+      return;
+    }
+    if (classification === "missing") { next(); return; }
+    if (classification === "standard" && (input.requestedPersistence !== undefined || input.requestedScope !== undefined)) {
+      if (input.sourceSessionId) {
         res.setHeader("Cache-Control", "no-store");
-        res.status(403).json({ error: "Browser target is quarantined" });
+        res.status(403).json({ error: "Standard browser agent access requires exact capability-bound tools" });
         return;
       }
       next();
       return;
     }
-    res.setHeader("Cache-Control", "no-store");
     try { assertBackendIssuedProtectedBrowserPersistence(input); }
     catch (error) { sendError(res, error); return; }
     if (!integration) {
+      if (classification === "standard" && !input.sourceSessionId) { next(); return; }
+      res.setHeader("Cache-Control", "no-store");
       res.status(403).json({ error: "Protected browser runtime integration is unavailable" });
       return;
     }
     void Promise.resolve().then(() => integration.select(input)).then((selection) => {
-      if (!selection) throw protectedError("Exact protected browser capability authority is unavailable");
+      if (!selection) {
+        if (classification === "standard" && !input.sourceSessionId) { next(); return; }
+        throw protectedError("Exact interactive browser capability authority is unavailable");
+      }
+      res.setHeader("Cache-Control", "no-store");
       protectedSelections.set(req, validateProtectedBrowserSelection(selection, input));
       next();
-    }).catch(() => sendError(res, protectedError("Exact protected browser capability authority is unavailable")));
+    }).catch(() => {
+      if (classification === "standard" && !input.sourceSessionId) { next(); return; }
+      sendError(res, protectedError("Exact interactive browser capability authority is unavailable"));
+    });
   };
 }
 
@@ -236,13 +255,26 @@ export async function selectProtectedBrowserWebSocket(
   const input = protectedBrowserSelectionInput(request, transport);
   const classification = selectedDurableClass(input);
   if (classification === "quarantined") throw protectedError("Browser target is quarantined");
-  if (classification !== "protected") return null;
+  if (classification === "missing") return null;
+  if (classification === "standard" && (input.requestedPersistence !== undefined || input.requestedScope !== undefined)) {
+    if (input.sourceSessionId) throw protectedError("Standard browser agent access requires exact capability-bound tools");
+    return null;
+  }
   assertBackendIssuedProtectedBrowserPersistence(input);
-  if (!integration) throw protectedError("Protected browser runtime integration is unavailable");
+  if (!integration) {
+    if (classification === "standard" && !input.sourceSessionId) return null;
+    throw protectedError("Interactive browser runtime integration is unavailable");
+  }
   let selection: ProtectedBrowserRouteSelection | null;
   try { selection = await integration.select(input); }
-  catch { throw protectedError("Exact protected browser capability authority is unavailable"); }
-  if (!selection) throw protectedError("Exact protected browser capability authority is unavailable");
+  catch {
+    if (classification === "standard" && !input.sourceSessionId) return null;
+    throw protectedError("Exact interactive browser capability authority is unavailable");
+  }
+  if (!selection) {
+    if (classification === "standard" && !input.sourceSessionId) return null;
+    throw protectedError("Exact interactive browser capability authority is unavailable");
+  }
   return validateProtectedBrowserSelection(selection, input);
 }
 

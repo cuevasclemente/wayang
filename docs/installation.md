@@ -150,7 +150,9 @@ Run `make pi-login` for OAuth or API-key storage managed by pi, or rerun `make c
 
 ### Browser executable not found
 
-Install Chromium/Chrome normally or set `WAYANG_CHROMIUM_PATH` to an absolute executable path in `.env`. The rest of Wayang remains usable without the browser workbench.
+Install Chromium/Chrome normally or set `WAYANG_CHROMIUM_PATH` to the absolute executable binary in `.env` (on macOS, the binary inside the app bundle, not the `.app` directory). The Browser pane reports whether resolution is `resolved`, `missing`, or `invalid_configured_path`; it never displays the configured path. The rest of Wayang remains usable without the browser workbench.
+
+If the Browser pane works manually but an agent has no `browser_*` tools, review its **Agent browser tools** diagnostic. Approve `wayang.standard-browser.v1` for a Standard Project-Agent pair or `wayang.protected-browser.v1` for a Protected pair, then start a fresh interactive runtime. Scheduled/background sessions intentionally never receive these tools.
 
 ### Port already in use
 

@@ -431,6 +431,7 @@ function App({ authEnabled, onLogout }: AppProps) {
       sessionId={activeSessionId}
       sessionCwd={activeSession?.cwd ?? null}
       browserMode={activeSession?.browser_mode ?? "unavailable"}
+      browserAgent={activeSession?.browser_agent ?? null}
     />
   );
 

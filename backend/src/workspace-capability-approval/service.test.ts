@@ -209,6 +209,7 @@ test("status separates current associations from PIN approval events", async () 
   const status = await service.status(10);
   assert.deepEqual(status.capabilities.map((entry) => entry.id), [
     "wayang.standard-resources.v1",
+    "wayang.standard-browser.v1",
     "wayang.host-execution.v1",
     "wayang.protected-browser.v1",
     "wayang.protected-automation.v1",

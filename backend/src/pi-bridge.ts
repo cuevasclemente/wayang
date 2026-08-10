@@ -66,9 +66,19 @@ import { getCommandGuardIdentityBridge } from "./command-guard-bridge.js";
 import { createWayangSessionCustomTools } from "./wayang-runtime-context.js";
 import { createWorkspaceToolDefinitions, workspaceToolsAllowedForRuntime } from "./workspace-tools.js";
 import { AgentSwitchAuthorityLifecycle } from "./agent-switch-authority-lifecycle.js";
-import type { ProtectedBrowserAuthoritySnapshot, ProtectedBrowserBinding } from "./browser/types.js";
-import { PROTECTED_BROWSER_TOOL_NAME, type ProtectedBrowserToolRuntime } from "./browser/protected-tools.js";
+import {
+  PROTECTED_BROWSER_CAPABILITY_ID,
+  STANDARD_BROWSER_CAPABILITY_ID,
+  type ProtectedBrowserAuthoritySnapshot,
+  type ProtectedBrowserBinding,
+} from "./browser/types.js";
+import {
+  INTERACTIVE_BROWSER_TOOL_NAMES,
+  PROTECTED_BROWSER_TOOL_NAME,
+  type ProtectedBrowserToolRuntime,
+} from "./browser/protected-tools.js";
 import { exactProtectedBrowserBindingEqual } from "./browser/protected-browser.js";
+import { getBrowserExecutableDiagnostic } from "./browser/manager.js";
 import {
   exactProtectedAutomationBindingEqual,
   type ProtectedAutomationBinding,
@@ -1932,15 +1942,18 @@ export async function createPiSession(
       && runtimeIdentity.row.pending_agent_switch === null
       && runtimeIdentity.row.scheduled_job_id === null && runtimeIdentity.row.scheduled_run_id === null) {
       assertCreationCurrent();
+      const browserCapabilityId = runtimeIdentity.project.access_policy.privacy_mode === "standard"
+        ? STANDARD_BROWSER_CAPABILITY_ID
+        : PROTECTED_BROWSER_CAPABILITY_ID;
       const protectedResolution = resolveWorkspaceCapability({
-        capability_id: "wayang.protected-browser.v1",
+        capability_id: browserCapabilityId,
         project_id: runtimeIdentity.project.id,
         agent_profile_id: runtimeIdentity.agentProfile.id,
       });
       assertCreationCurrent();
       if (protectedResolution.authorized) {
         const protectedBinding: ProtectedBrowserBinding = {
-          capabilityId: "wayang.protected-browser.v1",
+          capabilityId: browserCapabilityId,
           sourceSessionId: id,
           projectId: runtimeIdentity.project.id,
           projectCwd: runtimeIdentity.project.cwd,
@@ -2234,7 +2247,7 @@ export async function createPiSession(
       tools: pendingProtectedBrowserRuntime || pendingProtectedAutomationRuntime || pendingFileAudioExperimentRuntime
         ? [
             ...(includeRestrictedMcpActiveTool(runtimeResources.tools, pendingRestrictedMcpRuntime) ?? []),
-            ...(pendingProtectedBrowserRuntime ? [PROTECTED_BROWSER_TOOL_NAME] : []),
+            ...(pendingProtectedBrowserRuntime ? [...INTERACTIVE_BROWSER_TOOL_NAMES] : []),
             ...(pendingProtectedAutomationRuntime ? [PROTECTED_AUTOMATION_TOOL_NAME] : []),
             ...(pendingFileAudioExperimentRuntime ? [FILE_AUDIO_EXPERIMENT_TOOL_NAME] : []),
           ]
@@ -2253,7 +2266,7 @@ export async function createPiSession(
           scheduledRunId: runtimeIdentity.row.scheduled_run_id,
         }) ? createWorkspaceToolDefinitions({ sourceSessionId: id }) : []),
         ...(pendingRestrictedMcpRuntime ? [pendingRestrictedMcpRuntime.tool] : []),
-        ...(pendingProtectedBrowserRuntime ? [pendingProtectedBrowserRuntime.tool] : []),
+        ...(pendingProtectedBrowserRuntime ? [...pendingProtectedBrowserRuntime.tools] : []),
         ...(pendingProtectedAutomationRuntime ? [pendingProtectedAutomationRuntime.tool] : []),
         ...(pendingFileAudioExperimentRuntime ? [pendingFileAudioExperimentRuntime.tool] : []),
         ...(hostBashTool ? [hostBashTool] : []),
@@ -2657,6 +2670,7 @@ export interface ProtectedBrowserSurfaceScope {
   projectId: string;
   projectCwd: string;
   agentProfileId: string;
+  capabilityId: ProtectedBrowserBinding["capabilityId"];
   associationRevision: number;
 }
 
@@ -2669,9 +2683,12 @@ export function resolveProtectedBrowserSurfaceScope(
   if (!row || !isSessionCapabilityEligible(row) || row.pending_agent_switch !== null || !row.agent_profile_id
     || (expectedProjectCwd !== undefined && row.cwd !== expectedProjectCwd)) return null;
   const project = getProjectByCwd(row.cwd);
-  if (!project || project.access_policy.privacy_mode !== "protected") return null;
+  if (!project) return null;
+  const capabilityId = project.access_policy.privacy_mode === "standard"
+    ? STANDARD_BROWSER_CAPABILITY_ID
+    : PROTECTED_BROWSER_CAPABILITY_ID;
   const resolution = resolveWorkspaceCapability({
-    capability_id: "wayang.protected-browser.v1",
+    capability_id: capabilityId,
     project_id: project.id,
     agent_profile_id: row.agent_profile_id,
   });
@@ -2681,6 +2698,7 @@ export function resolveProtectedBrowserSurfaceScope(
     projectId: project.id,
     projectCwd: row.cwd,
     agentProfileId: row.agent_profile_id,
+    capabilityId,
     associationRevision: resolution.association.revision,
   };
 }
@@ -2690,9 +2708,10 @@ export function resolveProtectedBrowserPairAuthority(
   projectId: string,
   agentProfileId: string,
   associationRevision: number,
+  capabilityId: ProtectedBrowserBinding["capabilityId"] = PROTECTED_BROWSER_CAPABILITY_ID,
 ): boolean {
   const resolution = resolveWorkspaceCapability({
-    capability_id: "wayang.protected-browser.v1",
+    capability_id: capabilityId,
     project_id: projectId,
     agent_profile_id: agentProfileId,
   });
@@ -2715,7 +2734,7 @@ export function resolveProtectedBrowserAuthority(
     || handle.cwd !== binding.projectCwd
     || binding.processBootNonce !== PROCESS_BOOT_NONCE) return null;
   const resolution = resolveWorkspaceCapability({
-    capability_id: "wayang.protected-browser.v1",
+    capability_id: binding.capabilityId,
     project_id: binding.projectId,
     agent_profile_id: binding.agentProfileId,
   });
@@ -2735,6 +2754,97 @@ export function resolveProtectedBrowserAuthority(
 
 export type BrowserSurfaceMode = "standard" | "protected" | "unavailable";
 
+export type BrowserAgentReasonCode =
+  | "approval_required"
+  | "association_inactive"
+  | "incompatible_project_mode"
+  | "profile_disabled"
+  | "profile_not_allowed"
+  | "session_quarantined"
+  | "interactive_session_required"
+  | "fresh_runtime_required"
+  | "browser_not_found"
+  | "configured_path_invalid"
+  | "transport_unavailable"
+  | "tool_registration_failed";
+
+export interface BrowserAgentDiagnostic {
+  available: boolean;
+  capability_id: ProtectedBrowserBinding["capabilityId"] | null;
+  reason_code: BrowserAgentReasonCode | null;
+  remediation: string | null;
+  executable: ReturnType<typeof getBrowserExecutableDiagnostic>;
+  tool_state: "registered" | "withheld" | "stale_runtime";
+}
+
+const BROWSER_REMEDIATION: Readonly<Record<BrowserAgentReasonCode, string>> = Object.freeze({
+  approval_required: "Approve the compatible Browser capability for this exact Project-Agent pair, then start a fresh session runtime.",
+  association_inactive: "The Browser capability was revoked. Reapprove it only after reviewing the Project-Agent pair.",
+  incompatible_project_mode: "Use the Browser capability compatible with the project's current privacy mode.",
+  profile_disabled: "Enable the selected Agent Profile before using browser tools.",
+  profile_not_allowed: "Allow the selected Agent Profile for this Project before using browser tools.",
+  session_quarantined: "Legacy quarantined sessions cannot receive browser authority; create a fresh session.",
+  interactive_session_required: "Managed browser tools are available only to interactive sessions, not scheduled/background runs.",
+  fresh_runtime_required: "Start a fresh session runtime so the approved browser tools can be registered.",
+  browser_not_found: "Install Chromium/Chrome or configure WAYANG_CHROMIUM_PATH, then restart Wayang.",
+  configured_path_invalid: "Set WAYANG_CHROMIUM_PATH to an absolute executable Chromium/Chrome binary and restart Wayang.",
+  transport_unavailable: "The requested VNC browser transport is unavailable; install Xvfb/x11vnc on Linux or configure the CDP transport.",
+  tool_registration_failed: "Restart the session runtime; if this persists, review extension/tool-name collisions and backend logs.",
+});
+
+export function getPiSessionBrowserAgentDiagnostic(id: string, durableRow?: SessionRow): BrowserAgentDiagnostic {
+  const executable = getBrowserExecutableDiagnostic();
+  const denied = (capabilityId: ProtectedBrowserBinding["capabilityId"] | null, reason: BrowserAgentReasonCode, tool_state: BrowserAgentDiagnostic["tool_state"] = "withheld"): BrowserAgentDiagnostic => ({
+    available: false,
+    capability_id: capabilityId,
+    reason_code: reason,
+    remediation: BROWSER_REMEDIATION[reason],
+    executable,
+    tool_state,
+  });
+  const row = durableRow ?? getSessionById(id);
+  if (!row || row.legacy_private_session_quarantine || row.legacy_capability_ineligible) return denied(null, "session_quarantined");
+  const project = getProjectByCwd(row.cwd);
+  if (!project || !row.agent_profile_id) return denied(null, "profile_not_allowed");
+  const capabilityId = project.access_policy.privacy_mode === "standard"
+    ? STANDARD_BROWSER_CAPABILITY_ID
+    : PROTECTED_BROWSER_CAPABILITY_ID;
+  if (row.scheduled_job_id !== null || row.scheduled_run_id !== null) return denied(capabilityId, "interactive_session_required");
+  const resolution = resolveWorkspaceCapability({ capability_id: capabilityId, project_id: project.id, agent_profile_id: row.agent_profile_id });
+  if (!resolution.authorized) {
+    const reason: BrowserAgentReasonCode = resolution.reason === "association_inactive"
+      ? "association_inactive"
+      : resolution.reason === "incompatible_privacy_mode"
+        ? "incompatible_project_mode"
+        : resolution.reason === "profile_disabled"
+          ? "profile_disabled"
+          : resolution.reason === "profile_not_allowed"
+            ? "profile_not_allowed"
+            : "approval_required";
+    return denied(capabilityId, reason);
+  }
+  const handle = sessions.get(id);
+  const runtime = getLiveProtectedBrowserRuntime(id);
+  if (!handle || !runtime || row.pending_agent_switch) return denied(capabilityId, "fresh_runtime_required", "stale_runtime");
+  const anySession = handle.session as any;
+  const registry = anySession._toolRegistry;
+  const definitions = anySession._toolDefinitions;
+  const registered = runtime.tools.every((tool) => definitions instanceof Map
+    && definitions.get(tool.name)?.definition === tool
+    && registry instanceof Map
+    && registry.has(tool.name));
+  if (!registered) return denied(capabilityId, "tool_registration_failed", "stale_runtime");
+  if (executable.state !== "resolved" || executable.reasonCode === "transport_unavailable") {
+    const reason = executable.reasonCode === "configured_path_invalid"
+      ? "configured_path_invalid"
+      : executable.reasonCode === "transport_unavailable"
+        ? "transport_unavailable"
+        : "browser_not_found";
+    return denied(capabilityId, reason, "registered");
+  }
+  return { available: true, capability_id: capabilityId, reason_code: null, remediation: null, executable, tool_state: "registered" };
+}
+
 /** Backend-only projection for frontend gating; names and labels are never inputs.
  * `protected` may expose owner recovery UI from durable pair authority, but it
  * never implies a live agent/browser lease. Every browser operation still
@@ -2747,17 +2857,19 @@ export function getPiSessionBrowserMode(id: string, durableRow?: SessionRow): Br
   try { project = getProjectByCwd(row.cwd); }
   catch { return "unavailable"; }
   if (!project) return "unavailable";
-  if (project.access_policy.privacy_mode === "standard") return "standard";
   const surface = resolveProtectedBrowserSurfaceScope(id, row.cwd);
+  if (project.access_policy.privacy_mode === "standard" && !surface) return "standard";
   if (!surface) return "unavailable";
-  if (!handle || handle.capabilityAuthorityDenied) return "protected";
+  const mode: BrowserSurfaceMode = project.access_policy.privacy_mode === "standard" ? "standard" : "protected";
+  if (!handle || handle.capabilityAuthorityDenied) return mode;
   if (handle.agentProfileId !== row.agent_profile_id || handle.cwd !== row.cwd) return "unavailable";
   try {
     const runtime = getLiveProtectedBrowserRuntime(id);
-    return !runtime || runtime.browser.currentBinding.associationRevision === surface.associationRevision
-      ? "protected"
+    return !runtime || (runtime.browser.currentBinding.capabilityId === surface.capabilityId
+      && runtime.browser.currentBinding.associationRevision === surface.associationRevision)
+      ? mode
       : "unavailable";
-  } catch { return "protected"; }
+  } catch { return mode; }
 }
 
 /** Authoritative live-handle projection; durable rows never imply host access. */
@@ -2984,10 +3096,12 @@ function latchPiSessionHandleCapabilityDenial(handle: PiSessionHandle): void {
     }
     session._toolRegistry?.delete?.("bash");
     session._toolRegistry?.delete?.(PROTECTED_BROWSER_TOOL_NAME);
+    for (const name of INTERACTIVE_BROWSER_TOOL_NAMES) session._toolRegistry?.delete?.(name);
     session._toolRegistry?.delete?.(PROTECTED_AUTOMATION_TOOL_NAME);
     session._toolRegistry?.delete?.(FILE_AUDIO_EXPERIMENT_TOOL_NAME);
     session._toolDefinitions?.delete?.("bash");
     session._toolDefinitions?.delete?.(PROTECTED_BROWSER_TOOL_NAME);
+    for (const name of INTERACTIVE_BROWSER_TOOL_NAMES) session._toolDefinitions?.delete?.(name);
     session._toolDefinitions?.delete?.(PROTECTED_AUTOMATION_TOOL_NAME);
     session._toolDefinitions?.delete?.(FILE_AUDIO_EXPERIMENT_TOOL_NAME);
   }

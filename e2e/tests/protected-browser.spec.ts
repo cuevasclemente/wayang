@@ -49,6 +49,34 @@ function session(row: typeof sessions[number]) {
       : row.id === ordinarySessionId
         ? "standard"
         : "unavailable",
+    browser_agent: row.id === grantedSessionId
+      ? {
+          available: true,
+          capability_id: "wayang.protected-browser.v1",
+          reason_code: null,
+          remediation: null,
+          executable: { platform: "darwin", transport: "cdp-screencast", state: "resolved" },
+          tool_state: "registered",
+        }
+      : row.id === ordinarySessionId
+        ? {
+            available: false,
+            capability_id: "wayang.standard-browser.v1",
+            reason_code: "approval_required",
+            remediation: "Approve the compatible Browser capability for this exact Project-Agent pair, then start a fresh session runtime.",
+            executable: { platform: "darwin", transport: "cdp-screencast", state: "resolved" },
+            tool_state: "withheld",
+          }
+        : {
+            available: false,
+            capability_id: "wayang.protected-browser.v1",
+            reason_code: row.id === wrongProfileSessionId ? "profile_not_allowed" : "approval_required",
+            remediation: row.id === wrongProfileSessionId
+              ? "Allow the selected Agent Profile for this Project before using browser tools."
+              : "Approve the compatible Browser capability for this exact Project-Agent pair, then start a fresh session runtime.",
+            executable: { platform: "darwin", transport: "cdp-screencast", state: "resolved" },
+            tool_state: "withheld",
+          },
   };
 }
 
@@ -247,6 +275,8 @@ test("backend-issued protected runtime selects the generic protected-browser UX 
   const api = await prepare(page);
   await openBrowser(page, grantedSessionId);
 
+  await expect(page.getByTestId("browser-agent-diagnostic")).toContainText("Agent browser tools: available");
+  await expect(page.getByTestId("browser-agent-diagnostic")).toContainText("darwin/cdp-screencast");
   const safetyDetails = page.getByText("Safety, privacy, and browser details", { exact: true });
   await expect(safetyDetails).toBeVisible();
   await expect(page.locator('[role="note"]')).not.toBeVisible();
@@ -300,7 +330,11 @@ for (const denied of [
     await page.goto(`/sessions/${denied.sessionId}`);
     await expect(page.getByTestId("chat-input")).toBeEnabled();
 
-    await expect(page.getByRole("button", { name: "Browser", exact: true })).toHaveCount(0);
+    await page.getByRole("button", { name: "Browser", exact: true }).click();
+    await expect(page.getByText("Browser agent access is unavailable", { exact: true })).toBeVisible();
+    await expect(page.getByTestId("browser-agent-diagnostic")).toContainText(
+      denied.sessionId === wrongProfileSessionId ? "profile_not_allowed" : "approval_required",
+    );
     await expect(page.getByRole("note")).toHaveCount(0);
     expect(api.browserRequests.filter((entry) => entry.sessionId === denied.sessionId)).toEqual([]);
   });
@@ -312,6 +346,9 @@ test("ordinary sessions retain generic browser behavior", async ({ page }) => {
 
   await expect(page.getByRole("note")).toHaveCount(0);
   await expect(page.getByTestId("protected-downloads")).toHaveCount(0);
+  await expect(page.getByTestId("browser-agent-diagnostic")).toContainText("Agent browser tools: unavailable");
+  await expect(page.getByTestId("browser-agent-remediation")).toContainText("approval_required");
+  await expect(page.getByTestId("browser-agent-remediation")).toContainText("Approve the compatible Browser capability");
   await expect(page.getByText("Start Chromium to use the backend-selected browser runtime.", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Restart", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Credentials", exact: true })).toBeVisible();

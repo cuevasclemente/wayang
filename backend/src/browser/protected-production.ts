@@ -6,11 +6,10 @@ import type { CdpConnection, ChromeTarget } from "./cdp.js";
 import {
   ManagedChromiumRuntime,
   type BrowserCredentialContext,
-  type ManagedChromiumDownloadProgress,
-  type ManagedChromiumDownloadWillBegin,
   type ManagedChromiumRuntimeOptions,
 } from "./manager.js";
 import type { CredentialBroker } from "./credentials.js";
+import { InteractiveBrowserDownloadPublisher } from "./interactive-downloads.js";
 import {
   boundedElementLimit,
   compileGuardedDomOperation,
@@ -64,10 +63,25 @@ const SETTLE_INTERVAL_MS = 50;
 type MaybePromise<T> = T | Promise<T>;
 type CdpPort = Pick<CdpConnection, "send" | "on" | "close">;
 
+function agentVisibleBrowserUrl(value: string): string {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return parsed.protocol;
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+}
+
 export interface ProtectedManagedChromiumPort {
   readonly running: boolean;
   start(assertAuthorizedBeforeBrowserCdp?: () => Promise<void>): Promise<void>;
   stop(): Promise<void>;
+  cancelDownload(guid: string, assertAuthorizedBeforeBrowserCdp?: () => Promise<void>): Promise<void>;
   attachPageCdpViewer(): Promise<{ cdp: CdpPort; target: ChromeTarget; close(): void }>;
 }
 
@@ -226,16 +240,14 @@ async function executePageOperation(
         }));
         break;
       case "type_public":
-        await evaluate(cdp, guard, compileGuardedDomOperation({ kind: "public_active_target" }));
-        await guardedSend(cdp, guard, "Input.insertText", { text: operation.text });
-        value = { typed: true };
+        value = await evaluate(cdp, guard, compileGuardedDomOperation({ kind: "type_public", text: operation.text }));
         break;
       default:
         throw new Error("Protected browser page operation is unavailable");
     }
     const document = await settledDocument(cdp, target, guard, settleTimeoutMs, settleIntervalMs);
-    if (operation.kind === "navigate" && value && typeof value === "object") value = { ...value, url: document.topLevelUrl, title: document.title };
-    if (operation.kind === "accessibility" && value && typeof value === "object") value = { url: document.topLevelUrl, title: document.title, ...value };
+    if (operation.kind === "navigate" && value && typeof value === "object") value = { ...value, url: agentVisibleBrowserUrl(document.topLevelUrl), title: document.title };
+    if (operation.kind === "accessibility" && value && typeof value === "object") value = { url: agentVisibleBrowserUrl(document.topLevelUrl), title: document.title, ...value };
     return { value: credentialProtection.redact(value), topLevelUrl: credentialProtection.redact(document.topLevelUrl) };
   } finally {
     attachment.close();
@@ -493,7 +505,7 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
   const pairAuthorityResolver = options.pairAuthorityResolver ?? resolveProtectedBrowserPairAuthority;
   const pairAuthorized = (binding: Readonly<ProtectedBrowserBinding>): boolean => {
     try {
-      return pairAuthorityResolver(binding.projectId, binding.agentProfileId, binding.associationRevision);
+      return pairAuthorityResolver(binding.projectId, binding.agentProfileId, binding.associationRevision, binding.capabilityId);
     } catch {
       return false;
     }
@@ -506,7 +518,7 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
   const created = new Set<ProtectedBrowserToolRuntime>();
   const realmAttachers = new Map<string, (binding: ProtectedBrowserBinding) => Promise<ProtectedBrowserToolRuntime>>();
   const realmTeardowns = new Map<string, () => Promise<void>>();
-  const realmKey = (binding: Readonly<ProtectedBrowserBinding>) => `${binding.projectId.length}:${binding.projectId}${binding.agentProfileId.length}:${binding.agentProfileId}`;
+  const realmKey = (binding: Readonly<ProtectedBrowserBinding>) => `${binding.capabilityId.length}:${binding.capabilityId}${binding.projectId.length}:${binding.projectId}${binding.agentProfileId.length}:${binding.agentProfileId}`;
   const productionPorts = new WeakMap<ProtectedBrowserToolRuntime, {
     managed: ProtectedManagedChromiumPort;
     ownerControls: ProtectedBrowserOwnerControls;
@@ -533,8 +545,9 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
     }
     fs.mkdirSync(options.dataDir, { recursive: true, mode: 0o700 });
     fs.chmodSync(options.dataDir, 0o700);
-    const storage = ensureProtectedBrowserStorage(options.dataDir, binding.projectId, binding.agentProfileId, binding.projectCwd);
-    const downloadsDir = path.join(binding.projectCwd, ".wayang", "browser-downloads");
+    const storage = ensureProtectedBrowserStorage(options.dataDir, binding.projectId, binding.agentProfileId, binding.projectCwd, binding.capabilityId);
+    const downloadsDir = path.join(storage.runtimeDir, "downloads");
+    const downloadPublisher = new InteractiveBrowserDownloadPublisher(downloadsDir, binding.projectCwd);
     let activeBinding: ProtectedBrowserBinding = { ...binding };
     let browser!: CapabilityBoundProtectedBrowser;
     const invalidatePairPublication = () => { realmAttachers.delete(realmKey(activeBinding)); };
@@ -551,37 +564,29 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
       const snapshot = authorityResolver(current);
       if (!snapshot || !exactProtectedBrowserBindingEqual(snapshot, current)) throw new Error("Protected browser authority is unavailable");
     };
-    const downloadNames = new Map<string, string>();
-    const safeDownloadName = (value: string): string => {
-      const name = path.basename(value.trim()).replace(/[\u0000-\u001f\u007f]/gu, "");
-      return Array.from(name || "download").slice(0, 255).join("");
-    };
     managed = managedFactory({
       profileDir: storage.profileDir,
       downloadsDir,
-      downloadBehavior: "allow",
+      downloadBehavior: "allowAndName",
       workingDirectory: binding.projectCwd,
-      onDownloadWillBegin(event: ManagedChromiumDownloadWillBegin) {
-        const suggestedFilename = safeDownloadName(event.suggestedFilename);
-        downloadNames.set(event.guid, suggestedFilename);
-        latestDownload = { status: "downloading", suggestedFilename, updatedAt: Date.now() };
-        updatedAt = latestDownload.updatedAt;
+      onDownloadWillBegin(event) {
+        const decision = downloadPublisher.begin(event);
+        latestDownload = downloadPublisher.latest;
+        updatedAt = latestDownload?.updatedAt ?? Date.now();
+        if (!decision.accepted) {
+          void managed.cancelDownload(event.guid, currentAuthorization).catch(() => browser.revokeRealm());
+        }
       },
-      onDownloadProgress(event: ManagedChromiumDownloadProgress) {
-        const suggestedFilename = downloadNames.get(event.guid) ?? "download";
-        latestDownload = event.state === "completed"
-          ? {
-              status: "completed",
-              suggestedFilename,
-              relativePath: path.posix.join(".wayang", "browser-downloads", suggestedFilename),
-              bytes: event.receivedBytes,
-              updatedAt: Date.now(),
-            }
-          : event.state === "canceled"
-            ? { status: "canceled", suggestedFilename, updatedAt: Date.now() }
-            : { status: "downloading", suggestedFilename, bytes: event.receivedBytes, updatedAt: Date.now() };
-        if (event.state !== "inProgress") downloadNames.delete(event.guid);
-        updatedAt = latestDownload.updatedAt;
+      onDownloadProgress(event) {
+        void downloadPublisher.progress(event, currentAuthorization).then(async (result) => {
+          latestDownload = result.state;
+          updatedAt = latestDownload?.updatedAt ?? Date.now();
+          if (result.cancel) await managed.cancelDownload(event.guid, currentAuthorization);
+        }).catch(async () => {
+          latestDownload = downloadPublisher.latest;
+          updatedAt = latestDownload?.updatedAt ?? Date.now();
+          await managed.cancelDownload(event.guid).catch(() => undefined);
+        });
       },
       onTopLevelNavigation(url) {
         // This callback is delivered by the browser-lifetime Target observer,
@@ -624,7 +629,7 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
           ? { needsUserReason: "Human control is active for a protected browser step" }
           : {}),
         ...(lastResumeAt === undefined ? {} : { lastResumeAt }),
-        ...((browser?.mode ?? "agent") === "agent" && activeUrl !== undefined ? { activeUrl: credentialProtection.redact(activeUrl) } : {}),
+        ...((browser?.mode ?? "agent") === "agent" && activeUrl !== undefined ? { activeUrl: credentialProtection.redact(agentVisibleBrowserUrl(activeUrl)) } : {}),
         ...((browser?.mode ?? "agent") === "agent" && activeTitle !== undefined ? { activeTitle: credentialProtection.redact(activeTitle) } : {}),
         cdpReady: managed.running,
         viewerTransport: "cdp-screencast",
@@ -674,6 +679,7 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
       unsubscribeRealmPolicy = () => undefined;
       invalidatePairPublication();
       if (runtime) created.delete(runtime);
+      downloadPublisher.revoke();
       await resetCredentialRealm();
     }, finalStop);
     let handoffDocument: string | undefined;
@@ -898,12 +904,16 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
         throw new Error("Protected browser replacement does not match the persistent pair realm");
       }
       const priorBrowser = browser;
+      const pendingDownloads = downloadPublisher.pendingGuids();
+      await Promise.allSettled(pendingDownloads.map((guid) => managed.cancelDownload(guid, currentAuthorization)));
+      downloadPublisher.cancelPending();
       const cleanup = await Promise.allSettled([priorBrowser.revoke()]);
       if (cleanup.some((result) => result.status === "rejected")) {
         void priorBrowser.revokeRealm();
         throw new Error("Protected browser lease cleanup failed before replacement publication");
       }
 
+      latestDownload = undefined;
       const nextBinding: ProtectedBrowserBinding = {
         ...requested,
         controlGeneration: priorBrowser.currentBinding.controlGeneration,

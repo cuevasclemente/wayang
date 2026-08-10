@@ -9,6 +9,33 @@
 export type SessionRuntimeStatus = "active" | "starting" | "stopped";
 export type BashMode = "host" | "sandboxed" | "sandboxed-wren" | "unavailable";
 export type BrowserSurfaceMode = "standard" | "protected" | "unavailable";
+export type BrowserAgentReasonCode =
+  | "approval_required"
+  | "association_inactive"
+  | "incompatible_project_mode"
+  | "profile_disabled"
+  | "profile_not_allowed"
+  | "session_quarantined"
+  | "interactive_session_required"
+  | "fresh_runtime_required"
+  | "browser_not_found"
+  | "configured_path_invalid"
+  | "transport_unavailable"
+  | "tool_registration_failed";
+
+export interface BrowserAgentDiagnostic {
+  available: boolean;
+  capability_id: "wayang.standard-browser.v1" | "wayang.protected-browser.v1" | null;
+  reason_code: BrowserAgentReasonCode | null;
+  remediation: string | null;
+  executable: {
+    platform: string;
+    transport: "cdp-screencast" | "vnc";
+    state: "resolved" | "missing" | "invalid_configured_path";
+    reasonCode?: "browser_not_found" | "configured_path_invalid" | "transport_unavailable";
+  };
+  tool_state: "registered" | "withheld" | "stale_runtime";
+}
 
 export interface PendingAgentSwitch {
   switch_id: string;
@@ -45,6 +72,7 @@ export interface Session {
   runtime_last_activity_at: number | null;
   bash_mode: BashMode;
   browser_mode: BrowserSurfaceMode;
+  browser_agent?: BrowserAgentDiagnostic;
 }
 
 export interface Me {
@@ -640,6 +668,7 @@ export function fetchCapabilities(cwd?: string | null): Promise<{ cwd: string | 
 
 export const WORKSPACE_CAPABILITY_IDS = [
   "wayang.standard-resources.v1",
+  "wayang.standard-browser.v1",
   "wayang.host-execution.v1",
   "wayang.protected-browser.v1",
   "wayang.protected-automation.v1",
@@ -1055,6 +1084,7 @@ export interface ProtectedDownloadStatus {
   suggestedFilename: string;
   relativePath?: string;
   bytes?: number;
+  reason?: "count_quota" | "file_quota" | "aggregate_quota" | "unsafe_source" | "publication_failed";
   updatedAt: number;
 }
 

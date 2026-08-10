@@ -25,7 +25,7 @@ function snapshot(exact: ProtectedBrowserBinding): ProtectedBrowserAuthoritySnap
   return { ...exact, authorized: true, privacyMode: "protected", sourceSessionDurable: true, sourceQuarantined: false, profileEnabled: true, projectAllowsProfile: true };
 }
 
-test("protected tool exposes ordinary browser operations without a download permit protocol", async () => {
+test("capability-bound runtime exposes explicit browser tools without a download permit protocol", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-protected-tools-"));
   const exact = binding();
   const browserOps: string[] = [];
@@ -44,13 +44,18 @@ test("protected tool exposes ordinary browser operations without a download perm
   });
   const runtime = createProtectedBrowserToolRuntime({ browser });
   try {
-    const navigate = await (runtime.tool.execute as any)("navigate", { operation: "navigate", url: "https://example.invalid/path" });
+    assert.deepEqual(runtime.tools.map((tool) => tool.name), [
+      "browser_status", "browser_open", "browser_navigate", "browser_snapshot", "browser_dom_snapshot",
+      "browser_query_selector", "browser_click_selector", "browser_fill_selector", "browser_extract_links",
+      "browser_accessibility_snapshot", "browser_click", "browser_type_public", "browser_wait_for_user",
+      "browser_resume_status", "browser_close",
+    ]);
+    const navigateTool = runtime.toolForName("browser_navigate");
+    assert.ok(navigateTool);
+    const navigate = await (navigateTool.execute as any)("navigate", { url: "https://example.invalid/path" });
     assert.match(navigate.content[0].text, /navigate/);
     assert.deepEqual(browserOps, ["navigate"]);
-    await assert.rejects(
-      () => (runtime.tool.execute as any)("legacy", { operation: "arm_next_download" }),
-      /validation|schema|union|operation/i,
-    );
+    assert.equal(runtime.toolForName("protected_browser"), undefined);
   } finally {
     await runtime.close();
     fs.rmSync(root, { recursive: true, force: true });
@@ -68,9 +73,12 @@ test("protected tool latches denial after a browser coordinator failure", async 
   });
   const runtime = createProtectedBrowserToolRuntime({ browser });
   try {
-    await assert.rejects(() => (runtime.tool.execute as any)("navigate", { operation: "navigate", url: "https://example.invalid" }), /synthetic coordinator denial/);
+    const navigateTool = runtime.toolForName("browser_navigate");
+    const statusTool = runtime.toolForName("browser_status");
+    assert.ok(navigateTool && statusTool);
+    await assert.rejects(() => (navigateTool.execute as any)("navigate", { url: "https://example.invalid" }), /synthetic coordinator denial/);
     assert.equal(runtime.preflight().allowed, false);
-    await assert.rejects(() => (runtime.tool.execute as any)("stale", { operation: "status" }), /revoked/);
+    await assert.rejects(() => (statusTool.execute as any)("stale", {}), /revoked/);
   } finally {
     await runtime.close();
     fs.rmSync(root, { recursive: true, force: true });

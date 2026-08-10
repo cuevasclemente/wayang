@@ -17,6 +17,7 @@ Privileged authority belongs to a PIN-approved capability association between on
 The current publicly listed and grantable capabilities are:
 
 - `wayang.standard-resources.v1` for a Standard Project-Agent pair. It permits Pi global instructions, skills, prompts, and reviewed extensions for any provider/model used by that agent in the project.
+- `wayang.standard-browser.v1` for a Standard project/profile pair. It gives fresh interactive runtimes backend-owned explicit `browser_*` tools without loading global Pi extensions.
 - `wayang.host-execution.v1` for a Standard project/profile pair. It replaces sandboxed bash with direct execution as the Wayang OS user.
 - `wayang.protected-browser.v1` for a Protected project/profile pair. Protected projects remain browser-denied by default; assigning this exception gives the runtime broad control of its persistent authenticated browser.
 - `wayang.protected-automation.v1` for a Protected project/profile pair when the grantable build is deployed. It authorizes deterministic no-Pi automation for that exact pair.
@@ -151,7 +152,7 @@ If sandbox prerequisites are unavailable, bash is removed rather than replaced w
 
 Full destination access is an explicit operator tradeoff. A shell can forge HTTP origins and call passwordless Wayang or other local APIs, so source-attributed companion-tool authorization is not a network sandbox. Memory modes prevent participating memory tools and filesystem writes; they cannot prevent an agent from deliberately sending text to any reachable network service. Provider calls made by the host agent runtime are unaffected.
 
-Browser and Apps companion calls use source-session-attributed in-process capabilities and reauthorize the source profile against the target project. Protected browser access additionally requires the exact active `wayang.protected-browser.v1` assignment. Once granted, browser authority is broad and may mutate authenticated sites; the capability check is not an operation-level read-only policy. App manifest commands remain same-user unsandboxed processes, so agent start/restart fails closed whenever any Protected project exists; manual authenticated launch remains available after human review.
+Approved interactive browser access is backend-owned and requires the exact active `wayang.standard-browser.v1` or `wayang.protected-browser.v1` assignment compatible with the Project privacy mode. Fresh runtimes receive explicit `browser_*` tools; scheduled/background sessions receive none. Each operation reauthorizes the exact source Project, Agent Profile, association revision, runtime generation, and process generation. Once granted, browser authority is broad and may mutate authenticated sites; the capability check is not an operation-level read-only policy. Apps companion calls retain their separate source-session-attributed integration. App manifest commands remain same-user unsandboxed processes, so agent start/restart fails closed whenever any Protected project exists; manual authenticated launch remains available after human review.
 
 ## Security boundary
 

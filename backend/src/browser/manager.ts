@@ -259,20 +259,66 @@ export function resolveChromiumExecutableCandidate(candidate: string): string | 
   }
 }
 
-function findChromiumExecutable(): string {
+export type BrowserExecutableState = "resolved" | "missing" | "invalid_configured_path";
+
+export interface BrowserExecutableDiagnostic {
+  platform: NodeJS.Platform;
+  transport: "cdp-screencast" | "vnc";
+  state: BrowserExecutableState;
+  reasonCode?: "browser_not_found" | "configured_path_invalid" | "transport_unavailable";
+}
+
+/** Non-secret preflight: reports only platform/transport and resolution class,
+ * never candidate paths or environment values. */
+export function getBrowserExecutableDiagnostic(options: {
+  configuredPath?: string | null;
+  requestedTransport?: string;
+  vncAvailable?: boolean;
+  platform?: NodeJS.Platform;
+} = {}): BrowserExecutableDiagnostic {
+  const configured = options.configuredPath === undefined
+    ? process.env.WAYANG_CHROMIUM_PATH || process.env.CHROME_PATH || process.env.CHROMIUM_PATH
+    : options.configuredPath || undefined;
+  const vncAvailable = options.vncAvailable ?? canUseVncTransport();
+  const requestedTransport = options.requestedTransport ?? process.env.WAYANG_BROWSER_TRANSPORT ?? "auto";
+  const platform = options.platform ?? process.platform;
+  const transportUnavailable = requestedTransport === "vnc" && !vncAvailable;
+  const transport: BrowserExecutableDiagnostic["transport"] = requestedTransport === "vnc" ? "vnc" : selectedViewerTransport(vncAvailable);
+  if (configured) {
+    if (!path.isAbsolute(configured) || !resolveChromiumExecutableCandidate(configured)) {
+      return { platform, transport, state: "invalid_configured_path", reasonCode: "configured_path_invalid" };
+    }
+    return { platform, transport, state: "resolved", ...(transportUnavailable ? { reasonCode: "transport_unavailable" as const } : {}) };
+  }
+  const resolved = getChromiumCandidates(undefined).some((candidate) => Boolean(resolveChromiumExecutableCandidate(candidate)))
+    || ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"].some((name) => Boolean(executableOnPath(name)));
+  return resolved
+    ? { platform, transport, state: "resolved", ...(transportUnavailable ? { reasonCode: "transport_unavailable" as const } : {}) }
+    : { platform, transport, state: "missing", reasonCode: "browser_not_found" };
+}
+
+export function findChromiumExecutableCandidates(): string[] {
   const configured = process.env.WAYANG_CHROMIUM_PATH || process.env.CHROME_PATH || process.env.CHROMIUM_PATH;
-  if (configured && !path.isAbsolute(configured)) {
-    throw new Error("Configured Chromium executable path must be absolute.");
+  if (configured) {
+    if (!path.isAbsolute(configured)) throw new Error("Configured Chromium executable path must be absolute.");
+    const resolved = resolveChromiumExecutableCandidate(configured);
+    if (!resolved) throw new Error("Configured Chromium executable path is not an executable file.");
+    return [resolved];
   }
-  for (const candidate of getChromiumCandidates(configured)) {
-    const resolved = resolveChromiumExecutableCandidate(candidate);
-    if (resolved) return resolved;
-  }
+  const candidates = getChromiumCandidates(undefined)
+    .map(resolveChromiumExecutableCandidate)
+    .filter((candidate): candidate is string => Boolean(candidate));
   for (const name of ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"]) {
     const found = executableOnPath(name);
-    if (found) return found;
+    if (found) candidates.push(found);
   }
-  throw new Error("Chromium executable not found. Set WAYANG_CHROMIUM_PATH to a Chromium/Chrome binary.");
+  const unique = [...new Set(candidates)];
+  if (unique.length === 0) throw new Error("Chromium executable not found. Set WAYANG_CHROMIUM_PATH to a Chromium/Chrome binary.");
+  return unique;
+}
+
+function findChromiumExecutable(): string {
+  return findChromiumExecutableCandidates()[0];
 }
 
 function sanitizeKeySegment(value: string): string {
@@ -336,8 +382,11 @@ function cloneState(state: BrowserSessionState): BrowserSessionState {
 export function sanitizeBrowserErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error || "");
   if (/Configured Chromium executable path must be absolute/i.test(message)) return "Configured Chromium executable path must be absolute.";
+  if (/Configured Chromium executable path is not an executable file/i.test(message)) return "Configured Chromium executable path is not an executable file.";
   if (/Chromium executable not found/i.test(message)) return "Chromium executable not found. Configure WAYANG_CHROMIUM_PATH.";
   if (/VNC transport requested/i.test(message)) return "VNC transport is unavailable.";
+  if (/CDP startup failed|timed out waiting for Chromium CDP/i.test(message)) return "Chromium started but its control channel did not become ready before the timeout.";
+  if (/Chromium exited|spawn .*ENOENT|startup failed/i.test(message)) return "Chromium could not be started.";
   if (/agent control is paused|control changed during|sensitive field|not a fillable field|No destination field found/i.test(message)) return message;
   if (/Session not found|sessionId or projectCwd is required/i.test(message)) return message;
   return "Browser operation failed";
@@ -1773,8 +1822,16 @@ export class ManagedChromiumRuntime {
       if (this.running) return;
       fs.mkdirSync(this.options.profileDir, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.options.downloadsDir, { recursive: true, mode: 0o700 });
-      const executable = findChromiumExecutable();
-      const port = await allocatePort();
+      const executableCandidates = findChromiumExecutableCandidates();
+      let lastStartupError: unknown;
+      let authorizationError: unknown;
+      const assertAuthorized = async () => {
+        try { await assertAuthorizedBeforeBrowserCdp?.(); }
+        catch (error) { authorizationError = error; throw error; }
+      };
+      for (const executable of executableCandidates) {
+        await assertAuthorized();
+        const port = await allocatePort();
       const child = spawn(executable, [
         "--remote-debugging-address=127.0.0.1",
         `--remote-debugging-port=${port}`,
@@ -1810,7 +1867,7 @@ export class ManagedChromiumRuntime {
           };
           browserCdp.on("Target.targetCreated", observeTarget);
           browserCdp.on("Target.targetInfoChanged", observeTarget);
-          await assertAuthorizedBeforeBrowserCdp?.();
+          await assertAuthorized();
           await browserCdp.send("Target.setDiscoverTargets", { discover: true });
         }
         if (this.options.onDownloadWillBegin) {
@@ -1823,7 +1880,7 @@ export class ManagedChromiumRuntime {
             this.options.onDownloadProgress?.({ ...event });
           });
         }
-        await assertAuthorizedBeforeBrowserCdp?.();
+        await assertAuthorized();
         await browserCdp.send("Browser.setDownloadBehavior", {
           behavior: this.options.downloadBehavior ?? "allowAndName",
           downloadPath: this.options.downloadsDir,
@@ -1838,15 +1895,36 @@ export class ManagedChromiumRuntime {
           this.cdpPort = null;
           this.options.onUnexpectedExit?.();
         });
+        return;
       } catch (error) {
         this.browserCdp?.close();
         this.browserCdp = null;
         terminateChild(child);
-        await Promise.race([exited.then(() => undefined), sleep(3_000).then(() => killChild(child))]);
+        const exitedAfterTerm = await Promise.race([
+          exited,
+          sleep(3_000).then(() => false),
+        ]);
+        if (!exitedAfterTerm) {
+          killChild(child);
+          const exitedAfterKill = await Promise.race([
+            exited,
+            sleep(2_000).then(() => false),
+          ]);
+          if (!exitedAfterKill) {
+            this.child = null;
+            this.cdpPort = null;
+            throw new Error("Managed Chromium could not be terminated after a failed startup attempt");
+          }
+        }
         this.child = null;
         this.cdpPort = null;
-        throw error;
+        if (authorizationError !== undefined) throw authorizationError;
+        lastStartupError = error;
       }
+      }
+      throw lastStartupError instanceof Error
+        ? lastStartupError
+        : new Error("Managed Chromium failed to start with every detected executable");
     });
   }
 
