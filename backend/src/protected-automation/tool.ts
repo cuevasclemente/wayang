@@ -13,6 +13,7 @@ import {
   captureProtectedAutomationSnapshot,
   discardProtectedAutomationSnapshot,
   finalizeProtectedAutomationSnapshotCapture,
+  protectedAutomationSnapshotDiagnosticCode,
   type ProtectedAutomationSnapshotCaptureResult,
   type ProtectedAutomationSnapshotMetadata,
 } from "./snapshots.js";
@@ -282,6 +283,10 @@ function reloadScheduledJob(jobId: string): void {
 }
 
 function sanitizedError(error: unknown): Error {
+  const snapshotDiagnostic = protectedAutomationSnapshotDiagnosticCode(error);
+  if (snapshotDiagnostic) {
+    return new Error(`Protected automation snapshot capture failed safely (${snapshotDiagnostic})`);
+  }
   if (error instanceof WorkspaceStoreError && error.statusCode === 409
     && /job is paused$/u.test(error.message)) {
     return new Error("Protected automation job is paused; enable it before run_now");

@@ -100,6 +100,37 @@ function publishedRevisionNames(): string[] {
   }).sort();
 }
 
+test("snapshot diagnostics expose only explicit bounded capture stages through the exact-pair tool", async () => {
+  const f = fixture();
+  const runtime = createProtectedAutomationToolRuntime({ binding: f.binding, isRuntimeCurrent: () => true });
+  const forbidden = path.join(projectRoot, "source", ".env.example");
+  fs.writeFileSync(forbidden, "SYNTHETIC_NAME_WITHOUT_A_VALUE=\n");
+  try {
+    const error = await (runtime.tool.execute as any)("bounded-snapshot-diagnostic", {
+      operation: "capture_job",
+      ...configuration,
+    }).then(() => null, (failure: Error) => failure);
+    assert.ok(error);
+    assert.equal(error.message, "Protected automation snapshot capture failed safely (source_validation)");
+    assert.equal(error.message.includes(projectRoot), false);
+    assert.equal(error.message.includes(".env"), false);
+    assert.deepEqual(publishedRevisionNames(), []);
+
+    fs.unlinkSync(forbidden);
+    const entrypointError = await (runtime.tool.execute as any)("bounded-entrypoint-diagnostic", {
+      operation: "capture_job",
+      ...configuration,
+      entrypoint: "missing.mjs",
+    }).then(() => null, (failure: Error) => failure);
+    assert.ok(entrypointError);
+    assert.equal(entrypointError.message, "Protected automation snapshot capture failed safely (source_entrypoint)");
+    assert.equal(entrypointError.message.includes("missing.mjs"), false);
+    assert.deepEqual(publishedRevisionNames(), []);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test("capture/update/list expose only exact-pair metadata and strict schemas reject authority smuggling", async () => {
   const f = fixture();
   const runtime = createProtectedAutomationToolRuntime({ binding: f.binding, isRuntimeCurrent: () => true });

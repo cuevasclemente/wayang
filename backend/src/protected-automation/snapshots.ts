@@ -137,6 +137,26 @@ export class ProtectedAutomationSnapshotError extends Error {
   }
 }
 
+export const PROTECTED_AUTOMATION_SNAPSHOT_DIAGNOSTIC_CODES = [
+  "request", "source_path", "source_validation", "source_entrypoint",
+  "storage_safety", "storage_quota", "integrity", "publication", "capture_failed",
+] as const;
+
+export type ProtectedAutomationSnapshotDiagnosticCode =
+  typeof PROTECTED_AUTOMATION_SNAPSHOT_DIAGNOSTIC_CODES[number];
+
+class ProtectedAutomationSnapshotCaptureDiagnosticError extends ProtectedAutomationSnapshotError {
+  constructor(readonly diagnosticCode: ProtectedAutomationSnapshotDiagnosticCode, internalMessage: string) {
+    super(internalMessage);
+    this.name = "ProtectedAutomationSnapshotCaptureDiagnosticError";
+  }
+}
+
+/** Return only the explicit capture stage attached at the boundary. */
+export function protectedAutomationSnapshotDiagnosticCode(error: unknown): ProtectedAutomationSnapshotDiagnosticCode | null {
+  return error instanceof ProtectedAutomationSnapshotCaptureDiagnosticError ? error.diagnosticCode : null;
+}
+
 function fail(message: string): never {
   throw new ProtectedAutomationSnapshotError(message);
 }
@@ -902,9 +922,11 @@ export function finalizeProtectedAutomationSnapshotCapture(capture: ProtectedAut
   discardReceipts.delete(capture);
 }
 
-export function captureProtectedAutomationSnapshot(
+function captureProtectedAutomationSnapshotInternal(
   input: CaptureProtectedAutomationSnapshotInput,
+  setDiagnostic: (code: ProtectedAutomationSnapshotDiagnosticCode) => void,
 ): ProtectedAutomationSnapshotCaptureResult {
+  setDiagnostic("request");
   const projectId = validateIdentity(input.projectId, "project id");
   const agentProfileId = validateIdentity(input.agentProfileId, "agent profile id");
   const jobId = validateIdentity(input.jobId, "job id");
@@ -914,14 +936,19 @@ export function captureProtectedAutomationSnapshot(
   rejectForbiddenPath(sourceDirectory);
   rejectForbiddenPath(entrypoint);
 
+  setDiagnostic("source_path");
   const projectRoot = canonicalProjectRoot(input.projectRoot);
   const sourceRoot = resolveSourceRoot(projectRoot, sourceDirectory);
   if (pathsOverlap(sourceRoot, getWayangDataRoot())) fail("Snapshot source must not overlap private Wayang data");
+  setDiagnostic("storage_safety");
   reconcileProtectedAutomationSnapshots();
+  setDiagnostic("source_validation");
   const preflight = preflightSourceTree(sourceRoot);
+  setDiagnostic("source_entrypoint");
   const entrypointSource = preflight.files.find((file) => file.path === entrypoint);
   if (!entrypointSource) fail("Snapshot entrypoint must be one regular file inside the requested source directory");
 
+  setDiagnostic("storage_safety");
   const identity = { projectId, agentProfileId, jobId, revision, entrypoint };
   const { jobRoot, revisionsRoot, revisionRoot } = storagePaths(projectId, agentProfileId, jobId, revision, true);
   let incomingAllocationEstimate = estimatedCaptureAllocation(
@@ -937,6 +964,7 @@ export function captureProtectedAutomationSnapshot(
     );
   }
   if (!pathDoesNotExist(revisionRoot)) {
+    setDiagnostic("integrity");
     const existing = readPublishedSnapshot(revisionRoot, true);
     const requested = manifestFromSource(preflight, identity);
     const requestedBytes = canonicalManifestBytes(requested);
@@ -946,8 +974,10 @@ export function captureProtectedAutomationSnapshot(
     }
     return captureResult(metadataFor(existing.manifest, existing.manifestSha256), false, existing.allocatedBytes);
   }
+  setDiagnostic("storage_quota");
   assertCaptureCapacity(initialUsage, incomingAllocationEstimate);
 
+  setDiagnostic("publication");
   const tempRoot = path.join(revisionsRoot, `.${revision}.tmp-${randomUUID()}`);
   let tempCreated = false;
   activeTempRoots.add(tempRoot);
@@ -982,7 +1012,9 @@ export function captureProtectedAutomationSnapshot(
       activeTempRoots.delete(tempRoot);
       return captureResult(metadataFor(existing.manifest, existing.manifestSha256), false, existing.allocatedBytes);
     }
+    setDiagnostic("storage_safety");
     reconcileProtectedAutomationSnapshots();
+    setDiagnostic("integrity");
     const tempAllocation = readPublishedSnapshot(tempRoot, false).allocatedBytes;
     const publicationUsage = scanSnapshotUsage(projectId, agentProfileId, jobId, tempRoot);
     const publicationAllocation = publicationUsage.jobRevisions === 0
@@ -991,7 +1023,9 @@ export function captureProtectedAutomationSnapshot(
         addAllocation(privateDirectoryAllocation(jobRoot), privateDirectoryAllocation(revisionsRoot)),
       )
       : tempAllocation;
+    setDiagnostic("storage_quota");
     assertCaptureCapacity(publicationUsage, publicationAllocation);
+    setDiagnostic("publication");
     try {
       fs.renameSync(tempRoot, revisionRoot);
     } catch {
@@ -1011,6 +1045,21 @@ export function captureProtectedAutomationSnapshot(
     if (tempCreated && !pathDoesNotExist(tempRoot)) removePrivateTemp(tempRoot);
     if (error instanceof ProtectedAutomationSnapshotError) throw error;
     fail("Snapshot capture failed safely");
+  }
+}
+
+export function captureProtectedAutomationSnapshot(
+  input: CaptureProtectedAutomationSnapshotInput,
+): ProtectedAutomationSnapshotCaptureResult {
+  let diagnosticCode: ProtectedAutomationSnapshotDiagnosticCode = "capture_failed";
+  try {
+    return captureProtectedAutomationSnapshotInternal(input, (code) => { diagnosticCode = code; });
+  } catch (error) {
+    if (error instanceof ProtectedAutomationSnapshotCaptureDiagnosticError) throw error;
+    if (error instanceof ProtectedAutomationSnapshotError) {
+      throw new ProtectedAutomationSnapshotCaptureDiagnosticError(diagnosticCode, error.message);
+    }
+    throw error;
   }
 }
 
