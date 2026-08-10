@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Bot, FolderCog, Loader2, Lock, Settings, ShieldCheck, X } from "lucide-react";
+import { Bell, Bot, FolderCog, Loader2, Lock, Settings, ShieldCheck, X } from "lucide-react";
 import {
   ApiError,
   fetchAgentProfiles,
@@ -12,8 +12,9 @@ import {
 import { AgentProfilesSettings } from "./AgentProfilesSettings";
 import { ProjectSettingsForm } from "./ProjectSettingsForm";
 import { WorkspaceCapabilitiesSettings } from "./WorkspaceCapabilitiesSettings";
+import { BrowserNotificationsSettings } from "./BrowserNotificationsSettings";
 
-export type SettingsTab = "projects" | "agents" | "capabilities";
+export type SettingsTab = "projects" | "agents" | "capabilities" | "notifications";
 
 interface SettingsDialogProps {
   initialTab?: SettingsTab;
@@ -119,7 +120,7 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
       <div className="flex h-[min(92dvh,900px)] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-neutral-700 bg-neutral-950 shadow-2xl" onClick={(event) => event.stopPropagation()}>
         <header className="flex shrink-0 items-center gap-3 border-b border-neutral-800 px-4 py-3 sm:px-5">
           <Settings size={18} className="text-neutral-400" />
-          <div className="min-w-0 flex-1"><h2 id="workspace-settings-title" className="text-sm font-semibold text-neutral-100">Workspace settings</h2><p className="truncate text-xs text-neutral-500">Projects, agent profiles, and privileged Project-Agent capability associations</p></div>
+          <div className="min-w-0 flex-1"><h2 id="workspace-settings-title" className="text-sm font-semibold text-neutral-100">Workspace settings</h2><p className="truncate text-xs text-neutral-500">Projects, agent profiles, capabilities, and browser notification preferences</p></div>
           <button ref={closeRef} type="button" onClick={onClose} className="rounded p-2 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100" aria-label="Close settings"><X size={17} /></button>
         </header>
 
@@ -127,6 +128,7 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
           <TabButton active={tab === "projects"} onClick={() => setTab("projects")} icon={FolderCog}>Projects</TabButton>
           <TabButton active={tab === "agents"} onClick={() => setTab("agents")} icon={Bot}>Agents</TabButton>
           <TabButton active={tab === "capabilities"} onClick={() => setTab("capabilities")} icon={ShieldCheck}>Capabilities</TabButton>
+          <TabButton active={tab === "notifications"} onClick={() => setTab("notifications")} icon={Bell}>Notifications</TabButton>
         </div>
 
         {loading ? (
@@ -160,9 +162,13 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
           <main className="flex min-h-0 flex-1 p-4 sm:p-5">
             <AgentProfilesSettings profiles={profiles} models={models} onProfilesChanged={handleProfilesChanged} />
           </main>
-        ) : (
+        ) : tab === "capabilities" ? (
           <main className="flex min-h-0 flex-1 p-4 sm:p-5">
             <WorkspaceCapabilitiesSettings projects={projects} profiles={profiles} onChanged={handleCapabilitiesChanged} />
+          </main>
+        ) : (
+          <main className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
+            <BrowserNotificationsSettings />
           </main>
         )}
       </div>

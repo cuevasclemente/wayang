@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Group, Panel, Separator, usePanelRef } from "react-resizable-panels";
 import {
   AlertCircle,
+  BellRing,
   Columns3,
   FolderOpen,
   Loader2,
@@ -99,6 +100,7 @@ function App({ authEnabled, onLogout }: AppProps) {
   const activeSessionId = activeSession?.id ?? null;
   const [scrollToMessageId, setScrollToMessageId] = useState<string | null>(null);
   const [sessionChangeTrigger, setSessionChangeTrigger] = useState(0);
+  const [humanAttentionCount, setHumanAttentionCount] = useState(0);
   const [showNewSession, setShowNewSession] = useState(false);
   const [activeScheduledJobId, setActiveScheduledJobId] = useState<string | null>(null);
   const [showScheduledJobs, setShowScheduledJobs] = useState(false);
@@ -327,6 +329,7 @@ function App({ authEnabled, onLogout }: AppProps) {
         runtime_last_activity_at: null,
         bash_mode: "unavailable",
         browser_mode: "unavailable",
+        humanAttention: [],
       };
       navigateToSession(placeholder);
       void getSession(sessionId).then((session) => {
@@ -356,6 +359,7 @@ function App({ authEnabled, onLogout }: AppProps) {
       onSelectScheduledJob={handleSelectScheduledJob}
       onSelectProtectedAutomation={handleSelectProtectedAutomation}
       onArchiveActive={handleRemovedActiveSession}
+      onAttentionCountChange={setHumanAttentionCount}
       refreshTrigger={sessionChangeTrigger}
       onNewSession={() => {
         setShowNewSession(true);
@@ -451,6 +455,8 @@ function App({ authEnabled, onLogout }: AppProps) {
         rightCollapsed={rightCollapsed}
         isMobile={isMobile}
         onOpenSettings={() => setSettingsRequest({ tab: "projects", projectCwd: activeProjectCwd })}
+        humanAttentionCount={humanAttentionCount}
+        onOpenHumanAttention={handleBrowseSessions}
         onToggleLeft={() => {
           if (leftCollapsed) {
             leftPanelRef.current?.expand();
@@ -637,6 +643,8 @@ interface HeaderBarProps {
   rightCollapsed: boolean;
   isMobile: boolean;
   onOpenSettings: () => void;
+  humanAttentionCount: number;
+  onOpenHumanAttention: () => void;
   onToggleLeft: () => void;
   onToggleRight: () => void;
 }
@@ -650,6 +658,8 @@ function HeaderBar({
   rightCollapsed,
   isMobile,
   onOpenSettings,
+  humanAttentionCount,
+  onOpenHumanAttention,
   onToggleLeft,
   onToggleRight,
 }: HeaderBarProps) {
@@ -694,6 +704,18 @@ function HeaderBar({
         )}
       </div>
       <div className="flex items-center gap-2">
+        {humanAttentionCount > 0 && (
+          <button
+            type="button"
+            data-testid="global-human-attention-badge"
+            onClick={onOpenHumanAttention}
+            aria-label={`${humanAttentionCount} pending human-input ${humanAttentionCount === 1 ? "request" : "requests"}. Open sessions.`}
+            className="inline-flex items-center gap-1 rounded border border-amber-800/70 bg-amber-950/70 px-2 py-0.5 text-xs font-semibold text-amber-200 hover:bg-amber-900/70"
+          >
+            <BellRing size={12} aria-hidden="true" />
+            {humanAttentionCount}
+          </button>
+        )}
         <button
           type="button"
           onClick={onOpenSettings}

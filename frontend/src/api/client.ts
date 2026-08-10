@@ -2,6 +2,8 @@
  * api/client.ts — Frontend API client for wayang backend.
  */
 
+import { normalizeHumanAttention, type HumanAttention } from "../humanAttention";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -74,6 +76,18 @@ export interface Session {
   bash_mode: BashMode;
   browser_mode: BrowserSurfaceMode;
   browser_agent?: BrowserAgentDiagnostic;
+  humanAttention: HumanAttention[];
+}
+
+function normalizeSessionPayload(value: unknown): Session {
+  const session = value as Session;
+  return {
+    ...session,
+    humanAttention: normalizeHumanAttention(
+      value && typeof value === "object" ? (value as { humanAttention?: unknown }).humanAttention : undefined,
+      typeof session?.id === "string" ? session.id : "",
+    ),
+  };
 }
 
 export interface Me {
@@ -851,23 +865,23 @@ export function runScheduledAgentJob(id: string): Promise<ScheduledAgentRun> {
 
 export async function listSessions(signal?: AbortSignal): Promise<Session[]> {
   const payload = await request<unknown>("GET", "/api/sessions", undefined, signal);
-  return Array.isArray(payload) ? (payload as Session[]) : [];
+  return Array.isArray(payload) ? payload.map(normalizeSessionPayload) : [];
 }
 
-export function createSession(
+export async function createSession(
   cwd: string,
   title?: string,
   model?: string,
   provider?: string,
   agentProfileId?: string,
 ): Promise<Session> {
-  return apiPost<Session>("/api/sessions", {
+  return normalizeSessionPayload(await apiPost<unknown>("/api/sessions", {
     cwd,
     title: title ?? "",
     model,
     provider,
     agent_profile_id: agentProfileId,
-  });
+  }));
 }
 
 export interface SessionAgentSwitchPreview {
@@ -901,18 +915,19 @@ export function previewSessionAgentSwitch(
   );
 }
 
-export function switchSessionAgent(
+export async function switchSessionAgent(
   sessionId: string,
   agentProfileId: string,
 ): Promise<SessionAgentSwitchResult> {
-  return apiPut<SessionAgentSwitchResult>(
+  const result = await apiPut<SessionAgentSwitchResult>(
     `/api/sessions/${encodeURIComponent(sessionId)}/agent`,
     { agent_profile_id: agentProfileId },
   );
+  return { ...result, session: normalizeSessionPayload(result.session) };
 }
 
-export function getSession(id: string): Promise<Session> {
-  return apiGet<Session>(`/api/sessions/${encodeURIComponent(id)}`);
+export async function getSession(id: string): Promise<Session> {
+  return normalizeSessionPayload(await apiGet<unknown>(`/api/sessions/${encodeURIComponent(id)}`));
 }
 
 export function archiveSession(id: string): Promise<null> {
@@ -926,8 +941,8 @@ export function deleteSession(id: string, pin: string): Promise<{ deleted: true;
   );
 }
 
-export function stopSession(id: string): Promise<Session> {
-  return apiPost<Session>(`/api/sessions/${encodeURIComponent(id)}/stop`);
+export async function stopSession(id: string): Promise<Session> {
+  return normalizeSessionPayload(await apiPost<unknown>(`/api/sessions/${encodeURIComponent(id)}/stop`));
 }
 
 export function updateSessionTitle(id: string, title: string): Promise<null> {
@@ -954,15 +969,15 @@ export function updateSessionGoal(
   });
 }
 
-export function updateSessionModel(
+export async function updateSessionModel(
   id: string,
   provider: string | null,
   model: string | null,
 ): Promise<Session> {
-  return apiPut<Session>(`/api/sessions/${encodeURIComponent(id)}/model`, {
+  return normalizeSessionPayload(await apiPut<unknown>(`/api/sessions/${encodeURIComponent(id)}/model`, {
     provider,
     model,
-  });
+  }));
 }
 
 // ---------------------------------------------------------------------------
