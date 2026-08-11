@@ -12,7 +12,7 @@ import {
   commitWorkspaceCapabilityActivation,
   revokeWorkspaceCapabilityAssociation,
 } from "../workspace-capabilities.js";
-import { PROTECTED_BROWSER_TOOL_NAME } from "../browser/protected-tools.js";
+import { INTERACTIVE_BROWSER_TOOL_NAMES } from "../browser/protected-tools.js";
 import type { ProtectedAutomationBinding } from "./authority.js";
 import {
   createProtectedAutomationToolRuntime,
@@ -80,6 +80,8 @@ function syntheticPrivilegedRuntime(toolName: string) {
   };
   return {
     tool,
+    tools: [tool],
+    toolForName(name: string) { return name === toolName ? tool : undefined; },
     preflight: () => revoked
       ? { allowed: false as const, reason: "synthetic runtime is revoked" }
       : { allowed: true as const },
@@ -109,6 +111,8 @@ function guardSession(toolName: string, runtime: { tool: unknown }, mode: "exact
   return { session, get activeNames() { return activeNames; } };
 }
 
+const BROWSER_TOOL_NAME = INTERACTIVE_BROWSER_TOOL_NAMES[0];
+
 function installSyntheticPrivilegedGuard(session: any, sessionId: string, toolName: string, runtime: any): void {
   installAgentToolPolicyGuard(session, sessionId, toolName === PROTECTED_AUTOMATION_TOOL_NAME
     ? { protectedAutomationRuntime: runtime }
@@ -117,7 +121,7 @@ function installSyntheticPrivilegedGuard(session: any, sessionId: string, toolNa
 
 test("protected tool guards reject undefined candidate and trusted objects for browser and automation", () => {
   const f = fixture();
-  for (const toolName of [PROTECTED_AUTOMATION_TOOL_NAME, PROTECTED_BROWSER_TOOL_NAME]) {
+  for (const toolName of [PROTECTED_AUTOMATION_TOOL_NAME, BROWSER_TOOL_NAME]) {
     for (const mode of ["missing-candidate", "missing-trusted"] as const) {
       const runtime = syntheticPrivilegedRuntime(toolName);
       const guarded = guardSession(toolName, runtime, mode);
@@ -141,7 +145,7 @@ test("protected tool guards reject undefined candidate and trusted objects for b
 
 test("protected tool guards close once on same-name registry refresh drift", async () => {
   const f = fixture();
-  for (const toolName of [PROTECTED_AUTOMATION_TOOL_NAME, PROTECTED_BROWSER_TOOL_NAME]) {
+  for (const toolName of [PROTECTED_AUTOMATION_TOOL_NAME, BROWSER_TOOL_NAME]) {
     const runtime = syntheticPrivilegedRuntime(toolName);
     const guarded = guardSession(toolName, runtime, "exact");
     installSyntheticPrivilegedGuard(guarded.session, f.session.id, toolName, runtime);

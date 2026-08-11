@@ -17,7 +17,9 @@ import {
   clickBrowserSelector,
   fillBrowserCredential,
   fillBrowserSelector,
+  findChromiumExecutableCandidates,
   getBrowserCredentialContext,
+  getBrowserExecutableDiagnostic,
   getBrowserStatus,
   getChromiumCandidates,
   getChromiumHostArchitecture,
@@ -120,6 +122,43 @@ test("shared browser scope reuses one private data-dir profile while explicit sc
     else process.env.WAYANG_DATA_DIR = previous;
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("configured Chromium candidates fail closed without falling through to auto-detected browsers", () => {
+  const previousWayang = process.env.WAYANG_CHROMIUM_PATH;
+  const previousChrome = process.env.CHROME_PATH;
+  const previousChromium = process.env.CHROMIUM_PATH;
+  try {
+    process.env.WAYANG_CHROMIUM_PATH = "relative/chromium";
+    delete process.env.CHROME_PATH;
+    delete process.env.CHROMIUM_PATH;
+    assert.throws(() => findChromiumExecutableCandidates(), /must be absolute/i);
+    process.env.WAYANG_CHROMIUM_PATH = path.join(os.tmpdir(), "missing-wayang-chromium");
+    assert.throws(() => findChromiumExecutableCandidates(), /not an executable file/i);
+  } finally {
+    if (previousWayang === undefined) delete process.env.WAYANG_CHROMIUM_PATH;
+    else process.env.WAYANG_CHROMIUM_PATH = previousWayang;
+    if (previousChrome === undefined) delete process.env.CHROME_PATH;
+    else process.env.CHROME_PATH = previousChrome;
+    if (previousChromium === undefined) delete process.env.CHROMIUM_PATH;
+    else process.env.CHROMIUM_PATH = previousChromium;
+  }
+});
+
+test("browser executable diagnostics report an unavailable requested VNC transport without exposing paths", () => {
+  const diagnostic = getBrowserExecutableDiagnostic({
+    configuredPath: process.execPath,
+    requestedTransport: "vnc",
+    vncAvailable: false,
+    platform: "darwin",
+  });
+  assert.deepEqual(diagnostic, {
+    platform: "darwin",
+    transport: "vnc",
+    state: "resolved",
+    reasonCode: "transport_unavailable",
+  });
+  assert.equal(JSON.stringify(diagnostic).includes(process.execPath), false);
 });
 
 test("public browser state omits runtime paths, ports, target ids, generations, and child logs", () => {

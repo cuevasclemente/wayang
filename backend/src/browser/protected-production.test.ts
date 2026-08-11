@@ -433,8 +433,8 @@ test("production uses one pair realm with exclusive route/tool/viewer leases, or
     assert.equal(managed!.starts, 3);
     assert.ok(managed!.cdp.calls.includes("Page.getFrameTree"));
 
-    assert.equal(managed!.options.downloadBehavior, "allow");
-    assert.equal(managed!.options.downloadsDir, path.join(binding.projectCwd, ".wayang", "browser-downloads"));
+    assert.equal(managed!.options.downloadBehavior, "allowAndName");
+    assert.match(managed!.options.downloadsDir, /protected-browser.*runtime.*downloads/);
     const downloadGuid = "synthetic_observable_download";
     managed!.options.onDownloadWillBegin?.({
       frameId: "frame-1",
@@ -445,14 +445,17 @@ test("production uses one pair realm with exclusive route/tool/viewer leases, or
     assert.equal(controls!.state().download?.status, "downloading");
     const downloadBody = "synthetic observable download\n";
     fs.mkdirSync(managed!.options.downloadsDir, { recursive: true });
-    fs.writeFileSync(path.join(managed!.options.downloadsDir, "observable.txt"), downloadBody, { mode: 0o600 });
+    fs.writeFileSync(path.join(managed!.options.downloadsDir, downloadGuid), downloadBody, { mode: 0o600 });
     managed!.options.onDownloadProgress?.({
       guid: downloadGuid,
       state: "completed",
       totalBytes: Buffer.byteLength(downloadBody),
       receivedBytes: Buffer.byteLength(downloadBody),
     });
-    const status = await (live.tool.execute as any)("synthetic-status", { operation: "status" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const statusTool = live.toolForName("browser_status");
+    assert.ok(statusTool);
+    const status = await (statusTool.execute as any)("synthetic-status", {});
     const agentDownloadState = JSON.parse(status.content[0].text);
     assert.equal(agentDownloadState.download?.status, "completed");
     assert.equal(agentDownloadState.download?.relativePath, ".wayang/browser-downloads/observable.txt");

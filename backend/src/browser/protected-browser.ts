@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   PROTECTED_BROWSER_CAPABILITY_ID,
+  STANDARD_BROWSER_CAPABILITY_ID,
   type ProtectedBrowserAuthorityCheckpoint,
   type ProtectedBrowserAuthoritySnapshot,
   type ProtectedBrowserBinding,
@@ -158,8 +159,9 @@ function assertPositiveRevision(value: unknown, label: string): asserts value is
 
 export function assertProtectedBrowserBinding(binding: ProtectedBrowserBinding): void {
   if (!binding || typeof binding !== "object" || Object.getPrototypeOf(binding) !== Object.prototype
-    || binding.capabilityId !== PROTECTED_BROWSER_CAPABILITY_ID) {
-    throw protectedBrowserError("Protected browser capability binding is invalid");
+    || (binding.capabilityId !== PROTECTED_BROWSER_CAPABILITY_ID
+      && binding.capabilityId !== STANDARD_BROWSER_CAPABILITY_ID)) {
+    throw protectedBrowserError("Interactive browser capability binding is invalid");
   }
   const allowed = new Set<string>(BINDING_KEYS);
   if (Object.keys(binding).some((key) => !allowed.has(key))) {
@@ -194,11 +196,15 @@ function stableBindingEqualExceptControl(
   return BINDING_KEYS.every((key) => key === "controlGeneration" || left[key] === right[key]);
 }
 
-function snapshotAllowsProtectedBrowser(snapshot: ProtectedBrowserAuthoritySnapshot | null): snapshot is ProtectedBrowserAuthoritySnapshot {
+function snapshotAllowsProtectedBrowser(
+  snapshot: ProtectedBrowserAuthoritySnapshot | null,
+  binding: Readonly<ProtectedBrowserBinding>,
+): snapshot is ProtectedBrowserAuthoritySnapshot {
+  const expectedPrivacyMode = binding.capabilityId === STANDARD_BROWSER_CAPABILITY_ID ? "standard" : "protected";
   return Boolean(
     snapshot
     && snapshot.authorized
-    && snapshot.privacyMode === "protected"
+    && snapshot.privacyMode === expectedPrivacyMode
     && snapshot.sourceSessionDurable
     && !snapshot.sourceQuarantined
     && snapshot.profileEnabled
@@ -232,6 +238,7 @@ export function ensureProtectedBrowserStorage(
   projectId: string,
   agentProfileId: string,
   forbiddenProjectCwd?: string,
+  capabilityId: ProtectedBrowserBinding["capabilityId"] = PROTECTED_BROWSER_CAPABILITY_ID,
 ): ProtectedBrowserStorage {
   assertExactString(dataDir, "dataDir");
   const requestedBase = path.resolve(dataDir);
@@ -245,7 +252,7 @@ export function ensureProtectedBrowserStorage(
     }
   }
   const parts = [
-    "protected-browser",
+    capabilityId === STANDARD_BROWSER_CAPABILITY_ID ? "standard-browser" : "protected-browser",
     "v1",
     idStorageSegment("project", projectId),
     idStorageSegment("profile", agentProfileId),
@@ -390,6 +397,7 @@ export class CapabilityBoundProtectedBrowser {
       this.binding.projectId,
       this.binding.agentProfileId,
       this.binding.projectCwd,
+      this.binding.capabilityId,
     );
     this.installSubscription();
   }
@@ -443,7 +451,7 @@ export class CapabilityBoundProtectedBrowser {
     ) {
       throw protectedBrowserError("Protected browser authority has been revoked");
     }
-    if (!snapshotAllowsProtectedBrowser(snapshot) || !exactProtectedBrowserBindingEqual(snapshot, awaitedBinding)) {
+    if (!snapshotAllowsProtectedBrowser(snapshot, awaitedBinding) || !exactProtectedBrowserBindingEqual(snapshot, awaitedBinding)) {
       this.latchRevoked();
       throw protectedBrowserError(`Protected browser authority changed at ${checkpoint}`);
     }
@@ -638,7 +646,7 @@ export class CapabilityBoundProtectedBrowser {
     const next = await transition(permit.binding, mode);
     if (!this.permitStillCurrent(permit)) throw protectedBrowserError("Protected browser authority has been revoked");
     if (
-      !snapshotAllowsProtectedBrowser(next)
+      !snapshotAllowsProtectedBrowser(next, permit.binding)
       || !stableBindingEqualExceptControl(next, permit.binding)
       || next.controlGeneration <= permit.binding.controlGeneration
     ) {

@@ -28,6 +28,11 @@ export const WORKSPACE_CAPABILITY_REGISTRY: Readonly<Record<WorkspaceCapabilityI
     privacy_mode: "standard",
     risk: "global-resources",
   }),
+  "wayang.standard-browser.v1": Object.freeze({
+    id: "wayang.standard-browser.v1",
+    privacy_mode: "standard",
+    risk: "authenticated-browser",
+  }),
   "wayang.host-execution.v1": Object.freeze({
     id: "wayang.host-execution.v1",
     privacy_mode: "standard",

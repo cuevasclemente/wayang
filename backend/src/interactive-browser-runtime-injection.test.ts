@@ -1,0 +1,152 @@
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import test from "node:test";
+import { createAgentProfile } from "./agent-profiles.js";
+import { CapabilityBoundProtectedBrowser } from "./browser/protected-browser.js";
+import { createProtectedBrowserToolRuntime, INTERACTIVE_BROWSER_TOOL_NAMES } from "./browser/protected-tools.js";
+import type { ProtectedBrowserBinding } from "./browser/types.js";
+import { close, init } from "./db.js";
+import {
+  createPiSession,
+  destroyPiSession,
+  getLiveProtectedBrowserRuntime,
+  getPiSessionBrowserAgentDiagnostic,
+} from "./pi-bridge.js";
+import { createProject } from "./projects.js";
+import { createSession } from "./sessions.js";
+import {
+  commitWorkspaceCapabilityActivation,
+  revokeWorkspaceCapabilityAssociation,
+} from "./workspace-capabilities.js";
+
+function runtimeFactory(dataDir: string, captured: ProtectedBrowserBinding[]) {
+  return async (binding: ProtectedBrowserBinding) => {
+    captured.push({ ...binding });
+    const browser = new CapabilityBoundProtectedBrowser({
+      dataDir,
+      binding,
+      authority: {
+        resolve: async (current) => ({
+          ...current,
+          authorized: true,
+          privacyMode: current.capabilityId === "wayang.standard-browser.v1" ? "standard" : "protected",
+          sourceSessionDurable: true,
+          sourceQuarantined: false,
+          profileEnabled: true,
+          projectAllowsProfile: true,
+        }),
+      },
+      backend: {
+        async execute(operation) { return { value: { operation: operation.kind } }; },
+        stop() {},
+      },
+    });
+    return createProtectedBrowserToolRuntime({ browser });
+  };
+}
+
+test("approved Standard interactive sessions receive exact explicit browser tools while unapproved and scheduled sessions do not", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-standard-browser-injection-"));
+  const dataDir = path.join(root, "data");
+  const projectRoot = path.join(root, "project");
+  fs.mkdirSync(projectRoot, { recursive: true });
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
+  process.env.WAYANG_DATA_DIR = dataDir;
+  process.env.ANTHROPIC_API_KEY = "synthetic-test-key";
+  close();
+  init();
+  t.after(async () => {
+    await Promise.allSettled([]);
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const profile = createAgentProfile({ name: "Standard browser profile", resource_mode: "project_only" });
+  const project = createProject({
+    cwd: projectRoot,
+    default_agent_profile_id: profile.id,
+    access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [profile.id] },
+  });
+  const captured: ProtectedBrowserBinding[] = [];
+  const factory = runtimeFactory(dataDir, captured);
+
+  const unapproved = createSession(projectRoot, {
+    agentProfileId: profile.id,
+    provider: "anthropic",
+    model: "claude-sonnet-4-5",
+  });
+  const unapprovedHandle = await createPiSession(unapproved.id, projectRoot, unapproved.provider, unapproved.model, undefined, { protectedBrowserFactory: factory });
+  assert.equal(captured.length, 0);
+  assert.equal(getLiveProtectedBrowserRuntime(unapproved.id), undefined);
+  assert.equal(getPiSessionBrowserAgentDiagnostic(unapproved.id).reason_code, "approval_required");
+  assert.ok(INTERACTIVE_BROWSER_TOOL_NAMES.every((name) => !unapprovedHandle.session.getActiveToolNames().includes(name)));
+  await destroyPiSession(unapproved.id);
+
+  const association = commitWorkspaceCapabilityActivation({
+    capability_id: "wayang.standard-browser.v1",
+    project_id: project.id,
+    agent_profile_id: profile.id,
+    operation_digest: "a".repeat(64),
+  });
+  const approved = createSession(projectRoot, {
+    agentProfileId: profile.id,
+    provider: "anthropic",
+    model: "claude-sonnet-4-5",
+  });
+  const approvedHandle = await createPiSession(approved.id, projectRoot, approved.provider, approved.model, undefined, { protectedBrowserFactory: factory });
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0].capabilityId, "wayang.standard-browser.v1");
+  assert.deepEqual(
+    INTERACTIVE_BROWSER_TOOL_NAMES.filter((name) => approvedHandle.session.getActiveToolNames().includes(name)),
+    [...INTERACTIVE_BROWSER_TOOL_NAMES],
+  );
+  const live = getLiveProtectedBrowserRuntime(approved.id);
+  assert.ok(live);
+  const registry = (approvedHandle.session as any)._toolRegistry as Map<string, unknown>;
+  const definitions = (approvedHandle.session as any)._toolDefinitions as Map<string, { definition: unknown }>;
+  for (const tool of live!.tools) {
+    assert.equal(definitions.get(tool.name)?.definition, tool, `${tool.name} definition`);
+    assert.equal(registry.has(tool.name), true, `${tool.name} registry entry`);
+  }
+  assert.notEqual(getPiSessionBrowserAgentDiagnostic(approved.id).reason_code, "approval_required");
+
+  const scheduled = createSession(projectRoot, {
+    agentProfileId: profile.id,
+    provider: "anthropic",
+    model: "claude-sonnet-4-5",
+    scheduledJobId: "synthetic-scheduled-job",
+    scheduledRunId: "synthetic-scheduled-run",
+  });
+  const scheduledHandle = await createPiSession(scheduled.id, projectRoot, scheduled.provider, scheduled.model, undefined, { protectedBrowserFactory: factory });
+  assert.equal(captured.length, 1, "scheduled runtime never invokes the browser factory");
+  assert.equal(getPiSessionBrowserAgentDiagnostic(scheduled.id).reason_code, "interactive_session_required");
+  assert.ok(INTERACTIVE_BROWSER_TOOL_NAMES.every((name) => !scheduledHandle.session.getActiveToolNames().includes(name)));
+
+  revokeWorkspaceCapabilityAssociation({
+    capability_id: "wayang.standard-browser.v1",
+    project_id: project.id,
+    agent_profile_id: profile.id,
+    expected_revision: association.revision,
+  });
+  assert.equal(getPiSessionBrowserAgentDiagnostic(approved.id).reason_code, "association_inactive");
+  await destroyPiSession(approved.id);
+  await destroyPiSession(scheduled.id);
+
+  const afterRevoke = createSession(projectRoot, {
+    agentProfileId: profile.id,
+    provider: "anthropic",
+    model: "claude-sonnet-4-5",
+  });
+  const revokedHandle = await createPiSession(afterRevoke.id, projectRoot, afterRevoke.provider, afterRevoke.model, undefined, { protectedBrowserFactory: factory });
+  assert.equal(captured.length, 1, "revoked capability does not construct a later runtime");
+  assert.equal(getPiSessionBrowserAgentDiagnostic(afterRevoke.id).reason_code, "association_inactive");
+  assert.ok(INTERACTIVE_BROWSER_TOOL_NAMES.every((name) => !revokedHandle.session.getActiveToolNames().includes(name)));
+  await destroyPiSession(afterRevoke.id);
+});

@@ -34,6 +34,7 @@ export type GuardedDomOperation =
   | { kind: "selector_point"; selector: string; index?: number }
   | { kind: "activate_selector"; selector: string; index?: number; expectedName: string; documentNonce: string }
   | { kind: "fill_selector"; selector: string; index?: number; text: string }
+  | { kind: "type_public"; text: string }
   | { kind: "public_active_target" };
 
 export type ProtectedCredentialInspectionMode = "none" | "blocked" | "text-allowed";
@@ -125,6 +126,17 @@ function __wayangRedact(value) {
   for (const secret of __wayangSecrets()) text = text.split(secret).join("[REDACTED]");
   return text;
 }
+function __wayangSafeUrl(value) {
+  try {
+    const parsed = new URL(String(value || ""), location.href);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return parsed.protocol;
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch { return ""; }
+}
 function __wayangVisible(el) {
   if (!el || !el.isConnected || el.hidden) return false;
   const rects = Array.from(el.getClientRects());
@@ -162,7 +174,7 @@ function __wayangInfo(el, index) {
     type: el.getAttribute("type") || undefined, name: __wayangName(el),
     text: __wayangSensitive(el) ? "[REDACTED]" : __wayangRedact(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 500),
     value: "value" in el ? (__wayangSensitive(el) && el.value ? "[REDACTED]" : __wayangRedact(el.value).slice(0, 500)) : undefined,
-    href: el.href ? __wayangRedact(el.href) : undefined,
+    href: el.href ? __wayangSafeUrl(el.href) : undefined,
     disabled: __wayangDisabled(el),
     visible: __wayangVisible(el),
     rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) } };
@@ -204,24 +216,24 @@ export function boundedElementLimit(value: number | undefined, fallback: number)
 export function compileGuardedDomOperation(operation: Readonly<GuardedDomOperation>): string {
   switch (operation.kind) {
     case "snapshot":
-      return `return { url: __wayangRedact(location.href), title: __wayangRedact(document.title), text: document.body ? __wayangRedact(document.body.innerText || "").slice(0, ${MAX_TEXT_BYTES}) : "" };`;
+      return `return { url: __wayangSafeUrl(location.href), title: __wayangRedact(document.title), text: document.body ? __wayangRedact(document.body.innerText || "").slice(0, ${MAX_TEXT_BYTES}) : "" };`;
     case "dom_snapshot": {
       const limit = boundedElementLimit(operation.limit, 80);
-      return `const nodes = Array.from(document.querySelectorAll("a,button,input,textarea,select,[role],[contenteditable='true'],summary,label,h1,h2,h3,h4,h5,h6")).slice(0, ${limit}); return { url: __wayangRedact(location.href), title: __wayangRedact(document.title), text: ${Boolean(operation.includeText)} && document.body ? __wayangRedact(document.body.innerText || "").slice(0, ${MAX_TEXT_BYTES}) : undefined, elements: nodes.map(__wayangInfo) };`;
+      return `const nodes = Array.from(document.querySelectorAll("a,button,input,textarea,select,[role],[contenteditable='true'],summary,label,h1,h2,h3,h4,h5,h6")).slice(0, ${limit}); return { url: __wayangSafeUrl(location.href), title: __wayangRedact(document.title), text: ${Boolean(operation.includeText)} && document.body ? __wayangRedact(document.body.innerText || "").slice(0, ${MAX_TEXT_BYTES}) : undefined, elements: nodes.map(__wayangInfo) };`;
     }
     case "links": {
       const limit = boundedElementLimit(operation.limit, 100);
-      return `return { url: __wayangRedact(location.href), title: __wayangRedact(document.title), links: Array.from(document.querySelectorAll("a[href]")).slice(0, ${limit}).map((el, index) => ({ index, text: __wayangRedact(el.innerText || el.textContent || "").slice(0, 500), href: __wayangRedact(el.href), selector: el.id ? "#" + CSS.escape(el.id) : el.localName, visible: __wayangVisible(el) })) };`;
+      return `return { url: __wayangSafeUrl(location.href), title: __wayangRedact(document.title), links: Array.from(document.querySelectorAll("a[href]")).slice(0, ${limit}).map((el, index) => ({ index, text: __wayangRedact(el.innerText || el.textContent || "").slice(0, 500), href: __wayangSafeUrl(el.href), selector: el.id ? "#" + CSS.escape(el.id) : el.localName, visible: __wayangVisible(el) })) };`;
     }
     case "secrets":
       return "return __wayangSecrets();";
     case "query_selector": {
       const limit = boundedElementLimit(operation.limit, 25);
-      return `const selector = ${JSON.stringify(operation.selector)}; return { url: __wayangRedact(location.href), title: __wayangRedact(document.title), selector, elements: Array.from(document.querySelectorAll(selector)).slice(0, ${limit}).map(__wayangInfo) };`;
+      return `const selector = ${JSON.stringify(operation.selector)}; return { url: __wayangSafeUrl(location.href), title: __wayangRedact(document.title), selector, elements: Array.from(document.querySelectorAll(selector)).slice(0, ${limit}).map(__wayangInfo) };`;
     }
     case "query_visible_selector": {
       const limit = boundedElementLimit(operation.limit, 25);
-      return `const selector = ${JSON.stringify(operation.selector)}; globalThis[__wayangSelectorNonceKey] = ${JSON.stringify(operation.documentNonce)}; const visible = Array.from(document.querySelectorAll(selector)).filter(__wayangVisible).slice(0, ${limit}); return { url: __wayangRedact(location.href), title: __wayangRedact(document.title), selector, elements: visible.map(__wayangInfo) };`;
+      return `const selector = ${JSON.stringify(operation.selector)}; globalThis[__wayangSelectorNonceKey] = ${JSON.stringify(operation.documentNonce)}; const visible = Array.from(document.querySelectorAll(selector)).filter(__wayangVisible).slice(0, ${limit}); return { url: __wayangSafeUrl(location.href), title: __wayangRedact(document.title), selector, elements: visible.map(__wayangInfo) };`;
     }
     case "selector_point":
       return `const el = Array.from(document.querySelectorAll(${JSON.stringify(operation.selector)}))[${Math.floor(operation.index ?? 0)}]; if (!el) throw new Error("selector is not actionable"); el.scrollIntoView({ block: "center", inline: "center" }); if (!__wayangActionable(el)) throw new Error("selector is not actionable"); const rect = el.getBoundingClientRect(); return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };`;
@@ -229,6 +241,8 @@ export function compileGuardedDomOperation(operation: Readonly<GuardedDomOperati
       return `if (globalThis[__wayangSelectorNonceKey] !== ${JSON.stringify(operation.documentNonce)}) throw new Error("selector query document is stale"); const candidates = Array.from(document.querySelectorAll(${JSON.stringify(operation.selector)})).filter(__wayangVisible); const el = candidates[${Math.floor(operation.index ?? 0)}]; const expectedName = ${JSON.stringify(operation.expectedName)}; if (!el || __wayangName(el) !== expectedName) throw new Error("selector is not actionable"); el.scrollIntoView({ block: "center", inline: "center" }); const matches = candidates.filter((candidate) => __wayangName(candidate) === expectedName && __wayangActionable(candidate)); if (matches.length !== 1 || matches[0] !== el) throw new Error("selector is not actionable"); el.click(); return { clicked: true };`;
     case "fill_selector":
       return `const el = Array.from(document.querySelectorAll(${JSON.stringify(operation.selector)}))[${Math.floor(operation.index ?? 0)}]; if (!el || __wayangSensitive(el) || __wayangDisabled(el) || el.readOnly || !(el.isContentEditable || "value" in el)) throw new Error("unsafe public fill target"); const text = ${JSON.stringify(operation.text)}; if (el.isContentEditable) el.textContent = text; else el.value = text; el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true })); return { filled: true };`;
+    case "type_public":
+      return `const el = document.activeElement; if (!el || __wayangSensitive(el) || __wayangDisabled(el) || el.readOnly || !(el.isContentEditable || "value" in el)) throw new Error("unsafe public type target"); const text = ${JSON.stringify(operation.text)}; if (el.isContentEditable) { if (!document.execCommand("insertText", false, text)) el.textContent = String(el.textContent || "") + text; } else if (typeof el.setRangeText === "function") { const start = Number.isInteger(el.selectionStart) ? el.selectionStart : String(el.value || "").length; const end = Number.isInteger(el.selectionEnd) ? el.selectionEnd : start; el.setRangeText(text, start, end, "end"); } else el.value = String(el.value || "") + text; el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true })); return { typed: true };`;
     case "public_active_target":
       return "const el = document.activeElement; if (!el || __wayangSensitive(el) || __wayangDisabled(el) || el.readOnly || !(el.isContentEditable || 'value' in el)) throw new Error('unsafe public type target'); return true;";
   }

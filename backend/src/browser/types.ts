@@ -78,8 +78,13 @@ export interface BrowserSessionLookup {
   persistence?: BrowserPersistence;
 }
 
+export const STANDARD_BROWSER_CAPABILITY_ID = "wayang.standard-browser.v1" as const;
 export const PROTECTED_BROWSER_CAPABILITY_ID = "wayang.protected-browser.v1" as const;
-export type ProtectedBrowserCapabilityId = typeof PROTECTED_BROWSER_CAPABILITY_ID;
+export type InteractiveBrowserCapabilityId =
+  | typeof STANDARD_BROWSER_CAPABILITY_ID
+  | typeof PROTECTED_BROWSER_CAPABILITY_ID;
+/** @deprecated Retained as an internal compatibility name for the capability-bound browser runtime. */
+export type ProtectedBrowserCapabilityId = InteractiveBrowserCapabilityId;
 export type ProtectedBrowserControlMode = "agent" | "user" | "paused";
 export type ProtectedBrowserAuthorityCheckpoint =
   | "prequeue"

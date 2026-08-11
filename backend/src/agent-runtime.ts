@@ -26,7 +26,7 @@ import { type AgentProfileRow, type ProjectRow } from "./workspace-types.js";
 import { WAYANG_RUNTIME_CONTEXT_TOOL_NAME } from "./wayang-runtime-context.js";
 import { WAYANG_WORKSPACE_CHANGE_TOOL_NAME, WAYANG_WORKSPACE_READ_TOOL_NAME } from "./workspace-control.js";
 import { RESTRICTED_MCP_TOOL_NAME, type RestrictedMcpRuntime } from "./restricted-mcp/index.js";
-import { PROTECTED_BROWSER_TOOL_NAME, type ProtectedBrowserToolRuntime } from "./browser/protected-tools.js";
+import { INTERACTIVE_BROWSER_TOOL_NAMES, type ProtectedBrowserToolRuntime } from "./browser/protected-tools.js";
 import { PROTECTED_AUTOMATION_TOOL_NAME, type ProtectedAutomationToolRuntime } from "./protected-automation/tool.js";
 import { FILE_AUDIO_EXPERIMENT_TOOL_NAME, type FileAudioExperimentRuntime } from "./audio-experiment/types.js";
 import {
@@ -218,8 +218,8 @@ export function authorizeAgentToolCall(options: {
       ? { allowed: false, reason: "The restricted MCP proxy requires a source-bound runtime object" }
       : { allowed: true };
   }
-  if (toolName === PROTECTED_BROWSER_TOOL_NAME) {
-    return { allowed: false, reason: "The protected browser requires its exact source-bound runtime object" };
+  if ((INTERACTIVE_BROWSER_TOOL_NAMES as readonly string[]).includes(toolName)) {
+    return { allowed: false, reason: "The interactive browser requires its exact source-bound runtime object" };
   }
   if (toolName === PROTECTED_AUTOMATION_TOOL_NAME) {
     return { allowed: false, reason: "Protected automation requires its exact source-bound runtime object" };
@@ -399,17 +399,23 @@ function liveToolDecision(
     return { allowed: false, reason: authorization.reason ?? "Session is no longer authorized" };
   }
 
-  if (normalizedToolName === PROTECTED_BROWSER_TOOL_NAME) {
-    if (!options.protectedBrowserRuntime
-      || !exactTrustedToolObject(options.candidateTool, options.trustedProtectedBrowserTool)) {
+  if ((INTERACTIVE_BROWSER_TOOL_NAMES as readonly string[]).includes(normalizedToolName)) {
+    const trusted = options.trustedProtectedBrowserTool instanceof Map
+      ? options.trustedProtectedBrowserTool.get(normalizedToolName)
+      : undefined;
+    if (!options.protectedBrowserRuntime || !exactTrustedToolObject(options.candidateTool, trusted)) {
       closeRuntimeOnToolObjectDrift(options.protectedBrowserRuntime);
-      return { allowed: false, reason: "The protected browser tool object is not authorized for this runtime" };
+      return { allowed: false, reason: "The interactive browser tool object is not authorized for this runtime" };
+    }
+    if (scheduled) {
+      closeRuntimeOnToolObjectDrift(options.protectedBrowserRuntime);
+      return { allowed: false, reason: "Interactive browser tools are unavailable for scheduled sessions" };
     }
     try {
       const decision = options.protectedBrowserRuntime.preflight();
       return decision.allowed ? { allowed: true } : decision;
     } catch {
-      return { allowed: false, reason: "Protected browser preflight is unavailable" };
+      return { allowed: false, reason: "Interactive browser preflight is unavailable" };
     }
   }
   if (normalizedToolName === PROTECTED_AUTOMATION_TOOL_NAME) {
@@ -628,12 +634,16 @@ export function installAgentToolPolicyGuard(
   const trustedRestrictedMcpTool = restrictedMcpDefinitionEntry?.definition === restrictedMcpRuntime?.tool
     ? resolveRegisteredTool(session, RESTRICTED_MCP_TOOL_NAME)
     : undefined;
-  const protectedBrowserDefinitionEntry = protectedBrowserRuntime && anySession._toolDefinitions instanceof Map
-    ? anySession._toolDefinitions.get(PROTECTED_BROWSER_TOOL_NAME)
-    : undefined;
-  const trustedProtectedBrowserTool = protectedBrowserDefinitionEntry?.definition === protectedBrowserRuntime?.tool
-    ? resolveRegisteredTool(session, PROTECTED_BROWSER_TOOL_NAME)
-    : undefined;
+  const trustedProtectedBrowserTool = new Map<string, unknown>();
+  if (protectedBrowserRuntime && anySession._toolDefinitions instanceof Map) {
+    for (const definition of protectedBrowserRuntime.tools) {
+      const entry = anySession._toolDefinitions.get(definition.name);
+      if (entry?.definition === definition) {
+        const registered = resolveRegisteredTool(session, definition.name);
+        if (registered) trustedProtectedBrowserTool.set(definition.name, registered);
+      }
+    }
+  }
   const protectedAutomationDefinitionEntry = protectedAutomationRuntime && anySession._toolDefinitions instanceof Map
     ? anySession._toolDefinitions.get(PROTECTED_AUTOMATION_TOOL_NAME)
     : undefined;

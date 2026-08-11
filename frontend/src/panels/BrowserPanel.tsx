@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiError,
+  type BrowserAgentDiagnostic,
   type BrowserControlMode,
   type BrowserSessionState,
+  type BrowserSurfaceMode,
   type BrowserViewerTransport,
   fetchBrowserStatus,
   navigateBrowser,
@@ -20,10 +22,11 @@ import { BrowserViewer } from "../components/browser/BrowserViewer";
 interface BrowserPanelProps {
   sessionId: string | null;
   sessionCwd: string | null;
-  browserMode: "standard" | "protected";
+  browserMode: BrowserSurfaceMode;
+  browserAgent: BrowserAgentDiagnostic | null;
 }
 
-export function BrowserPanel({ sessionId, sessionCwd, browserMode }: BrowserPanelProps) {
+export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent }: BrowserPanelProps) {
   const [state, setState] = useState<BrowserSessionState | null>(null);
   const [viewerTransport, setViewerTransport] = useState<BrowserViewerTransport>("cdp-screencast");
   const [busy, setBusy] = useState(false);
@@ -48,7 +51,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode }: BrowserPane
   }, []);
 
   const refresh = useCallback(async () => {
-    if (!sessionId && !sessionCwd) return;
+    if (browserMode === "unavailable" || (!sessionId && !sessionCwd)) return;
     try {
       setError(null);
       const next = await fetchBrowserStatus(sessionId, sessionCwd);
@@ -247,7 +250,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode }: BrowserPane
   const running = state?.status === "running";
   const cooperative = state?.controlMode === "agent";
   const credentialInspection = state?.credentialInspection;
-  const protectedRuntime = browserMode === "protected";
+  const protectedRuntime = state?.profile.persistence === "protected" || browserMode === "protected";
   // Standard support is the existing generic backend contract. Protected
   // support is positive metadata from the exact runtime and is never inferred
   // from a project/profile label or from Protected styling alone.
@@ -264,8 +267,46 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode }: BrowserPane
     return <div className="p-4 text-sm text-neutral-500">Select or create a session before opening the Browser workbench.</div>;
   }
 
+  if (browserMode === "unavailable") {
+    return (
+      <div className="h-full bg-neutral-950 p-4 text-sm text-neutral-200">
+        <h2 className="font-medium">Browser agent access is unavailable</h2>
+        {browserAgent ? (
+          <div data-testid="browser-agent-diagnostic" className="mt-3 rounded border border-amber-900/60 bg-amber-950/25 p-3 text-xs text-amber-100">
+            <div>{browserAgent.reason_code ?? "unavailable"}</div>
+            <div data-testid="browser-agent-remediation" className="mt-1">{browserAgent.remediation ?? "Start a fresh authorized interactive runtime."}</div>
+            <div className="mt-2 text-neutral-400">{browserAgent.tool_state} · {browserAgent.executable.state} · {browserAgent.executable.platform}/{browserAgent.executable.transport}</div>
+          </div>
+        ) : (
+          <p className="mt-2 text-neutral-400">This session has no compatible managed-browser surface.</p>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-neutral-950 text-neutral-100">
+      {browserAgent && (
+        <div
+          data-testid="browser-agent-diagnostic"
+          className={`shrink-0 border-b px-3 py-2 text-xs ${browserAgent.available
+            ? "border-emerald-900/50 bg-emerald-950/25 text-emerald-100"
+            : "border-amber-900/50 bg-amber-950/25 text-amber-100"}`}
+        >
+          <div className="font-medium">
+            Agent browser tools: {browserAgent.available ? "available" : "unavailable"}
+            <span className="ml-2 font-normal text-neutral-400">
+              {browserAgent.tool_state} · {browserAgent.executable.state} · {browserAgent.executable.platform}/{browserAgent.executable.transport}
+            </span>
+          </div>
+          {!browserAgent.available && browserAgent.remediation && (
+            <div className="mt-1" data-testid="browser-agent-remediation">
+              {browserAgent.reason_code ? `${browserAgent.reason_code}: ` : ""}{browserAgent.remediation}
+            </div>
+          )}
+        </div>
+      )}
+
       <BrowserToolbar
         state={state}
         busy={busy}
@@ -283,9 +324,9 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode }: BrowserPane
         onPasteClipboard={() => void handlePasteClipboard()}
       />
 
-      {protectedRuntime && (
+      {state?.profile.persistence === "protected" && (
         <div data-testid="protected-downloads" className="shrink-0 border-b border-neutral-900 bg-neutral-950 px-3 py-1.5 text-xs text-neutral-500">
-          Downloads save directly to <code className="text-neutral-300">.wayang/browser-downloads/</code>.
+          Completed bounded downloads publish to <code className="text-neutral-300">.wayang/browser-downloads/</code>.
           {state?.download && (
             <span className="ml-2" data-testid="protected-download-status">
               Latest: <span className="text-neutral-300">{state.download.status}</span>

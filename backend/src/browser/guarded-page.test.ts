@@ -114,6 +114,7 @@ test("compiled DOM evaluation preserves sensitive-field redaction helpers and by
   const expression = compileGuardedPageExpression(body);
   assert.match(expression, /function __wayangSensitive/);
   assert.match(expression, /function __wayangRedact/);
+  assert.match(expression, /function __wayangSafeUrl/);
   assert.match(expression, /function __wayangVisible/);
   assert.match(expression, /!el\.isConnected/);
   assert.match(expression, /getClientRects/);
@@ -133,6 +134,18 @@ test("compiled DOM evaluation preserves sensitive-field redaction helpers and by
   assert.match(expression, /function __wayangInfo/);
   assert.ok(expression.includes(body));
   assert.equal(expression.includes("SYNTHETIC_SECRET_VALUE"), false);
+  const links = compileGuardedPageExpression(compileGuardedDomOperation({ kind: "links" }));
+  assert.match(links, /href: __wayangSafeUrl\(el\.href\)/);
+  assert.doesNotMatch(links, /href: __wayangRedact\(el\.href\)/);
+  const visibleQuery = compileGuardedDomOperation({
+    kind: "query_visible_selector", selector: "button", documentNonce: "synthetic-document-nonce",
+  });
+  assert.match(visibleQuery, /url: __wayangSafeUrl\(location\.href\)/);
+  assert.doesNotMatch(visibleQuery, /url: __wayangRedact\(location\.href\)/);
+  const typed = compileGuardedDomOperation({ kind: "type_public", text: publicText });
+  assert.ok(typed.includes(`const text = ${JSON.stringify(publicText)};`));
+  assert.match(typed, /const el = document\.activeElement/);
+  assert.match(typed, /__wayangDisabled\(el\)/);
 
   let guardChecks = 0;
   let sent: Record<string, unknown> | undefined;
