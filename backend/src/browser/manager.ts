@@ -259,7 +259,7 @@ export function resolveChromiumExecutableCandidate(candidate: string): string | 
   }
 }
 
-export type BrowserExecutableState = "resolved" | "missing" | "invalid_configured_path";
+export type BrowserExecutableState = "resolved" | "missing" | "invalid_configured_path" | "unchecked";
 
 export interface BrowserExecutableDiagnostic {
   platform: NodeJS.Platform;

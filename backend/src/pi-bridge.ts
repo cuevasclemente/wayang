@@ -2777,6 +2777,24 @@ export interface BrowserAgentDiagnostic {
   tool_state: "registered" | "withheld" | "stale_runtime";
 }
 
+let browserExecutableDiagnosticCache: { key: string; value: ReturnType<typeof getBrowserExecutableDiagnostic> } | undefined;
+
+function browserExecutableDiagnosticForProcess(): ReturnType<typeof getBrowserExecutableDiagnostic> {
+  const key = [
+    process.platform,
+    process.arch,
+    process.env.WAYANG_CHROMIUM_PATH ?? "",
+    process.env.CHROME_PATH ?? "",
+    process.env.CHROMIUM_PATH ?? "",
+    process.env.WAYANG_BROWSER_TRANSPORT ?? "",
+    process.env.PATH ?? "",
+  ].join("\u0000");
+  if (browserExecutableDiagnosticCache?.key === key) return browserExecutableDiagnosticCache.value;
+  const value = getBrowserExecutableDiagnostic();
+  browserExecutableDiagnosticCache = { key, value };
+  return value;
+}
+
 const BROWSER_REMEDIATION: Readonly<Record<BrowserAgentReasonCode, string>> = Object.freeze({
   approval_required: "Approve the compatible Browser capability for this exact Project-Agent pair, then start a fresh session runtime.",
   association_inactive: "The Browser capability was revoked. Reapprove it only after reviewing the Project-Agent pair.",
@@ -2793,8 +2811,17 @@ const BROWSER_REMEDIATION: Readonly<Record<BrowserAgentReasonCode, string>> = Ob
 });
 
 export function getPiSessionBrowserAgentDiagnostic(id: string, durableRow?: SessionRow): BrowserAgentDiagnostic {
-  const executable = getBrowserExecutableDiagnostic();
-  const denied = (capabilityId: ProtectedBrowserBinding["capabilityId"] | null, reason: BrowserAgentReasonCode, tool_state: BrowserAgentDiagnostic["tool_state"] = "withheld"): BrowserAgentDiagnostic => ({
+  const uncheckedExecutable: BrowserAgentDiagnostic["executable"] = {
+    platform: process.platform,
+    transport: process.env.WAYANG_BROWSER_TRANSPORT === "vnc" ? "vnc" : "cdp-screencast",
+    state: "unchecked",
+  };
+  const denied = (
+    capabilityId: ProtectedBrowserBinding["capabilityId"] | null,
+    reason: BrowserAgentReasonCode,
+    tool_state: BrowserAgentDiagnostic["tool_state"] = "withheld",
+    executable: BrowserAgentDiagnostic["executable"] = uncheckedExecutable,
+  ): BrowserAgentDiagnostic => ({
     available: false,
     capability_id: capabilityId,
     reason_code: reason,
@@ -2825,7 +2852,9 @@ export function getPiSessionBrowserAgentDiagnostic(id: string, durableRow?: Sess
   }
   const handle = sessions.get(id);
   const runtime = getLiveProtectedBrowserRuntime(id);
-  if (!handle || !runtime || row.pending_agent_switch) return denied(capabilityId, "fresh_runtime_required", "stale_runtime");
+  if (!handle || !runtime || row.pending_agent_switch) {
+    return denied(capabilityId, "fresh_runtime_required", "stale_runtime", browserExecutableDiagnosticForProcess());
+  }
   const anySession = handle.session as any;
   const registry = anySession._toolRegistry;
   const definitions = anySession._toolDefinitions;
@@ -2834,13 +2863,14 @@ export function getPiSessionBrowserAgentDiagnostic(id: string, durableRow?: Sess
     && registry instanceof Map
     && registry.has(tool.name));
   if (!registered) return denied(capabilityId, "tool_registration_failed", "stale_runtime");
+  const executable = browserExecutableDiagnosticForProcess();
   if (executable.state !== "resolved" || executable.reasonCode === "transport_unavailable") {
     const reason = executable.reasonCode === "configured_path_invalid"
       ? "configured_path_invalid"
       : executable.reasonCode === "transport_unavailable"
         ? "transport_unavailable"
         : "browser_not_found";
-    return denied(capabilityId, reason, "registered");
+    return denied(capabilityId, reason, "registered", executable);
   }
   return { available: true, capability_id: capabilityId, reason_code: null, remediation: null, executable, tool_state: "registered" };
 }
@@ -2857,10 +2887,10 @@ export function getPiSessionBrowserMode(id: string, durableRow?: SessionRow): Br
   try { project = getProjectByCwd(row.cwd); }
   catch { return "unavailable"; }
   if (!project) return "unavailable";
+  if (project.access_policy.privacy_mode === "standard") return "standard";
   const surface = resolveProtectedBrowserSurfaceScope(id, row.cwd);
-  if (project.access_policy.privacy_mode === "standard" && !surface) return "standard";
   if (!surface) return "unavailable";
-  const mode: BrowserSurfaceMode = project.access_policy.privacy_mode === "standard" ? "standard" : "protected";
+  const mode: BrowserSurfaceMode = "protected";
   if (!handle || handle.capabilityAuthorityDenied) return mode;
   if (handle.agentProfileId !== row.agent_profile_id || handle.cwd !== row.cwd) return "unavailable";
   try {
