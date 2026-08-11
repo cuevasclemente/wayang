@@ -182,7 +182,7 @@ async function selectorIsolatedWorld(
 
 interface SelectorQueryElementReceipt {
   index: number;
-  name: string;
+  accessibleName: string;
   visible: true;
   disabled: boolean;
 }
@@ -202,11 +202,11 @@ function selectorQueryElements(value: unknown): SelectorQueryElementReceipt[] {
   return elements.map((item, index) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) throw rpcError("Browser RPC query result is malformed");
     const element = item as Record<string, unknown>;
-    if (element.index !== index || typeof element.name !== "string" || element.name.length > 500
+    if (element.index !== index || typeof element.accessibleName !== "string" || element.accessibleName.length > 500
       || element.visible !== true || typeof element.disabled !== "boolean") {
       throw rpcError("Browser RPC query result is malformed");
     }
-    return { index, name: element.name, visible: true, disabled: element.disabled };
+    return { index, accessibleName: element.accessibleName, visible: true, disabled: element.disabled };
   });
 }
 
@@ -324,16 +324,19 @@ export class ProtectedAutomationBrowserRpc implements ProtectedAutomationBrowser
         return { ...value, queryToken };
       }
       case "browser.click_selector": {
-        const params = exactObject(rawParams, ["selector", "index", "expectedName", "queryToken"]);
+        const params = exactObject(rawParams, ["selector", "index", "expectedAccessibleName", "queryToken"]);
         const selector = boundedString(params.selector, "selector", MAX_SELECTOR_BYTES);
         const index = optionalBoundedIndex(params.index) ?? 0;
-        const expectedName = boundedString(params.expectedName, "expected element name", MAX_EXPECTED_ELEMENT_NAME_BYTES);
+        const expectedAccessibleName = boundedString(
+          params.expectedAccessibleName, "expected accessible name", MAX_EXPECTED_ELEMENT_NAME_BYTES,
+        );
         const queryToken = boundedString(params.queryToken, "selector query receipt", 128);
         const receipt = this.consumeSelectorQueryReceipt(queryToken);
         this.selectorQueryReceipts.clear();
         const observed = receipt.elements[index];
-        const eligible = receipt.elements.filter((element) => element.name === expectedName && element.visible && !element.disabled);
-        if (receipt.selector !== selector || !observed || observed.name !== expectedName || observed.disabled
+        const eligible = receipt.elements.filter((element) =>
+          element.accessibleName === expectedAccessibleName && element.visible && !element.disabled);
+        if (receipt.selector !== selector || !observed || observed.accessibleName !== expectedAccessibleName || observed.disabled
           || eligible.length !== 1 || eligible[0] !== observed) {
           throw rpcError("Browser RPC selector query receipt does not authorize this action");
         }
@@ -343,7 +346,7 @@ export class ProtectedAutomationBrowserRpc implements ProtectedAutomationBrowser
           }
           const contextId = await selectorIsolatedWorld(cdp, this.lease, before);
           return guardedDom(cdp, this.lease, {
-            kind: "activate_selector", selector, index, expectedName, documentNonce: receipt.documentNonce,
+            kind: "activate_selector", selector, index, expectedAccessibleName, documentNonce: receipt.documentNonce,
           }, contextId);
         })).value;
       }

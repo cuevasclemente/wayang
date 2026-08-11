@@ -166,11 +166,11 @@ test("compiled DOM evaluation preserves sensitive-field redaction helpers and by
   const selectorPoint = compileGuardedDomOperation({ kind: "selector_point", selector: "button", index: 2 });
   assert.match(selectorPoint, /!__wayangActionable\(el\)/);
   const activateSelector = compileGuardedDomOperation({
-    kind: "activate_selector", selector: "button", index: 2, expectedName: "Download Transactions",
-    documentNonce: "synthetic-document-nonce",
+    kind: "activate_selector", selector: "button", index: 2,
+    expectedAccessibleName: "Download Transactions", documentNonce: "synthetic-document-nonce",
   });
   assert.match(activateSelector, /globalThis\[__wayangSelectorNonceKey\]/);
-  assert.match(activateSelector, /__wayangName\(el\) !== expectedName/);
+  assert.match(activateSelector, /__wayangAccessibleName\(el\) !== expectedAccessibleName/);
   assert.match(activateSelector, /matches\.length !== 1 \|\| matches\[0\] !== el/);
   assert.match(activateSelector, /el\.click\(\); return \{ clicked: true \}/);
   assert.equal(activateSelector.includes("Input.dispatchMouseEvent"), false);
@@ -222,8 +222,8 @@ test("compiled visibility and activation helpers fail closed on hidden, disabled
     return vm.runInContext(compileGuardedPageExpression(compileGuardedDomOperation(operation)), sandbox);
   };
 
-  const activate = (expectedName = "Download Transactions", documentNonce = "synthetic-document-nonce") => evaluate({
-    kind: "activate_selector", selector: "button", index: 0, expectedName, documentNonce,
+  const activate = (expectedAccessibleName = "Download Transactions", documentNonce = "synthetic-document-nonce") => evaluate({
+    kind: "activate_selector", selector: "button", index: 0, expectedAccessibleName, documentNonce,
   });
   const query = evaluate({
     kind: "query_visible_selector", selector: "button", limit: 5, documentNonce: "synthetic-document-nonce",
@@ -293,11 +293,119 @@ test("compiled visibility and activation helpers fail closed on hidden, disabled
   };
   hit = (x: number) => x < 40 ? element : duplicate;
   assert.throws(() => evaluate({
-    kind: "activate_selector", selector: "button", index: 0, expectedName: "Download Transactions",
-    documentNonce: "synthetic-document-nonce",
+    kind: "activate_selector", selector: "button", index: 0,
+    expectedAccessibleName: "Download Transactions", documentNonce: "synthetic-document-nonce",
   }, [element, duplicate]), /not actionable/);
   assert.equal(clicked, 1);
   assert.equal(duplicateClicks, 0, "duplicate actionable semantic matches fail closed");
+});
+
+test("accessible names resolve bounded standard icon sources and remain activation-bound", () => {
+  const defaultStyle = { display: "block", visibility: "visible", contentVisibility: "visible", opacity: "1" };
+  const attrs = new Map<string, string>();
+  const references = new Map<string, any>();
+  const secrets: any[] = [];
+  let nested: any[] = [];
+  let clicked = 0;
+  const control: any = {
+    id: "control",
+    localName: "button",
+    isConnected: true,
+    hidden: false,
+    parentElement: null,
+    labels: [],
+    textContent: "",
+    innerText: "",
+    getClientRects: () => [{ width: 20, height: 10 }],
+    getBoundingClientRect: () => ({ left: 5, top: 5, width: 20, height: 10 }),
+    getAttribute: (name: string) => attrs.get(name) ?? null,
+    hasAttribute: (name: string) => attrs.has(name),
+    matches: () => false,
+    contains: (candidate: unknown) => candidate === control,
+    querySelectorAll: () => nested,
+    scrollIntoView: () => undefined,
+    click: () => { clicked += 1; },
+  };
+  const textNode = (text: string, attributes: Record<string, string> = {}) => ({
+    innerText: text,
+    textContent: text,
+    getAttribute: (name: string) => attributes[name] ?? null,
+  });
+  const sandbox = vm.createContext({
+    location: { href: "https://synthetic.invalid/" },
+    getComputedStyle: () => defaultStyle,
+    document: {
+      title: "Synthetic",
+      body: { innerText: "" },
+      activeElement: null,
+      getElementById: (id: string) => references.get(id) ?? null,
+      querySelectorAll: (selector: string) => {
+        if (selector === "button") return [control];
+        if (selector.startsWith("input,textarea")) return secrets;
+        return [];
+      },
+      elementFromPoint: () => control,
+    },
+  });
+  const evaluate = (operation: Parameters<typeof compileGuardedDomOperation>[0]) =>
+    vm.runInContext(compileGuardedPageExpression(compileGuardedDomOperation(operation)), sandbox);
+  const query = (nonce: string) => evaluate({
+    kind: "query_visible_selector", selector: "button", limit: 5, documentNonce: nonce,
+  }).elements[0].accessibleName as string;
+  const activate = (name: string, nonce: string) => evaluate({
+    kind: "activate_selector", selector: "button", index: 0,
+    expectedAccessibleName: name, documentNonce: nonce,
+  });
+  const reset = () => {
+    attrs.clear();
+    references.clear();
+    secrets.length = 0;
+    nested = [];
+    control.labels = [];
+    control.textContent = "";
+    control.innerText = "";
+  };
+
+  reset();
+  attrs.set("aria-label", "Settings");
+  assert.equal(query("direct"), "Settings");
+
+  reset();
+  attrs.set("aria-labelledby", "label-a label-b");
+  references.set("label-a", textNode("Account"));
+  references.set("label-b", textNode(" Settings "));
+  assert.equal(query("references"), "Account Settings");
+
+  reset();
+  control.labels = [textNode("Settings")];
+  assert.equal(query("native-label"), "Settings");
+
+  reset();
+  attrs.set("title", "Settings");
+  control.textContent = "HIDDEN_DESCENDANT_CANARY";
+  control.innerText = "";
+  assert.equal(query("title"), "Settings", "empty rendered host text never falls back to hidden descendants");
+  assert.equal(activate("Settings", "title").clicked, true);
+  assert.equal(clicked, 1);
+  attrs.set("title", "Different");
+  assert.throws(() => activate("Settings", "title"), /not actionable/);
+  assert.equal(clicked, 1, "accessible-name mutation invalidates activation");
+
+  reset();
+  nested = [textNode("Settings")];
+  assert.equal(query("nested"), "Settings");
+
+  reset();
+  attrs.set("aria-labelledby", "control");
+  references.set("control", control);
+  assert.equal(query("cycle"), "");
+
+  reset();
+  attrs.set("aria-labelledby", "private-label");
+  const secret = "SYNTHETIC_CAFE\u0301_ACCESSIBLE_SECRET";
+  secrets.push({ value: secret, textContent: "", getAttribute: (name: string) => name === "type" ? "password" : null });
+  references.set("private-label", textNode(secret.normalize("NFC")));
+  assert.equal(query("redacted"), "[REDACTED]", "canonical Unicode equivalents redact before release");
 });
 
 test("credential protection remains document-bound, one-use, mutation-safe, and redacting", () => {
