@@ -32,7 +32,7 @@ export type GuardedDomOperation =
   | { kind: "query_selector"; selector: string; limit?: number }
   | { kind: "query_visible_selector"; selector: string; limit?: number; documentNonce: string }
   | { kind: "selector_point"; selector: string; index?: number }
-  | { kind: "activate_selector"; selector: string; index?: number; expectedName: string; documentNonce: string }
+  | { kind: "activate_selector"; selector: string; index?: number; expectedAccessibleName: string; documentNonce: string }
   | { kind: "fill_selector"; selector: string; index?: number; text: string }
   | { kind: "public_active_target" };
 
@@ -121,8 +121,11 @@ function __wayangSecrets() {
     .filter(__wayangSensitive).map((el) => String(el.value || el.textContent || "")).filter(Boolean);
 }
 function __wayangRedact(value) {
-  let text = String(value == null ? "" : value);
-  for (const secret of __wayangSecrets()) text = text.split(secret).join("[REDACTED]");
+  let text = String(value == null ? "" : value).normalize("NFC");
+  for (const secret of __wayangSecrets()) {
+    const normalized = String(secret).normalize("NFC");
+    if (normalized) text = text.split(normalized).join("[REDACTED]");
+  }
   return text;
 }
 function __wayangVisible(el) {
@@ -156,10 +159,46 @@ function __wayangActionable(el) {
 function __wayangName(el) {
   return __wayangRedact(el.getAttribute("aria-label") || el.getAttribute("name") || el.textContent || "").slice(0, 500);
 }
+function __wayangAccessibleText(el, includeHidden = false) {
+  if (!el || __wayangSensitive(el)) return el ? "[REDACTED]" : "";
+  const raw = includeHidden ? el.textContent : ("innerText" in el ? el.innerText : el.textContent);
+  return __wayangRedact(raw || "").replace(/\s+/g, " ").trim().slice(0, 500);
+}
+function __wayangBoundedReferences(raw) {
+  const ids = String(raw || "").trim().split(/\s+/).filter(Boolean);
+  if (ids.length > 16 || new Set(ids).size !== ids.length) return [];
+  return ids;
+}
+function __wayangAccessibleName(el) {
+  const clean = (value) => __wayangRedact(value).normalize("NFC").replace(/\s+/g, " ").trim().slice(0, 500);
+  const referencedIds = __wayangBoundedReferences(el.getAttribute("aria-labelledby"));
+  if (referencedIds.length) {
+    const referenced = referencedIds.map((id) => document.getElementById(id)).filter((candidate) => candidate && candidate !== el);
+    if (referenced.length === referencedIds.length) {
+      const value = clean(referenced.map((candidate) => __wayangAccessibleText(candidate, true)).filter(Boolean).join(" "));
+      if (value) return value;
+    }
+  }
+  const direct = clean(el.getAttribute("aria-label") || "");
+  if (direct) return direct;
+  const labels = "labels" in el && el.labels ? Array.from(el.labels) : [];
+  if (labels.length > 16) return "";
+  const labelled = clean(labels.map((candidate) => __wayangAccessibleText(candidate, true)).filter(Boolean).join(" "));
+  if (labelled) return labelled;
+  const alt = clean(el.getAttribute("alt") || "");
+  if (alt) return alt;
+  const content = __wayangAccessibleText(el);
+  if (content) return content;
+  const title = clean(el.getAttribute("title") || "");
+  if (title) return title;
+  const nested = Array.from(el.querySelectorAll?.("svg title,[role='img'][aria-label],img[alt]") || []);
+  if (nested.length > 16) return "";
+  return clean(nested.map((candidate) => candidate.getAttribute("aria-label") || candidate.getAttribute("alt") || __wayangAccessibleText(candidate, true)).filter(Boolean).join(" "));
+}
 function __wayangInfo(el, index) {
   const rect = el.getBoundingClientRect();
   return { index, tag: el.localName, role: el.getAttribute("role") || undefined,
-    type: el.getAttribute("type") || undefined, name: __wayangName(el),
+    type: el.getAttribute("type") || undefined, name: __wayangName(el), accessibleName: __wayangAccessibleName(el),
     text: __wayangSensitive(el) ? "[REDACTED]" : __wayangRedact(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 500),
     value: "value" in el ? (__wayangSensitive(el) && el.value ? "[REDACTED]" : __wayangRedact(el.value).slice(0, 500)) : undefined,
     href: el.href ? __wayangRedact(el.href) : undefined,
@@ -226,7 +265,7 @@ export function compileGuardedDomOperation(operation: Readonly<GuardedDomOperati
     case "selector_point":
       return `const el = Array.from(document.querySelectorAll(${JSON.stringify(operation.selector)}))[${Math.floor(operation.index ?? 0)}]; if (!el) throw new Error("selector is not actionable"); el.scrollIntoView({ block: "center", inline: "center" }); if (!__wayangActionable(el)) throw new Error("selector is not actionable"); const rect = el.getBoundingClientRect(); return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };`;
     case "activate_selector":
-      return `if (globalThis[__wayangSelectorNonceKey] !== ${JSON.stringify(operation.documentNonce)}) throw new Error("selector query document is stale"); const candidates = Array.from(document.querySelectorAll(${JSON.stringify(operation.selector)})).filter(__wayangVisible); const el = candidates[${Math.floor(operation.index ?? 0)}]; const expectedName = ${JSON.stringify(operation.expectedName)}; if (!el || __wayangName(el) !== expectedName) throw new Error("selector is not actionable"); el.scrollIntoView({ block: "center", inline: "center" }); const matches = candidates.filter((candidate) => __wayangName(candidate) === expectedName && __wayangActionable(candidate)); if (matches.length !== 1 || matches[0] !== el) throw new Error("selector is not actionable"); el.click(); return { clicked: true };`;
+      return `if (globalThis[__wayangSelectorNonceKey] !== ${JSON.stringify(operation.documentNonce)}) throw new Error("selector query document is stale"); const candidates = Array.from(document.querySelectorAll(${JSON.stringify(operation.selector)})).filter(__wayangVisible); const el = candidates[${Math.floor(operation.index ?? 0)}]; const expectedAccessibleName = ${JSON.stringify(operation.expectedAccessibleName)}; if (!el || __wayangAccessibleName(el) !== expectedAccessibleName) throw new Error("selector is not actionable"); el.scrollIntoView({ block: "center", inline: "center" }); const matches = candidates.filter((candidate) => __wayangAccessibleName(candidate) === expectedAccessibleName && __wayangActionable(candidate)); if (matches.length !== 1 || matches[0] !== el) throw new Error("selector is not actionable"); el.click(); return { clicked: true };`;
     case "fill_selector":
       return `const el = Array.from(document.querySelectorAll(${JSON.stringify(operation.selector)}))[${Math.floor(operation.index ?? 0)}]; if (!el || __wayangSensitive(el) || __wayangDisabled(el) || el.readOnly || !(el.isContentEditable || "value" in el)) throw new Error("unsafe public fill target"); const text = ${JSON.stringify(operation.text)}; if (el.isContentEditable) el.textContent = text; else el.value = text; el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true })); return { filled: true };`;
     case "public_active_target":

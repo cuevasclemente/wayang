@@ -163,8 +163,9 @@ class SyntheticCdp {
           title: "Synthetic",
           selector: "button",
           elements: [{
-            index: 0, tag: "button", name: "Download Transactions", text: "Download Transactions",
-            disabled: false, visible: true, rect: { x: 1, y: 2, width: 3, height: 4 },
+            index: 0, tag: "button", name: "Download Transactions", accessibleName: "Download Transactions",
+            text: "Download Transactions", disabled: false, visible: true,
+            rect: { x: 1, y: 2, width: 3, height: 4 },
           }],
         } } };
       }
@@ -278,6 +279,7 @@ test("navigation and inspection require exact allowed HTTPS origins and settled 
       index: 0,
       tag: "button",
       name: "Download Transactions",
+      accessibleName: "Download Transactions",
       text: "Download Transactions",
       disabled: false,
       visible: true,
@@ -291,14 +293,15 @@ test("navigation and inspection require exact allowed HTTPS origins and settled 
     );
     await assert.rejects(
       () => f.request("browser.click_selector", {
-        selector: "button", index: 0, expectedName: "Download Transactions",
+        selector: "button", index: 0, expectedAccessibleName: "Download Transactions",
         queryToken: "00000000-0000-4000-8000-000000000000",
       }),
       /receipt is unavailable/i,
       "a fabricated receipt cannot activate even a guessed safe label",
     );
     const click = {
-      selector: "button", index: 0, expectedName: "Download Transactions", queryToken: buttons.queryToken,
+      selector: "button", index: 0,
+      expectedAccessibleName: "Download Transactions", queryToken: buttons.queryToken,
     };
     assert.deepEqual(await f.request("browser.click_selector", click), { clicked: true });
     await assert.rejects(() => f.request("browser.click_selector", click), /receipt is unavailable/i,
@@ -306,7 +309,8 @@ test("navigation and inspection require exact allowed HTTPS origins and settled 
     const stale = await f.request("browser.query_selector", { selector: "button", limit: 10 }) as any;
     await f.request("browser.navigate", { url: "https://allowed.example.test/after-query" });
     await assert.rejects(() => f.request("browser.click_selector", {
-      selector: "button", index: 0, expectedName: "Download Transactions", queryToken: stale.queryToken,
+      selector: "button", index: 0,
+      expectedAccessibleName: "Download Transactions", queryToken: stale.queryToken,
     }), /receipt is unavailable/i, "navigation invalidates prior query receipts");
     assert.equal(f.runtime.cdp.methods.includes("Input.dispatchMouseEvent"), false,
       "protected selector activation is validated and dispatched atomically in one guarded page operation");
