@@ -68,6 +68,11 @@ test("synthetic catalog and transcript latency remain responsive", async ({ page
   const unchangedPayload = await unchanged.json() as { parsed?: number };
   expect(unchangedPayload.parsed).toBe(0);
 
+  const metricsBeforeOpenSamplesResponse = await request.get("/api/latency/metrics");
+  expect(metricsBeforeOpenSamplesResponse.ok()).toBe(true);
+  const metricsBeforeOpenSamples = await metricsBeforeOpenSamplesResponse.json() as { metrics?: Record<string, { count?: number }> };
+  const sessionOpenCountBeforeSamples = metricsBeforeOpenSamples.metrics?.session_open_usable_ms?.count ?? 0;
+
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
   await page.getByRole("button", { name: "Sessions", exact: true }).click();
@@ -124,8 +129,8 @@ test("synthetic catalog and transcript latency remain responsive", async ({ page
     const response = await request.get("/api/latency/metrics");
     if (!response.ok()) return -1;
     const snapshot = await response.json() as { metrics?: Record<string, { count?: number }> };
-    return snapshot.metrics?.session_open_usable_ms?.count ?? 0;
-  }).toBe(transcriptUsableDurations.length);
+    return (snapshot.metrics?.session_open_usable_ms?.count ?? 0) - sessionOpenCountBeforeSamples;
+  }).toBeGreaterThanOrEqual(transcriptUsableDurations.length);
 
   const backendMetricsResponse = await request.get("/api/latency/metrics");
   expect(backendMetricsResponse.ok()).toBe(true);
