@@ -110,6 +110,29 @@ test("approved Standard interactive sessions receive exact explicit browser tool
     parameters: Type.Object({}, { additionalProperties: false }),
     async execute() { return { content: [{ type: "text" as const, text: "neutral-standard-runtime" }], details: {} }; },
   });
+  let invalidFactoryRevocations = 0;
+  const invalidLease = createSession(projectRoot, {
+    agentProfileId: profile.id,
+    provider: "anthropic",
+    model: "claude-sonnet-4-5",
+  });
+  await assert.rejects(
+    createPiSession(invalidLease.id, projectRoot, invalidLease.provider, invalidLease.model, undefined, {
+      protectedBrowserFactory: async (binding) => ({
+        kind: "standard" as const,
+        binding: { ...binding, controlGeneration: binding.controlGeneration + 1 },
+        tools: Object.freeze([neutralProbe]),
+        toolForName(name: string) { return name === neutralProbe.name ? neutralProbe : undefined; },
+        preflight() { return { allowed: true as const }; },
+        async detachAgentLease() {},
+        async closeSessionWorkspaces() {},
+        async revokeAuthority() { invalidFactoryRevocations++; },
+      }),
+    }),
+    /non-exact runtime lease/,
+  );
+  assert.equal(invalidFactoryRevocations, 1, "invalid factory lease is revoked rather than merely detached");
+
   const neutralFactory = async (binding: ProtectedBrowserBinding) => {
     neutralCaptured.push({ ...binding });
     let detached = false;

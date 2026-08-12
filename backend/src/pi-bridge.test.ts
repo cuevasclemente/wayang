@@ -14,6 +14,7 @@ import {
   cleanupPiSessionCapabilityDenial,
   closePiSessionAuthorities,
   createPiSession,
+  destroyPiSession,
   fileAudioExperimentRuntimeIsEligible,
   getPiSession,
   getPiSessionBashMode,
@@ -297,7 +298,7 @@ test("detached browser authority revocation reaches the process owner synchronou
   const uninstall = installInteractiveBrowserSessionLifecyclePort({
     closeSessionWorkspaces() { return Promise.resolve(); },
     revokeAuthority(scope, reason) {
-      calls.push(`${scope.capabilityId}:${scope.projectId}:${scope.agentProfileId}:${scope.associationRevision}:${reason}`);
+      calls.push(`${scope.capabilityId}:${scope.projectId}:${scope.agentProfileId}:${reason}`);
       return Promise.resolve();
     },
     blocksPiIdleDetach() { return false; },
@@ -313,10 +314,9 @@ test("detached browser authority revocation reaches the process owner synchronou
         capabilityId: "wayang.standard-browser.v1",
         projectId: "synthetic-project",
         agentProfileId: "synthetic-profile",
-        associationRevision: 7,
       },
     );
-    assert.deepEqual(calls, ["wayang.standard-browser.v1:synthetic-project:synthetic-profile:7:capability_revoked"]);
+    assert.deepEqual(calls, ["wayang.standard-browser.v1:synthetic-project:synthetic-profile:capability_revoked"]);
     await cleanupPiSessionCapabilityDenial([runtimeId]);
   } finally {
     uninstall();
@@ -579,6 +579,23 @@ test("starting runtime revocation fences privileged loading and publication, whi
     );
     assert.equal(freshAuthorized, true, "a later creation captures the advanced generation and re-resolves the current association");
     assert.deepEqual(effects, [] as string[]);
+
+    const destroyEntered = deferred();
+    const destroyRelease = deferred();
+    const destroyedCreation = createPiSession(row.id, cwd, row.provider, row.model, null, {
+      testHooks: {
+        async afterStandardResourcesResolution() {
+          destroyEntered.resolve();
+          await destroyRelease.promise;
+        },
+      },
+    });
+    await destroyEntered.promise;
+    const destroyed = destroyPiSession(row.id, { kind: "close_session", reason: "archive" });
+    destroyRelease.resolve();
+    await assert.rejects(destroyedCreation, /creation was revoked/);
+    await destroyed;
+    assert.equal(getPiSessionRuntimeState(row.id).runtime_status, "stopped", "destroy fences an unpublished creation");
   } finally {
     release.resolve();
     await cleanupPiSessionCapabilityDenial([row.id]);

@@ -519,6 +519,7 @@ const policyWrappedToolExecutes = new WeakSet<object>();
 /** Browser tool wrappers close over one exact session/runtime. Reusing the same
  * mutable ToolDefinition across sessions would inherit the first authority. */
 const interactiveBrowserToolWrapperOwners = new WeakMap<object, string>();
+const interactiveBrowserDefinitionOwners = new WeakMap<object, object>();
 const policyWrappedSessions = new WeakSet<object>();
 const policyWrappedAgents = new WeakSet<object>();
 
@@ -665,6 +666,13 @@ export function installAgentToolPolicyGuard(
     for (const definition of protectedBrowserRuntime.tools) {
       const entry = anySession._toolDefinitions.get(definition.name);
       if (entry?.definition === definition) {
+        const definitionObject = definition as object;
+        const priorOwner = interactiveBrowserDefinitionOwners.get(definitionObject);
+        if (priorOwner && priorOwner !== anySession) {
+          detachBrowserRuntimeOnToolObjectDrift(protectedBrowserRuntime);
+          throw new Error("Interactive browser ToolDefinition cannot be reused across session runtimes");
+        }
+        interactiveBrowserDefinitionOwners.set(definitionObject, anySession);
         const registered = resolveRegisteredTool(session, definition.name);
         if (registered) trustedProtectedBrowserTool.set(definition.name, registered);
       }

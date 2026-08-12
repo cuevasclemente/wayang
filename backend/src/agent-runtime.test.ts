@@ -492,13 +492,16 @@ test("interactive-browser ToolDefinitions cannot be reused across session-owned 
       async closeSessionWorkspaces() {},
       async revokeAuthority() {},
     });
-    const makeSession = () => ({
-      _toolDefinitions: new Map([[shared.name, { definition: shared }]]),
-      _toolRegistry: new Map([[shared.name, shared]]),
-      getActiveToolNames: () => [shared.name],
-      setActiveToolsByName() {},
-      agent: { state: { tools: [shared] }, async beforeToolCall() {} },
-    } as any);
+    const makeSession = () => {
+      const registered = { name: shared.name, async execute(...args: unknown[]) { return shared.execute(...args); } };
+      return {
+        _toolDefinitions: new Map([[shared.name, { definition: shared }]]),
+        _toolRegistry: new Map([[shared.name, registered]]),
+        getActiveToolNames: () => [shared.name],
+        setActiveToolsByName() {},
+        agent: { state: { tools: [registered] }, async beforeToolCall() {} },
+      } as any;
+    };
     installAgentToolPolicyGuard(makeSession(), first.id, { protectedBrowserRuntime: makeRuntime() });
     assert.throws(
       () => installAgentToolPolicyGuard(makeSession(), second.id, { protectedBrowserRuntime: makeRuntime() }),

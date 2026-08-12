@@ -45,7 +45,6 @@ class ProductionCapabilityRuntimeDenial implements WorkspaceCapabilityRuntimeDen
             capabilityId: input.association.capabilityId as "wayang.standard-browser.v1" | "wayang.protected-browser.v1",
             projectId: input.association.projectId,
             agentProfileId: input.association.agentProfileId,
-            associationRevision: input.association.revision,
           }
         : undefined,
     );

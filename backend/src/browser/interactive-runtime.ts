@@ -25,7 +25,6 @@ export interface InteractiveBrowserAuthorityScope {
   capabilityId: ProtectedBrowserBinding["capabilityId"];
   projectId: string;
   agentProfileId: string;
-  associationRevision: number;
 }
 
 /**
