@@ -431,6 +431,82 @@ test("interactive-browser guard preserves exact backend tool-object authorizatio
   } finally { f.cleanup(); }
 });
 
+test("interactive-browser guard suppresses updates and results when authority is revoked during execute", async () => {
+  const f = fixture("wayang-runtime-browser-release-fence-");
+  try {
+    const profile = createAgentProfile({ name: "Browser release fence" });
+    createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
+    const row = createSession(f.cwd, { agentProfileId: profile.id });
+    let allowed = true;
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    const definition: any = { name: "browser_workspace_probe", async execute() { return { content: [] }; } };
+    const registered: any = {
+      name: definition.name,
+      async execute(_id: string, _params: unknown, _signal: unknown, onUpdate: (value: unknown) => void) {
+        await waiting;
+        onUpdate({ content: [{ type: "text", text: "must-not-release" }] });
+        return { content: [{ type: "text", text: "must-not-return" }] };
+      },
+    };
+    const runtime: InteractiveBrowserToolRuntime = {
+      kind: "standard",
+      tools: [definition],
+      toolForName(name) { return name === definition.name ? definition : undefined; },
+      preflight: () => allowed ? { allowed: true } : { allowed: false, reason: "synthetic revoked" },
+      async detachAgentLease() {},
+      async closeSessionWorkspaces() {},
+      async revokeAuthority() {},
+    };
+    const updates: unknown[] = [];
+    const session: any = {
+      _toolDefinitions: new Map([[definition.name, { definition }]]),
+      _toolRegistry: new Map([[definition.name, registered]]),
+      getActiveToolNames: () => [definition.name],
+      setActiveToolsByName() {},
+      agent: { state: { tools: [registered] }, async beforeToolCall() {} },
+    };
+    installAgentToolPolicyGuard(session, row.id, { protectedBrowserRuntime: runtime });
+    const execution = registered.execute("synthetic", {}, undefined, (update: unknown) => updates.push(update));
+    allowed = false;
+    release();
+    await assert.rejects(() => execution, /suppressed browser_workspace_probe result: synthetic revoked/);
+    assert.deepEqual(updates, []);
+  } finally { f.cleanup(); }
+});
+
+test("interactive-browser ToolDefinitions cannot be reused across session-owned runtime wrappers", () => {
+  const f = fixture("wayang-runtime-browser-tool-reuse-");
+  try {
+    const profile = createAgentProfile({ name: "Browser tool reuse" });
+    createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
+    const first = createSession(f.cwd, { agentProfileId: profile.id });
+    const second = createSession(f.cwd, { agentProfileId: profile.id });
+    const shared: any = { name: "browser_workspace_probe", async execute() { return { content: [] }; } };
+    const makeRuntime = (): InteractiveBrowserToolRuntime => ({
+      kind: "standard",
+      tools: [shared],
+      toolForName(name) { return name === shared.name ? shared : undefined; },
+      preflight: () => ({ allowed: true }),
+      async detachAgentLease() {},
+      async closeSessionWorkspaces() {},
+      async revokeAuthority() {},
+    });
+    const makeSession = () => ({
+      _toolDefinitions: new Map([[shared.name, { definition: shared }]]),
+      _toolRegistry: new Map([[shared.name, shared]]),
+      getActiveToolNames: () => [shared.name],
+      setActiveToolsByName() {},
+      agent: { state: { tools: [shared] }, async beforeToolCall() {} },
+    } as any);
+    installAgentToolPolicyGuard(makeSession(), first.id, { protectedBrowserRuntime: makeRuntime() });
+    assert.throws(
+      () => installAgentToolPolicyGuard(makeSession(), second.id, { protectedBrowserRuntime: makeRuntime() }),
+      /cannot be reused across session runtimes/,
+    );
+  } finally { f.cleanup(); }
+});
+
 test("file-audio tool-object replacement closes the runtime and never invokes the replacement", async () => {
   const f = fixture("wayang-runtime-audio-tool-drift-");
   try {

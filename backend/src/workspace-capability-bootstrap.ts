@@ -40,6 +40,14 @@ class ProductionCapabilityRuntimeDenial implements WorkspaceCapabilityRuntimeDen
       browserCapability
         ? { kind: "revoke", reason: "capability_revoked" }
         : { kind: "detach", reason: "runtime_replaced" },
+      browserCapability
+        ? {
+            capabilityId: input.association.capabilityId as "wayang.standard-browser.v1" | "wayang.protected-browser.v1",
+            projectId: input.association.projectId,
+            agentProfileId: input.association.agentProfileId,
+            associationRevision: input.association.revision,
+          }
+        : undefined,
     );
   }
 

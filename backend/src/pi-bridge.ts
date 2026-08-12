@@ -89,6 +89,7 @@ import {
   type AgentLeaseDetachReason,
   type BrowserAuthorityRevokeReason,
   type CapabilityBoundInteractiveBrowserToolRuntime,
+  type InteractiveBrowserAuthorityScope,
   type InteractiveBrowserSessionLifecyclePort,
   type SessionWorkspaceCloseReason,
 } from "./browser/interactive-runtime.js";
@@ -272,8 +273,12 @@ const sessionCreations = new Map<string, Promise<PiSessionHandle>>();
 /** Monotonic process-local denial epoch. A creation may publish only while the
  * exact epoch captured before its first await remains current. */
 const sessionCapabilityDenialGenerations = new Map<string, bigint>();
-/** Strongest browser teardown requested while a runtime may still be starting. */
-const sessionBrowserTeardownIntents = new Map<string, PiSessionBrowserTeardown>();
+/** Strongest browser teardown requested for one exact denial generation. */
+interface SessionBrowserTeardownIntent {
+  generation: bigint;
+  action: PiSessionBrowserTeardown;
+}
+const sessionBrowserTeardownIntents = new Map<string, SessionBrowserTeardownIntent>();
 const agentSwitches = new Map<string, Promise<AgentSwitchResult>>();
 const runtimeEvents = new EventEmitter();
 const runtimeUnavailableNotifiedHandles = new WeakSet<object>();
@@ -944,7 +949,17 @@ export function getPiSessionRuntimeState(id: string): PiSessionRuntimeState {
 export function protectedBrowserIdleRetentionIsRequired(
   runtime: CapabilityBoundInteractiveBrowserToolRuntime | Pick<ProtectedBrowserToolRuntime, "browser" | "preflight"> | undefined,
 ): boolean {
-  if (!runtime || !("browser" in runtime) || runtime.browser.isRevoked || runtime.browser.mode === "agent") return false;
+  if (!runtime) return false;
+  if ("binding" in runtime && productionInteractiveBrowserSessionLifecycle) {
+    try {
+      if (productionInteractiveBrowserSessionLifecycle.blocksPiIdleDetach(runtime.binding)) return true;
+    } catch {
+      // An unavailable process-level owner cannot safely assert that a human
+      // control lease is detachable. Explicit denial/shutdown still revokes it.
+      return true;
+    }
+  }
+  if (!("browser" in runtime) || runtime.browser.isRevoked || runtime.browser.mode === "agent") return false;
   try { return runtime.preflight().allowed; }
   catch { return false; }
 }
@@ -1939,6 +1954,17 @@ function getPiSessionCapabilityDenialGeneration(id: string): bigint {
   return sessionCapabilityDenialGenerations.get(id) ?? 0n;
 }
 
+function currentBrowserTeardownIntent(id: string): PiSessionBrowserTeardown | undefined {
+  const intent = sessionBrowserTeardownIntents.get(id);
+  return intent?.generation === getPiSessionCapabilityDenialGeneration(id) ? intent.action : undefined;
+}
+
+function clearBrowserTeardownIntent(id: string, generation: bigint): void {
+  if (sessionBrowserTeardownIntents.get(id)?.generation === generation) {
+    sessionBrowserTeardownIntents.delete(id);
+  }
+}
+
 function assertPiSessionCreationGeneration(id: string, captured: bigint): void {
   if (getPiSessionCapabilityDenialGeneration(id) !== captured) {
     throw new WorkspaceStoreError("Session runtime creation was revoked; retry to create a fresh runtime", 409);
@@ -2194,7 +2220,9 @@ export async function createPiSession(
         assertCreationCurrent();
         if (pendingProtectedBrowserRuntime) assertInteractiveBrowserToolCatalog(pendingProtectedBrowserRuntime);
         const returnedBinding = pendingProtectedBrowserRuntime?.binding;
+        const expectedRuntimeKind = browserCapabilityId === STANDARD_BROWSER_CAPABILITY_ID ? "standard" : "protected";
         if (!pendingProtectedBrowserRuntime || !returnedBinding
+          || pendingProtectedBrowserRuntime.kind !== expectedRuntimeKind
           || returnedBinding.capabilityId !== protectedBinding.capabilityId
           || returnedBinding.sourceSessionId !== protectedBinding.sourceSessionId
           || returnedBinding.projectId !== protectedBinding.projectId
@@ -2702,11 +2730,13 @@ export async function createPiSession(
     pendingAgentSession = undefined;
     await pendingRestrictedMcpRuntime?.close().catch(() => undefined);
     pendingRestrictedMcpRuntime = undefined;
+    const teardownIntent = sessionBrowserTeardownIntents.get(id);
     if (pendingProtectedBrowserRuntime) {
-      const teardown = sessionBrowserTeardownIntents.get(id) ?? DEFAULT_BROWSER_TEARDOWN;
+      const teardown = currentBrowserTeardownIntent(id) ?? DEFAULT_BROWSER_TEARDOWN;
       await invokeBrowserTeardown(pendingProtectedBrowserRuntime, teardown).catch(() => undefined);
     }
     pendingProtectedBrowserRuntime = undefined;
+    if (teardownIntent) clearBrowserTeardownIntent(id, teardownIntent.generation);
     await pendingProtectedAutomationRuntime?.close().catch(() => undefined);
     pendingProtectedAutomationRuntime = undefined;
     await pendingFileAudioExperimentRuntime?.close().catch(() => undefined);
@@ -2907,21 +2937,36 @@ export function getLiveProtectedAutomationRuntime(
   catch { return undefined; }
 }
 
+/** Exact generic interactive-runtime registry access for diagnostics and
+ * backend tool publication. It never falls back by pair/name/cwd. */
+export function getLiveInteractiveBrowserRuntime(
+  sourceSessionId: string,
+  expectedBinding?: Readonly<ProtectedBrowserBinding>,
+): CapabilityBoundInteractiveBrowserToolRuntime | undefined {
+  const handle = sessions.get(sourceSessionId);
+  const runtime = handle?.protectedBrowserRuntime;
+  if (!handle || handle.capabilityAuthorityDenied || !runtime) return undefined;
+  const current = runtime.binding;
+  const expectedKind = current.capabilityId === STANDARD_BROWSER_CAPABILITY_ID ? "standard" : "protected";
+  if (runtime.kind !== expectedKind
+    || current.sourceSessionId !== sourceSessionId
+    || current.runtimeGeneration !== handle.runtimeGeneration
+    || current.processBootNonce !== PROCESS_BOOT_NONCE
+    || current.agentProfileId !== handle.agentProfileId
+    || current.projectCwd !== handle.cwd
+    || (expectedBinding && !exactProtectedBrowserBindingEqual(current, expectedBinding))) return undefined;
+  try { return runtime.preflight().allowed ? runtime : undefined; }
+  catch { return undefined; }
+}
+
 /** Exact protected-runtime registry access for routes/composition. This never
  * falls back by cwd, project, profile, name, or another live session. */
 export function getLiveProtectedBrowserRuntime(
   sourceSessionId: string,
   expectedBinding?: Readonly<ProtectedBrowserBinding>,
 ): ProtectedBrowserToolRuntime | undefined {
-  const handle = sessions.get(sourceSessionId);
-  const runtime = handle?.protectedBrowserRuntime;
-  if (!handle || handle.capabilityAuthorityDenied || !isProtectedBrowserToolRuntime(runtime) || runtime.browser.isRevoked) return undefined;
-  const current = runtime.binding;
-  if (current.sourceSessionId !== sourceSessionId
-    || current.runtimeGeneration !== handle.runtimeGeneration
-    || current.agentProfileId !== handle.agentProfileId
-    || current.projectCwd !== handle.cwd
-    || (expectedBinding && !exactProtectedBrowserBindingEqual(current, expectedBinding))) return undefined;
+  const runtime = getLiveInteractiveBrowserRuntime(sourceSessionId, expectedBinding);
+  if (!isProtectedBrowserToolRuntime(runtime) || runtime.kind !== "protected" || runtime.browser.isRevoked) return undefined;
   return runtime;
 }
 
@@ -3111,7 +3156,7 @@ export function getPiSessionBrowserAgentDiagnostic(id: string, durableRow?: Sess
     return denied(capabilityId, reason);
   }
   const handle = sessions.get(id);
-  const runtime = getLiveProtectedBrowserRuntime(id);
+  const runtime = getLiveInteractiveBrowserRuntime(id);
   if (!handle || !runtime || row.pending_agent_switch) {
     return denied(capabilityId, "fresh_runtime_required", "stale_runtime", browserExecutableDiagnosticForProcess());
   }
@@ -3464,17 +3509,30 @@ export function latchPiSessionCapabilityDenial(
   runtimeIds: readonly string[],
   lookup: PiSessionCapabilityDenialLookup = sessions,
   browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
+  browserAuthorityScope?: Readonly<InteractiveBrowserAuthorityScope>,
 ): void {
+  // Detached Standard workspaces have no Pi handle. Start pair-scoped denial
+  // before per-runtime cleanup so revocation never depends on a live lease.
+  if (browserTeardown.kind === "revoke" && browserAuthorityScope && productionInteractiveBrowserSessionLifecycle) {
+    try {
+      void Promise.resolve(productionInteractiveBrowserSessionLifecycle.revokeAuthority(
+        browserAuthorityScope,
+        browserTeardown.reason,
+      )).catch(() => undefined);
+    } catch { /* the durable denial remains authoritative */ }
+  }
   for (const id of new Set(runtimeIds)) {
-    const priorTeardown = sessionBrowserTeardownIntents.get(id);
-    const effectiveTeardown = priorTeardown
-      && browserTeardownSeverity(priorTeardown) >= browserTeardownSeverity(browserTeardown)
-      ? priorTeardown
-      : browserTeardown;
-    sessionBrowserTeardownIntents.set(id, effectiveTeardown);
     // Advance first and without awaiting or requiring a published handle. This
     // is the authoritative starting-runtime revocation latch.
-    sessionCapabilityDenialGenerations.set(id, getPiSessionCapabilityDenialGeneration(id) + 1n);
+    const generation = getPiSessionCapabilityDenialGeneration(id) + 1n;
+    sessionCapabilityDenialGenerations.set(id, generation);
+    const priorTeardown = sessionBrowserTeardownIntents.get(id);
+    const priorAction = priorTeardown?.action;
+    const effectiveTeardown = priorAction
+      && browserTeardownSeverity(priorAction) >= browserTeardownSeverity(browserTeardown)
+      ? priorAction
+      : browserTeardown;
+    sessionBrowserTeardownIntents.set(id, { generation, action: effectiveTeardown });
     const handle = lookup.get(id);
     if (handle) latchPiSessionHandleCapabilityDenial(handle, effectiveTeardown);
     else getActionApprovalBridge().cancelSession(id, "runtime capability authority revoked");
@@ -3488,8 +3546,11 @@ export async function cleanupPiSessionCapabilityDenial(runtimeIds: readonly stri
     const pending = sessionCreations.get(id);
     if (pending) await pending.catch(() => undefined);
     const handle = sessions.get(id);
-    if (!handle) return;
-    const browserTeardown = sessionBrowserTeardownIntents.get(id) ?? DEFAULT_BROWSER_TEARDOWN;
+    if (!handle) {
+      clearBrowserTeardownIntent(id, getPiSessionCapabilityDenialGeneration(id));
+      return;
+    }
+    const browserTeardown = currentBrowserTeardownIntent(id) ?? DEFAULT_BROWSER_TEARDOWN;
     latchPiSessionHandleCapabilityDenial(handle, browserTeardown);
     await beginPiSessionAuthorityCleanup(handle, browserTeardown);
     await stopPiSessionIfIdle(id).catch(() => false);
@@ -3512,6 +3573,7 @@ export async function destroyPiSession(
   // extension hooks. This is deliberately safe even when no live handle exists
   // (for example a stop/archive racing a just-finished session).
   getActionApprovalBridge().cancelSession(id, "session destroyed");
+  const teardownIntentGeneration = sessionBrowserTeardownIntents.get(id)?.generation;
   const handle = sessions.get(id);
   if (!handle) {
     if (browserTeardown.kind === "close_session") {
@@ -3524,7 +3586,12 @@ export async function destroyPiSession(
   if (browserTeardown.kind === "close_session") {
     await productionInteractiveBrowserSessionLifecycle?.closeSessionWorkspaces(id, browserTeardown.reason);
   } else if (browserTeardown.kind === "revoke" && browserBinding) {
-    await productionInteractiveBrowserSessionLifecycle?.revokeAuthority(browserBinding, browserTeardown.reason);
+    await productionInteractiveBrowserSessionLifecycle?.revokeAuthority({
+      capabilityId: browserBinding.capabilityId,
+      projectId: browserBinding.projectId,
+      agentProfileId: browserBinding.agentProfileId,
+      associationRevision: browserBinding.associationRevision,
+    }, browserTeardown.reason);
   }
   try {
     if (handle.session.isStreaming) {
@@ -3545,7 +3612,7 @@ export async function destroyPiSession(
   handle.events.removeAllListeners();
   if (handle.sessionFile) invalidateSessionFileSnapshot(handle.sessionFile);
   sessions.delete(id);
-  sessionBrowserTeardownIntents.delete(id);
+  if (teardownIntentGeneration !== undefined) clearBrowserTeardownIntent(id, teardownIntentGeneration);
   maybeStopIdleCleanupTimer();
   // Clean up web-session lookup mappings. Exact object ownership is removed
   // synchronously so a stale tool context cannot fall through to colliding

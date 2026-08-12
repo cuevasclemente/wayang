@@ -13,6 +13,7 @@ import { close, init } from "./db.js";
 import {
   createPiSession,
   destroyPiSession,
+  getLiveInteractiveBrowserRuntime,
   getLiveProtectedBrowserRuntime,
   getPiSessionBrowserAgentDiagnostic,
 } from "./pi-bridge.js";
@@ -136,6 +137,7 @@ test("approved Standard interactive sessions receive exact explicit browser tool
   assert.equal(neutralCaptured.length, 1);
   assert.equal(neutralCaptured[0].sourceSessionId, neutral.id);
   assert.equal(getLiveProtectedBrowserRuntime(neutral.id), undefined, "neutral Standard runtime never masquerades as Protected route integration");
+  assert.notEqual(getPiSessionBrowserAgentDiagnostic(neutral.id).reason_code, "fresh_runtime_required");
   assert.ok(neutralHandle.session.getActiveToolNames().includes(neutralProbe.name));
   const neutralRegistry = (neutralHandle.session as any)._toolRegistry as Map<string, any>;
   const neutralResult = await neutralRegistry.get(neutralProbe.name).execute("synthetic-probe", {});
@@ -154,7 +156,7 @@ test("approved Standard interactive sessions receive exact explicit browser tool
     INTERACTIVE_BROWSER_TOOL_NAMES.filter((name) => approvedHandle.session.getActiveToolNames().includes(name)),
     [...INTERACTIVE_BROWSER_TOOL_NAMES],
   );
-  const live = getLiveProtectedBrowserRuntime(approved.id);
+  const live = getLiveInteractiveBrowserRuntime(approved.id);
   assert.ok(live);
   const registry = (approvedHandle.session as any)._toolRegistry as Map<string, unknown>;
   const definitions = (approvedHandle.session as any)._toolDefinitions as Map<string, { definition: unknown }>;

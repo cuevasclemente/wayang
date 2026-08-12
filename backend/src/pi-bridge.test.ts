@@ -292,6 +292,50 @@ test("archive/delete lifecycle reaches detached Standard workspaces without a li
   }
 });
 
+test("detached browser authority revocation reaches the process owner synchronously without a Pi handle", async () => {
+  const calls: string[] = [];
+  const uninstall = installInteractiveBrowserSessionLifecyclePort({
+    closeSessionWorkspaces() { return Promise.resolve(); },
+    revokeAuthority(scope, reason) {
+      calls.push(`${scope.capabilityId}:${scope.projectId}:${scope.agentProfileId}:${scope.associationRevision}:${reason}`);
+      return Promise.resolve();
+    },
+    blocksPiIdleDetach() { return false; },
+    close() { return Promise.resolve(); },
+  });
+  const runtimeId = "synthetic-detached-capability-revoke";
+  try {
+    latchPiSessionCapabilityDenial(
+      [runtimeId],
+      { get: () => undefined },
+      { kind: "revoke", reason: "capability_revoked" },
+      {
+        capabilityId: "wayang.standard-browser.v1",
+        projectId: "synthetic-project",
+        agentProfileId: "synthetic-profile",
+        associationRevision: 7,
+      },
+    );
+    assert.deepEqual(calls, ["wayang.standard-browser.v1:synthetic-project:synthetic-profile:7:capability_revoked"]);
+    await cleanupPiSessionCapabilityDenial([runtimeId]);
+  } finally {
+    uninstall();
+  }
+});
+
+test("neutral Standard human-control retention consults the process lifecycle owner", () => {
+  const binding: any = { sourceSessionId: "synthetic-retained-standard" };
+  const runtime: any = { kind: "standard", binding, preflight: () => ({ allowed: true }) };
+  const uninstall = installInteractiveBrowserSessionLifecyclePort({
+    closeSessionWorkspaces() { return Promise.resolve(); },
+    revokeAuthority() { return Promise.resolve(); },
+    blocksPiIdleDetach(candidate) { return candidate === binding; },
+    close() { return Promise.resolve(); },
+  });
+  try { assert.equal(protectedBrowserIdleRetentionIsRequired(runtime), true); }
+  finally { uninstall(); }
+});
+
 test("Pi bridge capability denial latches tools and aborts active runtime authority before async cleanup", async () => {
   const cleanupRelease = deferred();
   const order: string[] = [];

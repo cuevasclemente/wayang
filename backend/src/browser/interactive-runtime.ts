@@ -20,6 +20,14 @@ export type BrowserAuthorityRevokeReason =
   | "project_or_profile_denied"
   | "service_shutdown";
 
+/** Durable authority scope; sufficient to revoke detached pair-owned state. */
+export interface InteractiveBrowserAuthorityScope {
+  capabilityId: ProtectedBrowserBinding["capabilityId"];
+  projectId: string;
+  agentProfileId: string;
+  associationRevision: number;
+}
+
 /**
  * Backend-owned interactive-browser tool runtime contract.
  *
@@ -73,7 +81,7 @@ export interface InteractiveBrowserSessionLifecyclePort {
     reason: SessionWorkspaceCloseReason,
   ): Promise<void>;
   revokeAuthority(
-    binding: Readonly<ProtectedBrowserBinding>,
+    scope: Readonly<InteractiveBrowserAuthorityScope>,
     reason: BrowserAuthorityRevokeReason,
   ): Promise<void>;
   blocksPiIdleDetach(binding: Readonly<ProtectedBrowserBinding>): boolean;

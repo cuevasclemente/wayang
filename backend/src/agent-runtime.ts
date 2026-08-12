@@ -516,6 +516,9 @@ function liveToolDecision(
 }
 
 const policyWrappedToolExecutes = new WeakSet<object>();
+/** Browser tool wrappers close over one exact session/runtime. Reusing the same
+ * mutable ToolDefinition across sessions would inherit the first authority. */
+const interactiveBrowserToolWrapperOwners = new WeakMap<object, string>();
 const policyWrappedSessions = new WeakSet<object>();
 const policyWrappedAgents = new WeakSet<object>();
 
@@ -550,9 +553,19 @@ function wrapToolExecute(
   trustedFileAudioExperimentTool: unknown,
 ): void {
   if (!tool || (typeof tool !== "object" && typeof tool !== "function") || typeof tool.name !== "string"
-    || typeof tool.execute !== "function" || policyWrappedToolExecutes.has(tool)) return;
-  const previousExecute = tool.execute.bind(tool);
+    || typeof tool.execute !== "function") return;
   const policyToolName = tool.name;
+  const interactiveBrowserReleaseFence = isInteractiveBrowserToolName(normalizeToolName(policyToolName));
+  if (interactiveBrowserReleaseFence) {
+    const priorOwner = interactiveBrowserToolWrapperOwners.get(tool);
+    if (priorOwner && priorOwner !== sessionId) {
+      detachBrowserRuntimeOnToolObjectDrift(protectedBrowserRuntime);
+      throw new Error("Interactive browser ToolDefinition cannot be reused across session runtimes");
+    }
+    interactiveBrowserToolWrapperOwners.set(tool, sessionId);
+  }
+  if (policyWrappedToolExecutes.has(tool)) return;
+  const previousExecute = tool.execute.bind(tool);
   const protectedAutomationReleaseFence = normalizeToolName(policyToolName) === PROTECTED_AUTOMATION_TOOL_NAME;
   const fileAudioExperimentReleaseFence = normalizeToolName(policyToolName) === FILE_AUDIO_EXPERIMENT_TOOL_NAME;
   let standardRuntimeRevoked = false;
@@ -582,7 +595,7 @@ function wrapToolExecute(
     const decision = decideWrappedCall(params);
     if (!decision.allowed) throw new Error(`Wayang policy blocked ${policyToolName}: ${decision.reason ?? "denied"}`);
     const guardedRest = [...rest];
-    if ((standardResourcesWitness || protectedAutomationReleaseFence || fileAudioExperimentReleaseFence) && typeof guardedRest[1] === "function") {
+    if ((standardResourcesWitness || interactiveBrowserReleaseFence || protectedAutomationReleaseFence || fileAudioExperimentReleaseFence) && typeof guardedRest[1] === "function") {
       const previousUpdate = guardedRest[1] as (...args: unknown[]) => unknown;
       guardedRest[1] = (...args: unknown[]) => {
         const release = decideWrappedCall(params);
@@ -591,7 +604,7 @@ function wrapToolExecute(
       };
     }
     const result = await previousExecute(toolCallId, params, ...guardedRest);
-    if (standardResourcesWitness || protectedAutomationReleaseFence || fileAudioExperimentReleaseFence) {
+    if (standardResourcesWitness || interactiveBrowserReleaseFence || protectedAutomationReleaseFence || fileAudioExperimentReleaseFence) {
       const release = decideWrappedCall(params);
       if (!release.allowed) throw new Error(`Wayang policy suppressed ${policyToolName} result: ${release.reason ?? "denied"}`);
     }

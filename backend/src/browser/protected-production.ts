@@ -34,8 +34,9 @@ import {
   type ProtectedBrowserCredentialPort,
 } from "./protected-browser.js";
 import { createProtectedBrowserToolRuntime, type ProtectedBrowserToolRuntime } from "./protected-tools.js";
-import type {
-  ProtectedBrowserBinding,
+import {
+  STANDARD_BROWSER_CAPABILITY_ID,
+  type ProtectedBrowserBinding,
   ProtectedBrowserDispatchResult,
   ProtectedBrowserOperation,
 } from "./types.js";
@@ -864,7 +865,7 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
         return cleanup;
       };
       leaseRuntime = {
-        kind: baseRuntime.kind,
+        kind: leaseBinding.capabilityId === STANDARD_BROWSER_CAPABILITY_ID ? "standard" : "protected",
         get binding() { return baseRuntime.binding; },
         tools: baseRuntime.tools,
         browser: baseRuntime.browser,
