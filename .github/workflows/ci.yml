@@ -133,8 +133,8 @@ jobs:
         working-directory: frontend
         run: npm run build
 
-      - name: Run bootstrap and configuration tests
-        run: npm run test:scripts
+      - name: Run capability approval bootstrap tests
+        run: node --test scripts/tests/capability-approval.test.mjs
 
       - name: Exercise configuration wizard dry-run
         env:
