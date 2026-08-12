@@ -43,3 +43,20 @@ export interface InteractiveBrowserToolRuntime {
 export interface CapabilityBoundInteractiveBrowserToolRuntime extends InteractiveBrowserToolRuntime {
   readonly binding: Readonly<ProtectedBrowserBinding>;
 }
+
+/**
+ * Process-level lifecycle port for workspaces that may outlive a Pi runtime.
+ * Archive/delete and authority denial must not depend on a live Pi handle.
+ */
+export interface InteractiveBrowserSessionLifecyclePort {
+  closeSessionWorkspaces(
+    sourceSessionId: string,
+    reason: SessionWorkspaceCloseReason,
+  ): Promise<void>;
+  revokeAuthority(
+    binding: Readonly<ProtectedBrowserBinding>,
+    reason: BrowserAuthorityRevokeReason,
+  ): Promise<void>;
+  blocksPiIdleDetach(binding: Readonly<ProtectedBrowserBinding>): boolean;
+  close(): Promise<void>;
+}
