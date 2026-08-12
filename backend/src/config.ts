@@ -73,6 +73,8 @@ export interface Config {
   port: number;
   host: string;
   dataDir: string;
+  /** Startup-immutable M0 gate; production remains inert until host/schema composition exists. */
+  readonly standardBrowserProfileHosts: boolean;
   dbPath: string;
   /** Root for filesystem operations (default: user home) */
   fsRoot: string;
@@ -212,6 +214,17 @@ export function validateAuthConfig(auth: AuthConfig): void {
   }
 }
 
+export const STANDARD_BROWSER_PROFILE_HOSTS_STARTUP_ERROR =
+  "WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1 cannot start: Standard Browser Profile host/schema composition is unavailable";
+
+export function assertStandardBrowserProfileHostsStartupReady(
+  config: Pick<Config, "standardBrowserProfileHosts">,
+): void {
+  if (config.standardBrowserProfileHosts) {
+    throw new Error(STANDARD_BROWSER_PROFILE_HOSTS_STARTUP_ERROR);
+  }
+}
+
 export function getConfig(overrides?: Partial<Config>): Config {
   const dataDir = getDataDir();
   const port = getEnvInt("WAYANG_PORT", 8787, "PI_WEB_UI_PORT");
@@ -219,6 +232,7 @@ export function getConfig(overrides?: Partial<Config>): Config {
     port,
     host: process.env.WAYANG_HOST || process.env.PI_WEB_UI_HOST || "127.0.0.1",
     dataDir,
+    standardBrowserProfileHosts: envFlag("WAYANG_STANDARD_BROWSER_PROFILE_HOSTS"),
     dbPath: path.join(dataDir, "wayang.db"),
     fsRoot: os.homedir(),
     maxReadSize: 2 * 1024 * 1024, // 2 MiB

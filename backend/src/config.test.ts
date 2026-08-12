@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getConfig } from "./config.js";
+import {
+  assertStandardBrowserProfileHostsStartupReady,
+  getConfig,
+  STANDARD_BROWSER_PROFILE_HOSTS_STARTUP_ERROR,
+} from "./config.js";
 
 test("legacy identity-specific host flag is not runtime authority", () => {
   const previous = process.env.WAYANG_WREN_HOST_BASH;
@@ -12,6 +16,43 @@ test("legacy identity-specific host flag is not runtime authority", () => {
     if (previous === undefined) delete process.env.WAYANG_WREN_HOST_BASH;
     else process.env.WAYANG_WREN_HOST_BASH = previous;
   }
+});
+
+test("Standard Browser Profile hosts gate is strict, disabled by default, and captured by Config", () => {
+  const previous = process.env.WAYANG_STANDARD_BROWSER_PROFILE_HOSTS;
+  try {
+    delete process.env.WAYANG_STANDARD_BROWSER_PROFILE_HOSTS;
+    const capturedDisabled = getConfig();
+    assert.equal(capturedDisabled.standardBrowserProfileHosts, false);
+
+    process.env.WAYANG_STANDARD_BROWSER_PROFILE_HOSTS = "1";
+    assert.equal(capturedDisabled.standardBrowserProfileHosts, false, "existing Config is startup immutable");
+    const capturedEnabled = getConfig();
+    assert.equal(capturedEnabled.standardBrowserProfileHosts, true);
+
+    process.env.WAYANG_STANDARD_BROWSER_PROFILE_HOSTS = "0";
+    assert.equal(getConfig().standardBrowserProfileHosts, false);
+
+    for (const invalid of ["", "true", "01", " 1", "1 "]) {
+      process.env.WAYANG_STANDARD_BROWSER_PROFILE_HOSTS = invalid;
+      assert.throws(
+        () => getConfig(),
+        /WAYANG_STANDARD_BROWSER_PROFILE_HOSTS must be 0 or 1/,
+      );
+    }
+  } finally {
+    if (previous === undefined) delete process.env.WAYANG_STANDARD_BROWSER_PROFILE_HOSTS;
+    else process.env.WAYANG_STANDARD_BROWSER_PROFILE_HOSTS = previous;
+  }
+});
+
+test("enabled Standard Browser Profile hosts fail bounded production readiness before composition", () => {
+  assert.doesNotThrow(() => assertStandardBrowserProfileHostsStartupReady({ standardBrowserProfileHosts: false }));
+  assert.throws(
+    () => assertStandardBrowserProfileHostsStartupReady({ standardBrowserProfileHosts: true }),
+    { message: STANDARD_BROWSER_PROFILE_HOSTS_STARTUP_ERROR },
+  );
+  assert.ok(Buffer.byteLength(STANDARD_BROWSER_PROFILE_HOSTS_STARTUP_ERROR, "utf8") <= 160);
 });
 
 test("file-audio private prompt artifacts have distinct path and frozen-digest configuration fields", () => {

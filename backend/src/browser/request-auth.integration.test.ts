@@ -18,6 +18,7 @@ import {
   browserAgentAuthorizationForSourceSession,
   BROWSER_AGENT_SOURCE_SESSION_HEADER,
   BROWSER_AGENT_TOKEN_HEADER,
+  LEGACY_BROWSER_AGENT_ATTRIBUTION_ERROR,
 } from "./request-auth.js";
 
 async function availablePort(): Promise<number> {
@@ -63,7 +64,10 @@ test("legacy generic browser agent tokens are route-scoped but cannot bypass exa
     cookieSecure: "auto",
     allowedOrigins: [baseUrl],
   };
-  const { server } = createApp({ authService: new AuthService(authConfig) });
+  const { server } = createApp({
+    config: { standardBrowserProfileHosts: false },
+    authService: new AuthService(authConfig),
+  });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", resolve);
@@ -106,6 +110,10 @@ test("legacy generic browser agent tokens are route-scoped but cannot bypass exa
 
   const status = await fetch(`${baseUrl}/api/browser/status?${query}`, { headers: agentHeaders });
   assert.equal(status.status, 403);
+  assert.equal(status.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await status.json(), {
+    error: "Standard browser agent access requires exact capability-bound tools",
+  }, "gate-off preserves the existing legacy attribution contract");
   const matchingSessionQuery = new URLSearchParams({
     session_id: source.id,
     project_cwd: project,
@@ -216,4 +224,49 @@ test("legacy generic browser agent tokens are route-scoped but cannot bypass exa
   });
   assert.equal(allowWithoutFill.status, 409);
   assert.equal(allowWithoutFill.headers.get("cache-control"), "no-store");
+});
+
+test("enabled Standard Browser Profile hosts reject legacy attribution before JSON parsing", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-browser-agent-gate-"));
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = path.join(root, "data");
+  const port = await availablePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const authConfig: AuthConfig = {
+    enabled: false,
+    passwordHash: "",
+    sessionSecret: "",
+    sessionDays: 30,
+    sessionStorePath: path.join(root, "auth-sessions.json"),
+    trustProxy: false,
+    proxyIdentityHeader: "",
+    cookieSecure: "auto",
+    allowedOrigins: [baseUrl],
+  };
+  const { server } = createApp({
+    config: { standardBrowserProfileHosts: true },
+    authService: new AuthService(authConfig),
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", resolve);
+  });
+  t.after(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const response = await fetch(`${baseUrl}/api/browser/status`, {
+    method: "POST",
+    headers: {
+      [BROWSER_AGENT_TOKEN_HEADER]: "synthetic-legacy-attribution",
+      "Content-Type": "application/json",
+    },
+    body: "{malformed-json",
+  });
+  assert.equal(response.status, 403);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await response.json(), { error: LEGACY_BROWSER_AGENT_ATTRIBUTION_ERROR });
 });

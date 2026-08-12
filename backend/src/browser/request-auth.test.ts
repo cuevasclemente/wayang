@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { NextFunction, Request, Response } from "express";
 import {
+  BROWSER_AGENT_SOURCE_SESSION_HEADER,
+  BROWSER_AGENT_TOKEN_HEADER,
   classifyGenericBrowserSourceSession,
   classifyGenericBrowserTarget,
+  createLegacyBrowserAgentAttributionRejection,
+  LEGACY_BROWSER_AGENT_ATTRIBUTION_ERROR,
   type DurableBrowserTargetStore,
 } from "./request-auth.js";
 
@@ -52,6 +57,67 @@ function storeFixture(): DurableBrowserTargetStore {
     getProjectByCwd(cwd) { return projects.find((project) => project.cwd === cwd); },
   } as DurableBrowserTargetStore;
 }
+
+test("gate-off legacy attribution middleware delegates without inspecting request headers", () => {
+  const req = Object.defineProperty({}, "headers", {
+    get() { throw new Error("gate-off middleware inspected headers"); },
+  }) as unknown as Request;
+  let nextCalled = false;
+  createLegacyBrowserAgentAttributionRejection(false)(
+    req,
+    {} as unknown as Response,
+    (() => { nextCalled = true; }) as NextFunction,
+  );
+  assert.equal(nextCalled, true);
+});
+
+test("gate-on legacy attribution middleware rejects either header before parsing with no-store", () => {
+  for (const header of [BROWSER_AGENT_TOKEN_HEADER, BROWSER_AGENT_SOURCE_SESSION_HEADER]) {
+    const responseHeaders = new Map<string, string>();
+    let statusCode: number | undefined;
+    let body: unknown;
+    let nextCalled = false;
+    const req = Object.defineProperties({}, {
+      headers: { value: { [header]: "synthetic-legacy-attribution" } },
+      body: { get() { throw new Error("legacy rejection parsed the request body"); } },
+    }) as unknown as Request;
+    const res = {
+      setHeader(name: string, value: string) {
+        responseHeaders.set(name.toLowerCase(), value);
+        return this;
+      },
+      status(value: number) {
+        statusCode = value;
+        return this;
+      },
+      json(value: unknown) {
+        body = value;
+        return this;
+      },
+    } as unknown as Response;
+
+    createLegacyBrowserAgentAttributionRejection(true)(
+      req,
+      res,
+      (() => { nextCalled = true; }) as NextFunction,
+    );
+
+    assert.equal(nextCalled, false, header);
+    assert.equal(statusCode, 403, header);
+    assert.equal(responseHeaders.get("cache-control"), "no-store", header);
+    assert.deepEqual(body, { error: LEGACY_BROWSER_AGENT_ATTRIBUTION_ERROR }, header);
+  }
+});
+
+test("gate-on legacy attribution middleware preserves unattributed requests", () => {
+  let nextCalled = false;
+  createLegacyBrowserAgentAttributionRejection(true)(
+    { headers: {} } as unknown as Request,
+    {} as unknown as Response,
+    (() => { nextCalled = true; }) as NextFunction,
+  );
+  assert.equal(nextCalled, true);
+});
 
 test("generic browser classification uses only durable privacy/quarantine state, never names", () => {
   const store = storeFixture();

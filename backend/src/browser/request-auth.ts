@@ -10,6 +10,29 @@ import type { BrowserSessionLookup } from "./types.js";
 
 export const BROWSER_AGENT_TOKEN_HEADER = "x-wayang-browser-agent-token";
 export const BROWSER_AGENT_SOURCE_SESSION_HEADER = "x-wayang-source-session-id";
+export const LEGACY_BROWSER_AGENT_ATTRIBUTION_ERROR =
+  "Legacy generic browser-agent attribution is unavailable when Standard Browser Profile hosts are enabled";
+
+/**
+ * M0 pre-parser rejection for the legacy generic browser-agent attribution
+ * contract. Gate-off requests delegate without inspecting attribution headers.
+ */
+export function createLegacyBrowserAgentAttributionRejection(
+  standardBrowserProfileHosts: boolean,
+): RequestHandler {
+  if (!standardBrowserProfileHosts) return (_req, _res, next) => { next(); };
+  return (req, res, next) => {
+    if (
+      req.headers[BROWSER_AGENT_TOKEN_HEADER] === undefined
+      && req.headers[BROWSER_AGENT_SOURCE_SESSION_HEADER] === undefined
+    ) {
+      next();
+      return;
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.status(403).json({ error: LEGACY_BROWSER_AGENT_ATTRIBUTION_ERROR });
+  };
+}
 
 const browserAgentSecret = crypto.randomBytes(32);
 const agentSourceSessions = new WeakMap<Request, string>();

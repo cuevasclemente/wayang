@@ -2,7 +2,11 @@ import express from "express";
 import * as http from "node:http";
 import * as path from "node:path";
 import * as fs from "node:fs";
-import { getConfig, type Config } from "./config.js";
+import {
+  assertStandardBrowserProfileHostsStartupReady,
+  getConfig,
+  type Config,
+} from "./config.js";
 import { AuthService } from "./auth/service.js";
 import { createAuthRouter } from "./auth/routes.js";
 import { init } from "./db.js";
@@ -39,6 +43,7 @@ import { stopAllApps } from "./apps/process-manager.js";
 import { registerBrowserStopHook, stopAllBrowsers } from "./browser/manager.js";
 import {
   clearBrowserAgentToken,
+  createLegacyBrowserAgentAttributionRejection,
   installBrowserAgentToken,
   isBrowserAgentRequest,
   recognizeBrowserAgent,
@@ -171,6 +176,11 @@ export function createApp(options: CreateAppOptions = {}) {
     });
   }
 
+  // When the startup-immutable M0 gate is enabled, reject legacy generic
+  // browser-agent attribution before target lookup, authentication, or parsing.
+  // The disabled middleware delegates immediately for legacy compatibility.
+  app.use("/api/browser", createLegacyBrowserAgentAttributionRejection(config.standardBrowserProfileHosts));
+
   // Durable Protected/capability selection runs before generic agent-token,
   // credential, or browser-registry lookup. Standard browser requests pass
   // through unchanged; unavailable Protected integration fails closed.
@@ -289,6 +299,9 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
 
 export function start() {
   const config = getConfig();
+  // M0 is deliberately startup-inert until full host/schema composition lands.
+  // Fail before durable-store initialization or any browser/profile bootstrap.
+  assertStandardBrowserProfileHostsStartupReady(config);
 
   // Initialize the durable store before composing production authority. These
   // bootstraps are inert: they install policy/runtime bridges but do not create
