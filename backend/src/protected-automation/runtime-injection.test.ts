@@ -78,17 +78,24 @@ function syntheticPrivilegedRuntime(toolName: string) {
       return { content: [] };
     },
   };
+  const close = async () => {
+    closes += 1;
+    revoked = true;
+  };
   return {
+    ...(toolName === PROTECTED_AUTOMATION_TOOL_NAME ? {} : { kind: "protected" as const }),
     tool,
     tools: [tool],
     toolForName(name: string) { return name === toolName ? tool : undefined; },
     preflight: () => revoked
       ? { allowed: false as const, reason: "synthetic runtime is revoked" }
       : { allowed: true as const },
-    async close() {
-      closes += 1;
-      revoked = true;
-    },
+    ...(toolName === PROTECTED_AUTOMATION_TOOL_NAME ? {} : {
+      detachAgentLease: close,
+      closeSessionWorkspaces: close,
+      revokeAuthority: close,
+    }),
+    close,
     get closes() { return closes; },
     get executions() { return executions; },
   };

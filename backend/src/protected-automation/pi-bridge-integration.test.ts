@@ -23,7 +23,9 @@ test("Pi bridge authority-close seam closes the exact browser and automation run
   let automationCloses = 0;
   let aborts = 0;
   const browserRuntime = {
-    async close() { browserCloses += 1; },
+    async detachAgentLease() { browserCloses += 1; },
+    async closeSessionWorkspaces() { browserCloses += 1; },
+    async revokeAuthority() { browserCloses += 1; },
   };
   const automationRuntime = {
     async close() { automationCloses += 1; },
