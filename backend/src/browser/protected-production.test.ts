@@ -32,7 +32,7 @@ function allowed(binding: Readonly<ProtectedBrowserBinding>): ProtectedBrowserAu
   return {
     ...binding,
     authorized: true,
-    privacyMode: "protected",
+    privacyMode: binding.capabilityId === "wayang.standard-browser.v1" ? "standard" : "protected",
     sourceSessionDurable: true,
     sourceQuarantined: false,
     profileEnabled: true,
@@ -587,6 +587,105 @@ test("viewer result release remains observed and a delayed forbidden redirect cl
   } finally {
     await f.production.close();
     fs.rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("legacy gate-off Standard same-Project/Agent collision exclusively replaces the first source in one realm", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-standard-gate-off-collision-"));
+  const projectRoot = path.join(root, "standard-project");
+  fs.mkdirSync(projectRoot, { mode: 0o700 });
+  const firstBinding: ProtectedBrowserBinding = {
+    ...exactBinding(fs.realpathSync.native(projectRoot)),
+    capabilityId: "wayang.standard-browser.v1",
+    sourceSessionId: "synthetic-standard-source-first",
+    runtimeGeneration: "synthetic-standard-runtime-first",
+  };
+  let managedCreations = 0;
+  let managed: FakeManagedChromium | undefined;
+  const production = bootstrapProtectedBrowserProduction({
+    dataDir: path.join(root, "data"),
+    owner: { resolve() { return "synthetic-owner"; } },
+    authorityResolver(current) { return allowed(current); },
+    pairAuthorityResolver() { return true; },
+    managedChromiumFactory(options) {
+      managedCreations += 1;
+      managed = new FakeManagedChromium(options);
+      return managed;
+    },
+    installFactory() { return () => undefined; },
+    subscribePolicy() { return () => undefined; },
+  });
+  try {
+    const first = await production.factory(firstBinding);
+    await first.browser.execute({ kind: "start" });
+    const firstManaged = managed;
+    const second = await production.factory({
+      ...firstBinding,
+      sourceSessionId: "synthetic-standard-source-second",
+      runtimeGeneration: "synthetic-standard-runtime-second",
+    });
+
+    assert.equal(first.browser.isRevoked, true, "legacy Standard collision revokes the first source lease");
+    await assert.rejects(() => first.browser.execute({ kind: "status" }), /revoked/i);
+    assert.equal(second.browser.isRevoked, false, "the replacement Standard source is the sole live lease");
+    assert.equal(second.browser.currentBinding.sourceSessionId, "synthetic-standard-source-second");
+    assert.equal(managedCreations, 1, "gate-off Standard collisions retain exactly one pair realm");
+    assert.equal(managed, firstManaged, "replacement reuses the existing managed runtime");
+    assert.equal(managed!.running, true, "replacement does not stop the pair's managed Chromium process");
+  } finally {
+    await production.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Protected same-Project/Agent exclusivity remains frozen under concurrent factory calls", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-protected-concurrent-exclusivity-"));
+  const projectRoot = path.join(root, "protected-project");
+  fs.mkdirSync(projectRoot, { mode: 0o700 });
+  const firstBinding = exactBinding(fs.realpathSync.native(projectRoot));
+  const managed: FakeManagedChromium[] = [];
+  const production = bootstrapProtectedBrowserProduction({
+    dataDir: path.join(root, "data"),
+    owner: { resolve() { return "synthetic-owner"; } },
+    authorityResolver(current) { return allowed(current); },
+    pairAuthorityResolver() { return true; },
+    managedChromiumFactory(options) {
+      const instance = new FakeManagedChromium(options);
+      managed.push(instance);
+      return instance;
+    },
+    installFactory() { return () => undefined; },
+    subscribePolicy() { return () => undefined; },
+  });
+  try {
+    const first = await production.factory(firstBinding);
+    await first.browser.execute({ kind: "start" });
+    const secondBinding: ProtectedBrowserBinding = {
+      ...firstBinding,
+      sourceSessionId: "synthetic-protected-source-second",
+      runtimeGeneration: "synthetic-protected-runtime-second",
+    };
+    const thirdBinding: ProtectedBrowserBinding = {
+      ...firstBinding,
+      sourceSessionId: "synthetic-protected-source-third",
+      runtimeGeneration: "synthetic-protected-runtime-third",
+    };
+
+    const secondCall = production.factory(secondBinding);
+    const thirdCall = production.factory(thirdBinding);
+    const [second, third] = await Promise.all([secondCall, thirdCall]);
+
+    assert.equal(managed.length, 1, "concurrent same-pair calls construct no additional Protected realm");
+    assert.equal(managed[0]!.running, true, "serialized lease transfers retain the managed Chromium process");
+    assert.equal(first.browser.isRevoked, true, "the original Protected source is revoked before replacement");
+    assert.equal(second.browser.isRevoked, true, "the serialized intermediate source is revoked by the final call");
+    assert.equal(third.browser.isRevoked, false, "only the final serialized Protected source remains live");
+    assert.equal(third.browser.currentBinding.sourceSessionId, thirdBinding.sourceSessionId);
+    await assert.rejects(() => second.browser.execute({ kind: "status" }), /revoked/i);
+    assert.equal((await third.browser.execute<any>({ kind: "status" })).sessionId, thirdBinding.sourceSessionId);
+  } finally {
+    await production.close();
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
