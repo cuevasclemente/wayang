@@ -642,7 +642,7 @@ test("project registration deletion checks every central reference class and nev
     fs.writeFileSync(canary, "SYNTHETIC_KEEP\n");
     const target = createProject({ cwd: targetCwd });
     const store = getStore();
-    store.sessions.push({ id: "archived-ref", cwd: targetCwd, archived: 1 } as any);
+    store.sessions.push({ id: "archived-ref", cwd: targetCwd, project_id: target.id, archived: 1 } as any);
     store.scheduledJobs.push({ id: "job-ref", cwd: targetCwd } as any);
     store.scheduledRuns.push({ id: "run-ref", job_id: "job-ref" } as any);
     store.apps.push({ id: "app-ref", project_cwd: targetCwd } as any);
@@ -655,6 +655,7 @@ test("project registration deletion checks every central reference class and nev
       scheduled_runs: ["run-ref"],
       protected_automation_jobs: [],
       protected_automation_runs: [],
+      messaging_endpoints: [],
       apps: ["app-ref"],
       app_states: ["state-ref"],
       app_events: ["event-ref"],

@@ -73,6 +73,24 @@ function decision(
   return { status, requestId, sessionId, argumentsHash };
 }
 
+test("headless lease atomically excludes clients and pending approvals", async () => {
+  const bridge = new PiActionApprovalBridge();
+  const release = bridge.acquireHeadlessLease("session-headless");
+  assert.ok(release);
+  const ignoredDetach = bridge.attachClient("session-headless", "client-a");
+  assert.equal(bridge.hasClient("session-headless"), false);
+  assert.equal((await bridge.requestApproval("session-headless", actionInput())).status, "denied");
+  ignoredDetach();
+  release!();
+
+  const detach = bridge.attachClient("session-headless", "client-a");
+  const pending = bridge.requestApproval("session-headless", actionInput());
+  detach();
+  assert.equal(bridge.acquireHeadlessLease("session-headless"), null, "detached pending authority still fences a headless turn");
+  bridge.cancelSession("session-headless", "synthetic cleanup");
+  assert.equal((await pending).status, "cancelled");
+});
+
 test("action approval returns an exact denied proof when no client is attached", async () => {
   const bridge = new PiActionApprovalBridge();
   const requests: ExternalActionRequest[] = [];

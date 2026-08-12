@@ -1,4 +1,4 @@
-export const STORE_SCHEMA_VERSION = 3;
+export const STORE_SCHEMA_VERSION = 4;
 
 /**
  * Legacy stable IDs retained so schema-1 stores keep their references. Names

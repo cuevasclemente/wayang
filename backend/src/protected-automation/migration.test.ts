@@ -28,20 +28,26 @@ function rewriteFreshStoreAsSchemaTwo(mutator?: (store: Record<string, unknown>)
   store.schema_version = 2;
   delete store.protectedAutomationJobs;
   delete store.protectedAutomationRuns;
+  delete store.messagingEndpoints;
+  delete store.messagingEvents;
+  delete store.messagingTransactions;
+  delete store.messagingDeliveries;
   mutator?.(store);
   fs.writeFileSync(storePath, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
 }
 
-test("schema 2 migrates explicitly to schema 3 with empty inert automation arrays", () => {
+test("schema 2 migrates explicitly to current schema with empty inert authority and messaging arrays", () => {
   rewriteFreshStoreAsSchemaTwo();
   init();
   const store = getStore();
   assert.equal(store.schema_version, STORE_SCHEMA_VERSION);
-  assert.equal(STORE_SCHEMA_VERSION, 3);
+  assert.equal(STORE_SCHEMA_VERSION, 4);
   assert.deepEqual(store.protectedAutomationJobs, []);
   assert.deepEqual(store.protectedAutomationRuns, []);
   assert.deepEqual(store.workspaceCapabilityAssociations, []);
   assert.deepEqual(store.workspaceCapabilityApprovalEvents, []);
+  assert.deepEqual(store.messagingEndpoints, []);
+  assert.deepEqual(store.messagingEvents, []);
   const backups = fs.readdirSync(dataDir).filter((name) => name.startsWith("store.json.backup-v2-"));
   assert.equal(backups.length, 1);
   assert.equal(fs.statSync(path.join(dataDir, backups[0]!)).mode & 0o777, 0o600);
@@ -70,11 +76,13 @@ test("schema 2 cannot seed protected automation authority that did not exist in 
   assert.throws(() => init(), /cannot contain protected automation authority/);
 });
 
-test("fresh schema 3 stores create no automation authority, jobs, or runs", () => {
+test("fresh current-schema stores create no automation or messaging authority", () => {
   init();
   const store = getStore();
-  assert.equal(store.schema_version, 3);
+  assert.equal(store.schema_version, 4);
   assert.deepEqual(store.protectedAutomationJobs, []);
   assert.deepEqual(store.protectedAutomationRuns, []);
   assert.equal(store.workspaceCapabilityAssociations.some((row) => row.capability_id === "wayang.protected-automation.v1"), false);
+  assert.deepEqual(store.messagingEndpoints, []);
+  assert.deepEqual(store.messagingEvents, []);
 });

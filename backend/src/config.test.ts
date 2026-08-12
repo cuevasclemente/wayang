@@ -49,6 +49,29 @@ test("file-audio private prompt artifacts have distinct path and frozen-digest c
   }
 });
 
+test("messaging is disabled by default and strict flags expose only a private config path selector", () => {
+  const previousEnabled = process.env.WAYANG_MESSAGING_ENABLED;
+  const previousPath = process.env.WAYANG_MESSAGING_CONFIG_PATH;
+  try {
+    delete process.env.WAYANG_MESSAGING_ENABLED;
+    delete process.env.WAYANG_MESSAGING_CONFIG_PATH;
+    assert.deepEqual(getConfig().messaging, { enabled: false, configPath: "" });
+    process.env.WAYANG_MESSAGING_ENABLED = "1";
+    process.env.WAYANG_MESSAGING_CONFIG_PATH = "/synthetic/private/messaging.json";
+    assert.deepEqual(getConfig().messaging, {
+      enabled: true,
+      configPath: "/synthetic/private/messaging.json",
+    });
+    process.env.WAYANG_MESSAGING_ENABLED = "yes";
+    assert.throws(() => getConfig(), /WAYANG_MESSAGING_ENABLED must be 0 or 1/);
+  } finally {
+    if (previousEnabled === undefined) delete process.env.WAYANG_MESSAGING_ENABLED;
+    else process.env.WAYANG_MESSAGING_ENABLED = previousEnabled;
+    if (previousPath === undefined) delete process.env.WAYANG_MESSAGING_CONFIG_PATH;
+    else process.env.WAYANG_MESSAGING_CONFIG_PATH = previousPath;
+  }
+});
+
 test("file-audio experiment is disabled by default with a bounded short permit TTL", () => {
   const previousEnabled = process.env.WAYANG_FILE_AUDIO_EXPERIMENT_ENABLED;
   const previousTtl = process.env.WAYANG_FILE_AUDIO_EXPERIMENT_PERMIT_TTL_MS;

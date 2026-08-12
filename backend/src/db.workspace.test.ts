@@ -91,6 +91,28 @@ test("legacy migration is private, canonical, seeded, and idempotent", () => wit
   assert.deepEqual(backups(dir), firstBackupNames);
 }));
 
+test("schema 3 migrates to schema 4 with no messaging endpoint or authority", () => withDataDir((dir) => {
+  init();
+  const storePath = path.join(dir, "store.json");
+  close();
+  const schemaThree = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, unknown>;
+  schemaThree.schema_version = 3;
+  delete schemaThree.messagingEndpoints;
+  delete schemaThree.messagingEvents;
+  delete schemaThree.messagingTransactions;
+  delete schemaThree.messagingDeliveries;
+  fs.writeFileSync(storePath, JSON.stringify(schemaThree));
+
+  init();
+  const migrated = getStore();
+  assert.equal(migrated.schema_version, STORE_SCHEMA_VERSION);
+  assert.deepEqual(migrated.messagingEndpoints, []);
+  assert.deepEqual(migrated.messagingEvents, []);
+  assert.deepEqual(migrated.messagingTransactions, []);
+  assert.deepEqual(migrated.messagingDeliveries, []);
+  assert.equal(backups(dir).filter((name) => name.includes("backup-v3-")).length, 1);
+}));
+
 test("legacy migration defaults omitted nullable session provider", () => withDataDir((dir) => {
   const project = path.join(dir, "project");
   fs.mkdirSync(project);

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -19,6 +19,8 @@ export interface CreateSessionOptions {
   agentProfileId?: string;
   scheduledJobId?: string | null;
   scheduledRunId?: string | null;
+  /** Internal crash-idempotency key; never derived from connector display text. */
+  idempotencyKey?: string;
 }
 
 export function normalizeSessionCwd(cwd: string): string {
@@ -57,12 +59,32 @@ export function createSession(
       explicitProvider: options.provider ?? null,
       explicitModel: options.model ?? null,
     });
+    let deterministicId: string | null = null;
+    if (options.idempotencyKey !== undefined) {
+      if (!options.idempotencyKey || Buffer.byteLength(options.idempotencyKey, "utf8") > 1024
+        || /[\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/u.test(options.idempotencyKey)) {
+        throw new WorkspaceStoreError("Session idempotency key is invalid");
+      }
+      const hex = createHash("sha256").update(`wayang-session-idempotency-v1\0${options.idempotencyKey}`, "utf8").digest("hex");
+      deterministicId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+      const existing = draft.sessions.find((row) => row.id === deterministicId);
+      if (existing) {
+        if (existing.project_id !== project.id || existing.cwd !== project.cwd
+          || existing.agent_profile_id !== effective.agent_profile_id
+          || existing.scheduled_job_id !== (options.scheduledJobId || null)
+          || existing.scheduled_run_id !== (options.scheduledRunId || null)) {
+          throw new WorkspaceStoreError("Session idempotency key resolved to a different scope", 409);
+        }
+        return cloneSession(existing);
+      }
+    }
     const now = Date.now();
     const created: SessionRow = {
-      id: randomUUID(),
+      id: deterministicId ?? randomUUID(),
       pi_session_file: null,
       title: options.title || "",
       cwd: project.cwd,
+      project_id: project.id,
       provider: effective.provider,
       model: effective.model,
       agent_profile_id: effective.agent_profile_id,
@@ -201,6 +223,28 @@ function incrementDirectMutation(row: SessionRow): void {
   row.catalog_mutation_version = rowMutationVersion(row) + 1;
 }
 
+/**
+ * Transcript cwd is mutable metadata, never Project authority. If an existing
+ * row moves, preserve that fact only by making its historical Project binding
+ * unresolved; never adopt the Project currently registered at the new cwd.
+ */
+function updateTranscriptCwd(row: SessionRow, cwd: string): boolean {
+  if (row.cwd === cwd) return false;
+  row.cwd = cwd;
+  row.project_id = null;
+  row.legacy_capability_ineligible = true;
+  // Keep the same durable write valid and denial-first if a catalog update
+  // discovers the move while this session is selected by an endpoint.
+  const now = Date.now();
+  for (const endpoint of getStore().messagingEndpoints) {
+    if (endpoint.active_session_id !== row.id) continue;
+    endpoint.active_session_id = null;
+    endpoint.revision++;
+    endpoint.updated_at = now;
+  }
+  return true;
+}
+
 function publishDirectMutation(triggerScan = false): void {
   sessionCatalog?.bumpGeneration();
   if (triggerScan) sessionCatalog?.requestScan("internal-write", 0);
@@ -228,7 +272,7 @@ function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; upda
 
   // Preserve web-only grace and missing-file grace without parsing anything.
   for (const row of store.sessions) {
-    if (row.archived) continue;
+    if (row.archived || store.messagingEndpoints.some((endpoint) => endpoint.active_session_id === row.id)) continue;
     if (!row.pi_session_file) {
       if (now - (row.created_at || now) < WEB_ONLY_SESSION_ARCHIVE_GRACE_MS) continue;
       row.archived = 1;
@@ -272,6 +316,7 @@ function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; upda
         pi_session_file: info.path,
         title: derivedTitle,
         cwd,
+        project_id: projectResult.project.id,
         provider: info.provider,
         model: info.model,
         agent_profile_id: null,
@@ -305,7 +350,7 @@ function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; upda
       byPath.set(info.path, row);
       rowChanged = true;
     }
-    if (row.cwd !== cwd) { row.cwd = cwd; rowChanged = true; }
+    if (updateTranscriptCwd(row, cwd)) rowChanged = true;
     // Explicit, non-empty Wayang titles win over transcript-derived titles.
     if (!row.title && row.title !== derivedTitle) { row.title = derivedTitle; rowChanged = true; }
     if (row.created_at !== info.createdAt) { row.created_at = info.createdAt; rowChanged = true; }
@@ -417,7 +462,7 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
   // rename), creating a brief window where fs.existsSync returns false.
   const now = Date.now();
   for (const row of store.sessions) {
-    if (row.archived) continue;
+    if (row.archived || store.messagingEndpoints.some((endpoint) => endpoint.active_session_id === row.id)) continue;
     if (!row.pi_session_file) {
       const ageMs = now - (row.created_at || now);
       if (ageMs < WEB_ONLY_SESSION_ARCHIVE_GRACE_MS) continue;
@@ -469,7 +514,7 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
       const nextTitle = row.title || title;
       const previousLastActive = row.last_active || 0;
       const hasNewFileActivity = lastInteractionAt > previousLastActive;
-      let changed = false;
+      let changed = updateTranscriptCwd(row, cwd);
 
       if (row.archived) {
         const archivedAt = row.archived_at;
@@ -484,12 +529,10 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
       }
 
       if (
-        row.cwd !== cwd ||
         row.title !== nextTitle ||
         row.last_active !== lastInteractionAt ||
         row.created_at !== createdAt
       ) {
-        row.cwd = cwd;
         row.title = nextTitle;
         row.created_at = createdAt;
         row.last_active = lastInteractionAt;
@@ -512,7 +555,7 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
       const previousLastActive = row.last_active || 0;
       const hasNewFileActivity = lastInteractionAt > previousLastActive;
       row.pi_session_file = sessionFile;
-      row.cwd = cwd;
+      updateTranscriptCwd(row, cwd);
       if (!row.title) row.title = title;
       row.created_at = createdAt;
       row.last_active = lastInteractionAt;
@@ -545,6 +588,7 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
       pi_session_file: sessionFile,
       title,
       cwd,
+      project_id: projectResult.project.id,
       provider: currentModel?.provider ?? null,
       model: currentModel?.model ?? null,
       agent_profile_id: null,
@@ -665,6 +709,12 @@ function validatePendingAgentSwitch(pending: PendingAgentSwitch): void {
   if (!target || !target.enabled) throw new WorkspaceStoreError("Target agent profile must exist and be enabled", 409);
 }
 
+function assertSessionNotActivelyMessagingBound(id: string, operation: "archive" | "delete" | "switch"): void {
+  if (getStore().messagingEndpoints.some((endpoint) => endpoint.active_session_id === id)) {
+    throw new WorkspaceStoreError(`Actively messaging-bound sessions cannot ${operation}`, 409);
+  }
+}
+
 function pendingSwitchesEqual(a: PendingAgentSwitch, b: PendingAgentSwitch): boolean {
   return a.switch_id === b.switch_id
     && a.from_agent_profile_id === b.from_agent_profile_id
@@ -682,6 +732,7 @@ export function beginAgentSwitch(id: string, pending: PendingAgentSwitch): Sessi
   if (isLegacyPrivateSessionQuarantined(row)) {
     throw new WorkspaceStoreError("Quarantined legacy sessions cannot switch agent profiles", 403);
   }
+  assertSessionNotActivelyMessagingBound(id, "switch");
   validatePendingAgentSwitch(pending);
   const current = row.pending_agent_switch ?? null;
   if (current) {
@@ -758,6 +809,7 @@ export function updateSessionAgentProfile(id: string, agentProfileId: string | n
   if (isLegacyPrivateSessionQuarantined(row)) {
     throw new WorkspaceStoreError("Quarantined legacy sessions cannot switch agent profiles", 403);
   }
+  assertSessionNotActivelyMessagingBound(id, "switch");
   commitStoreMutation((draft) => {
     const target = draft.sessions.find((session) => session.id === id);
     if (!target) return;
@@ -846,16 +898,17 @@ export function updateSessionError(id: string, error: string | null): void {
 }
 
 export function archiveSession(id: string): void {
-  const store = getStore();
-  for (const row of store.sessions) {
-    if (row.id === id) {
-      row.archived = 1;
-      row.archived_at = Date.now();
-      markDirectMutation(row);
-      flush();
-      return;
-    }
-  }
+  const row = getStore().sessions.find((candidate) => candidate.id === id);
+  if (!row || row.archived) return;
+  assertSessionNotActivelyMessagingBound(id, "archive");
+  commitStoreMutation((draft) => {
+    const target = draft.sessions.find((candidate) => candidate.id === id);
+    if (!target) throw new WorkspaceStoreError("Session disappeared during archive", 409);
+    target.archived = 1;
+    target.archived_at = Date.now();
+    incrementDirectMutation(target);
+  });
+  publishDirectMutation(false);
 }
 
 export interface DeleteSessionResult {
@@ -869,6 +922,7 @@ export function deleteSession(id: string): DeleteSessionResult | null {
   if (index < 0) return null;
 
   const session = store.sessions[index]!;
+  assertSessionNotActivelyMessagingBound(id, "delete");
   let deletedSessionFile: string | null = null;
   if (session.pi_session_file) {
     deletedSessionFiles.add(session.pi_session_file);
