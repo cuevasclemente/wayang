@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
   buildLocalHttpsCaddyfile,
   localHttpsCaddyEnvironment,
+  localHttpsEffectiveValues,
   localHttpsSettings,
 } from "../lib/local-https.mjs";
 
@@ -29,6 +30,7 @@ test("local HTTPS settings require a loopback backend, authenticated exact HTTPS
   assert.deepEqual(localHttpsSettings(validValues()), {
     publicOrigin: "https://wayang-host.example:8443",
     publicAuthority: "wayang-host.example:8443",
+    publicHostname: "wayang-host.example",
     backendOrigin: "http://127.0.0.1:8787",
   });
 
@@ -52,21 +54,44 @@ test("local HTTPS settings require a loopback backend, authenticated exact HTTPS
   }
 });
 
-test("generated Caddyfile covers the whole origin and replaces forwarding metadata", () => {
+test("effective settings use the same ambient-over-file precedence as Wayang startup", () => {
+  assert.throws(
+    () => localHttpsSettings(localHttpsEffectiveValues(validValues(), { WAYANG_AUTH_ENABLED: "0" })),
+    /built-in authentication/,
+  );
+  assert.throws(
+    () => localHttpsSettings(localHttpsEffectiveValues(validValues(), { WAYANG_HOST: "0.0.0.0" })),
+    /127\.0\.0\.1/,
+  );
+  assert.throws(
+    () => localHttpsSettings(localHttpsEffectiveValues(validValues(), { WAYANG_PUBLIC_ORIGIN: "http://wayang-host.example:8443" })),
+    /HTTPS/,
+  );
+  assert.throws(
+    () => localHttpsSettings(localHttpsEffectiveValues(validValues(), { WAYANG_AUTH_SESSION_SECRET: "" })),
+    /shared-password credentials/,
+  );
+});
+
+test("generated Caddyfile covers the whole bound origin and replaces forwarding metadata", () => {
   const config = buildLocalHttpsCaddyfile(localHttpsSettings(validValues()));
-  assert.match(config, /^\{\n\s+admin off\n\}/);
+  assert.match(config, /^\{\n\s+admin off\n\s+skip_install_trust\n\}/);
   assert.match(config, /https:\/\/wayang-host\.example:8443 \{/);
+  assert.match(config, /bind "wayang-host\.example"/);
   assert.match(config, /tls internal/);
   assert.match(config, /reverse_proxy http:\/\/127\.0\.0\.1:8787/);
   assert.match(config, /header_up Host "wayang-host\.example:8443"/);
   assert.match(config, /header_up -Forwarded/);
-  assert.match(config, /header_up -X-Forwarded-For/);
-  assert.match(config, /header_up -X-Forwarded-Host/);
-  assert.match(config, /header_up -X-Forwarded-Proto/);
+  assert.match(config, /header_up -X-Forwarded-\*/);
   assert.match(config, /header_up X-Forwarded-For "\{http\.request\.remote\.host\}"/);
   assert.match(config, /header_up X-Forwarded-Proto "https"/);
   assert.doesNotMatch(config, /AUTH_PASSWORD|SESSION_SECRET|synthetic-password|synthetic-session/);
   assert.doesNotMatch(config, /log\s*\{/i, "request logging stays off unless the operator adds it deliberately");
+
+  const ipv6 = buildLocalHttpsCaddyfile(localHttpsSettings(validValues({
+    WAYANG_PUBLIC_ORIGIN: "https://[fd00::1]:8443",
+  })));
+  assert.match(ipv6, /bind "\[fd00::1\]"/);
 });
 
 test("Caddy receives only non-secret process mechanics", () => {

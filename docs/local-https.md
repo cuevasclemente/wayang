@@ -27,22 +27,29 @@ make local-https
 
 The command:
 
-- parses `.env` as inert data, retains only the selected non-secret
-  networking/authentication shape, and checks authentication values only for
+- parses `.env` as inert data, then applies the same ambient-environment
+  precedence as `make start`; it retains only the selected non-secret
+  networking/authentication shape and checks authentication values only for
   presence; those values are never returned or forwarded;
-- generates no file and writes no configuration;
+- generates no Caddyfile and writes no Wayang configuration; Caddy creates and
+  retains its private local-CA and leaf-certificate material in its own data
+  directory when it first serves the origin;
 - validates the generated Caddyfile before startup;
 - passes Caddy only a strict process-mechanics environment, never Wayang,
   provider, proxy, or loader credentials;
-- disables Caddy's admin API and does not enable request logging;
-- proxies every HTTP path and WebSocket upgrade;
+- disables Caddy's admin API and automatic trust-store installation, and does
+  not enable request logging;
+- binds the HTTPS listener only to the configured public-origin hostname and
+  proxies every HTTP path and WebSocket upgrade;
 - strips caller-supplied `Forwarded` and `X-Forwarded-*` headers, then sets the
   exact public `Host`, direct client address, and HTTPS protocol;
 - runs Caddy in the foreground and forwards termination signals.
 
-It never installs Caddy, edits DNS, creates/trusts certificates, changes `.env`,
-sets a password, opens a firewall, or installs a system service. Those remain
-explicit human/deployment actions.
+It never installs Caddy, edits DNS, installs CA trust, changes `.env`, sets a
+password, opens a firewall, or installs a system service. Caddy does create the
+private certificate-authority key and certificates required by `tls internal`;
+protect its data directory and never transfer the CA private key. DNS, trust,
+and other deployment actions remain explicit and human-managed.
 
 ## Prerequisites
 
@@ -78,7 +85,8 @@ Select:
   enabled;
 - **Secure cookie:** retain `auto` (or explicitly use `1`).
 
-The local HTTPS command fails closed unless all of these are true:
+The local HTTPS command evaluates these settings with the same ambient-over-file
+precedence as Wayang startup and fails closed unless all of these are true:
 
 - `WAYANG_HOST=127.0.0.1`;
 - the public origin is exact HTTPS, non-loopback, and uses an explicit
@@ -129,7 +137,11 @@ The human must establish trust before entering the Wayang password:
 4. Verify the browser shows a valid HTTPS connection for the exact configured
    hostname and port. Do not click through a certificate warning.
 
-Each client must also resolve the configured hostname to the Wayang host.
+Each client must also resolve the configured hostname to the Wayang host. Caddy
+binds that hostname rather than a wildcard interface; ensure it resolves to a
+local address on the server before startup. DNS can still map the hostname to
+an unintended or Internet-facing interface, so keep the host firewall/private
+network boundary explicit.
 
 ## Verify remote Settings ownership
 

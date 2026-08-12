@@ -14,6 +14,18 @@ const CADDY_ENVIRONMENT_KEYS = Object.freeze([
   "LOGNAME",
 ]);
 
+const LOCAL_HTTPS_CONFIGURATION_KEYS = Object.freeze([
+  "WAYANG_HOST",
+  "WAYANG_PORT",
+  "WAYANG_PUBLIC_ORIGIN",
+  "WAYANG_AUTH_ENABLED",
+  "WAYANG_AUTH_PASSWORD_HASH",
+  "WAYANG_AUTH_SESSION_SECRET",
+  "WAYANG_TRUST_PROXY",
+  "WAYANG_AUTH_COOKIE_SECURE",
+  "WAYANG_AUTH_PROXY_IDENTITY_HEADER",
+]);
+
 function required(values, key, message) {
   const value = values.get(key)?.trim() || "";
   if (!value) throw new Error(message);
@@ -36,7 +48,26 @@ function localHttpsPublicOrigin(raw) {
   if (!parsed.port || !Number.isInteger(httpsPort) || httpsPort < 1024 || httpsPort > 65535) {
     throw new Error("Local HTTPS proxy mode requires an explicit unprivileged port from 1024 through 65535");
   }
-  return { publicOrigin, publicAuthority: parsed.host };
+  return {
+    publicOrigin,
+    publicAuthority: parsed.host,
+    publicHostname: parsed.hostname,
+  };
+}
+
+/** Apply the same ambient-over-.env precedence as scripts/run-with-env.mjs.
+ * Empty ambient values deliberately override .env too: the backend would see
+ * those exact values, so the proxy check must reject rather than silently use
+ * a safer file value. */
+export function localHttpsEffectiveValues(fileValues, environment = process.env) {
+  if (!(fileValues instanceof Map)) throw new Error("Wayang configuration values are unavailable");
+  const effective = new Map(fileValues);
+  for (const key of LOCAL_HTTPS_CONFIGURATION_KEYS) {
+    if (Object.hasOwn(environment, key) && environment[key] !== undefined) {
+      effective.set(key, String(environment[key]));
+    }
+  }
+  return effective;
 }
 
 /** Validate only the non-secret deployment shape needed by the local Caddy
@@ -82,20 +113,21 @@ export function localHttpsSettings(values) {
  * origin, proxies every path/WebSocket to loopback, and replaces rather than
  * trusts caller-supplied forwarding metadata. */
 export function buildLocalHttpsCaddyfile(settings) {
-  if (!settings?.publicOrigin || !settings?.publicAuthority || !settings?.backendOrigin) {
+  if (!settings?.publicOrigin || !settings?.publicAuthority
+    || !settings?.publicHostname || !settings?.backendOrigin) {
     throw new Error("Validated local HTTPS settings are required");
   }
   return `{
 \tadmin off
+\tskip_install_trust
 }
 
 ${settings.publicOrigin} {
+\tbind ${JSON.stringify(settings.publicHostname)}
 \ttls internal
 \treverse_proxy ${settings.backendOrigin} {
 \t\theader_up -Forwarded
-\t\theader_up -X-Forwarded-For
-\t\theader_up -X-Forwarded-Host
-\t\theader_up -X-Forwarded-Proto
+\t\theader_up -X-Forwarded-*
 \t\theader_up Host ${JSON.stringify(settings.publicAuthority)}
 \t\theader_up X-Forwarded-For "{http.request.remote.host}"
 \t\theader_up X-Forwarded-Proto "https"

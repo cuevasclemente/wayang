@@ -7,6 +7,7 @@ import { parseEnv } from "./lib/config.mjs";
 import {
   buildLocalHttpsCaddyfile,
   localHttpsCaddyEnvironment,
+  localHttpsEffectiveValues,
   localHttpsSettings,
 } from "./lib/local-https.mjs";
 
@@ -53,7 +54,7 @@ function deployment() {
   if (!existsSync(envPath)) throw new Error("Wayang .env is not configured; run make configure in a local terminal");
   const text = readFileSync(envPath, "utf8");
   const values = parseEnv(text, envPath).values;
-  return localHttpsSettings(values);
+  return localHttpsSettings(localHttpsEffectiveValues(values));
 }
 
 function validateCaddy(caddy, config, environment) {
