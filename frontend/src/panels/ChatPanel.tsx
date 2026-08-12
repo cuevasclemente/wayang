@@ -9,6 +9,7 @@ import {
   fetchProjects,
   fetchSlashCommands,
   previewSessionAgentSwitch,
+  recordSessionOpenLatency,
   refreshSessionTitle,
   switchSessionAgent,
   synthesizeTts,
@@ -43,6 +44,7 @@ import {
 
 interface ChatPanelProps {
   activeSession: Session | null;
+  sessionSelectionStartedAt?: number | null;
   onSessionChange?: () => void;
   onSessionUpdate?: (session: Session) => void;
   /**
@@ -2682,6 +2684,7 @@ function AgentSwitchDialog({
 
 export function ChatPanel({
   activeSession,
+  sessionSelectionStartedAt,
   onSessionChange,
   onSessionUpdate,
   scrollToMessageId,
@@ -2878,6 +2881,9 @@ export function ChatPanel({
   const selectionIdRef = useRef<string | null>(null);
   const selectionGenerationRef = useRef(0);
   const selectionStartedAtRef = useRef(0);
+  const sessionSelectionStartedAtInputRef = useRef(sessionSelectionStartedAt);
+  sessionSelectionStartedAtInputRef.current = sessionSelectionStartedAt;
+  const reportedSessionOpenSelectionIdRef = useRef<string | null>(null);
   const scrollAnchorRef = useRef<HTMLDivElement | null>(null);
   const activeTurnUserMessageRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
@@ -2925,6 +2931,7 @@ export function ChatPanel({
   useLayoutEffect(() => {
     selectedSessionIdRef.current = activeSessionId;
     selectionGenerationRef.current += 1;
+    selectionStartedAtRef.current = sessionSelectionStartedAtInputRef.current ?? performance.now();
     const selectionId = activeSessionId ? createSelectionId() : null;
     const previousPrompt = activeCommandGuardPinPromptRef.current;
     if (
@@ -3622,12 +3629,18 @@ export function ChatPanel({
               domRows: scrollContainerRef.current?.querySelectorAll("[data-message-id]").length ?? 0,
             });
             requestAnimationFrame(() => requestAnimationFrame(() => {
-              if (selectionIdRef.current !== acceptedSelectionId) return;
+              if (
+                selectionIdRef.current !== acceptedSelectionId
+                || reportedSessionOpenSelectionIdRef.current === acceptedSelectionId
+              ) return;
+              reportedSessionOpenSelectionIdRef.current = acceptedSelectionId;
+              const durationMs = performance.now() - selectionStartedAtRef.current;
               chatWsProfile("transcript_usable", {
                 sessionId: activeSessionIdRef.current,
                 selectionId: acceptedSelectionId,
-                elapsedMs: Math.round(performance.now() - selectionStartedAtRef.current),
+                elapsedMs: Math.round(durationMs),
               });
+              void recordSessionOpenLatency(durationMs).catch(() => {});
             }));
             if (!scrollToMessageId) scrollAnchorRef.current?.scrollIntoView();
           }));
@@ -4340,7 +4353,6 @@ export function ChatPanel({
     activeSessionIdRef.current = activeSessionId;
     const selectionGeneration = selectionGenerationRef.current;
     const selectionId = selectionIdRef.current;
-    selectionStartedAtRef.current = performance.now();
     chatWsProfile("selection_started", { activeSessionId, selectionId, selectionGeneration });
     chatWsProfile("active_session_effect", {
       activeSessionId,

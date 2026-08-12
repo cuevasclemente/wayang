@@ -49,7 +49,7 @@ import { schedulerManager } from "./scheduler/manager.js";
 import { startWatcher, stopWatcher } from "./search/index.js";
 import { drainSubmittedInterviews } from "./interview-delivery.js";
 import { startSessionCatalog, stopSessionCatalog } from "./sessions.js";
-import { getLatencyMetricsSnapshot, startLatencyMetrics, stopLatencyMetrics } from "./latency-metrics.js";
+import { getLatencyMetricsSnapshot, recordLatencyMetric, startLatencyMetrics, stopLatencyMetrics } from "./latency-metrics.js";
 import {
   createProductionWorkspaceCapabilityBootstrap,
   type ProductionWorkspaceCapabilityBootstrap,
@@ -188,6 +188,15 @@ export function createApp(options: CreateAppOptions = {}) {
   // ids, cwd, titles, transcript text, or environment values.
   app.get("/api/latency/metrics", (_req, res) => {
     res.json(getLatencyMetricsSnapshot());
+  });
+  app.post("/api/latency/metrics/session-open", (req, res) => {
+    const durationMs = req.body?.duration_ms;
+    if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0 || durationMs > 600_000) {
+      res.status(400).json({ error: "duration_ms must be a finite number between 0 and 600000" });
+      return;
+    }
+    recordLatencyMetric("session_open_usable_ms", durationMs);
+    res.status(204).end();
   });
 
   // Routes. The search router is mounted before sessionsRouter so that
