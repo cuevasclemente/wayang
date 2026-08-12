@@ -58,10 +58,38 @@ test("omits a recovered provider overflow from rendered history while retaining 
       summary: "synthetic compacted context",
       timestamp: new Date().toISOString(),
     },
+    {
+      type: "custom",
+      id: "overflow-retry-marker",
+      parentId: "compaction",
+      customType: "wayang-overflow-retry-v1",
+      data: { compactionEntryId: "compaction", overflowEntryId: "overflow" },
+    },
   ]);
 
   assert.deepEqual(history.map((entry) => entry.type), ["user", "custom"]);
   assert.equal((history[1].message as any)?.customType, "compaction-summary");
+});
+
+test("retains a terminal overflow after manual or unmarked compaction", () => {
+  const history = serializeHistoryEntries([
+    { type: "message", id: "user", parentId: null, message: { role: "user", content: "synthetic" } },
+    {
+      type: "message",
+      id: "overflow",
+      parentId: "user",
+      message: {
+        role: "assistant",
+        content: [],
+        provider: "openai-codex",
+        model: "gpt-5.6-sol",
+        stopReason: "error",
+        errorMessage: "Codex error: Your input exceeds the context window of this model.",
+      },
+    },
+    { type: "compaction", id: "manual-compaction", parentId: "overflow", summary: "manual summary" },
+  ]);
+  assert.equal((history.find((entry) => entry.id === "overflow")?.message as any)?.stopReason, "error");
 });
 
 test("retains terminal assistant errors that were not followed by recovery compaction", () => {

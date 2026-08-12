@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { createSession, listSessions, syncPiSessionFiles, updateSessionTitle, archiveSession, deleteSession, getSessionById, updateGoal, getSessionCatalogGeneration, onSessionCatalogGeneration, type SessionRow } from "../sessions.js";
-import { getPiSession, getPiSessionBashMode, getPiSessionBrowserAgentDiagnostic, getPiSessionBrowserMode, getPiSessionRuntimeState, listModels, listSlashCommands, previewSessionAgentSwitch, setSessionDefaultModel, setSessionModel, stopPiSession, switchSessionAgent } from "../pi-bridge.js";
+import { classifyAssistantErrorKind, getPiSession, getPiSessionBashMode, getPiSessionBrowserAgentDiagnostic, getPiSessionBrowserMode, getPiSessionRuntimeState, listModels, listSlashCommands, previewSessionAgentSwitch, setSessionDefaultModel, setSessionModel, stopPiSession, switchSessionAgent } from "../pi-bridge.js";
 import { validateCommandGuardIdentityPin } from "../command-guard-pin.js";
 import { removeSession as removeSearchSession } from "../search/indexer.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
@@ -11,6 +11,7 @@ type SessionResponse = SessionRow & ReturnType<typeof getPiSessionRuntimeState> 
   bash_mode: ReturnType<typeof getPiSessionBashMode>;
   browser_mode: ReturnType<typeof getPiSessionBrowserMode>;
   browser_agent: ReturnType<typeof getPiSessionBrowserAgentDiagnostic>;
+  error_kind: ReturnType<typeof classifyAssistantErrorKind>;
 };
 
 /** @internal Exported for focused response-projection tests. */
@@ -21,6 +22,7 @@ export function serializeSession(session: SessionRow): SessionResponse {
     bash_mode: getPiSessionBashMode(session.id),
     browser_mode: getPiSessionBrowserMode(session.id, session),
     browser_agent: getPiSessionBrowserAgentDiagnostic(session.id, session),
+    error_kind: classifyAssistantErrorKind(session.error),
   };
 }
 

@@ -10,7 +10,7 @@ The installing agent must:
 - run `make doctor` before changing the checkout;
 - never read or display `.env`, `.env.backup`, pi `auth.json`, secret stores, provider credentials, cookies, private keys, browser profiles, or real transcripts;
 - never request secrets in chat or put them in command arguments, logs, commits, screenshots, test fixtures, or tool calls;
-- pause for a human-local handoff for `/login`, `/trust`, API-key entry, the Wayang shared password, normal command-guard PIN entry when approving a capability, MFA, and account selection;
+- pause for a human-local handoff for `/login`, API-key entry, the Wayang shared password, normal command-guard PIN entry when approving a capability, MFA, and account selection;
 - keep `WAYANG_HOST=127.0.0.1` unless the human explicitly requests a networking/security discussion;
 - use `npm ci` through the repository commands, with no global packages, `sudo`, service installation, or system-package mutation;
 - use synthetic HOME/pi/Wayang directories and fake credentials for tests;
@@ -57,7 +57,7 @@ This supports hidden API-key entry, optional shared-password setup, and safe bin
 make pi-login
 ```
 
-The human types `/login`, selects the provider, completes browser/device authorization, then types `/quit`. For a reviewed project that needs project-local `.pi` resources, the human separately starts the pinned CLI from that project, runs `/trust`, exits, and creates a new Wayang session. The agent must not auto-approve repositories or watch, scrape, summarize, or copy secret-bearing interactions. A user may configure OAuth and then rerun `make configure` for server/password settings.
+The human types `/login`, selects the provider, completes browser/device authorization, then types `/quit`. Wayang treats registered project folders as trusted for project-local Pi resources, which may execute as the host user for every profile; register only reviewed folders. The agent must not watch, scrape, summarize, or copy secret-bearing interactions. A user may configure OAuth and then rerun `make configure` for server/password settings.
 
 If the human uses reviewed privileged workspace capabilities, Wayang reuses the command guard's existing identity PIN; normal PIN entry in the approval UI is the human authorization action. The deployed service automatically creates missing non-secret attempt/cooldown state under `WAYANG_DATA_DIR` with owner-only permissions on startup and preserves it across reboots. Capability associations, deterministic jobs, and schedules persist in the service store; restart is needed only when deploying new code. `make setup-capability-approval` is an optional human-run preflight/migration, not installation or activation setup. The agent must not create a PIN, inspect either file, or substitute ad-hoc shell redirection for the supported command.
 

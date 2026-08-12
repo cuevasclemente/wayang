@@ -34,6 +34,14 @@ test("session HTTP projection reports unavailable without an active PiSessionHan
   assert.equal(serialized.agent_profile_id, "lookalike-wren-profile");
 });
 
+test("session HTTP projection classifies terminal context overflow without exposing provider details", () => {
+  const row = stoppedSessionRow("slice-c-context-overflow");
+  row.error = "Codex error: Your input exceeds the context window of this model.";
+  const serialized = serializeSession(row);
+  assert.equal(serialized.error_kind, "context_overflow");
+  assert.equal(serializeSession(stoppedSessionRow("slice-c-no-error")).error_kind, null);
+});
+
 test("session runtime WebSocket projection is selection-scoped and fail-closed", () => {
   assert.deepEqual(
     serializeSessionRuntimeState("slice-c-ws-stopped", "selection-123"),

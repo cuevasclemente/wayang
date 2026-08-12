@@ -8,12 +8,12 @@
 
 import type { AgentSession, AgentSessionEvent, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import {
-  AuthStorage,
   createAgentSession,
   DefaultResourceLoader,
   discoverAndLoadExtensions,
   getAgentDir,
   ModelRegistry,
+  ModelRuntime,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -35,6 +35,7 @@ import {
   rollbackAgentSwitch,
   updatePiSessionFile,
   updateSessionAgentProfile,
+  updateSessionError,
   updateSessionModel,
   type SessionRow,
 } from "./sessions.js";
@@ -150,6 +151,10 @@ export interface PiSessionHandle {
   queuedBrowserMessages: Map<string, QueuedBrowserMessageRecord>;
   /** Latest in-progress Pi message, retained across the pre-persistence message_end gap. */
   liveStreamingMessage?: any;
+  /** Successful overflow compaction awaiting a successful SDK continuation. */
+  pendingOverflowRecovery?: { compactionEntryId: string; overflowEntryId: string; successObserved?: boolean };
+  /** Lifecycle failure not represented by a final assistant message. */
+  pendingSessionError?: string;
   liveStreamingMessageUnsubscribe?: () => void;
   /** Permanent process-local denial latch; only a fresh handle may regain authority. */
   capabilityAuthorityDenied?: boolean;
@@ -273,14 +278,16 @@ const piSessionManagerToWebSessionId = new WeakMap<object, string>();
 (globalThis as any).__pi_action_session_files = piSessionFileToWebSessionId;
 
 // Lazy-initialized singletons
-let _authStorage: AuthStorage | null = null;
+let _modelRuntime: ModelRuntime | null = null;
+let _modelRuntimePromise: Promise<ModelRuntime> | null = null;
 let _modelRegistry: ModelRegistry | null = null;
 let _agentDir: string | null = null;
 let _extensionProviderLoadPromise: Promise<void> | null = null;
 let _extensionProviderLoadError: string | undefined;
 let _extensionProvidersLoaded = false;
+let _modelListingRuntime: ModelRuntime | null = null;
 let _modelListingRegistry: ModelRegistry | null = null;
-let _modelListingRegistryPromise: Promise<{ registry: ModelRegistry; error?: string }> | null = null;
+let _modelListingRegistryPromise: Promise<{ runtime: ModelRuntime; registry: ModelRegistry; error?: string }> | null = null;
 let _modelListingRegistryError: string | undefined;
 
 const DYNAMIC_MODEL_REFRESH_MS = 5 * 60 * 1000;
@@ -532,23 +539,51 @@ export function installWayangRawSudoFailClosedGuard(session: AgentSession, sessi
   };
 }
 
-function getAuthStorage(): AuthStorage {
-  if (!_authStorage) _authStorage = AuthStorage.create();
-  return _authStorage;
+export type ModelContext = { runtime: ModelRuntime; registry: ModelRegistry };
+
+/** @internal Exported for synthetic provider-isolation regression tests. */
+export async function createModelContext(options: { agentDir?: string } = {}): Promise<ModelContext> {
+  const agentDir = options.agentDir ?? getAgentDirPath();
+  const runtime = await ModelRuntime.create({
+    authPath: path.join(agentDir, "auth.json"),
+    modelsPath: path.join(agentDir, "models.json"),
+    allowModelNetwork: false,
+  });
+  return { runtime, registry: new ModelRegistry(runtime) };
 }
 
-/**
- * Reload AuthStorage from disk. Call after externally updating auth.json
- * (e.g. via the key-mode route) so new sessions pick up the new credentials
- * without needing a server restart.
- */
+async function getModelRuntime(): Promise<ModelRuntime> {
+  if (_modelRuntime) return _modelRuntime;
+  _modelRuntimePromise ??= createModelContext().then(({ runtime, registry }) => {
+    _modelRuntime = runtime;
+    _modelRegistry = registry;
+    return runtime;
+  }).finally(() => {
+    _modelRuntimePromise = null;
+  });
+  return _modelRuntimePromise;
+}
+
+async function getModelContext(): Promise<ModelContext> {
+  const runtime = await getModelRuntime();
+  if (!_modelRegistry) throw new Error("Model runtime initialized without a registry");
+  return { runtime, registry: _modelRegistry };
+}
+
+async function getModelRegistry(): Promise<ModelRegistry> {
+  return (await getModelContext()).registry;
+}
+
+/** Refresh model/auth snapshots after an external credential write. */
 export function reloadAuthStorage(): void {
-  if (_authStorage) _authStorage.reload();
-}
-
-function getModelRegistry(): ModelRegistry {
-  if (!_modelRegistry) _modelRegistry = ModelRegistry.create(getAuthStorage());
-  return _modelRegistry;
+  // Keep the runtime object: extension providers are registered on it and must
+  // survive credential refresh. Refresh is deliberately backgrounded because
+  // the key-mode route historically treats this notification as synchronous;
+  // new requests still resolve auth through the runtime's file-backed store.
+  if (_modelRuntime) void _modelRuntime.refresh({ allowNetwork: false }).catch(() => undefined);
+  if (_modelListingRuntime && _modelListingRuntime !== _modelRuntime) {
+    void _modelListingRuntime.refresh({ allowNetwork: false }).catch(() => undefined);
+  }
 }
 
 function getAgentDirPath(): string {
@@ -862,34 +897,36 @@ const STORED_AUTH_PROVIDER_PREFERENCE = [
   "fireworks",
 ];
 
-function providerHasConfiguredModel(provider: string): boolean {
-  const registry = getModelRegistry();
+function providerHasConfiguredModel(registry: ModelRegistry, provider: string): boolean {
   return registry.getAll().some((model) => String(model.provider) === provider && registry.hasConfiguredAuth(model));
 }
 
-function resolveUsableModel(provider: string | null | undefined, modelId: string | null | undefined): Model<Api> | undefined {
+function resolveUsableModel(
+  registry: ModelRegistry,
+  provider: string | null | undefined,
+  modelId: string | null | undefined,
+): Model<Api> | undefined {
   if (!provider || !modelId) return undefined;
-  const model = resolveRegisteredModel(provider, modelId);
-  if (!model || !getModelRegistry().hasConfiguredAuth(model)) return undefined;
-  return model;
+  const model = resolveModelFromRegistry(registry, provider, modelId);
+  return model && registry.hasConfiguredAuth(model) ? model : undefined;
 }
 
-function resolveSettingsDefaultModel(settingsManager: SettingsManager): Model<Api> | undefined {
-  return resolveUsableModel(settingsManager.getDefaultProvider(), settingsManager.getDefaultModel());
+function resolveSettingsDefaultModel(settingsManager: SettingsManager, registry: ModelRegistry): Model<Api> | undefined {
+  return resolveUsableModel(registry, settingsManager.getDefaultProvider(), settingsManager.getDefaultModel());
 }
 
-function resolveDetectedDefaultModel(): Model<Api> | undefined {
-  const provider = detectDefaultProvider();
-  return resolveUsableModel(provider, provider ? DEFAULT_MODELS[provider] : undefined);
+async function resolveWebDefaultModel(settingsManager: SettingsManager, context: ModelContext): Promise<Model<Api> | undefined> {
+  const configured = resolveSettingsDefaultModel(settingsManager, context.registry);
+  if (configured) return configured;
+  const provider = await detectDefaultProvider(context);
+  if (!provider) return undefined;
+  return resolveUsableModel(context.registry, provider, DEFAULT_MODELS[provider])
+    || context.registry.getAll().find((model) => String(model.provider) === provider && context.registry.hasConfiguredAuth(model));
 }
 
-function resolveWebDefaultModel(settingsManager?: SettingsManager): Model<Api> | undefined {
-  return (settingsManager ? resolveSettingsDefaultModel(settingsManager) : undefined) || resolveDetectedDefaultModel();
-}
-
-function firstConfiguredProvider(providers: Iterable<string>): string | null {
+function firstConfiguredProvider(registry: ModelRegistry, providers: Iterable<string>): string | null {
   for (const provider of providers) {
-    if (providerHasConfiguredModel(provider)) return provider;
+    if (providerHasConfiguredModel(registry, provider)) return provider;
   }
   return null;
 }
@@ -901,31 +938,29 @@ function firstConfiguredProvider(providers: Iterable<string>): string | null {
  * unattended jobs also need providers configured by `/login` in auth.json. When
  * selecting from stored auth, prefer OAuth-backed OpenAI subscription creds.
  */
-function detectDefaultProvider(): string | null {
-  const authStorage = getAuthStorage();
-  const configured = new Set(authStorage.list());
+async function detectDefaultProvider({ runtime, registry }: ModelContext): Promise<string | null> {
+  const credentials = await runtime.listCredentials();
+  const configured = new Set(credentials.map((credential) => credential.providerId));
   const oauthProviders = new Set(
-    authStorage
-      .getOAuthProviders()
-      .map((provider) => provider.id)
-      .filter((provider) => authStorage.get(provider)?.type === "oauth"),
+    credentials.filter((credential) => credential.type === "oauth").map((credential) => credential.providerId),
   );
 
   // Prefer subscription/OAuth providers for unattended web sessions. This keeps
   // scheduled jobs from accidentally using an unrelated API-key env var inherited
   // by the wayang process.
   const storedOAuthProvider = firstConfiguredProvider(
+    registry,
     STORED_AUTH_PROVIDER_PREFERENCE.filter((provider) => configured.has(provider) && oauthProviders.has(provider)),
   );
   if (storedOAuthProvider) return storedOAuthProvider;
 
   for (const [provider, envVars] of Object.entries(PROVIDER_ENV_MAP)) {
-    if (envVars.some((v) => process.env[v]) && providerHasConfiguredModel(provider)) return provider;
+    if (envVars.some((v) => process.env[v]) && providerHasConfiguredModel(registry, provider)) return provider;
   }
 
   return (
-    firstConfiguredProvider(STORED_AUTH_PROVIDER_PREFERENCE.filter((provider) => configured.has(provider))) ||
-    firstConfiguredProvider(configured)
+    firstConfiguredProvider(registry, STORED_AUTH_PROVIDER_PREFERENCE.filter((provider) => configured.has(provider))) ||
+    firstConfiguredProvider(registry, configured)
   );
 }
 
@@ -937,7 +972,7 @@ async function ensureExtensionProvidersLoaded(cwd = process.cwd()): Promise<void
   if (_extensionProvidersLoaded) return;
   if (!_extensionProviderLoadPromise) {
     _extensionProviderLoadPromise = (async () => {
-      const registry = getModelRegistry();
+      const { runtime, registry } = await getModelContext();
       const errors: string[] = [];
       try {
         const result = await discoverAndLoadExtensions([], cwd, getAgentDirPath());
@@ -954,6 +989,16 @@ async function ensureExtensionProvidersLoaded(cwd = process.cwd()): Promise<void
           }
         }
         result.runtime.pendingProviderRegistrations = [];
+        for (const { provider, extensionPath } of result.runtime.pendingNativeProviderRegistrations) {
+          try {
+            runtime.registerNativeProvider(provider);
+          } catch (error) {
+            errors.push(
+              `Extension "${extensionPath}" failed to register native provider "${provider.id}": ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+        result.runtime.pendingNativeProviderRegistrations = [];
       } catch (error) {
         errors.push(`Failed to load extension providers: ${error instanceof Error ? error.message : String(error)}`);
       } finally {
@@ -970,10 +1015,9 @@ async function ensureExtensionProvidersLoaded(cwd = process.cwd()): Promise<void
 async function createReviewedModelListingRegistry(options: {
   cwd: string;
   agentDir: string;
-  authStorage: AuthStorage;
-}): Promise<{ registry: ModelRegistry; error?: string }> {
-  const registry = ModelRegistry.create(options.authStorage, path.join(options.agentDir, "models.json"));
-  if (REVIEWED_PROVIDER_EXTENSION_PATHS.length === 0) return { registry };
+}): Promise<{ runtime: ModelRuntime; registry: ModelRegistry; error?: string }> {
+  const { runtime, registry } = await createModelContext({ agentDir: options.agentDir });
+  if (REVIEWED_PROVIDER_EXTENSION_PATHS.length === 0) return { runtime, registry };
 
   const errors: string[] = [];
   const loader = new DefaultResourceLoader({
@@ -1003,31 +1047,41 @@ async function createReviewedModelListingRegistry(options: {
       }
     }
     result.runtime.pendingProviderRegistrations = [];
+    for (const { provider, extensionPath } of result.runtime.pendingNativeProviderRegistrations) {
+      try {
+        runtime.registerNativeProvider(provider);
+      } catch (error) {
+        errors.push(
+          `Reviewed provider extension "${extensionPath}" failed to register native provider "${provider.id}": ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    result.runtime.pendingNativeProviderRegistrations = [];
   } catch (error) {
     errors.push(`Reviewed provider extensions failed to load: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return { registry, error: formatLoadErrors(errors) };
+  return { runtime, registry, error: formatLoadErrors(errors) };
 }
 
 async function getModelListingRegistry(options?: {
   cwd?: string;
   agentDir?: string;
-  authStorage?: AuthStorage;
-}): Promise<{ registry: ModelRegistry; error?: string }> {
-  if (options?.cwd || options?.agentDir || options?.authStorage) {
+}): Promise<{ runtime: ModelRuntime; registry: ModelRegistry; error?: string }> {
+  if (options?.cwd || options?.agentDir) {
     const agentDir = options.agentDir ?? getAgentDirPath();
     return createReviewedModelListingRegistry({
       cwd: options.cwd ?? process.cwd(),
       agentDir,
-      authStorage: options.authStorage ?? getAuthStorage(),
     });
   }
-  if (_modelListingRegistry) return { registry: _modelListingRegistry, error: _modelListingRegistryError };
+  if (_modelListingRuntime && _modelListingRegistry) {
+    return { runtime: _modelListingRuntime, registry: _modelListingRegistry, error: _modelListingRegistryError };
+  }
   _modelListingRegistryPromise ??= createReviewedModelListingRegistry({
     cwd: process.cwd(),
     agentDir: getAgentDirPath(),
-    authStorage: getAuthStorage(),
   }).then((result) => {
+    _modelListingRuntime = result.runtime;
     _modelListingRegistry = result.registry;
     _modelListingRegistryError = result.error;
     return result;
@@ -1183,15 +1237,11 @@ async function fetchOpenRouterDynamicModels(registry: ModelRegistry): Promise<Mo
 }
 
 async function fetchAnthropicDynamicModels(registry: ModelRegistry): Promise<Model<Api>[]> {
-  const authStorage = getAuthStorage();
-  const credential = authStorage.get("anthropic");
   // Claude subscription/OAuth credentials can be valid for messages while the
   // public model-list endpoint rejects them. OpenRouter's public catalog still
   // lets us derive current canonical Anthropic model IDs for the picker.
-  if (credential?.type === "oauth") return [];
-
   const template = findProviderTemplate(registry, "anthropic", "claude-opus-4-7");
-  if (!template || !registry.hasConfiguredAuth(template)) return [];
+  if (!template || registry.isUsingOAuth(template) || !registry.hasConfiguredAuth(template)) return [];
 
   const auth = await registry.getApiKeyAndHeaders(template);
   if (!auth.ok || !auth.apiKey) return [];
@@ -1270,10 +1320,6 @@ async function refreshDynamicModels(registry: ModelRegistry, force = false): Pro
   return _dynamicModelRefreshPromise;
 }
 
-function resolveRegisteredModel(provider: string, modelId: string): Model<Api> | undefined {
-  return resolveModelFromRegistry(getModelRegistry(), provider, modelId);
-}
-
 function resolveModelFromRegistry(registry: ModelRegistry, provider: string, modelId: string): Model<Api> | undefined {
   return (
     registry.find(provider, modelId) ||
@@ -1332,7 +1378,6 @@ export async function listModels(options: {
   /** Synthetic-test/internal overrides; API callers use the safe defaults. */
   cwd?: string;
   agentDir?: string;
-  authStorage?: AuthStorage;
   includeDynamicModels?: boolean;
 } = {}): Promise<{ models: WebModelInfo[]; defaultModel: WebDefaultModelInfo | null; error?: string }> {
   const listing = await getModelListingRegistry(options);
@@ -1390,6 +1435,10 @@ async function getSessionModelSelectionRegistry(id: string): Promise<ModelRegist
     : { authorized: false as const };
   if (standard.authorized && _extensionProvidersLoaded) return getModelRegistry();
   return (await getModelListingRegistry()).registry;
+}
+
+async function getSessionModelContext(restricted: boolean): Promise<ModelContext> {
+  return restricted ? createModelContext() : getModelContext();
 }
 
 /** Deny the old runtime synchronously, then wait until every old surface and
@@ -1575,7 +1624,7 @@ async function resolveAgentSwitchTarget(sessionRow: SessionRow, targetProfileId:
   // Preview never discovers arbitrary extensions. Only a current pair association
   // may consult an already-loaded global provider registry.
   const registry = standard.authorized && _extensionProvidersLoaded
-    ? getModelRegistry()
+    ? await getModelRegistry()
     : (await getModelListingRegistry()).registry;
   let model: Model<Api> | undefined;
   if (effective.provider && effective.model) {
@@ -1852,7 +1901,8 @@ export async function createPiSession(
     // Restricted runtimes use a fresh registry, so provider registrations from
     // arbitrary global extensions already loaded elsewhere in this process
     // cannot bleed into this session.
-    const modelRegistry = runtimeResources.restricted ? ModelRegistry.create(getAuthStorage()) : getModelRegistry();
+    const modelContext = await getSessionModelContext(runtimeResources.restricted);
+    const modelRegistry = modelContext.registry;
 
     // Prefer explicit web session settings, then a fully usable pi settings
     // provider/model pair, then credential-based provider detection. A provider
@@ -1878,7 +1928,7 @@ export async function createPiSession(
     } else {
       model = runtimeResources.restricted
         ? resolveRestrictedDefaultModel(settingsManager, modelRegistry)
-        : resolveWebDefaultModel(settingsManager);
+        : await resolveWebDefaultModel(settingsManager, modelContext);
       if (!model) {
         throw new Error(
           "No usable default model found. Set an API key environment variable (e.g., OPENROUTER_API_KEY, ANTHROPIC_API_KEY), configure a valid default provider/model in pi settings, or use /login to log into a provider.",
@@ -2239,8 +2289,7 @@ export async function createPiSession(
       cwd,
       agentDir: getAgentDirPath(),
       model: model,
-      authStorage: getAuthStorage(),
-      modelRegistry,
+      modelRuntime: modelContext.runtime,
       sessionManager,
       settingsManager,
       resourceLoader: runtimeResources.resourceLoader,
@@ -2392,6 +2441,8 @@ export async function createPiSession(
       queuedBrowserMessages: new Map(),
     };
     handle.liveStreamingMessageUnsubscribe = session.subscribe((event: AgentSessionEvent) => {
+      trackOverflowRecovery(handle, event);
+      persistSettledSessionError(handle, event);
       if (event.type === "message_start" || event.type === "message_update") {
         handle.liveStreamingMessage = event.message;
         return;
@@ -3380,7 +3431,7 @@ export async function sendBrowserMessageTurn(
         throw new Error("Duplicate queued browser message ID");
       }
       const queueBefore = clientMessageId ? snapshotQueuedChatMessages(handle.session) : undefined;
-      // In pi 0.80.6 steer() mutates the queue synchronously before returning
+      // In pi 0.84.1 steer() mutates the queue synchronously before returning
       // its promise. Capture in this same event-loop turn so concurrent browser
       // messages cannot collapse two registrations into one ambiguous delta.
       const steering = handle.session.steer(content, images);
@@ -3666,6 +3717,65 @@ export async function abortSession(
   return abortInteractiveTurn(handle, options);
 }
 
+/** @internal Exported for zero-subscriber lifecycle regression tests. */
+export function trackOverflowRecovery(handle: PiSessionHandle, event: AgentSessionEvent): void {
+  if (event.type === "compaction_end" && event.reason === "overflow") {
+    handle.pendingOverflowRecovery = undefined;
+    if (!event.result || !event.willRetry) return;
+    const branch = handle.session.sessionManager.getBranch();
+    const compaction = [...branch].reverse().find((entry: any) => (
+      entry?.type === "compaction"
+      && typeof entry.id === "string"
+      && typeof entry.parentId === "string"
+    )) as any;
+    if (!compaction) return;
+    handle.pendingOverflowRecovery = {
+      compactionEntryId: compaction.id,
+      overflowEntryId: compaction.parentId,
+    };
+    return;
+  }
+  if (event.type === "message_end" && event.message?.role === "assistant" && handle.pendingOverflowRecovery) {
+    const assistant = event.message as any;
+    if (assistant.stopReason !== "error" && assistant.stopReason !== "length") {
+      handle.pendingOverflowRecovery.successObserved = true;
+    }
+    return;
+  }
+  if (event.type !== "agent_settled" || !handle.pendingOverflowRecovery) return;
+  const recovery = handle.pendingOverflowRecovery;
+  handle.pendingOverflowRecovery = undefined;
+  if (!recovery.successObserved) return;
+  handle.session.sessionManager.appendCustomEntry(OVERFLOW_RETRY_MARKER, {
+    compactionEntryId: recovery.compactionEntryId,
+    overflowEntryId: recovery.overflowEntryId,
+  });
+}
+
+/** @internal Exported for lifecycle persistence regression tests. */
+export function persistSettledSessionError(handle: PiSessionHandle, event: AgentSessionEvent): void {
+  if (event.type === "compaction_end") {
+    if (event.reason === "manual") {
+      if (event.result) updateSessionError(handle.id, null);
+      else if (event.errorMessage) updateSessionError(handle.id, event.errorMessage);
+      return;
+    }
+    if (event.errorMessage) handle.pendingSessionError = event.errorMessage;
+    return;
+  }
+  if (event.type === "message_end" && event.message?.role === "assistant") {
+    const assistant = event.message as any;
+    if (assistant.stopReason !== "error" && assistant.stopReason !== "length") {
+      handle.pendingSessionError = undefined;
+    }
+    return;
+  }
+  if (event.type !== "agent_settled") return;
+  const outcome = classifyScheduledPromptResult(handle.session.messages);
+  updateSessionError(handle.id, outcome.error ?? handle.pendingSessionError ?? null);
+  handle.pendingSessionError = undefined;
+}
+
 /**
  * Subscribe to pi session events and forward serialized messages
  * to a callback. Returns an unsubscribe function.
@@ -3820,6 +3930,13 @@ function serializeMessage(
   return { type, message: serializeMessageValue(message) };
 }
 
+export function classifyAssistantErrorKind(errorMessage: string | null | undefined): "context_overflow" | null {
+  if (!errorMessage) return null;
+  return isContextOverflow({ role: "assistant", content: [], stopReason: "error", errorMessage } as any)
+    ? "context_overflow"
+    : null;
+}
+
 function serializeMessageValue(msg: any): Record<string, unknown> {
   const base: Record<string, unknown> = {
     role: msg.role,
@@ -3830,7 +3947,11 @@ function serializeMessageValue(msg: any): Record<string, unknown> {
   if (msg.model) base.model = msg.model;
   if (msg.stopReason) base.stopReason = msg.stopReason;
   if (msg.usage) base.usage = msg.usage;
-  if (msg.errorMessage) base.errorMessage = msg.errorMessage;
+  if (msg.errorMessage) {
+    base.errorMessage = msg.errorMessage;
+    const errorKind = msg.role === "assistant" ? classifyAssistantErrorKind(msg.errorMessage) : null;
+    if (errorKind) base.errorKind = errorKind;
+  }
   if (msg.customType) base.customType = msg.customType;
   if (msg.toolCallId) base.toolCallId = msg.toolCallId;
   if (msg.toolName) base.toolName = msg.toolName;
@@ -3979,16 +4100,31 @@ function customHistoryMessage(customType: string, content: unknown, timestamp?: 
   };
 }
 
+const OVERFLOW_RETRY_MARKER = "wayang-overflow-retry-v1";
+
 export function serializeHistoryEntries(entries: any[]): SerializedMessage[] {
   const serialized: SerializedMessage[] = [];
-  // Pi persists the provider's overflow error before appending the successful
-  // recovery compaction. Keep the canonical JSONL audit trail intact, but do
-  // not render that recovered intermediate failure as a terminal chat error.
-  const recoveredOverflowEntryIds = new Set(
-    entries
-      .filter((entry) => entry?.type === "compaction" && typeof entry.parentId === "string")
-      .map((entry) => entry.parentId),
-  );
+  // Compaction entries do not persist their reason or retry outcome. Suppress a
+  // provider overflow only when Wayang observed a successful assistant response
+  // after Pi's compact-and-retry continuation. Markers carry validated IDs so
+  // extension-appended entries between compaction and continuation are harmless.
+  const compactionById = new Map(entries
+    .filter((entry) => entry?.type === "compaction" && typeof entry.id === "string")
+    .map((entry) => [entry.id, entry]));
+  const recoveredOverflowEntryIds = new Set<string>();
+  for (const marker of entries) {
+    if (marker?.type !== "custom" || marker.customType !== OVERFLOW_RETRY_MARKER) continue;
+    const compactionEntryId = marker.data?.compactionEntryId;
+    const overflowEntryId = marker.data?.overflowEntryId;
+    const compaction = typeof compactionEntryId === "string" ? compactionById.get(compactionEntryId) : undefined;
+    if (
+      compaction
+      && typeof overflowEntryId === "string"
+      && compaction.parentId === overflowEntryId
+    ) {
+      recoveredOverflowEntryIds.add(overflowEntryId);
+    }
+  }
 
   for (const entry of entries) {
     if (entry.type === "message") {

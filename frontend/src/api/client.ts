@@ -65,6 +65,7 @@ export interface Session {
   scheduled_job_id: string | null;
   scheduled_run_id: string | null;
   error: string | null;
+  error_kind: "context_overflow" | null;
   runtime_status: SessionRuntimeStatus;
   runtime_is_streaming: boolean;
   runtime_is_compacting: boolean;

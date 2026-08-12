@@ -5,7 +5,7 @@ import { WorkspaceStoreError } from "./workspace-types.js";
 import { WAYANG_WORKSPACE_CHANGE_TOOL_NAME, WAYANG_WORKSPACE_READ_TOOL_NAME } from "./workspace-control.js";
 export { WAYANG_WORKSPACE_CHANGE_TOOL_NAME, WAYANG_WORKSPACE_READ_TOOL_NAME } from "./workspace-control.js";
 
-// Pi 0.80.6 coerces typed string schemas before tool execution, including
+// Pi 0.84.1 coerces typed string schemas before tool execution, including
 // string|null unions (null becomes "" or numbers become strings). Preserve the
 // raw JSON value here; the canonical workspace parser strictly enforces
 // nonempty string|null semantics before preview or commit authority is issued.

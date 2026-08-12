@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
-import { AuthStorage, SessionManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   abortInteractiveTurn,
   appendStreamingMessageToHistory,
@@ -26,6 +26,8 @@ import {
   interviewSubmissionContent,
   listModels,
   onPiSessionRuntimeEvent,
+  persistSettledSessionError,
+  trackOverflowRecovery,
   piSessionHandleRequiresFreshRuntime,
   previewSessionAgentSwitch,
   protectedBrowserIdleRetentionIsRequired,
@@ -162,6 +164,42 @@ function currentTurnFixture(name: string) {
     },
   };
 }
+
+test("settled lifecycle persists terminal assistant and compaction failures", () => {
+  const f = currentTurnFixture("wayang-settled-error-");
+  try {
+    const row = createSession(f.cwd, { agentProfileId: f.profile.id });
+    const handle = {
+      id: row.id,
+      session: { messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "Context window exceeded" }] },
+    } as unknown as PiSessionHandle;
+    persistSettledSessionError(handle, { type: "agent_settled" } as any);
+    assert.equal(getSessionById(row.id)?.error, "Context window exceeded");
+
+    (handle.session as any).messages = [];
+    persistSettledSessionError(handle, {
+      type: "compaction_end",
+      reason: "overflow",
+      result: undefined,
+      aborted: false,
+      willRetry: false,
+      errorMessage: "Context overflow recovery failed: synthetic",
+    } as any);
+    persistSettledSessionError(handle, { type: "agent_settled" } as any);
+    assert.equal(getSessionById(row.id)?.error, "Context overflow recovery failed: synthetic");
+
+    persistSettledSessionError(handle, {
+      type: "compaction_end",
+      reason: "manual",
+      result: { summary: "recovered", firstKeptEntryId: "entry", tokensBefore: 100, estimatedTokensAfter: 10 },
+      aborted: false,
+      willRetry: false,
+    } as any);
+    assert.equal(getSessionById(row.id)?.error, null);
+  } finally {
+    f.cleanup();
+  }
+});
 
 test("Pi bridge stopped projections never infer host authority from durable identity", () => {
   assert.equal(getPiSessionBashMode("synthetic-stopped-session"), "unavailable");
@@ -728,6 +766,47 @@ test("Pi bridge browser turns mint the exact persisted current-branch boundary a
   }
 });
 
+test("overflow retry provenance persists without a browser subscriber", () => {
+  const manager = SessionManager.inMemory();
+  manager.appendMessage({
+    role: "assistant",
+    content: [],
+    api: "openai-responses",
+    provider: "openai-codex",
+    model: "gpt-5.6-sol",
+    stopReason: "error",
+    errorMessage: "Context window exceeded",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    timestamp: Date.now(),
+  } as any);
+  const overflowId = manager.getLeafId();
+  manager.appendCompaction("synthetic recovery summary", overflowId!, 100_000);
+  const handle = {
+    session: { sessionManager: manager },
+    subscriberCount: 0,
+  } as unknown as PiSessionHandle;
+
+  trackOverflowRecovery(handle, {
+    type: "compaction_end",
+    reason: "overflow",
+    result: { summary: "synthetic recovery summary", firstKeptEntryId: overflowId!, tokensBefore: 100_000, estimatedTokensAfter: 10_000 },
+    aborted: false,
+    willRetry: true,
+  } as any);
+  assert.notEqual((manager.getBranch().at(-1) as any).customType, "wayang-overflow-retry-v1");
+
+  trackOverflowRecovery(handle, {
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "Recovered response" }], stopReason: "stop" },
+  } as any);
+  assert.notEqual((manager.getBranch().at(-1) as any).customType, "wayang-overflow-retry-v1");
+  trackOverflowRecovery(handle, { type: "agent_settled" } as any);
+  const leaf = manager.getBranch().at(-1) as any;
+  assert.equal(leaf.customType, "wayang-overflow-retry-v1");
+  assert.equal(leaf.data.compactionEntryId, manager.getBranch().find((entry: any) => entry.type === "compaction")?.id);
+  assert.equal(leaf.data.overflowEntryId, overflowId);
+});
+
 test("listModels does not execute an unrelated installed extension factory", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-model-list-canary-"));
   const cwd = path.join(dir, "project");
@@ -747,7 +826,6 @@ test("listModels does not execute an unrelated installed extension factory", asy
     const result = await listModels({
       cwd,
       agentDir,
-      authStorage: AuthStorage.create(path.join(agentDir, "auth.json")),
       includeDynamicModels: false,
     });
     assert.ok(result.models.length > 0, "built-in models remain discoverable");

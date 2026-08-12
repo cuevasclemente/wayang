@@ -48,7 +48,7 @@ For a single-user private LAN without an existing reverse proxy, Wayang includes
 
 ## Pi provider authentication
 
-Wayang uses pi 0.80.6's standard authentication and model registry.
+Wayang uses pi 0.84.1's standard authentication and model runtime.
 
 ### OAuth or pi-managed API key
 
@@ -93,7 +93,7 @@ Credential resolution in pi prefers a CLI override, then pi `auth.json`, then en
 | `PI_SKIP_VERSION_CHECK=1` | Disable only pi's version check. |
 | `PI_TELEMETRY=0` | Disable pi install/update telemetry. |
 
-Pi 0.80.6 also protects project-local `.pi` settings, extensions, skills, prompts, themes, system prompts, and packages with a saved project-trust decision. Wayang does not auto-approve repositories. To trust a reviewed project, start `backend/node_modules/.bin/pi` from that project in a local terminal, run `/trust`, exit, and start a new Wayang session. The decision is stored in pi's private trust store; do not read or copy it. `AGENTS.md`/`CLAUDE.md` context remains available without project trust, and trust is not a sandbox.
+Unlike the interactive Pi CLI, Wayang treats every registered project folder as trusted for project-local `.pi` settings, extensions, skills, prompts, themes, system prompts, and packages. These resources may install dependencies or execute code as the Wayang host user for any agent profile. Register only reviewed projects inside the same single-user trust boundary. Restricted agent tool policies do not sandbox project-local Pi code.
 
 Pi session JSONL files, authentication state, trust decisions, and chat attachments are sensitive. New uploads live under private `WAYANG_DATA_DIR/attachments/<full-session-id>/` directories; participating agent tools deny cross-session attachments and the deprecated shared `/tmp/wayang-attachments` root. Do not point test runs at a real Pi or Wayang data directory.
 

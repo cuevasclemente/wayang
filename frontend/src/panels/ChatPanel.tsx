@@ -145,6 +145,7 @@ interface CommandGuardState {
 interface RuntimeErrorState {
   message: string;
   timestamp: number;
+  recovery: "context_overflow" | null;
 }
 
 type WsStatus = "connecting" | "connected" | "disconnected";
@@ -1222,7 +1223,7 @@ function suppressActiveRecoveryErrors(messages: ChatMessage[]): ChatMessage[] {
   return messages.filter((message, index) => (
     index <= lastUserIndex
     || message.type !== "assistant"
-    || !assistantErrorMessage(message.message)
+    || message.message?.errorKind !== "context_overflow"
   ));
 }
 
@@ -2897,7 +2898,7 @@ export function ChatPanel({
   const activeSessionErrorRef = useRef<string | null>(null);
   const activeSessionRuntimeStreamingRef = useRef(false);
   const activeSessionRuntimeCompactingRef = useRef(false);
-  const pendingLifecycleErrorRef = useRef<string | null>(null);
+  const pendingLifecycleErrorRef = useRef<{ message: string; kind: "context_overflow" | null } | null>(null);
   const isStreamingRef = useRef(false);
   const pinActiveTurnScrollRef = useRef(false);
   const lastProgrammaticScrollAtRef = useRef(0);
@@ -3092,9 +3093,13 @@ export function ChatPanel({
     setStreamingBlocksSynced({ content: [] });
   }, [setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
 
-  const appendRuntimeError = useCallback((message: string) => {
+  const appendRuntimeError = useCallback((message: string, recovery: "context_overflow" | null = null) => {
     const trimmed = message.trim() || "Unknown error";
-    setRuntimeError({ message: trimmed, timestamp: Date.now() });
+    setRuntimeError({
+      message: trimmed,
+      timestamp: Date.now(),
+      recovery,
+    });
     setStreamingHistoryPrefixSynced({ content: [] });
     setMessages((prev) => {
       const last = prev[prev.length - 1];
@@ -3718,7 +3723,15 @@ export function ChatPanel({
           }
 
           const turnError = agentEndErrorMessage(msg);
-          if (turnError) pendingLifecycleErrorRef.current = turnError;
+          if (turnError) {
+            const assistant = Array.isArray(msg.messages)
+              ? [...msg.messages].reverse().find((message) => message?.role === "assistant")
+              : null;
+            pendingLifecycleErrorRef.current = {
+              message: turnError,
+              kind: assistant?.errorKind === "context_overflow" ? "context_overflow" : null,
+            };
+          }
 
           setStreamingHistoryPrefixSynced({ content: [] });
           setStreamingBlocksSynced({ content: [] });
@@ -3738,9 +3751,17 @@ export function ChatPanel({
 
         if (msg.type === "compaction_end") {
           setIsCompacting(false);
-          pendingLifecycleErrorRef.current = null;
           if (typeof msg.error === "string" && msg.error.trim()) {
-            appendRuntimeError(msg.error);
+            const recovery = msg.reason === "overflow" ? "context_overflow" : null;
+            pendingLifecycleErrorRef.current = { message: msg.error, kind: recovery };
+            appendRuntimeError(msg.error, recovery);
+          } else if (msg.succeeded === true) {
+            // A successful overflow compaction can still be followed by a failed
+            // SDK continuation. Keep pending lifecycle provenance until settled.
+            if (msg.reason !== "overflow" || msg.will_retry !== true) {
+              pendingLifecycleErrorRef.current = null;
+              clearRuntimeError();
+            }
           }
           return;
         }
@@ -3749,7 +3770,7 @@ export function ChatPanel({
           setIsCompacting(false);
           const pendingError = pendingLifecycleErrorRef.current;
           pendingLifecycleErrorRef.current = null;
-          if (pendingError) appendRuntimeError(pendingError);
+          if (pendingError) appendRuntimeError(pendingError.message, pendingError.kind);
           isStreamingRef.current = false;
           pinActiveTurnScrollRef.current = false;
           setActiveTurnScrollAnchorText(null);
@@ -4230,8 +4251,12 @@ export function ChatPanel({
           // rendered as a terminal red error while recovery is still active.
           if (message.role === "assistant" && msg.type === "message_end") {
             const error = assistantErrorMessage(message);
-            if (error) pendingLifecycleErrorRef.current = error;
-            else pendingLifecycleErrorRef.current = null;
+            if (error) {
+              pendingLifecycleErrorRef.current = {
+                message: error,
+                kind: message.errorKind === "context_overflow" ? "context_overflow" : null,
+              };
+            } else pendingLifecycleErrorRef.current = null;
           }
           return;
         }
@@ -4418,7 +4443,14 @@ export function ChatPanel({
     setPendingAttachments([]);
     setAttachmentError("");
     const sessionError = activeSessionErrorRef.current;
-    setRuntimeError(sessionError ? { message: sessionError, timestamp: Date.now() } : null);
+    const sessionErrorKind = activeSession?.error_kind ?? null;
+    const suppressRecoveringOverflow = sessionErrorKind === "context_overflow"
+      && (activeSessionRuntimeCompactingRef.current || activeSessionRuntimeStreamingRef.current);
+    setRuntimeError(sessionError && !suppressRecoveringOverflow ? {
+      message: sessionError,
+      timestamp: Date.now(),
+      recovery: sessionErrorKind === "context_overflow" ? "context_overflow" : null,
+    } : null);
     setResendingMessageId(null);
     // Preserve a running-state hint when opening an already-live session. The
     // backend will also synthesize agent_start on attach if the turn is still
@@ -4459,7 +4491,7 @@ export function ChatPanel({
       chatWsProfile("invoke_connect", { activeSessionId });
       connectRef.current();
     }
-  }, [activeSessionId, sendWs, clearExternalActionAuthority, clearQueuedAndDeferredUserMessages, setExternalActionApprovalsSynced, setInterviewQueueSynced, setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
+  }, [activeSessionId, activeSession?.error_kind, sendWs, clearExternalActionAuthority, clearQueuedAndDeferredUserMessages, setExternalActionApprovalsSynced, setInterviewQueueSynced, setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
 
   // Mark a sent response retryable when a connected socket never returns the
   // required durable acknowledgement. This does not resend in a loop; the
@@ -4807,6 +4839,12 @@ export function ChatPanel({
     setQueuedMessagesSynced,
     clearRuntimeError,
   ]);
+
+  const handleCompactAfterOverflow = useCallback(() => {
+    if (wsStatus !== "connected" || !activeSessionId || hasActiveAssistantOutput() || isCompacting) return;
+    const sent = sendWs({ type: "message", content: "/compact Preserve current goals, completed work, constraints, and next steps." });
+    if (sent) setIsCompacting(true);
+  }, [activeSessionId, hasActiveAssistantOutput, isCompacting, sendWs, wsStatus]);
 
   const handleCancelQueuedMessage = useCallback((messageId: string) => {
     const queuedMessage = queuedUserMessagesRef.current.find((message) => message.id === messageId);
@@ -5668,6 +5706,22 @@ export function ChatPanel({
                 Session error
               </div>
               <pre className="mt-1 whitespace-pre-wrap break-words font-sans text-sm leading-relaxed text-red-100">{runtimeError.message}</pre>
+              {runtimeError.recovery === "context_overflow" && (
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    data-testid="compact-after-overflow"
+                    onClick={handleCompactAfterOverflow}
+                    disabled={wsStatus !== "connected" || isStreaming || isCompacting}
+                    className="rounded border border-red-700 bg-red-900/40 px-3 py-1.5 text-xs font-semibold text-red-50 hover:bg-red-900/70 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Compact context
+                  </button>
+                  <span className="text-xs leading-relaxed text-red-200/80">
+                    Automatic recovery stopped. Compact, then resend deliberately to avoid repeating tool side effects.
+                  </span>
+                </div>
+              )}
             </div>
             <button
               type="button"

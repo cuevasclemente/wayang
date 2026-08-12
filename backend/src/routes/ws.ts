@@ -1052,10 +1052,9 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
           sendCommandNotice(ws, "Compaction complete.");
           sendContextUsage(ws, sessionId);
         })
-        .catch((err: any) => sendSafe(ws, {
-          type: "error",
-          error: err?.message || String(err),
-        }));
+        // AgentSession emits the authoritative structured compaction_end event,
+        // including a bounded failure message. Avoid a second generic error.
+        .catch(() => {});
       return true;
     }
 
@@ -1186,7 +1185,6 @@ async function handleClientMessage(
           clientMessageId,
           { content: trimmedContent, attachmentNames: queuedAttachmentNames(msg.attachments) },
         ).then((result) => {
-          updateSessionError(sessionId, null);
           if (clientMessageId) {
             sendSafe(ws, {
               type: "queued_message_ack",
@@ -1257,9 +1255,7 @@ async function handleClientMessage(
         sendSafe(ws, { ...getTodoState(sessionId), session_id: sessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
         sendContextUsage(ws, sessionId, selectionId);
 
-        result.turn.then(() => {
-          updateSessionError(sessionId, null);
-        }).catch((err) => {
+        result.turn.catch((err) => {
           const error = safeSessionError(sessionId, err, "Agent turn failed: ");
           updateSessionError(sessionId, error);
           sendSafe(ws, { type: "error", session_id: sessionId, ...(selectionId ? { selection_id: selectionId } : {}), error });

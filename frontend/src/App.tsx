@@ -319,6 +319,7 @@ function App({ authEnabled, onLogout }: AppProps) {
         scheduled_job_id: null,
         scheduled_run_id: null,
         error: null,
+        error_kind: null,
         runtime_status: "stopped",
         runtime_is_streaming: false,
         runtime_is_compacting: false,

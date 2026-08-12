@@ -99,6 +99,18 @@ async function installTimelineSocket(
           });
           this.emit({ type: "agent_start" });
         };
+        (window as unknown as { emitSyntheticTerminalOverflow: () => void }).emitSyntheticTerminalOverflow = () => {
+          const overflow = {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+            errorKind: "context_overflow",
+          };
+          this.emit({ type: "message_end", message: overflow });
+          this.emit({ type: "agent_end", messages: [overflow], will_retry: false });
+          this.emit({ type: "agent_settled" });
+        };
         (window as unknown as { emitSyntheticTerminalError: () => void }).emitSyntheticTerminalError = () => {
           const terminalError = {
             role: "assistant",
@@ -151,7 +163,12 @@ async function installTimelineSocket(
 
       send(raw: string): void {
         const message = JSON.parse(raw) as { type?: string; content?: string };
-        if (this.promptHandled || message.type !== "message" || typeof message.content !== "string") return;
+        if (message.type !== "message" || typeof message.content !== "string") return;
+        const sent = (window as unknown as { __syntheticSentMessages?: string[] }).__syntheticSentMessages ?? [];
+        sent.push(message.content);
+        (window as unknown as { __syntheticSentMessages?: string[] }).__syntheticSentMessages = sent;
+        if (message.content.startsWith("/compact")) return;
+        if (this.promptHandled) return;
         this.promptHandled = true;
         this.emit({ type: "message_start", message: { id: "timeline-user", role: "user", content: message.content } });
         this.emit({ type: "agent_start" });
@@ -338,7 +355,7 @@ test("restores compacting state and suppresses the active overflow error on reat
     {
       type: "assistant",
       id: "recovery-overflow",
-      message: { role: "assistant", content: [], stopReason: "error", errorMessage: overflow },
+      message: { role: "assistant", content: [], stopReason: "error", errorMessage: overflow, errorKind: "context_overflow" },
     },
   ], true);
   const session = await createE2eSession(request, "e2e compacting reattach lifecycle");
@@ -355,7 +372,7 @@ test("suppresses the overflow during the reattach race before compaction_start",
     {
       type: "assistant",
       id: "race-overflow",
-      message: { role: "assistant", content: [], stopReason: "error", errorMessage: overflow },
+      message: { role: "assistant", content: [], stopReason: "error", errorMessage: overflow, errorKind: "context_overflow" },
     },
   ], false, true);
   const session = await createE2eSession(request, "e2e overflow recovery reattach race");
@@ -385,6 +402,30 @@ test("retains terminal errors from stored assistant responses with partial conte
 
   await expect(page.locator('[data-testid="chat-message"][data-role="assistant"]')).toContainText("Partial answer before failure");
   await expect(page.locator('[data-testid="chat-message"][data-role="error"]')).toContainText(terminalError);
+});
+
+test("offers deliberate compaction after terminal context recovery failure", async ({ page, request }) => {
+  await installTimelineSocket(page);
+  const session = await createE2eSession(request, "e2e terminal context recovery failure");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Exercise terminal overflow recovery failure.");
+  await page.evaluate(() => {
+    (window as unknown as { emitSyntheticTerminalOverflow: () => void }).emitSyntheticTerminalOverflow();
+  });
+
+  await expect(page.getByTestId("chat-runtime-error")).toContainText("Context overflow recovery failed");
+  const compact = page.getByTestId("compact-after-overflow");
+  await expect(compact).toBeEnabled();
+  await compact.click();
+  await expect(page.getByTestId("chat-runtime-error")).toContainText("Context overflow recovery failed");
+  await expect.poll(() => page.evaluate(() => (
+    (window as unknown as { __syntheticSentMessages?: string[] }).__syntheticSentMessages ?? []
+  ).filter((message) => message.startsWith("/compact")).length)).toBe(1);
+  await page.evaluate(() => {
+    (window as unknown as { completeSyntheticOverflowRecovery: () => void }).completeSyntheticOverflowRecovery();
+  });
+  await expect(page.getByTestId("chat-runtime-error")).toHaveCount(0);
 });
 
 test("surfaces an assistant provider error after the lifecycle settles without recovery", async ({ page, request }) => {
