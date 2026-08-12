@@ -657,7 +657,7 @@ function revokeInteractiveTurn(handle: PiSessionHandle): void {
   handle.activeInteractiveTurn = null;
 }
 
-export type NonBrowserTurnSource = "resend" | "interview_submission" | "scheduled_prompt";
+export type NonBrowserTurnSource = "resend" | "interview_submission" | "scheduled_prompt" | "messaging_prompt";
 
 /** Non-browser continuations may run the agent, but can never mint mutation provenance. */
 export function beginNonBrowserTurn(handle: PiSessionHandle, _source: NonBrowserTurnSource): void {
