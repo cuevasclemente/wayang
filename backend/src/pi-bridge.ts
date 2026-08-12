@@ -2166,7 +2166,7 @@ export async function createPiSession(
           || returnedBinding.associationRevision !== protectedBinding.associationRevision
           || returnedBinding.runtimeGeneration !== protectedBinding.runtimeGeneration
           || returnedBinding.processBootNonce !== protectedBinding.processBootNonce) {
-          await pendingProtectedBrowserRuntime?.close().catch(() => undefined);
+          await pendingProtectedBrowserRuntime?.detachAgentLease("factory-binding-mismatch").catch(() => undefined);
           pendingProtectedBrowserRuntime = undefined;
           throw new WorkspaceStoreError("Protected browser factory returned a non-exact runtime lease", 409);
         }
@@ -2665,7 +2665,7 @@ export async function createPiSession(
     pendingAgentSession = undefined;
     await pendingRestrictedMcpRuntime?.close().catch(() => undefined);
     pendingRestrictedMcpRuntime = undefined;
-    await pendingProtectedBrowserRuntime?.close().catch(() => undefined);
+    await pendingProtectedBrowserRuntime?.detachAgentLease("runtime-creation-failed").catch(() => undefined);
     pendingProtectedBrowserRuntime = undefined;
     await pendingProtectedAutomationRuntime?.close().catch(() => undefined);
     pendingProtectedAutomationRuntime = undefined;
@@ -3287,6 +3287,13 @@ function beginPiSessionAuthorityCleanup(handle: PiSessionHandle): Promise<void> 
     try { return runtime ? Promise.resolve(runtime.close()) : Promise.resolve(); }
     catch (error) { return Promise.reject(error); }
   };
+  const detachBrowserLease = (): Promise<void> => {
+    try {
+      return protectedBrowser
+        ? Promise.resolve(protectedBrowser.detachAgentLease("session-authority-cleanup"))
+        : Promise.resolve();
+    } catch (error) { return Promise.reject(error); }
+  };
   const invokeAgentAbort = (): Promise<void> => {
     try {
       const abort = (handle.session as any)?.abort;
@@ -3297,7 +3304,7 @@ function beginPiSessionAuthorityCleanup(handle: PiSessionHandle): Promise<void> 
     hostBashTeardown ?? Promise.resolve(),
     invokeAgentAbort(),
     invokeClose(restricted),
-    invokeClose(protectedBrowser),
+    detachBrowserLease(),
     invokeClose(protectedAutomation),
     invokeClose(fileAudioExperiment),
   ]).then(() => undefined);

@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
+import type { InteractiveBrowserRuntime } from "./interactive-runtime.js";
 import { CapabilityBoundProtectedBrowser } from "./protected-browser.js";
 import { createProtectedBrowserToolRuntime } from "./protected-tools.js";
 import type { ProtectedBrowserAuthoritySnapshot, ProtectedBrowserBinding } from "./types.js";
@@ -60,6 +61,39 @@ test("capability-bound runtime exposes explicit browser tools without a download
     await runtime.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Protected adapter exposes distinct idempotent neutral lifecycle delegation", async () => {
+  let leaseRevocations = 0;
+  let realmRevocations = 0;
+  const browser = {
+    isRevoked: false,
+    close() {
+      leaseRevocations += 1;
+      return Promise.resolve();
+    },
+    revokeRealm() {
+      realmRevocations += 1;
+      return Promise.resolve();
+    },
+  } as unknown as CapabilityBoundProtectedBrowser;
+  const protectedRuntime = createProtectedBrowserToolRuntime({ browser });
+  const runtime: InteractiveBrowserRuntime = protectedRuntime;
+
+  const firstDetach = runtime.detachAgentLease("runtime-replaced");
+  assert.equal(runtime.detachAgentLease("duplicate-runtime-replaced"), firstDetach);
+  assert.equal(protectedRuntime.close(), firstDetach, "deprecated close preserves lease-only behavior");
+  await firstDetach;
+  assert.equal(leaseRevocations, 1);
+  assert.equal(realmRevocations, 0);
+
+  const firstWorkspaceClose = runtime.closeSessionWorkspaces("session-destroyed");
+  assert.equal(runtime.closeSessionWorkspaces("duplicate-session-destroyed"), firstWorkspaceClose);
+  assert.equal(runtime.revokeAuthority("association-revoked"), firstWorkspaceClose);
+  await firstWorkspaceClose;
+  assert.equal(leaseRevocations, 1);
+  assert.equal(realmRevocations, 1);
+  assert.equal(runtime.preflight().allowed, false);
 });
 
 test("protected tool latches denial after a browser coordinator failure", async () => {

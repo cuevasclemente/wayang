@@ -6,6 +6,7 @@ import {
   truncateHead,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import type { InteractiveBrowserRuntime } from "./interactive-runtime.js";
 import { CapabilityBoundProtectedBrowser } from "./protected-browser.js";
 import type { ProtectedBrowserOperation } from "./types.js";
 
@@ -32,11 +33,9 @@ export const INTERACTIVE_BROWSER_TOOL_NAMES = Object.freeze([
 
 export type InteractiveBrowserToolName = typeof INTERACTIVE_BROWSER_TOOL_NAMES[number];
 
-export interface ProtectedBrowserToolRuntime {
-  readonly tools: readonly ToolDefinition[];
+export interface ProtectedBrowserToolRuntime extends InteractiveBrowserRuntime {
   readonly browser: CapabilityBoundProtectedBrowser;
-  toolForName(name: string): ToolDefinition | undefined;
-  preflight(): { allowed: true } | { allowed: false; reason: string };
+  /** @deprecated Incremental compatibility alias for detachAgentLease(). */
   close(): Promise<void>;
 }
 
@@ -87,9 +86,34 @@ export function createProtectedBrowserToolRuntime(options: {
   browser: CapabilityBoundProtectedBrowser;
 }): ProtectedBrowserToolRuntime {
   let revoked = false;
-  const deny = async (error: unknown): Promise<never> => {
+  let agentLeaseDetach: Promise<void> | undefined;
+  let realmRevocation: Promise<void> | undefined;
+  const detachAgentLease = (reason: string): Promise<void> => {
+    void reason;
     revoked = true;
-    await Promise.allSettled([options.browser.revoke()]);
+    agentLeaseDetach ??= options.browser.close();
+    return agentLeaseDetach;
+  };
+  const revokeRealm = (): Promise<void> => {
+    revoked = true;
+    if (!realmRevocation) {
+      realmRevocation = options.browser.revokeRealm();
+      // Realm revocation includes lease revocation. A later detach must not
+      // delegate teardown a second time through the adapter.
+      agentLeaseDetach ??= realmRevocation;
+    }
+    return realmRevocation;
+  };
+  const closeSessionWorkspaces = (reason: string): Promise<void> => {
+    void reason;
+    return revokeRealm();
+  };
+  const revokeAuthority = (reason: string): Promise<void> => {
+    void reason;
+    return revokeRealm();
+  };
+  const deny = async (error: unknown): Promise<never> => {
+    await Promise.allSettled([detachAgentLease("protected-browser-operation-failed")]);
     throw error instanceof Error ? error : new Error("Interactive browser operation failed");
   };
   const preflight = () => revoked || options.browser.isRevoked
@@ -271,9 +295,11 @@ export function createProtectedBrowserToolRuntime(options: {
     browser: options.browser,
     toolForName(name) { return byName.get(name); },
     preflight,
-    async close() {
-      revoked = true;
-      await Promise.allSettled([options.browser.close()]);
+    detachAgentLease,
+    closeSessionWorkspaces,
+    revokeAuthority,
+    close() {
+      return detachAgentLease("deprecated-close");
     },
   };
 }

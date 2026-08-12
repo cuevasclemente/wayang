@@ -35,6 +35,7 @@ import { WREN_AGENT_PROFILE_ID, type AgentProfileRow } from "./workspace-types.j
 import { WAYANG_RUNTIME_CONTEXT_TOOL_NAME } from "./wayang-runtime-context.js";
 import { RESTRICTED_MCP_TOOL_NAME, type RestrictedMcpRuntime } from "./restricted-mcp/index.js";
 import { FILE_AUDIO_EXPERIMENT_TOOL_NAME, type FileAudioExperimentRuntime } from "./audio-experiment/types.js";
+import type { InteractiveBrowserRuntime } from "./browser/interactive-runtime.js";
 
 function fixture(name: string): {
   dir: string;
@@ -385,6 +386,47 @@ test("standard-resource runtime fence prevents A → B → A stale wrapper reviv
     oldGenerationCurrent = true;
     await assert.rejects(() => tool.execute("stale-after-return-to-a", {}), /permanently revoked/);
     assert.equal(executions, 1);
+  } finally { f.cleanup(); }
+});
+
+test("interactive-browser guard preserves exact backend tool-object authorization through the neutral seam", async () => {
+  const f = fixture("wayang-runtime-browser-tool-drift-");
+  try {
+    const profile = createAgentProfile({ name: "Browser tool drift" });
+    createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
+    const row = createSession(f.cwd, { agentProfileId: profile.id });
+    let detachments = 0;
+    let replacements = 0;
+    const definition: any = { name: "browser_status", async execute() { return { content: [] }; } };
+    const original: any = { name: "browser_status", async execute(...args: unknown[]) { return definition.execute(...args); } };
+    const replacement: any = { name: "browser_status", async execute() { replacements++; return { content: [] }; } };
+    const runtime: InteractiveBrowserRuntime = {
+      tools: [definition],
+      toolForName(name) { return name === definition.name ? definition : undefined; },
+      preflight: () => ({ allowed: true }),
+      async detachAgentLease() { detachments++; },
+      async closeSessionWorkspaces() {},
+      async revokeAuthority() {},
+    };
+    let active = [definition.name];
+    const session: any = {
+      _toolDefinitions: new Map([[definition.name, { definition }]]),
+      _toolRegistry: new Map([[definition.name, original]]),
+      getActiveToolNames: () => active,
+      setActiveToolsByName(names: string[]) { active = [...names]; },
+      agent: { state: { tools: [original] }, async beforeToolCall() {} },
+    };
+    installAgentToolPolicyGuard(session, row.id, { protectedBrowserRuntime: runtime });
+    assert.deepEqual(active, [definition.name]);
+
+    session._toolRegistry.set(definition.name, replacement);
+    session.agent.state.tools = [replacement];
+    session.setActiveToolsByName([definition.name]);
+    assert.deepEqual(active, []);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(detachments, 1);
+    await assert.rejects(() => replacement.execute("counterfeit", {}), /tool object is not authorized/);
+    assert.equal(replacements, 0);
   } finally { f.cleanup(); }
 });
 

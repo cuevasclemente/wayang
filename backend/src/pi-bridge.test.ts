@@ -248,7 +248,7 @@ test("Pi bridge capability denial latches tools and aborts active runtime author
       revokeActiveExecutions() { order.push("host-terminated"); return Promise.resolve(); },
     },
     protectedBrowserRuntime: {
-      close() { order.push("protected-latched"); return cleanupRelease.promise; },
+      detachAgentLease() { order.push("protected-latched"); return cleanupRelease.promise; },
     },
     restrictedMcpRuntime: {
       close() { order.push("restricted-latched"); return cleanupRelease.promise; },
@@ -538,7 +538,7 @@ test("fluid model changes preserve pair authority while destroying every old run
       close() { closes.push("loader-hooks"); return cleanupRelease.promise; },
     } as any;
     handle.protectedBrowserRuntime = {
-      close() { closes.push("host-browser-tools"); return cleanupRelease.promise; },
+      detachAgentLease() { closes.push("host-browser-tools"); return cleanupRelease.promise; },
     } as any;
 
     try {
