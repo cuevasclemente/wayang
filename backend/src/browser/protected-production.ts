@@ -813,7 +813,9 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
           await guardedSend(attachment.cdp, currentAuthorization, "Input.insertText", { text });
           const document = await settledDocument(attachment.cdp, attachment.target, currentAuthorization, settleTimeoutMs, settleIntervalMs);
           if (!isProtectedBrowserAllowedTopLevelUrl(document.topLevelUrl)) {
-            await browser.revokeRealm();
+            // Owner paste is lease-tracked; latch now and let this dispatch
+            // unwind before revocation cleanup waits for tracked work.
+            void browser.revokeRealm().catch(() => undefined);
             throw new Error("Protected browser direct paste reached a forbidden top-level document");
           }
           activeUrl = document.topLevelUrl;
