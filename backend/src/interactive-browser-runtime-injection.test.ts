@@ -53,8 +53,10 @@ test("approved Standard interactive sessions receive exact explicit browser tool
   const projectRoot = path.join(root, "project");
   fs.mkdirSync(projectRoot, { recursive: true });
   const previousDataDir = process.env.WAYANG_DATA_DIR;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
   process.env.WAYANG_DATA_DIR = dataDir;
+  process.env.PI_CODING_AGENT_DIR = path.join(root, "agent");
   process.env.ANTHROPIC_API_KEY = "synthetic-test-key";
   close();
   init();
@@ -63,6 +65,8 @@ test("approved Standard interactive sessions receive exact explicit browser tool
     close();
     if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
     else process.env.WAYANG_DATA_DIR = previousDataDir;
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
     fs.rmSync(root, { recursive: true, force: true });

@@ -568,17 +568,16 @@ async function getModelRegistry(): Promise<ModelRegistry> {
   return (await getModelContext()).registry;
 }
 
-/**
- * Invalidate the cached model/auth snapshot after an external credential write.
- * Existing sessions retain their bound runtime; new sessions rebuild from disk.
- */
+/** Refresh model/auth snapshots after an external credential write. */
 export function reloadAuthStorage(): void {
-  _modelRuntime = null;
-  _modelRuntimePromise = null;
-  _modelRegistry = null;
-  _modelListingRuntime = null;
-  _modelListingRegistry = null;
-  _modelListingRegistryPromise = null;
+  // Keep the runtime object: extension providers are registered on it and must
+  // survive credential refresh. Refresh is deliberately backgrounded because
+  // the key-mode route historically treats this notification as synchronous;
+  // new requests still resolve auth through the runtime's file-backed store.
+  if (_modelRuntime) void _modelRuntime.refresh({ allowNetwork: false }).catch(() => undefined);
+  if (_modelListingRuntime && _modelListingRuntime !== _modelRuntime) {
+    void _modelListingRuntime.refresh({ allowNetwork: false }).catch(() => undefined);
+  }
 }
 
 function getAgentDirPath(): string {
@@ -967,7 +966,7 @@ async function ensureExtensionProvidersLoaded(cwd = process.cwd()): Promise<void
   if (_extensionProvidersLoaded) return;
   if (!_extensionProviderLoadPromise) {
     _extensionProviderLoadPromise = (async () => {
-      const registry = await getModelRegistry();
+      const { runtime, registry } = await getModelContext();
       const errors: string[] = [];
       try {
         const result = await discoverAndLoadExtensions([], cwd, getAgentDirPath());
@@ -984,6 +983,16 @@ async function ensureExtensionProvidersLoaded(cwd = process.cwd()): Promise<void
           }
         }
         result.runtime.pendingProviderRegistrations = [];
+        for (const { provider, extensionPath } of result.runtime.pendingNativeProviderRegistrations) {
+          try {
+            runtime.registerNativeProvider(provider);
+          } catch (error) {
+            errors.push(
+              `Extension "${extensionPath}" failed to register native provider "${provider.id}": ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+        result.runtime.pendingNativeProviderRegistrations = [];
       } catch (error) {
         errors.push(`Failed to load extension providers: ${error instanceof Error ? error.message : String(error)}`);
       } finally {
@@ -1032,6 +1041,16 @@ async function createReviewedModelListingRegistry(options: {
       }
     }
     result.runtime.pendingProviderRegistrations = [];
+    for (const { provider, extensionPath } of result.runtime.pendingNativeProviderRegistrations) {
+      try {
+        runtime.registerNativeProvider(provider);
+      } catch (error) {
+        errors.push(
+          `Reviewed provider extension "${extensionPath}" failed to register native provider "${provider.id}": ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    result.runtime.pendingNativeProviderRegistrations = [];
   } catch (error) {
     errors.push(`Reviewed provider extensions failed to load: ${error instanceof Error ? error.message : String(error)}`);
   }

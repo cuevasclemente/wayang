@@ -145,6 +145,11 @@ interface CommandGuardState {
 interface RuntimeErrorState {
   message: string;
   timestamp: number;
+  recovery: "context_overflow" | null;
+}
+
+function isContextOverflowError(message: string): boolean {
+  return /context(?:_|\s|-)*(?:length|window)|maximum context|input exceeds|prompt (?:is )?too long|too many tokens|context overflow/i.test(message);
 }
 
 type WsStatus = "connecting" | "connected" | "disconnected";
@@ -3094,7 +3099,11 @@ export function ChatPanel({
 
   const appendRuntimeError = useCallback((message: string) => {
     const trimmed = message.trim() || "Unknown error";
-    setRuntimeError({ message: trimmed, timestamp: Date.now() });
+    setRuntimeError({
+      message: trimmed,
+      timestamp: Date.now(),
+      recovery: isContextOverflowError(trimmed) ? "context_overflow" : null,
+    });
     setStreamingHistoryPrefixSynced({ content: [] });
     setMessages((prev) => {
       const last = prev[prev.length - 1];
@@ -4418,7 +4427,11 @@ export function ChatPanel({
     setPendingAttachments([]);
     setAttachmentError("");
     const sessionError = activeSessionErrorRef.current;
-    setRuntimeError(sessionError ? { message: sessionError, timestamp: Date.now() } : null);
+    setRuntimeError(sessionError ? {
+      message: sessionError,
+      timestamp: Date.now(),
+      recovery: isContextOverflowError(sessionError) ? "context_overflow" : null,
+    } : null);
     setResendingMessageId(null);
     // Preserve a running-state hint when opening an already-live session. The
     // backend will also synthesize agent_start on attach if the turn is still
@@ -4807,6 +4820,12 @@ export function ChatPanel({
     setQueuedMessagesSynced,
     clearRuntimeError,
   ]);
+
+  const handleCompactAfterOverflow = useCallback(() => {
+    if (wsStatus !== "connected" || !activeSessionId || hasActiveAssistantOutput() || isCompacting) return;
+    clearRuntimeError();
+    sendWs({ type: "message", content: "/compact Preserve current goals, completed work, constraints, and next steps." });
+  }, [activeSessionId, clearRuntimeError, hasActiveAssistantOutput, isCompacting, sendWs, wsStatus]);
 
   const handleCancelQueuedMessage = useCallback((messageId: string) => {
     const queuedMessage = queuedUserMessagesRef.current.find((message) => message.id === messageId);
@@ -5668,6 +5687,22 @@ export function ChatPanel({
                 Session error
               </div>
               <pre className="mt-1 whitespace-pre-wrap break-words font-sans text-sm leading-relaxed text-red-100">{runtimeError.message}</pre>
+              {runtimeError.recovery === "context_overflow" && (
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    data-testid="compact-after-overflow"
+                    onClick={handleCompactAfterOverflow}
+                    disabled={wsStatus !== "connected" || isStreaming || isCompacting}
+                    className="rounded border border-red-700 bg-red-900/40 px-3 py-1.5 text-xs font-semibold text-red-50 hover:bg-red-900/70 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Compact context
+                  </button>
+                  <span className="text-xs leading-relaxed text-red-200/80">
+                    Automatic recovery stopped. Compact, then resend deliberately to avoid repeating tool side effects.
+                  </span>
+                </div>
+              )}
             </div>
             <button
               type="button"
