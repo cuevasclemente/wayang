@@ -108,7 +108,10 @@ async function installSyntheticWebSocket(page: Page): Promise<void> {
           type: "history",
           session_id: this.sessionId,
           selection_id: this.selectionId,
-          messages: [{ type: "user", id: "synthetic-history", message: { role: "user", content: "Synthetic retained transcript marker" } }],
+          messages: [
+            { type: "user", id: "synthetic-history", message: { role: "user", content: "Synthetic retained transcript marker" } },
+            { type: "assistant", id: "synthetic-assistant", message: { role: "assistant", content: [{ type: "text", text: "Synthetic named agent response" }] } },
+          ],
         });
       }
     }
@@ -214,8 +217,11 @@ test("arbitrary profile labels switch by stable IDs and preserve the session dra
   await page.goto(`/sessions/${sessionId}`);
 
   const transcript = page.getByText("Synthetic retained transcript marker", { exact: true });
+  const assistantResponse = page.locator('[data-testid="chat-message"][data-role="assistant"]').last();
   const composer = page.getByTestId("chat-input");
   await expect(transcript).toBeVisible();
+  await expect(assistantResponse).toContainText("Synthetic named agent response");
+  await expect(assistantResponse.getByTestId("chat-agent-response-name")).toHaveText("Cobalt Finch");
   await composer.fill("Synthetic unsent composer draft");
 
   await page.getByRole("button", { name: "Cobalt Finch", exact: true }).click();
