@@ -150,7 +150,8 @@ export function capabilityPairRuntimeSessionIds(
   const project = getProject(projectId);
   if (!project) return [];
   return listSessions(true)
-    .filter((session) => session.cwd === project.cwd && session.agent_profile_id === profileId)
+    .filter((session) => session.project_id === project.id
+      && session.cwd === project.cwd && session.agent_profile_id === profileId)
     .map((session) => session.id);
 }
 

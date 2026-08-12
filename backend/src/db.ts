@@ -14,6 +14,13 @@ import { getConfig } from "./config.js";
 import type { AppEvent, AppManifest } from "./apps/types.js";
 import type { ScheduledJobRow, ScheduledRunRow } from "./scheduler/types.js";
 import type { FileFingerprint } from "./session-metadata.js";
+import type {
+  MessagingDeliveryRow,
+  MessagingEndpointRow,
+  MessagingEventRow,
+  MessagingTransactionRow,
+} from "./messaging/store-types.js";
+import { validateMessagingStoreRows } from "./messaging/store-validation.js";
 import { validateCronExpression } from "./scheduler/cron.js";
 import {
   MAX_PROTECTED_AUTOMATION_ARGV_BYTES,
@@ -57,6 +64,8 @@ export interface SessionRow {
   pi_session_file: string | null;
   title: string;
   cwd: string;
+  /** Immutable Project authority; null is reserved for unresolved legacy rows. */
+  project_id?: string | null;
   provider: string | null;
   model: string | null;
   /** Null means a legacy/imported session whose historical identity is unknown. */
@@ -193,13 +202,18 @@ export interface StoreData {
   scheduledRuns: ScheduledRunRow[];
   protectedAutomationJobs: ProtectedAutomationJobRow[];
   protectedAutomationRuns: ProtectedAutomationRunRow[];
+  messagingEndpoints: MessagingEndpointRow[];
+  messagingEvents: MessagingEventRow[];
+  messagingTransactions: MessagingTransactionRow[];
+  messagingDeliveries: MessagingDeliveryRow[];
   interviews: InterviewRecord[];
 }
 
 const ARRAY_KEYS = [
   "workspaceCapabilityAssociations", "workspaceCapabilityApprovalEvents", "sessions", "projects", "agentProfiles",
   "agentTeams", "teamMembers", "goals", "apps", "appStates", "appEvents", "scheduledJobs", "scheduledRuns",
-  "protectedAutomationJobs", "protectedAutomationRuns", "interviews",
+  "protectedAutomationJobs", "protectedAutomationRuns", "messagingEndpoints", "messagingEvents",
+  "messagingTransactions", "messagingDeliveries", "interviews",
 ] as const;
 
 const STORE_LOCK_FILENAME = "store.json.lock";
@@ -447,6 +461,26 @@ function projectName(cwd: string): string {
   return path.basename(cwd) || cwd;
 }
 
+/**
+ * Old schemas had only cwd attribution. Promote it to Project authority only
+ * when one exact canonical Project row already owns that exact cwd. Never
+ * guess across aliases or duplicate registrations.
+ */
+function backfillLegacySessionProjectIds(sessions: SessionRow[], projects: ProjectRow[]): void {
+  const projectsByCwd = new Map<string, ProjectRow[]>();
+  for (const project of projects) {
+    if (canonicalizeLegacyCwd(project.cwd) !== project.cwd) continue;
+    const matches = projectsByCwd.get(project.cwd) ?? [];
+    matches.push(project);
+    projectsByCwd.set(project.cwd, matches);
+  }
+  for (const session of sessions) {
+    const matches = projectsByCwd.get(session.cwd) ?? [];
+    session.project_id = matches.length === 1 ? matches[0]!.id : null;
+    if (session.project_id === null) session.legacy_capability_ineligible = true;
+  }
+}
+
 function legacySeededProfiles(now: number): AgentProfileRow[] {
   return [
     {
@@ -526,6 +560,10 @@ function emptyStore(now = Date.now()): StoreData {
     scheduledRuns: [],
     protectedAutomationJobs: [],
     protectedAutomationRuns: [],
+    messagingEndpoints: [],
+    messagingEvents: [],
+    messagingTransactions: [],
+    messagingDeliveries: [],
     interviews: [],
   };
 }
@@ -796,13 +834,15 @@ function validateCurrentStore(raw: Record<string, unknown>): StoreData {
   for (const [index, session] of (raw.sessions as unknown[]).entries()) {
     if (
       !session || typeof session !== "object" || typeof (session as SessionRow).id !== "string"
-      || typeof (session as SessionRow).cwd !== "string" || !("agent_profile_id" in session)
-      || !("pending_agent_switch" in session)
+      || typeof (session as SessionRow).cwd !== "string" || !("project_id" in session)
+      || !((session as SessionRow).project_id === null || validStableId((session as SessionRow).project_id))
+      || !("agent_profile_id" in session) || !("pending_agent_switch" in session)
       || "finance_private_data_taint" in session
       || typeof (session as SessionRow).legacy_private_session_quarantine !== "boolean"
       || typeof (session as SessionRow).legacy_capability_ineligible !== "boolean"
       || ((session as SessionRow).legacy_private_session_quarantine && !(session as SessionRow).legacy_capability_ineligible)
       || ((session as SessionRow).agent_profile_id === null && !(session as SessionRow).legacy_capability_ineligible)
+      || ((session as SessionRow).project_id === null && !(session as SessionRow).legacy_capability_ineligible)
     ) {
       throw new Error(`Wayang store contains a malformed session at index ${index}`);
     }
@@ -831,6 +871,7 @@ function validateCurrentStore(raw: Record<string, unknown>): StoreData {
   }
 
   const projectIds = new Set<string>();
+  const projectsById = new Map<string, ProjectRow>();
   const projectCwds = new Set<string>();
   for (const project of raw.projects as unknown[]) {
     const value = project as Partial<ProjectRow> | null;
@@ -851,7 +892,35 @@ function validateCurrentStore(raw: Record<string, unknown>): StoreData {
     if (projectIds.has(value.id) || projectCwds.has(value.cwd)) throw new Error("Wayang store contains duplicate project ids or cwds");
     if (!profileIds.has(value.default_agent_profile_id)) throw new Error("Wayang project references an unknown default agent profile");
     projectIds.add(value.id);
+    projectsById.set(value.id, value as ProjectRow);
     projectCwds.add(value.cwd);
+  }
+
+  for (const session of raw.sessions as SessionRow[]) {
+    if (session.project_id !== null) {
+      const project = projectsById.get(session.project_id!);
+      if (!project || session.cwd !== project.cwd || canonicalizeLegacyCwd(session.cwd) !== project.cwd) {
+        throw new Error("Wayang session Project attribution does not match its canonical cwd");
+      }
+    }
+    if (session.agent_profile_id !== null && (typeof session.agent_profile_id !== "string" || !profileIds.has(session.agent_profile_id))) {
+      throw new Error("Wayang session references an unknown agent profile");
+    }
+    const pending = session.pending_agent_switch;
+    if (pending !== null && (
+      !pending || typeof pending !== "object" || typeof pending.switch_id !== "string" || !pending.switch_id
+      || !(pending.from_agent_profile_id === null || (typeof pending.from_agent_profile_id === "string" && profileIds.has(pending.from_agent_profile_id)))
+      || !validDefaultPair(pending.from_provider, pending.from_model)
+      || typeof pending.to_agent_profile_id !== "string" || !profileIds.has(pending.to_agent_profile_id)
+      || !(raw.agentProfiles as AgentProfileRow[]).find((profile) => profile.id === pending.to_agent_profile_id)?.enabled
+      || pending.from_agent_profile_id !== (session.agent_profile_id ?? null)
+      || pending.from_provider !== session.provider || pending.from_model !== session.model
+      || typeof pending.target_provider !== "string" || !pending.target_provider
+      || typeof pending.target_model !== "string" || !pending.target_model
+      || typeof pending.changed_at !== "number" || !Number.isFinite(pending.changed_at)
+    )) {
+      throw new Error("Wayang session contains a malformed pending agent switch");
+    }
   }
 
   const associationKeys = new Set<string>();
@@ -918,26 +987,16 @@ function validateCurrentStore(raw: Record<string, unknown>): StoreData {
     }
   }
   validateProtectedAutomationRows(raw, projectIds, profileIds, associationsByKey);
-  for (const session of raw.sessions as SessionRow[]) {
-    if (session.agent_profile_id !== null && (typeof session.agent_profile_id !== "string" || !profileIds.has(session.agent_profile_id))) {
-      throw new Error("Wayang session references an unknown agent profile");
-    }
-    const pending = session.pending_agent_switch;
-    if (pending !== null && (
-      !pending || typeof pending !== "object" || typeof pending.switch_id !== "string" || !pending.switch_id
-      || !(pending.from_agent_profile_id === null || (typeof pending.from_agent_profile_id === "string" && profileIds.has(pending.from_agent_profile_id)))
-      || !validDefaultPair(pending.from_provider, pending.from_model)
-      || typeof pending.to_agent_profile_id !== "string" || !profileIds.has(pending.to_agent_profile_id)
-      || !(raw.agentProfiles as AgentProfileRow[]).find((profile) => profile.id === pending.to_agent_profile_id)?.enabled
-      || pending.from_agent_profile_id !== (session.agent_profile_id ?? null)
-      || pending.from_provider !== session.provider || pending.from_model !== session.model
-      || typeof pending.target_provider !== "string" || !pending.target_provider
-      || typeof pending.target_model !== "string" || !pending.target_model
-      || typeof pending.changed_at !== "number" || !Number.isFinite(pending.changed_at)
-    )) {
-      throw new Error("Wayang session contains a malformed pending agent switch");
-    }
-  }
+  validateMessagingStoreRows({
+    messagingEndpoints: raw.messagingEndpoints as unknown[],
+    messagingEvents: raw.messagingEvents as unknown[],
+    messagingTransactions: raw.messagingTransactions as unknown[],
+    messagingDeliveries: raw.messagingDeliveries as unknown[],
+  }, {
+    projects: raw.projects as ProjectRow[],
+    agentProfiles: raw.agentProfiles as AgentProfileRow[],
+    sessions: raw.sessions as SessionRow[],
+  });
   for (const [index, job] of (raw.scheduledJobs as unknown[]).entries()) {
     const value = job as StoredScheduledJobRow | null;
     if (!value || typeof value !== "object" || typeof value.legacy_capability_ineligible !== "boolean") {
@@ -964,7 +1023,9 @@ function normalizeLegacyStore(raw: Record<string, unknown>): StoreData {
   const legacyKeys = new Set<string>(ARRAY_KEYS.filter((key) =>
     key !== "workspaceCapabilityAssociations" && key !== "workspaceCapabilityApprovalEvents"
     && key !== "projects" && key !== "agentProfiles"
-    && key !== "protectedAutomationJobs" && key !== "protectedAutomationRuns"));
+    && key !== "protectedAutomationJobs" && key !== "protectedAutomationRuns"
+    && key !== "messagingEndpoints" && key !== "messagingEvents"
+    && key !== "messagingTransactions" && key !== "messagingDeliveries"));
   for (const key of Object.keys(raw)) {
     if (!legacyKeys.has(key)) throw new Error(`Legacy Wayang store contains unsupported field ${key}`);
   }
@@ -1059,6 +1120,7 @@ function normalizeLegacyStore(raw: Record<string, unknown>): StoreData {
       updated_at: now,
     });
   }
+  backfillLegacySessionProjectIds(data.sessions as SessionRow[], data.projects);
   return data;
 }
 
@@ -1130,16 +1192,23 @@ function normalizeSchemaOneStore(raw: Record<string, unknown>): StoreData {
     scheduledRuns: structuredClone(raw.scheduledRuns) as ScheduledRunRow[],
     protectedAutomationJobs: [],
     protectedAutomationRuns: [],
+    messagingEndpoints: [],
+    messagingEvents: [],
+    messagingTransactions: [],
+    messagingDeliveries: [],
     interviews: structuredClone(raw.interviews) as InterviewRecord[],
   };
   // Migration changes only schema-owned authority metadata. Existing display
   // names, descriptions, defaults, and ordinary runtime fields remain intact.
   for (const profile of data.agentProfiles) profile.updated_at = profile.updated_at ?? now;
+  backfillLegacySessionProjectIds(data.sessions as SessionRow[], data.projects);
   return validateCurrentStore(data as unknown as Record<string, unknown>);
 }
 
 function normalizeSchemaTwoStore(raw: Record<string, unknown>): StoreData {
-  const schemaTwoArrayKeys = ARRAY_KEYS.filter((key) => key !== "protectedAutomationJobs" && key !== "protectedAutomationRuns");
+  const schemaTwoArrayKeys = ARRAY_KEYS.filter((key) => key !== "protectedAutomationJobs" && key !== "protectedAutomationRuns"
+    && key !== "messagingEndpoints" && key !== "messagingEvents"
+    && key !== "messagingTransactions" && key !== "messagingDeliveries");
   const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaTwoArrayKeys]);
   for (const key of Object.keys(raw)) {
     if (!allowedKeys.has(key)) throw new Error(`Schema-2 Wayang store contains unsupported field ${key}`);
@@ -1160,7 +1229,36 @@ function normalizeSchemaTwoStore(raw: Record<string, unknown>): StoreData {
     schema_version: STORE_SCHEMA_VERSION,
     protectedAutomationJobs: [],
     protectedAutomationRuns: [],
+    messagingEndpoints: [],
+    messagingEvents: [],
+    messagingTransactions: [],
+    messagingDeliveries: [],
   } as unknown as StoreData;
+  backfillLegacySessionProjectIds(migrated.sessions as SessionRow[], migrated.projects);
+  return validateCurrentStore(migrated as unknown as Record<string, unknown>);
+}
+
+function normalizeSchemaThreeStore(raw: Record<string, unknown>): StoreData {
+  const messagingKeys = new Set(["messagingEndpoints", "messagingEvents", "messagingTransactions", "messagingDeliveries"]);
+  const schemaThreeArrayKeys = ARRAY_KEYS.filter((key) => !messagingKeys.has(key));
+  const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaThreeArrayKeys]);
+  for (const key of Object.keys(raw)) {
+    if (!allowedKeys.has(key)) throw new Error(`Schema-3 Wayang store contains unsupported field ${key}`);
+  }
+  for (const key of schemaThreeArrayKeys) {
+    if (!Array.isArray(raw[key])) throw new Error(`Schema-3 Wayang store field ${key} must be an array`);
+  }
+  // Schema 3 had no messaging domain. Migration creates no endpoint,
+  // conversation binding, event claim, transaction, delivery, or authority.
+  const migrated = {
+    ...structuredClone(raw),
+    schema_version: STORE_SCHEMA_VERSION,
+    messagingEndpoints: [],
+    messagingEvents: [],
+    messagingTransactions: [],
+    messagingDeliveries: [],
+  } as unknown as StoreData;
+  backfillLegacySessionProjectIds(migrated.sessions as SessionRow[], migrated.projects);
   return validateCurrentStore(migrated as unknown as Record<string, unknown>);
 }
 
@@ -1271,7 +1369,8 @@ function writeWorkspaceCapabilityStoreProjections(data: StoreData): void {
       continue;
     }
     const sessions = data.sessions.filter((session) =>
-      session.cwd === project.cwd
+      session.project_id === project.id
+      && session.cwd === project.cwd
       && session.agent_profile_id === profile.id
       && !session.legacy_private_session_quarantine
       && !session.legacy_capability_ineligible);
@@ -1411,7 +1510,8 @@ function loadStore(storePath: string): StoreData {
   // durable private backup. Any backup error aborts startup.
   createPrivateBackup(storePath, contents, version);
   let migrated: StoreData;
-  if (version === 2) migrated = normalizeSchemaTwoStore(raw);
+  if (version === 3) migrated = normalizeSchemaThreeStore(raw);
+  else if (version === 2) migrated = normalizeSchemaTwoStore(raw);
   else if (version === 1) migrated = normalizeSchemaOneStore(raw);
   else if (version === 0) migrated = normalizeLegacyStore(raw);
   else throw new Error(`Wayang store schema ${version} has no supported migration path`);

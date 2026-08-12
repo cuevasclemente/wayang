@@ -18,6 +18,25 @@ Companion tools are optional. The `make configure` wizard recommends the configu
 
 Deprecated compatibility aliases `PI_WEB_UI_HOST`, `PI_WEB_UI_PORT`, and `PI_WEB_UI_DATA_DIR` are still read when the corresponding `WAYANG_*` variable is absent. New installations should not use them.
 
+## Connector-neutral messaging and Matrix Application Service
+
+Messaging is disabled by default. Its first adapter uses the Matrix Application Service API, but no homeserver registration, virtual user, room, token, or route becomes active merely by building Wayang.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `WAYANG_MESSAGING_ENABLED` | `0` | `1` enables the reviewed connector bootstrap; any other value fails configuration. |
+| `WAYANG_MESSAGING_CONFIG_PATH` | empty | Absolute canonical path to the owner-private versioned messaging JSON. Required when enabled. |
+
+Disabled startup does not open or validate the path and performs no Matrix network, provisioning, worker, or session action. Enabled startup requires a no-symlink regular file owned by the current uid, exact mode `0600`, bounded bytes, strict JSON with no unknown fields, an exact Matrix homeserver origin/server name/Application Service namespace, an exact Wayang base URL for `/sessions/<id>` handoffs, opaque `hs_token`/`as_token` values, and reviewed immutable Project/Profile endpoint declarations. Homeserver and handoff origins must use HTTPS except for exact loopback HTTP. More than one endpoint for the same exact Project/Profile pair is rejected across connectors.
+
+Keep Matrix tokens only in that private file. Do not place them in `.env`, command arguments, URLs, logs, fixtures, screenshots, or chat. The inbound Application Service route accepts only the homeserver's exact bearer `hs_token`; browser sessions and the outbound `as_token` confer no inbound authority.
+
+Completed transaction/event/delivery graphs retain a seven-day deduplication horizon and are pruned atomically only after all related deliveries are terminal. High-water capacity is reported as connector attention.
+
+If messaging is explicitly enabled with malformed or unsafe configuration, Wayang fails before listening. Once configuration is valid, a temporarily unavailable homeserver does not take down the Wayang browser workbench: Matrix remains blocked/retrying with bounded attention state. E2EE is not implemented; encrypted events are never treated as prompts and the adapter never claims end-to-end confidentiality merely because room encryption state exists.
+
+Real Tuwunel registration, token provisioning, room/user creation, and service activation require the separate M4 deployment review. Do not point this development configuration at a live homeserver during tests.
+
 ## Built-in shared-password login
 
 Wayang's optional built-in login is one password for one trusted instance. It has no username, accounts, roles, per-project authorization, or tenant isolation.

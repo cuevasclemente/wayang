@@ -50,6 +50,7 @@ import {
   createPiSession,
   getPiSession,
   getPiSessionBashMode,
+  getRuntimeMutationSessionState,
   sendMessage,
   resendMessage,
   abortSession,
@@ -100,6 +101,10 @@ import {
   type ExternalActionRequest,
 } from "../action-approval-bridge.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
+import type {
+  ExternalActionTerminalMessage,
+  SessionRuntimeStateMessage,
+} from "@wayang/protocol";
 import { authorizeProjectAction } from "../policy.js";
 import type { AuthService } from "../auth/service.js";
 import { prepareAttachments } from "../attachments.js";
@@ -128,7 +133,7 @@ function wsProfile(sessionId: string | null | undefined, event: string, details 
 }
 
 /** @internal Exported for focused wire-contract tests. */
-export function serializeSessionRuntimeState(sessionId: string, selectionId: string | null) {
+export function serializeSessionRuntimeState(sessionId: string, selectionId: string | null): SessionRuntimeStateMessage {
   return {
     type: "session_runtime_state" as const,
     session_id: sessionId,
@@ -141,15 +146,16 @@ export function serializeSessionRuntimeState(sessionId: string, selectionId: str
 export function isExternalActionApprovalClientEligible(
   selectionId: string | null,
   quarantined: boolean,
+  mutationLocked = false,
 ): selectionId is string {
-  return !quarantined && typeof selectionId === "string" && selectionId.length > 0;
+  return !quarantined && !mutationLocked && typeof selectionId === "string" && selectionId.length > 0;
 }
 
 /** @internal Exported for focused terminal wire-contract tests. */
 export function serializeExternalActionTerminal(
   event: ApprovalTerminalEvent,
   selectionId: string,
-) {
+): ExternalActionTerminalMessage {
   return {
     type: "external_action_terminal" as const,
     requestId: event.requestId,
@@ -582,7 +588,11 @@ function handleConnection(
       // External actions bind only to an exact, non-empty selection
       // generation. Legacy/invalid sockets without one can still read chat but
       // are never counted as interactive approvers.
-      if (isExternalActionApprovalClientEligible(selectionId, quarantined)) {
+      if (isExternalActionApprovalClientEligible(
+        selectionId,
+        quarantined,
+        getRuntimeMutationSessionState(nextSessionId).mutation_locked,
+      )) {
         // Register listeners before advertising this browser as interactive,
         // then publish an authoritative snapshot so a request cannot fall into
         // an attach/reconnect race.
@@ -1377,6 +1387,10 @@ function handleInterviewResponse(
   submissionContext: InterviewSubmissionContext,
 ): void {
   const requestId = typeof msg?.requestId === "string" ? msg.requestId : "";
+  if (getRuntimeMutationSessionState(sessionId).mutation_locked) {
+    sendSafe(ws, { type: "interview_response_ack", requestId: requestId || null, sessionId, status: "rejected", errorCode: "session_busy", error: "Session is reserved for a headless turn" });
+    return;
+  }
   if (!requestId || !Array.isArray(msg?.answers)) {
     sendSafe(ws, { type: "interview_response_ack", requestId: requestId || null, sessionId, status: "rejected", errorCode: "invalid_answers", error: "requestId and answers are required" });
     return;
@@ -1424,6 +1438,10 @@ function handleInterviewResponse(
 
 function handleInterviewCancel(ws: WebSocket, sessionId: string, msg: any): void {
   const requestId = typeof msg?.requestId === "string" ? msg.requestId : "";
+  if (getRuntimeMutationSessionState(sessionId).mutation_locked) {
+    sendSafe(ws, { type: "interview_cancel_ack", requestId: requestId || null, sessionId, status: "rejected", errorCode: "session_busy" });
+    return;
+  }
   if (!requestId) {
     sendSafe(ws, { type: "interview_cancel_ack", requestId: null, sessionId, status: "rejected", errorCode: "not_found" });
     return;
@@ -1473,6 +1491,7 @@ export async function handleExternalActionResponse(
     && selectionId.length > 0
     && argumentsHash.length > 0
     && currentSelectionId !== null
+    && !getRuntimeMutationSessionState(sessionId).mutation_locked
     && sessionId === currentSessionId
     && selectionId === currentSelectionId
   ) {
@@ -1502,6 +1521,7 @@ export async function handleExternalActionResponse(
  */
 function handleSudoResponse(sessionId: string, msg: any): void {
   const { requestId } = msg;
+  if (getRuntimeMutationSessionState(sessionId).mutation_locked) return;
   if (!requestId || typeof requestId !== "string") return;
 
   const bridge = getSudoBridge();
@@ -1524,6 +1544,7 @@ function handleCommandGuardPinResponse(
   currentSelectionId: string | null,
   msg: any,
 ): void {
+  if (getRuntimeMutationSessionState(sessionId).mutation_locked) return;
   const requestId = typeof msg?.requestId === "string" ? msg.requestId : "";
   const responseSessionId = typeof msg?.sessionId === "string" ? msg.sessionId : "";
   const responseSelectionId = typeof msg?.selection_id === "string" ? msg.selection_id : "";

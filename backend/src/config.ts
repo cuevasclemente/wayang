@@ -42,6 +42,13 @@ export interface BrowserConfig {
   credentials: BrowserCredentialsConfig;
 }
 
+export interface MessagingConfig {
+  /** Optional connector subsystem. Disabled startup must not open configPath. */
+  enabled: boolean;
+  /** Owner-private exact Matrix/application-service configuration. */
+  configPath: string;
+}
+
 export interface FileAudioExperimentConfig {
   /** Inert unless the direct-audio/media/DSP/isolated-Sol composition is explicitly installed. */
   enabled: boolean;
@@ -74,6 +81,7 @@ export interface Config {
   tts: TtsConfig;
   auth: AuthConfig;
   browser: BrowserConfig;
+  messaging: MessagingConfig;
   fileAudioExperiment: FileAudioExperimentConfig;
 }
 
@@ -244,6 +252,10 @@ export function getConfig(overrides?: Partial<Config>): Config {
         maxCliOutputBytes: 4 * 1024 * 1024,
         cliTimeoutMs: 15_000,
       },
+    },
+    messaging: {
+      enabled: envFlag("WAYANG_MESSAGING_ENABLED"),
+      configPath: process.env.WAYANG_MESSAGING_CONFIG_PATH?.trim() || "",
     },
     fileAudioExperiment: {
       enabled: envFlag("WAYANG_FILE_AUDIO_EXPERIMENT_ENABLED"),

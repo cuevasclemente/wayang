@@ -120,6 +120,10 @@ function hasProtectedAutomationReferences(id: string): boolean {
     || store.protectedAutomationRuns.some((run) => run.agent_profile_id === id);
 }
 
+function hasMessagingReferences(id: string): boolean {
+  return getStore().messagingEndpoints.some((endpoint) => endpoint.agent_profile_id === id);
+}
+
 function isDefaultInUse(id: string): boolean {
   const store = getStore();
   return store.workspaceSettings.default_agent_profile_id === id
@@ -297,6 +301,9 @@ export function deleteAgentProfile(id: string, replacementAgentProfileId?: strin
   rejectPendingSwitchReference(id);
   if (hasProtectedAutomationReferences(id)) {
     throw new WorkspaceStoreError("Agent profile cannot be deleted while protected automation history references its exact stable ID", 409);
+  }
+  if (hasMessagingReferences(id)) {
+    throw new WorkspaceStoreError("Agent profile cannot be deleted while messaging endpoints reference its exact stable ID", 409);
   }
   const replacement = isInUse(id) ? requireEnabledReplacement(replacementAgentProfileId, id) : null;
   commitStoreMutation((draft) => {

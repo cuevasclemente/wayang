@@ -57,17 +57,20 @@ import {
 import {
   bootstrapProtectedBrowserProduction,
   type ProtectedBrowserOwnerPort,
-  type ProtectedBrowserProductionBootstrap,
 } from "./browser/protected-production.js";
 import {
   bootstrapProtectedAutomationProduction,
-  type ProtectedAutomationProductionBootstrap,
   type ProtectedAutomationProductionIntegration,
 } from "./protected-automation/production.js";
+import { bootstrapFileAudioExperimentProduction } from "./audio-experiment/production.js";
 import {
-  bootstrapFileAudioExperimentProduction,
-  type FileAudioExperimentProductionBootstrap,
-} from "./audio-experiment/production.js";
+  createProductionMatrixMessaging,
+  createUnavailableMatrixApplicationServiceRouter,
+  loadMatrixMessagingConfig,
+  type MatrixProductionBootstrap,
+} from "./messaging/connectors/matrix/index.js";
+import { getProject } from "./projects.js";
+import { authorizeProjectAction } from "./policy.js";
 
 const serverCredentialBrokers = new WeakMap<http.Server, CredentialBroker>();
 const serverProtectedAutomationWsClosers = new WeakMap<http.Server, () => void>();
@@ -78,12 +81,9 @@ const serverProductionCleanup = new WeakMap<http.Server, Promise<void>>();
 
 function bindProductionBootstraps(
   server: http.Server,
-  workspaceCapabilities: ProductionWorkspaceCapabilityBootstrap,
-  protectedBrowser: ProtectedBrowserProductionBootstrap,
-  protectedAutomation: ProtectedAutomationProductionBootstrap,
-  fileAudioExperiment: FileAudioExperimentProductionBootstrap,
+  ...bootstraps: readonly { close(): Promise<void> }[]
 ): void {
-  serverProductionBootstraps.set(server, [workspaceCapabilities, protectedBrowser, protectedAutomation, fileAudioExperiment]);
+  serverProductionBootstraps.set(server, bootstraps);
   server.once("close", () => { void closeProductionBootstraps(server); });
 }
 
@@ -120,6 +120,8 @@ export interface CreateAppOptions {
   workspaceCapabilities?: WorkspaceCapabilitiesRouterOptions;
   /** App-owned deterministic automation metadata/preparation/purge integration. Missing means these routes fail closed. */
   protectedAutomation?: ProtectedAutomationProductionIntegration;
+  /** Optional server-to-server Matrix AS integration. Missing installs an explicit unavailable Matrix router. */
+  matrixMessaging?: Pick<MatrixProductionBootstrap, "router">;
 }
 
 export function createApp(options: CreateAppOptions = {}) {
@@ -139,6 +141,11 @@ export function createApp(options: CreateAppOptions = {}) {
   });
 
   app.use("/api/auth", createAuthRouter(auth));
+
+  // Matrix homeserver callbacks have a separate hs_token boundary and neither
+  // browser cookies nor browser Origin authority. The connector router owns a
+  // bounded parser after token verification and must precede generic parsers.
+  app.use(options.matrixMessaging?.router ?? createUnavailableMatrixApplicationServiceRouter());
 
   // Settings capability approval owns exact authenticated web-session+Origin
   // resolution and a bounded parser. Mount it before broad auth/JSON so a PIN
@@ -307,6 +314,31 @@ export function start() {
   // impossible until a valid enabled same-turn experiment execute reaches it.
   const fileAudioExperiment = bootstrapFileAudioExperimentProduction(config.fileAudioExperiment);
 
+  // Disabled messaging is inert and does not open the configured path. Enabled
+  // configuration is a pre-listen security boundary: unsafe files, malformed
+  // declarations, or unavailable exact Project/Profile authority abort startup.
+  const matrixConfig = loadMatrixMessagingConfig({
+    WAYANG_MESSAGING_ENABLED: config.messaging.enabled ? "1" : "0",
+    WAYANG_MESSAGING_CONFIG_PATH: config.messaging.configPath,
+  }, {
+    authorizeDeclarations(declarations) {
+      for (const declaration of declarations) {
+        const project = getProject(declaration.projectId);
+        if (!project) throw new Error("Matrix messaging endpoint Project was not found");
+        const decision = authorizeProjectAction({
+          cwd: project.cwd,
+          actor: "interactive",
+          agentProfileId: declaration.agentProfileId,
+        });
+        if (!decision.allowed || decision.project?.id !== declaration.projectId
+          || decision.agentProfile?.id !== declaration.agentProfileId) {
+          throw new Error("Matrix messaging endpoint Project/Profile authority is unavailable");
+        }
+      }
+    },
+  });
+  const matrixMessaging = createProductionMatrixMessaging(matrixConfig);
+
   if (!config.auth.enabled && !isLoopbackHost(config.host)) {
     console.warn("[wayang] WARNING: built-in authentication is disabled on a non-loopback bind; protect every HTTP and WebSocket path with a trusted network or authenticated reverse proxy.");
   }
@@ -318,9 +350,23 @@ export function start() {
     protectedBrowser: protectedBrowser.integration,
     protectedAutomation: protectedAutomation.integration,
     credentialBroker,
+    matrixMessaging,
   });
-  bindProductionBootstraps(server, workspaceCapabilities, protectedBrowser, protectedAutomation, fileAudioExperiment);
+  bindProductionBootstraps(
+    server,
+    workspaceCapabilities,
+    protectedBrowser,
+    protectedAutomation,
+    fileAudioExperiment,
+    matrixMessaging,
+  );
   protectedAutomation.start();
+  // Valid configuration plus homeserver/provisioning outage must not take down
+  // the Wayang browser workbench. The Matrix route remains 503/not-ready and
+  // the bootstrap retains bounded retry/attention state.
+  void matrixMessaging.start().catch(() => {
+    console.error("[messaging] Matrix startup recovery or provisioning is unavailable");
+  });
 
   // Durable submissions survive a backend restart. Delivery failures stay in
   // the store and are retried again when their session's WebSocket attaches.

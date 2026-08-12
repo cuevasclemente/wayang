@@ -70,6 +70,8 @@ export interface ApprovalRequestOptions {
 export interface ActionApprovalBridge {
   attachClient(sessionId: string, clientId: string): () => void;
   hasClient(sessionId: string): boolean;
+  /** Atomically exclude browser clients and all pending approvals for a headless turn. */
+  acquireHeadlessLease(sessionId: string): (() => void) | null;
   requestApproval(
     sessionId: string,
     input: ExternalActionRequestInput,
@@ -280,6 +282,7 @@ function cloneTerminalEvent(event: ApprovalTerminalEvent): ApprovalTerminalEvent
 export class PiActionApprovalBridge implements ActionApprovalBridge {
   private readonly clients = new Map<string, Map<string, number>>();
   private readonly pending = new Map<string, PendingApproval>();
+  private readonly headlessLeases = new Set<string>();
   private readonly requestListeners = new Set<RequestCallback>();
   private readonly terminalListeners = new Set<TerminalCallback>();
   private pinAttempts: SettingsPinAttemptPort | undefined;
@@ -298,6 +301,7 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
   }
 
   attachClient(sessionId: string, clientId: string): () => void {
+    if (this.headlessLeases.has(sessionId)) return () => {};
     let sessionClients = this.clients.get(sessionId);
     if (!sessionClients) {
       sessionClients = new Map<string, number>();
@@ -324,11 +328,28 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
     return (this.clients.get(sessionId)?.size ?? 0) > 0;
   }
 
+  acquireHeadlessLease(sessionId: string): (() => void) | null {
+    if (this.headlessLeases.has(sessionId) || this.hasClient(sessionId)
+      || [...this.pending.values()].some((pending) => pending.request.sessionId === sessionId)) {
+      return null;
+    }
+    this.headlessLeases.add(sessionId);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.headlessLeases.delete(sessionId);
+    };
+  }
+
   requestApproval(
     sessionId: string,
     input: ExternalActionRequestInput,
     options: ApprovalRequestOptions = {},
   ): Promise<ApprovalDecision> {
+    if (this.headlessLeases.has(sessionId)) {
+      return Promise.resolve(deniedAdmissionDecision(sessionId, (input as any)?.argumentsHash));
+    }
     const runtimeInput: unknown = input;
     const runtimeOptions: unknown = options;
     const inputRecord = isRecord(runtimeInput) ? runtimeInput : null;
@@ -470,6 +491,9 @@ export class PiActionApprovalBridge implements ActionApprovalBridge {
     approved: unknown,
     pin?: unknown,
   ): Promise<ApprovalResponse> {
+    if (this.headlessLeases.has(sessionId)) {
+      return { status: "rejected", errorCode: "request_identity_mismatch" };
+    }
     const pending = this.pending.get(requestId);
     if (!pending) {
       return { status: "stale", errorCode: "request_not_pending" };

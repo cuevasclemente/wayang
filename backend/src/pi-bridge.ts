@@ -3350,6 +3350,7 @@ export async function deliverInterviewSubmission(
   sessionId: string,
   record: InterviewRecord,
 ): Promise<InterviewSubmissionDelivery> {
+  assertRuntimeMutationUnlocked(sessionId);
   if (record.session_id !== sessionId) throw new Error("Interview delivery session mismatch");
   const sessionRow = getSessionById(sessionId);
   if (!sessionRow) throw new Error("Interview session no longer exists");
@@ -3365,6 +3366,7 @@ export async function deliverInterviewSubmission(
 
   const existing = findInterviewSubmissionEntry(handle, record);
   if (existing) return { entryId: existing, alreadyPresent: true };
+  assertRuntimeMutationUnlocked(sessionId);
 
   // Delayed interview delivery is not a fresh browser sendMessage turn and
   // cannot carry interactive-turn mutation provenance.
@@ -3667,6 +3669,136 @@ export async function waitForScheduledPrompt(
     throw timeoutError;
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+export interface MessagingPromptOrigin {
+  connectorId: string;
+  connectorEventId: string;
+  endpointId: string;
+  canonicalEventSha256: string;
+}
+
+function validMessagingPromptOrigin(origin: MessagingPromptOrigin): boolean {
+  const ids = [origin.connectorId, origin.connectorEventId, origin.endpointId];
+  return ids.every((value) => typeof value === "string" && value.length > 0
+    && value.length <= 512 && value === value.normalize("NFC")
+    && !/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(value))
+    && /^[a-f0-9]{64}$/u.test(origin.canonicalEventSha256);
+}
+
+function messagingOriginEntry(handle: PiSessionHandle, origin: MessagingPromptOrigin): any | undefined {
+  return handle.session.sessionManager.getEntries().find((entry: any) => (
+    entry?.type === "custom_message"
+    && entry.customType === "wayang-messaging-input"
+    && entry.details?.connector_id === origin.connectorId
+    && entry.details?.connector_event_id === origin.connectorEventId
+    && entry.details?.endpoint_id === origin.endpointId
+    && entry.details?.canonical_event_sha256 === origin.canonicalEventSha256
+  ));
+}
+
+export function hasMessagingPromptOrigin(id: string, origin: MessagingPromptOrigin): boolean {
+  if (!validMessagingPromptOrigin(origin)) return false;
+  const handle = sessions.get(id);
+  return Boolean(handle && messagingOriginEntry(handle, origin));
+}
+
+/**
+ * Run one connector-originated prompt without browser provenance, steering, or
+ * approval-client presence. The custom message is the durable prompt and exact
+ * origin marker, so a recovered event can fail closed instead of replaying it.
+ */
+export async function runMessagingPromptAndWait(
+  id: string,
+  content: string,
+  origin: MessagingPromptOrigin,
+  options: { timeoutMs?: number } = {},
+): Promise<RunPromptResult> {
+  assertRuntimeMutationUnlocked(id);
+  if (!validMessagingPromptOrigin(origin)) throw new WorkspaceStoreError("Messaging prompt origin is invalid");
+  if (typeof content !== "string" || !content.trim() || Buffer.byteLength(content, "utf8") > 64 * 1024) {
+    throw new WorkspaceStoreError("Messaging prompt content is invalid");
+  }
+  const handle = sessions.get(id);
+  if (!handle) throw new Error(`Session ${id} not found`);
+  assertCapabilityAuthorityAvailable(handle);
+  if (handle.session.isStreaming || handle.session.pendingMessageCount > 0) {
+    throw new WorkspaceStoreError("Wayang session is busy", 409);
+  }
+  const actionBridge = getActionApprovalBridge();
+  if (actionBridge.hasClient(id)) {
+    throw new WorkspaceStoreError("Wayang session has an interactive approval client; continue in Wayang or close it first", 409);
+  }
+  if (!lockRuntimeMutationSession(id)) throw new WorkspaceStoreError("Wayang session is already reserved", 409);
+  let releaseHeadlessLease: (() => void) | null = null;
+  let priorToolNames: string[] | null = null;
+
+  try {
+    releaseHeadlessLease = actionBridge.acquireHeadlessLease(id);
+    const current = sessions.get(id);
+    if (!releaseHeadlessLease || current !== handle || handle.session.isStreaming
+      || handle.session.pendingMessageCount > 0) {
+      throw new WorkspaceStoreError("Wayang session changed or has pending approval authority before messaging dispatch", 409);
+    }
+    if (messagingOriginEntry(handle, origin)) {
+      throw new WorkspaceStoreError("Messaging event origin is already present in the Wayang session", 409);
+    }
+    const timeoutMs = options.timeoutMs;
+    if (timeoutMs !== undefined
+      && (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 60 * 60 * 1000)) {
+      throw new WorkspaceStoreError("Messaging prompt timeout is invalid");
+    }
+    priorToolNames = handle.session.getActiveToolNames();
+    handle.session.setActiveToolsByName([]);
+    const firstNewMessageIndex = handle.session.messages.length;
+    markSessionActivity(id);
+    beginNonBrowserTurn(handle, "messaging_prompt");
+    const completion = (async () => {
+      await handle.session.sendCustomMessage({
+        customType: "wayang-messaging-input",
+        content,
+        display: true,
+        details: {
+          connector_id: origin.connectorId,
+          connector_event_id: origin.connectorEventId,
+          endpoint_id: origin.endpointId,
+          canonical_event_sha256: origin.canonicalEventSha256,
+        },
+      }, { triggerTurn: true });
+      await handle.session.waitForIdle();
+    })();
+
+    if (timeoutMs !== undefined) {
+      let timer: NodeJS.Timeout | null = null;
+      const timeoutError = new Error(`Messaging prompt timed out after ${timeoutMs}ms`);
+      try {
+        await Promise.race([
+          completion,
+          new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(timeoutError), timeoutMs); }),
+        ]);
+      } catch (error) {
+        if (error !== timeoutError) throw error;
+        try { await handle.session.abort(); } catch { /* timeout classification remains authoritative */ }
+        try { await completion; } catch { /* abort may reject the in-flight custom turn */ }
+        throw timeoutError;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    } else {
+      await completion;
+    }
+
+    const outcome = classifyScheduledPromptResult(handle.session.messages.slice(firstNewMessageIndex));
+    if (outcome.error) throw new Error(outcome.error);
+    return { resultSummary: outcome.resultSummary, messages: getMessageHistory(id) };
+  } finally {
+    try {
+      if (priorToolNames) handle.session.setActiveToolsByName(priorToolNames);
+    } finally {
+      releaseHeadlessLease?.();
+      unlockRuntimeMutationSession(id);
+    }
   }
 }
 

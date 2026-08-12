@@ -290,14 +290,14 @@ test("pair runtime query resolves cwd from immutable Project ID", () => {
   const input = pair();
   const store = getStore();
   store.sessions.push({
-    id: "matching", pi_session_file: null, title: "Matching", cwd: projectRoot, provider: "p", model: "m",
+    id: "matching", pi_session_file: null, title: "Matching", cwd: projectRoot, project_id: input.project_id, provider: "p", model: "m",
     agent_profile_id: input.agent_profile_id, pending_agent_switch: null,
     legacy_private_session_quarantine: false, legacy_capability_ineligible: false,
     created_at: 1, last_active: 1, archived: 0, archived_at: null, goal: null, goal_status: null,
     scheduled_job_id: null, scheduled_run_id: null, error: null,
   });
   store.sessions.push({
-    id: "wrong-profile", pi_session_file: null, title: "Wrong", cwd: projectRoot, provider: "p", model: "m",
+    id: "wrong-profile", pi_session_file: null, title: "Wrong", cwd: projectRoot, project_id: input.project_id, provider: "p", model: "m",
     agent_profile_id: getStore().workspaceSettings.default_agent_profile_id, pending_agent_switch: null,
     legacy_private_session_quarantine: false, legacy_capability_ineligible: false,
     created_at: 1, last_active: 1, archived: 0, archived_at: null, goal: null, goal_status: null,
@@ -342,6 +342,10 @@ test("schema-1 migration creates zero positive authority and removes subject aut
   delete initial.workspaceCapabilityApprovalEvents;
   delete initial.protectedAutomationJobs;
   delete initial.protectedAutomationRuns;
+  delete initial.messagingEndpoints;
+  delete initial.messagingEvents;
+  delete initial.messagingTransactions;
+  delete initial.messagingDeliveries;
   initial.schema_version = 1;
   initial.agentProfiles = (initial.agentProfiles as Array<Record<string, unknown>>).map((profile) => ({
     ...profile, name: "Finance", capability_grants: [{ provider: "legacy", model: "legacy", active: true }], authorization_revision: 99,
@@ -360,11 +364,13 @@ test("schema-1 migration creates zero positive authority and removes subject aut
 
   init();
   const migrated = getStore();
-  assert.equal(migrated.schema_version, 3);
+  assert.equal(migrated.schema_version, 4);
   assert.deepEqual(migrated.workspaceCapabilityAssociations, []);
   assert.deepEqual(migrated.workspaceCapabilityApprovalEvents, []);
   assert.deepEqual(migrated.protectedAutomationJobs, []);
   assert.deepEqual(migrated.protectedAutomationRuns, []);
+  assert.deepEqual(migrated.messagingEndpoints, []);
+  assert.deepEqual(migrated.messagingEvents, []);
   assert.ok(migrated.agentProfiles.every((profile) => !("capability_grants" in profile) && !("authorization_revision" in profile)));
   assert.ok(migrated.projects.every((project) => !("capability_grants" in project) && !("authorization_revision" in project)));
   assert.equal(migrated.sessions[0]!.legacy_private_session_quarantine, true);

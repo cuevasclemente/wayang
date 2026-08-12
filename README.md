@@ -31,6 +31,7 @@ Read [SECURITY.md](SECURITY.md) before changing the bind address or exposing Way
 - optional shared-password login using an HttpOnly session cookie
 - optional foreground Caddy local-HTTPS path for authenticated non-localhost administration
 - responsive desktop and mobile web UI
+- Android companion app (`mobile/`, React Native): native session list, streaming chat, approvals/interviews/sudo surfaces, offline transcript cache, and a WebView fallback for the full web UI — see `docs/mobile-app.md` and `mobile/README.md`
 
 Some agent-side conveniences, such as tools that create or focus apps, require optional pi extensions. Core chat and the web UI do not require a global pi installation; the checkout includes pi through the backend dependency.
 

@@ -19,7 +19,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:e2e": "tsx src/index.ts",
-    "build": "tsc",
+    "build": "tsc -b",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "benchmark:session-catalog": "tsx src/scripts/benchmark-session-catalog.ts",
     "start": "node dist/index.js"

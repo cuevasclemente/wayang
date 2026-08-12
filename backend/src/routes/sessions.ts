@@ -4,6 +4,7 @@ import { classifyAssistantErrorKind, getPiSession, getPiSessionBashMode, getPiSe
 import { validateCommandGuardIdentityPin } from "../command-guard-pin.js";
 import { removeSession as removeSearchSession } from "../search/indexer.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
+import type { Session as ProtocolSession } from "@wayang/protocol";
 
 export const router = Router();
 

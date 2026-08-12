@@ -68,6 +68,7 @@ function seedSession(opts: {
     pi_session_file: file,
     title: opts.title,
     cwd: project.cwd,
+    project_id: project.id,
     provider: "openrouter",
     model: "test-model",
     agent_profile_id: project.default_agent_profile_id,

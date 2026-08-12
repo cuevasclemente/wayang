@@ -50,6 +50,7 @@ export interface ProjectRegistrationReferences {
   scheduled_runs: string[];
   protected_automation_jobs: string[];
   protected_automation_runs: string[];
+  messaging_endpoints: string[];
   apps: string[];
   app_states: string[];
   app_events: string[];
@@ -263,7 +264,8 @@ export function getProjectRegistrationReferences(id: string): ProjectRegistratio
   const store = getStore();
   const project = store.projects.find((candidate) => candidate.id === id);
   if (!project) throw new WorkspaceStoreError("Project not found", 404);
-  const sessionIds = new Set(store.sessions.filter((session) => session.cwd === project.cwd).map((session) => session.id));
+  const sessionIds = new Set(store.sessions.filter((session) => session.project_id === project.id
+    || (session.project_id === null && session.cwd === project.cwd)).map((session) => session.id));
   const allSessionIds = new Set(store.sessions.map((session) => session.id));
   const jobIds = new Set(store.scheduledJobs.filter((job) => job.cwd === project.cwd).map((job) => job.id));
   const allJobIds = new Set(store.scheduledJobs.map((job) => job.id));
@@ -281,6 +283,8 @@ export function getProjectRegistrationReferences(id: string): ProjectRegistratio
       .filter((job) => job.project_id === project.id).map((job) => job.id).sort(),
     protected_automation_runs: store.protectedAutomationRuns
       .filter((run) => run.project_id === project.id).map((run) => run.id).sort(),
+    messaging_endpoints: store.messagingEndpoints
+      .filter((endpoint) => endpoint.project_id === project.id).map((endpoint) => endpoint.endpoint_id).sort(),
     apps: store.apps.filter((app) => app.project_cwd === project.cwd).map((app) => app.id).sort(),
     app_states: store.appStates.filter((state) => state.project_cwd === project.cwd).map((state) => state.app_id).sort(),
     app_events: store.appEvents.filter((event) => event.projectCwd === project.cwd).map((event) => event.id).sort(),
