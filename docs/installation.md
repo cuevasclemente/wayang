@@ -19,6 +19,7 @@ Optional:
 - Chromium or Google Chrome for the embedded browser workbench
 - Playwright's Chromium build for E2E tests (`make install-e2e-browser`)
 - Xvfb and x11vnc on Linux for the VNC browser transport; CDP mode is the portable fallback
+- Caddy for the optional foreground local-HTTPS remote-administration path; Wayang never installs it
 
 ## Automated interactive bootstrap
 
@@ -107,6 +108,8 @@ make dev
 Open <http://127.0.0.1:5173>. Ctrl-C stops both child processes.
 
 No systemd or launchd unit is shipped. If you later add process supervision, keep `.env` private, preserve the working directory, run as an unprivileged user, and apply the full network/authentication requirements in [SECURITY.md](../SECURITY.md).
+
+For authenticated Settings/capability administration from another private-LAN device, follow [Local HTTPS remote administration](local-https.md). After human configuration and Caddy installation, `make local-https-check` validates the non-secret deployment shape and generated proxy configuration; `make local-https` runs Caddy in a separate foreground process. It does not weaken remote owner checks or treat the command-guard PIN as a network password.
 
 ## Validate the checkout
 

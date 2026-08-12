@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help doctor bootstrap install configure setup-capability-approval pi-login browser-credentials-unlock build start dev test test-scripts test-e2e install-e2e-browser check smoke
+.PHONY: help doctor bootstrap install configure local-https-check local-https setup-capability-approval pi-login browser-credentials-unlock build start dev test test-scripts test-e2e install-e2e-browser check smoke
 
 help: ## Show this help (the safe, non-mutating default)
 	@printf '%s\n' 'Wayang v0.1 source-checkout commands:'
@@ -22,6 +22,12 @@ install: ## Deterministically install backend, frontend, and E2E dependencies
 
 configure: ## Run the interactive, secret-safe configuration wizard
 	@node scripts/configure.mjs
+
+local-https-check: ## Validate the optional foreground Caddy HTTPS proxy configuration
+	@node scripts/local-https.mjs --check
+
+local-https: ## Run the optional Caddy HTTPS reverse proxy in the foreground
+	@node scripts/local-https.mjs
 
 setup-capability-approval: ## Optional manual preflight; service startup initializes missing cooldown state automatically
 	@node scripts/run-with-env.mjs -- node scripts/setup-capability-approval.mjs
