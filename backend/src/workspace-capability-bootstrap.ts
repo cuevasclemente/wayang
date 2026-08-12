@@ -67,7 +67,7 @@ export function createProductionWorkspaceCapabilityBootstrap(
   const pinAttemptStatePath = path.join(dataDir, "workspace-capability-approval", "pin-attempt-state.json");
   const provisioned = provisionPinAttemptStateForService(pinAttemptStatePath);
   if (provisioned.status === "unavailable") {
-    console.warn(`[workspace-capabilities] PIN approval remains unavailable (${provisioned.reason})`);
+    console.warn(`[workspace-capabilities] PIN approval remains unavailable (${provisioned.reason}); run make doctor and optionally make setup-capability-approval`);
   }
   const denial = new ProductionCapabilityRuntimeDenial();
   const { integration, service, pinAttempts } = createWorkspaceCapabilityApprovalIntegration({

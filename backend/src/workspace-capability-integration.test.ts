@@ -11,6 +11,8 @@ import type { CapabilityApprovalBinding } from "./workspace-capability-approval/
 import {
   HardenedSettingsPinAttemptAdapter,
   WorkspaceCapabilityIntegration,
+  provisionPinAttemptStateForService,
+  syncDirectoryBestEffort,
   type WorkspaceCapabilityRuntimeDenialPort,
 } from "./workspace-capability-integration.js";
 
@@ -156,6 +158,20 @@ test("missing or unsafe PIN/cooldown authority fails closed without creating def
   });
   assert.deepEqual(result, { status: "unavailable" });
   assert.equal(fs.existsSync(statePath), false);
+});
+
+test("unsupported directory fsync is best-effort", () => {
+  const directory = path.join(root, "portable-directory-sync");
+  fs.mkdirSync(directory, { mode: 0o700 });
+  let called = false;
+  assert.doesNotThrow(() => syncDirectoryBestEffort(directory, (descriptor) => {
+    called = true;
+    assert.equal(fs.fstatSync(descriptor).isDirectory(), true);
+    const error = new Error("directory fsync is unsupported") as NodeJS.ErrnoException;
+    error.code = "EINVAL";
+    throw error;
+  }));
+  assert.equal(called, true);
 });
 
 test("failed startup initialization latches an otherwise valid state unavailable for the process", async () => {

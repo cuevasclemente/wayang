@@ -365,6 +365,18 @@ function readPinAttemptState(filePath: string): DurablePinAttemptState | null {
   finally { if (fd !== null) try { fs.closeSync(fd); } catch { /* best effort */ } }
 }
 
+export function syncDirectoryBestEffort(directoryPath: string, syncDescriptor = fs.fsyncSync): void {
+  let descriptor: number | null = null;
+  try {
+    const noFollow = fs.constants.O_NOFOLLOW;
+    if (typeof noFollow !== "number") return;
+    descriptor = fs.openSync(directoryPath,
+      fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | noFollow);
+    try { syncDescriptor(descriptor); } catch { /* unsupported directory sync is best effort */ }
+  } catch { /* opening a directory for sync is not portable */ }
+  finally { if (descriptor !== null) try { fs.closeSync(descriptor); } catch { /* best effort */ } }
+}
+
 function writePinAttemptState(filePath: string, state: DurablePinAttemptState): boolean {
   const parent = path.dirname(filePath);
   if (!ownerOnlyPrivateDirectory(parent) || !ownerOnlyRegularFile(filePath)) return false;
@@ -379,10 +391,8 @@ function writePinAttemptState(filePath: string, state: DurablePinAttemptState): 
       fs.fsyncSync(fd);
     } finally { fs.closeSync(fd); }
     fs.renameSync(temp, filePath);
-    const directoryDescriptor = fs.openSync(parent,
-      fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | noFollow);
-    try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
-    return true;
+    syncDirectoryBestEffort(parent);
+    return readPinAttemptState(filePath) !== null;
   } catch {
     try { fs.unlinkSync(temp); } catch { /* best effort */ }
     return false;
@@ -425,13 +435,7 @@ export function provisionPinAttemptStateForService(filePath: string): PinAttempt
   }
   const noFollow = fs.constants.O_NOFOLLOW;
   if (typeof noFollow !== "number") return { status: "unavailable", reason: "state_create" };
-  if (parentCreated) {
-    try {
-      const rootDescriptor = fs.openSync(dataRoot,
-        fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | noFollow);
-      try { fs.fsyncSync(rootDescriptor); } finally { fs.closeSync(rootDescriptor); }
-    } catch { return { status: "unavailable", reason: "state_parent" }; }
-  }
+  if (parentCreated) syncDirectoryBestEffort(dataRoot);
   const parentBefore = ownerOnlyPrivateDirectory(parent);
   if (!parentBefore) return { status: "unavailable", reason: "state_parent" };
 
@@ -463,9 +467,7 @@ export function provisionPinAttemptStateForService(filePath: string): PinAttempt
     // Drop the temporary hard link before validating the canonical file's
     // required single-link invariant.
     fs.unlinkSync(temp);
-    const directoryDescriptor = fs.openSync(parent,
-      fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | noFollow);
-    try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
+    syncDirectoryBestEffort(parent);
     const parentAfter = ownerOnlyPrivateDirectory(parent);
     if (!parentAfter || parentAfter.dev !== parentBefore.dev || parentAfter.ino !== parentBefore.ino) {
       return { status: "unavailable", reason: "state_parent" };
