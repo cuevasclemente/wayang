@@ -435,7 +435,9 @@ async function openCdpViewer(options: {
   const attestAfterInput = async () => {
     const document = await settledDocument(cdp, target, options.authorize, options.settleTimeoutMs, options.settleIntervalMs);
     if (!isProtectedBrowserAllowedTopLevelUrl(document.topLevelUrl)) {
-      await options.revoke();
+      // This runs inside lease-tracked viewer work. Latch denial now, but do
+      // not await cleanup that includes this same dispatch.
+      void options.revoke().catch(() => undefined);
       throw new Error("Protected browser viewer reached a forbidden top-level document");
     }
     emit(options.redact({ type: "page", url: document.topLevelUrl, title: document.title }));
@@ -654,8 +656,10 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
         return publicState();
       },
       async stop() {
-        await resetCredentialRealm();
+        // Keep taint/redaction live until Chromium and in-flight CDP work are
+        // drained; clearing it first would briefly expose the last document.
         await managed.stop();
+        await resetCredentialRealm();
         synchronizeState();
         return publicState();
       },
@@ -921,20 +925,23 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
         throw new Error("Protected browser replacement does not match the persistent pair realm");
       }
       const priorBrowser = browser;
+      // revoke() latches synchronously. No download await may leave the old
+      // source lease authorized after replacement has begun.
+      const priorRevocation = priorBrowser.revoke();
       const pendingDownloads = downloadPublisher.pendingGuids();
       await Promise.allSettled(pendingDownloads.map((guid) => managed.cancelDownload(guid, currentAuthorization)));
       downloadPublisher.cancelPending();
-      const cleanup = await Promise.allSettled([priorBrowser.revoke()]);
+      const cleanup = await Promise.allSettled([priorRevocation]);
       if (cleanup.some((result) => result.status === "rejected")) {
         void priorBrowser.revokeRealm();
         throw new Error("Protected browser lease cleanup failed before replacement publication");
       }
 
+      if (closed || !pairAuthorized(requested)) {
+        throw new Error("Protected browser pair authority changed during replacement");
+      }
       latestDownload = undefined;
-      const nextBinding: ProtectedBrowserBinding = {
-        ...requested,
-        controlGeneration: priorBrowser.currentBinding.controlGeneration,
-      };
+      const nextBinding: ProtectedBrowserBinding = { ...requested };
       activeBinding = nextBinding;
       const nextAuthority = createAuthorityPort(nextBinding, authorityResolver);
       const nextBrowser = new CapabilityBoundProtectedBrowser({
