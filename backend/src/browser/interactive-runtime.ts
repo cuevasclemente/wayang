@@ -1,19 +1,45 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ProtectedBrowserBinding } from "./types.js";
+
+export type InteractiveBrowserAllowDecision =
+  | { allowed: true }
+  | { allowed: false; reason: string };
+
+export type AgentLeaseDetachReason =
+  | "pi_idle"
+  | "runtime_replaced"
+  | "model_or_agent_switch";
+
+export type SessionWorkspaceCloseReason =
+  | "archive"
+  | "session_delete"
+  | "owner_close_all";
+
+export type BrowserAuthorityRevokeReason =
+  | "capability_revoked"
+  | "project_or_profile_denied"
+  | "service_shutdown";
 
 /**
- * Backend-owned interactive-browser runtime contract.
+ * Backend-owned interactive-browser tool runtime contract.
  *
  * Lifecycle methods are intentionally separate: detaching an agent lease,
  * closing session-owned workspaces, and revoking authority are different
  * operations even when an incremental adapter currently shares teardown work.
- * The reason is backend diagnostic context only and must never participate in
+ * The reason is bounded diagnostic context only and never participates in
  * authorization.
  */
-export interface InteractiveBrowserRuntime {
+export interface InteractiveBrowserToolRuntime {
+  readonly kind: "standard" | "protected";
   readonly tools: readonly ToolDefinition[];
   toolForName(name: string): ToolDefinition | undefined;
-  preflight(): { allowed: true } | { allowed: false; reason: string };
-  detachAgentLease(reason: string): Promise<void>;
-  closeSessionWorkspaces(reason: string): Promise<void>;
-  revokeAuthority(reason: string): Promise<void>;
+  preflight(): InteractiveBrowserAllowDecision;
+  detachAgentLease(reason: AgentLeaseDetachReason): Promise<void>;
+  closeSessionWorkspaces(reason: SessionWorkspaceCloseReason): Promise<void>;
+  revokeAuthority(reason: BrowserAuthorityRevokeReason): Promise<void>;
+}
+
+/** Capability factory result validated before publication by pi-bridge. */
+export interface CapabilityBoundInteractiveBrowserToolRuntime extends InteractiveBrowserToolRuntime {
+  readonly binding: Readonly<ProtectedBrowserBinding>;
 }

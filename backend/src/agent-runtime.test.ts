@@ -35,7 +35,7 @@ import { WREN_AGENT_PROFILE_ID, type AgentProfileRow } from "./workspace-types.j
 import { WAYANG_RUNTIME_CONTEXT_TOOL_NAME } from "./wayang-runtime-context.js";
 import { RESTRICTED_MCP_TOOL_NAME, type RestrictedMcpRuntime } from "./restricted-mcp/index.js";
 import { FILE_AUDIO_EXPERIMENT_TOOL_NAME, type FileAudioExperimentRuntime } from "./audio-experiment/types.js";
-import type { InteractiveBrowserRuntime } from "./browser/interactive-runtime.js";
+import type { InteractiveBrowserToolRuntime } from "./browser/interactive-runtime.js";
 
 function fixture(name: string): {
   dir: string;
@@ -400,7 +400,8 @@ test("interactive-browser guard preserves exact backend tool-object authorizatio
     const definition: any = { name: "browser_status", async execute() { return { content: [] }; } };
     const original: any = { name: "browser_status", async execute(...args: unknown[]) { return definition.execute(...args); } };
     const replacement: any = { name: "browser_status", async execute() { replacements++; return { content: [] }; } };
-    const runtime: InteractiveBrowserRuntime = {
+    const runtime: InteractiveBrowserToolRuntime = {
+      kind: "standard",
       tools: [definition],
       toolForName(name) { return name === definition.name ? definition : undefined; },
       preflight: () => ({ allowed: true }),

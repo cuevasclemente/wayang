@@ -6,7 +6,12 @@ import {
   truncateHead,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import type { InteractiveBrowserRuntime } from "./interactive-runtime.js";
+import type {
+  AgentLeaseDetachReason,
+  BrowserAuthorityRevokeReason,
+  CapabilityBoundInteractiveBrowserToolRuntime,
+  SessionWorkspaceCloseReason,
+} from "./interactive-runtime.js";
 import { CapabilityBoundProtectedBrowser } from "./protected-browser.js";
 import type { ProtectedBrowserOperation } from "./types.js";
 
@@ -33,7 +38,7 @@ export const INTERACTIVE_BROWSER_TOOL_NAMES = Object.freeze([
 
 export type InteractiveBrowserToolName = typeof INTERACTIVE_BROWSER_TOOL_NAMES[number];
 
-export interface ProtectedBrowserToolRuntime extends InteractiveBrowserRuntime {
+export interface ProtectedBrowserToolRuntime extends CapabilityBoundInteractiveBrowserToolRuntime {
   readonly browser: CapabilityBoundProtectedBrowser;
   /** @deprecated Incremental compatibility alias for detachAgentLease(). */
   close(): Promise<void>;
@@ -88,7 +93,7 @@ export function createProtectedBrowserToolRuntime(options: {
   let revoked = false;
   let agentLeaseDetach: Promise<void> | undefined;
   let realmRevocation: Promise<void> | undefined;
-  const detachAgentLease = (reason: string): Promise<void> => {
+  const detachAgentLease = (reason: AgentLeaseDetachReason): Promise<void> => {
     void reason;
     revoked = true;
     agentLeaseDetach ??= options.browser.close();
@@ -104,16 +109,16 @@ export function createProtectedBrowserToolRuntime(options: {
     }
     return realmRevocation;
   };
-  const closeSessionWorkspaces = (reason: string): Promise<void> => {
+  const closeSessionWorkspaces = (reason: SessionWorkspaceCloseReason): Promise<void> => {
     void reason;
     return revokeRealm();
   };
-  const revokeAuthority = (reason: string): Promise<void> => {
+  const revokeAuthority = (reason: BrowserAuthorityRevokeReason): Promise<void> => {
     void reason;
     return revokeRealm();
   };
   const deny = async (error: unknown): Promise<never> => {
-    await Promise.allSettled([detachAgentLease("protected-browser-operation-failed")]);
+    await Promise.allSettled([detachAgentLease("runtime_replaced")]);
     throw error instanceof Error ? error : new Error("Interactive browser operation failed");
   };
   const preflight = () => revoked || options.browser.isRevoked
@@ -291,6 +296,8 @@ export function createProtectedBrowserToolRuntime(options: {
 
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
   return {
+    kind: options.browser.currentBinding.capabilityId === "wayang.standard-browser.v1" ? "standard" : "protected",
+    get binding() { return options.browser.currentBinding; },
     tools: Object.freeze([...tools]),
     browser: options.browser,
     toolForName(name) { return byName.get(name); },
@@ -299,7 +306,7 @@ export function createProtectedBrowserToolRuntime(options: {
     closeSessionWorkspaces,
     revokeAuthority,
     close() {
-      return detachAgentLease("deprecated-close");
+      return detachAgentLease("runtime_replaced");
     },
   };
 }

@@ -2166,7 +2166,7 @@ export async function createPiSession(
           || returnedBinding.associationRevision !== protectedBinding.associationRevision
           || returnedBinding.runtimeGeneration !== protectedBinding.runtimeGeneration
           || returnedBinding.processBootNonce !== protectedBinding.processBootNonce) {
-          await pendingProtectedBrowserRuntime?.detachAgentLease("factory-binding-mismatch").catch(() => undefined);
+          await pendingProtectedBrowserRuntime?.detachAgentLease("runtime_replaced").catch(() => undefined);
           pendingProtectedBrowserRuntime = undefined;
           throw new WorkspaceStoreError("Protected browser factory returned a non-exact runtime lease", 409);
         }
@@ -2665,7 +2665,7 @@ export async function createPiSession(
     pendingAgentSession = undefined;
     await pendingRestrictedMcpRuntime?.close().catch(() => undefined);
     pendingRestrictedMcpRuntime = undefined;
-    await pendingProtectedBrowserRuntime?.detachAgentLease("runtime-creation-failed").catch(() => undefined);
+    await pendingProtectedBrowserRuntime?.detachAgentLease("runtime_replaced").catch(() => undefined);
     pendingProtectedBrowserRuntime = undefined;
     await pendingProtectedAutomationRuntime?.close().catch(() => undefined);
     pendingProtectedAutomationRuntime = undefined;
@@ -3290,7 +3290,7 @@ function beginPiSessionAuthorityCleanup(handle: PiSessionHandle): Promise<void> 
   const detachBrowserLease = (): Promise<void> => {
     try {
       return protectedBrowser
-        ? Promise.resolve(protectedBrowser.detachAgentLease("session-authority-cleanup"))
+        ? Promise.resolve(protectedBrowser.detachAgentLease("runtime_replaced"))
         : Promise.resolve();
     } catch (error) { return Promise.reject(error); }
   };

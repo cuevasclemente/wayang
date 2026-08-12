@@ -26,7 +26,7 @@ import { type AgentProfileRow, type ProjectRow } from "./workspace-types.js";
 import { WAYANG_RUNTIME_CONTEXT_TOOL_NAME } from "./wayang-runtime-context.js";
 import { WAYANG_WORKSPACE_CHANGE_TOOL_NAME, WAYANG_WORKSPACE_READ_TOOL_NAME } from "./workspace-control.js";
 import { RESTRICTED_MCP_TOOL_NAME, type RestrictedMcpRuntime } from "./restricted-mcp/index.js";
-import type { InteractiveBrowserRuntime } from "./browser/interactive-runtime.js";
+import type { InteractiveBrowserToolRuntime } from "./browser/interactive-runtime.js";
 import { INTERACTIVE_BROWSER_TOOL_NAMES } from "./browser/protected-tools.js";
 import { PROTECTED_AUTOMATION_TOOL_NAME, type ProtectedAutomationToolRuntime } from "./protected-automation/tool.js";
 import { FILE_AUDIO_EXPERIMENT_TOOL_NAME, type FileAudioExperimentRuntime } from "./audio-experiment/types.js";
@@ -352,7 +352,7 @@ interface LiveToolDecisionOptions {
   skipRestrictedMcpPreflight?: boolean;
   standardResourcesWitness?: ExactStandardResourcesWitness;
   standardResourcesRuntimeFence?: StandardResourcesRuntimeFence;
-  protectedBrowserRuntime?: InteractiveBrowserRuntime;
+  protectedBrowserRuntime?: InteractiveBrowserToolRuntime;
   trustedProtectedBrowserTool?: unknown;
   protectedAutomationRuntime?: ProtectedAutomationToolRuntime;
   trustedProtectedAutomationTool?: unknown;
@@ -375,10 +375,10 @@ function closeRuntimeOnToolObjectDrift(runtime: { close(): Promise<void> } | und
   catch { /* the failed-closed decision remains authoritative */ }
 }
 
-function detachBrowserRuntimeOnToolObjectDrift(runtime: InteractiveBrowserRuntime | undefined): void {
+function detachBrowserRuntimeOnToolObjectDrift(runtime: InteractiveBrowserToolRuntime | undefined): void {
   if (!runtime || driftClosedPrivilegedRuntimes.has(runtime)) return;
   driftClosedPrivilegedRuntimes.add(runtime);
-  try { void runtime.detachAgentLease("tool-object-drift").catch(() => undefined); }
+  try { void runtime.detachAgentLease("runtime_replaced").catch(() => undefined); }
   catch { /* the failed-closed decision remains authoritative */ }
 }
 
@@ -538,7 +538,7 @@ function wrapToolExecute(
   trustedRestrictedMcpTool: unknown,
   standardResourcesWitness: ExactStandardResourcesWitness | undefined,
   standardResourcesRuntimeFence: StandardResourcesRuntimeFence | undefined,
-  protectedBrowserRuntime: InteractiveBrowserRuntime | undefined,
+  protectedBrowserRuntime: InteractiveBrowserToolRuntime | undefined,
   trustedProtectedBrowserTool: unknown,
   protectedAutomationRuntime: ProtectedAutomationToolRuntime | undefined,
   trustedProtectedAutomationTool: unknown,
@@ -603,7 +603,7 @@ function wrapCurrentTools(
   trustedRestrictedMcpTool: unknown,
   standardResourcesWitness: ExactStandardResourcesWitness | undefined,
   standardResourcesRuntimeFence: StandardResourcesRuntimeFence | undefined,
-  protectedBrowserRuntime: InteractiveBrowserRuntime | undefined,
+  protectedBrowserRuntime: InteractiveBrowserToolRuntime | undefined,
   trustedProtectedBrowserTool: unknown,
   protectedAutomationRuntime: ProtectedAutomationToolRuntime | undefined,
   trustedProtectedAutomationTool: unknown,
@@ -629,7 +629,7 @@ export function installAgentToolPolicyGuard(
     restrictedMcpRuntime?: RestrictedMcpRuntime;
     standardResourcesWitness?: ExactStandardResourcesWitness;
     standardResourcesRuntimeFence?: StandardResourcesRuntimeFence;
-    protectedBrowserRuntime?: InteractiveBrowserRuntime;
+    protectedBrowserRuntime?: InteractiveBrowserToolRuntime;
     protectedAutomationRuntime?: ProtectedAutomationToolRuntime;
     fileAudioExperimentRuntime?: FileAudioExperimentRuntime;
   } = {},
