@@ -133,6 +133,9 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+      - name: Run bootstrap and configuration tests
+        run: npm run test:scripts
+
       - name: Exercise configuration wizard dry-run
         env:
           HOME: ${{ runner.temp }}/wayang-config-home
