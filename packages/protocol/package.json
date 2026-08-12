@@ -1,0 +1,32 @@
+{
+  "name": "@wayang/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared TypeScript wire types (REST payloads and chat WebSocket messages) for Wayang and its companion clients. Types only: no runtime code, no dependencies.",
+  "license": "MPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cuevasclemente/wayang.git",
+    "directory": "packages/protocol"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./ws": {
+      "types": "./dist/ws.d.ts",
+      "default": "./dist/ws.js"
+    },
+    "./rest": {
+      "types": "./dist/rest.d.ts",
+      "default": "./dist/rest.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  }
+}
