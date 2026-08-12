@@ -35,6 +35,7 @@ import {
   rollbackAgentSwitch,
   updatePiSessionFile,
   updateSessionAgentProfile,
+  updateSessionError,
   updateSessionModel,
   type SessionRow,
 } from "./sessions.js";
@@ -150,6 +151,10 @@ export interface PiSessionHandle {
   queuedBrowserMessages: Map<string, QueuedBrowserMessageRecord>;
   /** Latest in-progress Pi message, retained across the pre-persistence message_end gap. */
   liveStreamingMessage?: any;
+  /** Successful overflow compaction awaiting a successful SDK continuation. */
+  pendingOverflowRecovery?: { compactionEntryId: string; overflowEntryId: string; successObserved?: boolean };
+  /** Lifecycle failure not represented by a final assistant message. */
+  pendingSessionError?: string;
   liveStreamingMessageUnsubscribe?: () => void;
   /** Permanent process-local denial latch; only a fresh handle may regain authority. */
   capabilityAuthorityDenied?: boolean;
@@ -537,11 +542,11 @@ export function installWayangRawSudoFailClosedGuard(session: AgentSession, sessi
 export type ModelContext = { runtime: ModelRuntime; registry: ModelRegistry };
 
 /** @internal Exported for synthetic provider-isolation regression tests. */
-export async function createModelContext(options: { agentDir?: string; includeModelConfig?: boolean } = {}): Promise<ModelContext> {
+export async function createModelContext(options: { agentDir?: string } = {}): Promise<ModelContext> {
   const agentDir = options.agentDir ?? getAgentDirPath();
   const runtime = await ModelRuntime.create({
     authPath: path.join(agentDir, "auth.json"),
-    modelsPath: options.includeModelConfig === false ? null : path.join(agentDir, "models.json"),
+    modelsPath: path.join(agentDir, "models.json"),
     allowModelNetwork: false,
   });
   return { runtime, registry: new ModelRegistry(runtime) };
@@ -1433,7 +1438,7 @@ async function getSessionModelSelectionRegistry(id: string): Promise<ModelRegist
 }
 
 async function getSessionModelContext(restricted: boolean): Promise<ModelContext> {
-  return restricted ? createModelContext({ includeModelConfig: false }) : getModelContext();
+  return restricted ? createModelContext() : getModelContext();
 }
 
 /** Deny the old runtime synchronously, then wait until every old surface and
@@ -2436,6 +2441,8 @@ export async function createPiSession(
       queuedBrowserMessages: new Map(),
     };
     handle.liveStreamingMessageUnsubscribe = session.subscribe((event: AgentSessionEvent) => {
+      trackOverflowRecovery(handle, event);
+      persistSettledSessionError(handle, event);
       if (event.type === "message_start" || event.type === "message_update") {
         handle.liveStreamingMessage = event.message;
         return;
@@ -3424,7 +3431,7 @@ export async function sendBrowserMessageTurn(
         throw new Error("Duplicate queued browser message ID");
       }
       const queueBefore = clientMessageId ? snapshotQueuedChatMessages(handle.session) : undefined;
-      // In pi 0.80.6 steer() mutates the queue synchronously before returning
+      // In pi 0.84.1 steer() mutates the queue synchronously before returning
       // its promise. Capture in this same event-loop turn so concurrent browser
       // messages cannot collapse two registrations into one ambiguous delta.
       const steering = handle.session.steer(content, images);
@@ -3710,19 +3717,69 @@ export async function abortSession(
   return abortInteractiveTurn(handle, options);
 }
 
+/** @internal Exported for zero-subscriber lifecycle regression tests. */
+export function trackOverflowRecovery(handle: PiSessionHandle, event: AgentSessionEvent): void {
+  if (event.type === "compaction_end" && event.reason === "overflow") {
+    handle.pendingOverflowRecovery = undefined;
+    if (!event.result || !event.willRetry) return;
+    const branch = handle.session.sessionManager.getBranch();
+    const compaction = [...branch].reverse().find((entry: any) => (
+      entry?.type === "compaction"
+      && typeof entry.id === "string"
+      && typeof entry.parentId === "string"
+    )) as any;
+    if (!compaction) return;
+    handle.pendingOverflowRecovery = {
+      compactionEntryId: compaction.id,
+      overflowEntryId: compaction.parentId,
+    };
+    return;
+  }
+  if (event.type === "message_end" && event.message?.role === "assistant" && handle.pendingOverflowRecovery) {
+    const assistant = event.message as any;
+    if (assistant.stopReason !== "error" && assistant.stopReason !== "length") {
+      handle.pendingOverflowRecovery.successObserved = true;
+    }
+    return;
+  }
+  if (event.type !== "agent_settled" || !handle.pendingOverflowRecovery) return;
+  const recovery = handle.pendingOverflowRecovery;
+  handle.pendingOverflowRecovery = undefined;
+  if (!recovery.successObserved) return;
+  handle.session.sessionManager.appendCustomEntry(OVERFLOW_RETRY_MARKER, {
+    compactionEntryId: recovery.compactionEntryId,
+    overflowEntryId: recovery.overflowEntryId,
+  });
+}
+
+/** @internal Exported for lifecycle persistence regression tests. */
+export function persistSettledSessionError(handle: PiSessionHandle, event: AgentSessionEvent): void {
+  if (event.type === "compaction_end") {
+    if (event.reason === "manual") {
+      if (event.result) updateSessionError(handle.id, null);
+      else if (event.errorMessage) updateSessionError(handle.id, event.errorMessage);
+      return;
+    }
+    if (event.errorMessage) handle.pendingSessionError = event.errorMessage;
+    return;
+  }
+  if (event.type === "message_end" && event.message?.role === "assistant") {
+    const assistant = event.message as any;
+    if (assistant.stopReason !== "error" && assistant.stopReason !== "length") {
+      handle.pendingSessionError = undefined;
+    }
+    return;
+  }
+  if (event.type !== "agent_settled") return;
+  const outcome = classifyScheduledPromptResult(handle.session.messages);
+  updateSessionError(handle.id, outcome.error ?? handle.pendingSessionError ?? null);
+  handle.pendingSessionError = undefined;
+}
+
 /**
  * Subscribe to pi session events and forward serialized messages
  * to a callback. Returns an unsubscribe function.
  */
-function persistOverflowRetryMarker(handle: PiSessionHandle, event: AgentSessionEvent): void {
-  if (event.type !== "compaction_end" || event.reason !== "overflow" || !event.result || !event.willRetry) return;
-  const branch = handle.session.sessionManager.getBranch();
-  const leaf = branch[branch.length - 1] as any;
-  if (leaf?.type === "custom" && leaf.customType === OVERFLOW_RETRY_MARKER) return;
-  if (leaf?.type !== "compaction" || typeof leaf.id !== "string") return;
-  handle.session.sessionManager.appendCustomEntry(OVERFLOW_RETRY_MARKER, { compactionEntryId: leaf.id });
-}
-
 export function subscribeToSession(
   id: string,
   onMessage: (msg: SerializedMessage) => void,
@@ -3737,7 +3794,6 @@ export function subscribeToSession(
     // No queued or future result is released from a denied handle. A fresh
     // runtime/handle is required after cleanup.
     if (handle.capabilityAuthorityDenied) return;
-    persistOverflowRetryMarker(handle, event);
     if (event.type === "queue_update" && handle.queuedBrowserMessages.size > 0) {
       for (const [clientMessageId, record] of handle.queuedBrowserMessages) {
         if (queuedChatMessageState(record.capture) === "claimed") handle.queuedBrowserMessages.delete(clientMessageId);
@@ -3874,6 +3930,13 @@ function serializeMessage(
   return { type, message: serializeMessageValue(message) };
 }
 
+export function classifyAssistantErrorKind(errorMessage: string | null | undefined): "context_overflow" | null {
+  if (!errorMessage) return null;
+  return isContextOverflow({ role: "assistant", content: [], stopReason: "error", errorMessage } as any)
+    ? "context_overflow"
+    : null;
+}
+
 function serializeMessageValue(msg: any): Record<string, unknown> {
   const base: Record<string, unknown> = {
     role: msg.role,
@@ -3884,7 +3947,11 @@ function serializeMessageValue(msg: any): Record<string, unknown> {
   if (msg.model) base.model = msg.model;
   if (msg.stopReason) base.stopReason = msg.stopReason;
   if (msg.usage) base.usage = msg.usage;
-  if (msg.errorMessage) base.errorMessage = msg.errorMessage;
+  if (msg.errorMessage) {
+    base.errorMessage = msg.errorMessage;
+    const errorKind = msg.role === "assistant" ? classifyAssistantErrorKind(msg.errorMessage) : null;
+    if (errorKind) base.errorKind = errorKind;
+  }
   if (msg.customType) base.customType = msg.customType;
   if (msg.toolCallId) base.toolCallId = msg.toolCallId;
   if (msg.toolName) base.toolName = msg.toolName;
@@ -4037,23 +4104,25 @@ const OVERFLOW_RETRY_MARKER = "wayang-overflow-retry-v1";
 
 export function serializeHistoryEntries(entries: any[]): SerializedMessage[] {
   const serialized: SerializedMessage[] = [];
-  // Compaction entries do not persist their reason or retry intent. Suppress a
-  // provider overflow only when Wayang recorded Pi's authoritative successful
-  // overflow-compaction event with willRetry=true. Manual compaction and older
-  // sessions without that marker retain the terminal error for audit truth.
+  // Compaction entries do not persist their reason or retry outcome. Suppress a
+  // provider overflow only when Wayang observed a successful assistant response
+  // after Pi's compact-and-retry continuation. Markers carry validated IDs so
+  // extension-appended entries between compaction and continuation are harmless.
+  const compactionById = new Map(entries
+    .filter((entry) => entry?.type === "compaction" && typeof entry.id === "string")
+    .map((entry) => [entry.id, entry]));
   const recoveredOverflowEntryIds = new Set<string>();
-  for (let index = 0; index < entries.length; index++) {
-    const compaction = entries[index];
-    const marker = entries[index + 1];
+  for (const marker of entries) {
+    if (marker?.type !== "custom" || marker.customType !== OVERFLOW_RETRY_MARKER) continue;
+    const compactionEntryId = marker.data?.compactionEntryId;
+    const overflowEntryId = marker.data?.overflowEntryId;
+    const compaction = typeof compactionEntryId === "string" ? compactionById.get(compactionEntryId) : undefined;
     if (
-      compaction?.type === "compaction"
-      && typeof compaction.parentId === "string"
-      && marker?.type === "custom"
-      && marker.customType === OVERFLOW_RETRY_MARKER
-      && marker.parentId === compaction.id
-      && marker.data?.compactionEntryId === compaction.id
+      compaction
+      && typeof overflowEntryId === "string"
+      && compaction.parentId === overflowEntryId
     ) {
-      recoveredOverflowEntryIds.add(compaction.parentId);
+      recoveredOverflowEntryIds.add(overflowEntryId);
     }
   }
 

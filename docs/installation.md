@@ -79,15 +79,7 @@ make doctor
 
 The optional initializer never reads or creates the PIN and accepts no PIN argument. It validates PIN authority by filesystem metadata, uses owner-only no-follow/no-overwrite creation when state is absent, and leaves valid existing cooldown state—including attempts or a live reservation—unchanged. Missing or unsafe PIN metadata and unsafe, symlinked, hard-linked, incorrectly permissioned, malformed, or unsupported existing state fail closed rather than being repaired or replaced. This command does not assign or activate a capability, configure a project/profile tuple, launch Wayang, or restart anything. `make doctor` checks metadata only; see [Configuration](configuration.md#capability-approval-cooldown-state) for the exact contract.
 
-Pi 0.80.6 requires explicit trust before a Wayang SDK session loads executable or configuration-bearing project `.pi` resources. After reviewing a project, save trust from a local terminal:
-
-```sh
-cd /path/to/trusted-project
-/path/to/wayang/backend/node_modules/.bin/pi
-# Run /trust, exit pi, then create a new Wayang session.
-```
-
-Do not approve untrusted repositories merely to make an extension appear. Project trust controls input loading; it does not sandbox pi or its tools.
+Wayang treats registered project folders as trusted Pi projects. Their `.pi/settings.json`, project packages, and extensions may load or execute as the Wayang host user for any agent profile. Register only reviewed folders inside the same single-user trust boundary; agent tool restrictions are not a sandbox for project-local Pi code.
 
 ## Start Wayang
 

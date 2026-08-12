@@ -764,11 +764,18 @@ function exactProjectAgentsFile(cwd: string): Array<{ path: string; content: str
 }
 
 export function createInMemorySettingsSnapshot(cwd: string, agentDir: string): SettingsManager {
-  const source = SettingsManager.create(cwd, agentDir);
-  const memory = SettingsManager.inMemory(source.getGlobalSettings());
-  memory.applyOverrides(source.getProjectSettings());
-  memory.setProjectTrusted(source.isProjectTrusted());
-  return memory;
+  const source = SettingsManager.create(cwd, agentDir, { projectTrusted: true });
+  const content = {
+    global: JSON.stringify(source.getGlobalSettings(), null, 2),
+    project: JSON.stringify(source.getProjectSettings(), null, 2),
+  };
+  const storage = {
+    withLock(scope: "global" | "project", fn: (current: string | undefined) => string | undefined): void {
+      const next = fn(content[scope]);
+      if (next !== undefined) content[scope] = next;
+    },
+  };
+  return SettingsManager.fromStorage(storage, { projectTrusted: true });
 }
 
 export interface AgentResourceLoaderResult {
@@ -835,16 +842,14 @@ export async function buildAgentResourceLoader(options: {
     settingsManager = createInMemorySettingsSnapshot(options.cwd, options.agentDir);
   }
 
-  // noExtensions is a pre-load exclusion. No extension path or factory is
-  // supplied here, so an excluded factory cannot execute before filtering.
+  // Registered project Pi code is intentionally trusted for every profile.
+  // Tool/path restrictions below remain policy controls, not a sandbox around
+  // project settings, packages, extensions, skills, prompts, or themes.
+  settingsManager.setProjectTrusted(true);
   const resourceLoader = new DefaultResourceLoader({
     cwd: options.cwd,
     agentDir: options.agentDir,
     settingsManager,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
     noContextFiles: true,
     agentsFilesOverride: () => ({ agentsFiles: exactProjectAgentsFile(options.cwd) }),
     systemPromptOverride: () => undefined,

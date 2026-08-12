@@ -105,6 +105,7 @@ async function installTimelineSocket(
             content: [],
             stopReason: "error",
             errorMessage: "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+            errorKind: "context_overflow",
           };
           this.emit({ type: "message_end", message: overflow });
           this.emit({ type: "agent_end", messages: [overflow], will_retry: false });
@@ -354,7 +355,7 @@ test("restores compacting state and suppresses the active overflow error on reat
     {
       type: "assistant",
       id: "recovery-overflow",
-      message: { role: "assistant", content: [], stopReason: "error", errorMessage: overflow },
+      message: { role: "assistant", content: [], stopReason: "error", errorMessage: overflow, errorKind: "context_overflow" },
     },
   ], true);
   const session = await createE2eSession(request, "e2e compacting reattach lifecycle");
@@ -371,7 +372,7 @@ test("suppresses the overflow during the reattach race before compaction_start",
     {
       type: "assistant",
       id: "race-overflow",
-      message: { role: "assistant", content: [], stopReason: "error", errorMessage: overflow },
+      message: { role: "assistant", content: [], stopReason: "error", errorMessage: overflow, errorKind: "context_overflow" },
     },
   ], false, true);
   const session = await createE2eSession(request, "e2e overflow recovery reattach race");
@@ -417,9 +418,13 @@ test("offers deliberate compaction after terminal context recovery failure", asy
   const compact = page.getByTestId("compact-after-overflow");
   await expect(compact).toBeEnabled();
   await compact.click();
+  await expect(page.getByTestId("chat-runtime-error")).toContainText("Context overflow recovery failed");
   await expect.poll(() => page.evaluate(() => (
     (window as unknown as { __syntheticSentMessages?: string[] }).__syntheticSentMessages ?? []
   ).filter((message) => message.startsWith("/compact")).length)).toBe(1);
+  await page.evaluate(() => {
+    (window as unknown as { completeSyntheticOverflowRecovery: () => void }).completeSyntheticOverflowRecovery();
+  });
   await expect(page.getByTestId("chat-runtime-error")).toHaveCount(0);
 });
 

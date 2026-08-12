@@ -1,6 +1,6 @@
 # Pi capability portability
 
-Wayang v0.1 embeds pi through the `@earendil-works/pi-*` SDK packages. The backend pins `pi-agent-core`, `pi-ai`, and `pi-coding-agent` to the tested `0.80.6` release. Node.js `>=22.19.0` is required.
+Wayang v0.1 embeds pi through the `@earendil-works/pi-*` SDK packages. The backend pins `pi-agent-core`, `pi-ai`, and `pi-coding-agent` to the tested `0.84.1` release. Node.js `>=22.19.0` is required.
 
 A global `pi` installation is not required. The checkout installs the matching CLI with the backend dependencies; release tooling should invoke that local binary (for example, `npm --prefix backend exec -- pi`).
 
@@ -11,7 +11,7 @@ Use pi's supported authentication flows rather than copying credential files:
 - **OAuth subscription:** start the checkout's pi CLI, run `/login`, and choose a provider. Pi manages its own authentication storage.
 - **Provider API key:** set the environment variable documented by pi for the chosen provider in the Wayang process environment.
 
-Wayang's SDK sessions honor standard pi configuration at `~/.pi/agent/settings.json`. Pi 0.80.6 applies project trust before loading `<project>/.pi/settings.json`, project extensions, skills, prompts, themes, system prompts, or project packages. For a trusted project, open the checkout's pi CLI in that project, use `/trust`, and restart the Wayang session; an unapproved project still provides basic chat and context files but its protected project-local resources are ignored. Do not set `defaultProjectTrust: "always"` unless every opened project is inside the same trust boundary.
+Wayang's SDK sessions honor standard pi configuration at `~/.pi/agent/settings.json`. Wayang intentionally treats every registered project folder as trusted for `<project>/.pi/settings.json`, project extensions, skills, prompts, themes, system prompts, and project packages. Those resources may execute as the Wayang host user for any agent profile. Register only reviewed projects inside the same single-user trust boundary; profile tool restrictions do not sandbox project-local Pi code.
 
 Never copy or inspect another installation's authentication or trust stores, private extension configuration, or key files as part of Wayang setup.
 
@@ -74,6 +74,6 @@ Do not copy such extensions into this repository merely to make a capability bad
 
 ## Compatibility expectations
 
-Wayang v0.1 is tested as a unit with pi `0.80.6`. Upgrading any of the three direct pi SDK packages should be done together, followed by a clean `npm ci`, backend tests/build, frontend build, and a smoke test covering session creation, extension loading, settings, model selection, and WebSocket chat.
+Wayang v0.1 is tested as a unit with pi `0.84.1`. Upgrading any of the three direct pi SDK packages should be done together, followed by a clean `npm ci`, backend tests/build, frontend build, and a smoke test covering session creation, extension loading, settings, model selection, and WebSocket chat.
 
 Third-party extensions are outside that compatibility promise. Their presence must not be required for a clean checkout, and their failure should remove only the associated optional capability rather than basic Wayang operation. In particular, approved managed-browser tools are now backend-owned and do not depend on a globally installed `browser-control.ts` extension.

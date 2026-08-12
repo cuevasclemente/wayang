@@ -63,7 +63,7 @@ test("omits a recovered provider overflow from rendered history while retaining 
       id: "overflow-retry-marker",
       parentId: "compaction",
       customType: "wayang-overflow-retry-v1",
-      data: { compactionEntryId: "compaction" },
+      data: { compactionEntryId: "compaction", overflowEntryId: "overflow" },
     },
   ]);
 

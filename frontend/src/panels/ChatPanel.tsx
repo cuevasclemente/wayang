@@ -148,10 +148,6 @@ interface RuntimeErrorState {
   recovery: "context_overflow" | null;
 }
 
-function isContextOverflowError(message: string): boolean {
-  return /context(?:_|\s|-)*(?:length|window)|maximum context|input exceeds|prompt (?:is )?too long|too many tokens|context overflow/i.test(message);
-}
-
 type WsStatus = "connecting" | "connected" | "disconnected";
 
 function isBashMode(value: unknown): value is BashMode {
@@ -1227,7 +1223,7 @@ function suppressActiveRecoveryErrors(messages: ChatMessage[]): ChatMessage[] {
   return messages.filter((message, index) => (
     index <= lastUserIndex
     || message.type !== "assistant"
-    || !assistantErrorMessage(message.message)
+    || message.message?.errorKind !== "context_overflow"
   ));
 }
 
@@ -2902,7 +2898,7 @@ export function ChatPanel({
   const activeSessionErrorRef = useRef<string | null>(null);
   const activeSessionRuntimeStreamingRef = useRef(false);
   const activeSessionRuntimeCompactingRef = useRef(false);
-  const pendingLifecycleErrorRef = useRef<string | null>(null);
+  const pendingLifecycleErrorRef = useRef<{ message: string; kind: "context_overflow" | null } | null>(null);
   const isStreamingRef = useRef(false);
   const pinActiveTurnScrollRef = useRef(false);
   const lastProgrammaticScrollAtRef = useRef(0);
@@ -3097,12 +3093,12 @@ export function ChatPanel({
     setStreamingBlocksSynced({ content: [] });
   }, [setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
 
-  const appendRuntimeError = useCallback((message: string) => {
+  const appendRuntimeError = useCallback((message: string, recovery: "context_overflow" | null = null) => {
     const trimmed = message.trim() || "Unknown error";
     setRuntimeError({
       message: trimmed,
       timestamp: Date.now(),
-      recovery: isContextOverflowError(trimmed) ? "context_overflow" : null,
+      recovery,
     });
     setStreamingHistoryPrefixSynced({ content: [] });
     setMessages((prev) => {
@@ -3727,7 +3723,15 @@ export function ChatPanel({
           }
 
           const turnError = agentEndErrorMessage(msg);
-          if (turnError) pendingLifecycleErrorRef.current = turnError;
+          if (turnError) {
+            const assistant = Array.isArray(msg.messages)
+              ? [...msg.messages].reverse().find((message) => message?.role === "assistant")
+              : null;
+            pendingLifecycleErrorRef.current = {
+              message: turnError,
+              kind: assistant?.errorKind === "context_overflow" ? "context_overflow" : null,
+            };
+          }
 
           setStreamingHistoryPrefixSynced({ content: [] });
           setStreamingBlocksSynced({ content: [] });
@@ -3747,9 +3751,17 @@ export function ChatPanel({
 
         if (msg.type === "compaction_end") {
           setIsCompacting(false);
-          pendingLifecycleErrorRef.current = null;
           if (typeof msg.error === "string" && msg.error.trim()) {
-            appendRuntimeError(msg.error);
+            const recovery = msg.reason === "overflow" ? "context_overflow" : null;
+            pendingLifecycleErrorRef.current = { message: msg.error, kind: recovery };
+            appendRuntimeError(msg.error, recovery);
+          } else if (msg.succeeded === true) {
+            // A successful overflow compaction can still be followed by a failed
+            // SDK continuation. Keep pending lifecycle provenance until settled.
+            if (msg.reason !== "overflow" || msg.will_retry !== true) {
+              pendingLifecycleErrorRef.current = null;
+              clearRuntimeError();
+            }
           }
           return;
         }
@@ -3758,7 +3770,7 @@ export function ChatPanel({
           setIsCompacting(false);
           const pendingError = pendingLifecycleErrorRef.current;
           pendingLifecycleErrorRef.current = null;
-          if (pendingError) appendRuntimeError(pendingError);
+          if (pendingError) appendRuntimeError(pendingError.message, pendingError.kind);
           isStreamingRef.current = false;
           pinActiveTurnScrollRef.current = false;
           setActiveTurnScrollAnchorText(null);
@@ -4239,8 +4251,12 @@ export function ChatPanel({
           // rendered as a terminal red error while recovery is still active.
           if (message.role === "assistant" && msg.type === "message_end") {
             const error = assistantErrorMessage(message);
-            if (error) pendingLifecycleErrorRef.current = error;
-            else pendingLifecycleErrorRef.current = null;
+            if (error) {
+              pendingLifecycleErrorRef.current = {
+                message: error,
+                kind: message.errorKind === "context_overflow" ? "context_overflow" : null,
+              };
+            } else pendingLifecycleErrorRef.current = null;
           }
           return;
         }
@@ -4427,10 +4443,13 @@ export function ChatPanel({
     setPendingAttachments([]);
     setAttachmentError("");
     const sessionError = activeSessionErrorRef.current;
-    setRuntimeError(sessionError ? {
+    const sessionErrorKind = activeSession?.error_kind ?? null;
+    const suppressRecoveringOverflow = sessionErrorKind === "context_overflow"
+      && (activeSessionRuntimeCompactingRef.current || activeSessionRuntimeStreamingRef.current);
+    setRuntimeError(sessionError && !suppressRecoveringOverflow ? {
       message: sessionError,
       timestamp: Date.now(),
-      recovery: isContextOverflowError(sessionError) ? "context_overflow" : null,
+      recovery: sessionErrorKind === "context_overflow" ? "context_overflow" : null,
     } : null);
     setResendingMessageId(null);
     // Preserve a running-state hint when opening an already-live session. The
@@ -4472,7 +4491,7 @@ export function ChatPanel({
       chatWsProfile("invoke_connect", { activeSessionId });
       connectRef.current();
     }
-  }, [activeSessionId, sendWs, clearExternalActionAuthority, clearQueuedAndDeferredUserMessages, setExternalActionApprovalsSynced, setInterviewQueueSynced, setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
+  }, [activeSessionId, activeSession?.error_kind, sendWs, clearExternalActionAuthority, clearQueuedAndDeferredUserMessages, setExternalActionApprovalsSynced, setInterviewQueueSynced, setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
 
   // Mark a sent response retryable when a connected socket never returns the
   // required durable acknowledgement. This does not resend in a loop; the
@@ -4823,9 +4842,9 @@ export function ChatPanel({
 
   const handleCompactAfterOverflow = useCallback(() => {
     if (wsStatus !== "connected" || !activeSessionId || hasActiveAssistantOutput() || isCompacting) return;
-    clearRuntimeError();
-    sendWs({ type: "message", content: "/compact Preserve current goals, completed work, constraints, and next steps." });
-  }, [activeSessionId, clearRuntimeError, hasActiveAssistantOutput, isCompacting, sendWs, wsStatus]);
+    const sent = sendWs({ type: "message", content: "/compact Preserve current goals, completed work, constraints, and next steps." });
+    if (sent) setIsCompacting(true);
+  }, [activeSessionId, hasActiveAssistantOutput, isCompacting, sendWs, wsStatus]);
 
   const handleCancelQueuedMessage = useCallback((messageId: string) => {
     const queuedMessage = queuedUserMessagesRef.current.find((message) => message.id === messageId);

@@ -3,7 +3,7 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 /**
  * Queue cancellation compatibility seam for the exact pinned pi SDK.
  *
- * pi 0.80.6 exposes whole-queue clearing but not removal of one queued item.
+ * pi 0.84.1 exposes whole-queue clearing but not removal of one queued item.
  * Wayang captures the exact AgentMessage object added by one browser steering
  * send, then removes only that object if it is still pending. Every shape is
  * checked before mutation so an upstream SDK layout change fails closed rather

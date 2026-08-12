@@ -83,7 +83,7 @@ test("Wayang checkout secrets stay protected without project registration", () =
   }
 });
 
-test("restricted resource loader uses pre-load exclusions and exact root AGENTS only", async () => {
+test("restricted resource loader trusts project Pi code while retaining instruction overlays and tool policy", async () => {
   const f = fixture("wayang-runtime-resources-");
   const marker = path.join(f.dir, "factory-executed");
   try {
@@ -93,12 +93,13 @@ test("restricted resource loader uses pre-load exclusions and exact root AGENTS 
     fs.writeFileSync(path.join(f.agentDir, "SYSTEM.md"), "synthetic global system override");
     fs.writeFileSync(path.join(f.agentDir, "APPEND_SYSTEM.md"), "synthetic global append");
     fs.mkdirSync(path.join(f.cwd, ".pi"), { recursive: true });
+    fs.writeFileSync(path.join(f.cwd, ".pi", "settings.json"), JSON.stringify({ defaultProvider: "synthetic-project-provider" }));
     fs.writeFileSync(path.join(f.cwd, ".pi", "SYSTEM.md"), "synthetic project system override");
     fs.writeFileSync(path.join(f.cwd, ".pi", "APPEND_SYSTEM.md"), "synthetic project append");
     fs.mkdirSync(path.join(f.agentDir, "skills", "synthetic"), { recursive: true });
     fs.writeFileSync(path.join(f.agentDir, "skills", "synthetic", "SKILL.md"), "---\nname: synthetic\ndescription: synthetic\n---\nbody");
-    fs.mkdirSync(path.join(f.agentDir, "extensions"), { recursive: true });
-    fs.writeFileSync(path.join(f.agentDir, "extensions", "canary.ts"), [
+    fs.mkdirSync(path.join(f.cwd, ".pi", "extensions"), { recursive: true });
+    fs.writeFileSync(path.join(f.cwd, ".pi", "extensions", "canary.ts"), [
       'import * as fs from "node:fs";',
       `fs.writeFileSync(${JSON.stringify(marker)}, "executed");`,
       "export default function canary() {}",
@@ -108,10 +109,10 @@ test("restricted resource loader uses pre-load exclusions and exact root AGENTS 
     const project = createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
     const result = await buildAgentResourceLoader({ cwd: f.cwd, agentDir: f.agentDir, agentProfile: profile, project });
 
-    assert.equal(fs.existsSync(marker), false, "excluded extension module/factory must never execute");
-    assert.equal(result.resourceLoader.getExtensions().extensions.length, 0);
-    assert.equal(result.resourceLoader.getSkills().skills.length, 0);
-    assert.equal(result.resourceLoader.getPrompts().prompts.length, 0);
+    assert.equal(fs.existsSync(marker), true, "registered project extension should execute under explicit trust-all policy");
+    assert.equal(result.resourceLoader.getExtensions().extensions.length, 1);
+    assert.equal(result.resourceLoader.getSkills().skills.length, 1);
+    assert.equal(result.settingsManager.getDefaultProvider(), "synthetic-project-provider");
     assert.equal(result.resourceLoader.getSystemPrompt(), undefined);
     assert.deepEqual(result.resourceLoader.getAppendSystemPrompt(), ["synthetic profile overlay"]);
     assert.deepEqual(result.resourceLoader.getAgentsFiles().agentsFiles, [{
