@@ -269,6 +269,10 @@ export function fetchMe(): Promise<Me> {
   return apiGet<Me>("/api/me");
 }
 
+export function recordSessionOpenLatency(durationMs: number): Promise<null> {
+  return apiPost<null>("/api/latency/metrics/session-open", { duration_ms: durationMs });
+}
+
 export function fetchModels(options: { refresh?: boolean } = {}): Promise<{ models: ModelOption[]; defaultModel: DefaultModelOption | null; error?: string }> {
   const query = options.refresh ? "?refresh=1" : "";
   return apiGet<{ models: ModelOption[]; defaultModel: DefaultModelOption | null; error?: string }>(`/api/models${query}`);

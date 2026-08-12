@@ -134,6 +134,19 @@ test("auth-disabled mode preserves API and WebSocket access without setting a se
   assert.equal(loginResponse.status, 200);
   assert.equal(loginResponse.headers.get("set-cookie"), null);
 
+  const sessionOpenMetric = await fetch(`${baseUrl}/api/latency/metrics/session-open`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: baseUrl },
+    body: JSON.stringify({ duration_ms: 123.45 }),
+  });
+  assert.equal(sessionOpenMetric.status, 204);
+  const invalidSessionOpenMetric = await fetch(`${baseUrl}/api/latency/metrics/session-open`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: baseUrl },
+    body: JSON.stringify({ duration_ms: "private-session-id" }),
+  });
+  assert.equal(invalidSessionOpenMetric.status, 400);
+
   const crossOriginPost = await fetch(`${baseUrl}/api/sessions/search/reindex`, {
     method: "POST",
     headers: { Origin: "https://unrelated.example" },

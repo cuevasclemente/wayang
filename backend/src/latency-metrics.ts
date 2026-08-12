@@ -10,6 +10,7 @@ const ALLOWED_METRICS = new Set([
   "history_snapshot_ms",
   "history_snapshot_bytes",
   "history_stringify_ms",
+  "session_open_usable_ms",
   "lazy_session_create_ms",
   "lazy_extensions_ms",
   "lazy_settings_model_ms",

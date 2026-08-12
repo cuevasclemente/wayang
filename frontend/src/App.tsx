@@ -107,6 +107,7 @@ function App({ authEnabled, onLogout }: AppProps) {
   const [settingsRequest, setSettingsRequest] = useState<{ tab: SettingsTab; projectCwd: string | null } | null>(null);
   const [routeResolution, setRouteResolution] = useState<RouteResolution>(initialRouteResolution);
   const routeRequestGenerationRef = useRef(0);
+  const sessionSelectionStartedAtRef = useRef<number | null>(null);
 
   const isMobile = useMediaQuery("(max-width: 768px)");
   const [mobileTab, setMobileTab] = useState<MobileTab>("chat");
@@ -119,6 +120,7 @@ function App({ authEnabled, onLogout }: AppProps) {
     (session: Session, messageId: string | null = null) => {
       // Known metadata can render immediately. Any in-flight URL restoration
       // is stale as soon as the user makes an explicit selection.
+      sessionSelectionStartedAtRef.current = performance.now();
       routeRequestGenerationRef.current += 1;
       setRouteResolution({ kind: "ready", requestedId: session.id });
       setActiveSession(session);
@@ -215,6 +217,7 @@ function App({ authEnabled, onLogout }: AppProps) {
       return;
     }
 
+    sessionSelectionStartedAtRef.current = performance.now();
     setActiveSession(null);
     setActiveProjectCwd(null);
     setRouteResolution({ kind: "loading", requestedId: route.sessionId });
@@ -374,6 +377,7 @@ function App({ authEnabled, onLogout }: AppProps) {
       <div className={`h-full ${showNewSession || showScheduledJobs || showProtectedAutomations || hasRouteNotice ? "hidden" : ""}`}>
         <ChatPanel
           activeSession={activeSession}
+          sessionSelectionStartedAt={sessionSelectionStartedAtRef.current}
           onSessionChange={handleSessionChange}
           onSessionUpdate={setActiveSession}
           scrollToMessageId={scrollToMessageId}

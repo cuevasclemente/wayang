@@ -120,6 +120,13 @@ test("synthetic catalog and transcript latency remain responsive", async ({ page
   const connectCountAfterMobileCycle = (await getWsProfileEntries(page)).filter((entry) => entry.event === "connect_start").length;
   expect(connectCountAfterMobileCycle).toBe(connectCountBeforeMobileCycle);
 
+  await expect.poll(async () => {
+    const response = await request.get("/api/latency/metrics");
+    if (!response.ok()) return -1;
+    const snapshot = await response.json() as { metrics?: Record<string, { count?: number }> };
+    return snapshot.metrics?.session_open_usable_ms?.count ?? 0;
+  }).toBe(transcriptUsableDurations.length);
+
   const backendMetricsResponse = await request.get("/api/latency/metrics");
   expect(backendMetricsResponse.ok()).toBe(true);
   const backendMetrics = await backendMetricsResponse.json() as Record<string, unknown>;
@@ -148,7 +155,8 @@ test("synthetic catalog and transcript latency remain responsive", async ({ page
   // against response-finish handler metrics below.
   expect(listStats.p95!).toBeLessThanOrEqual(100);
   expect(listStats.p99!).toBeLessThanOrEqual(150);
-  const backendMetricBuckets = (backendMetrics.metrics ?? {}) as Record<string, { p95?: number; p99?: number }>;
+  const backendMetricBuckets = (backendMetrics.metrics ?? {}) as Record<string, { count?: number; p95?: number; p99?: number }>;
+  expect(backendMetricBuckets.session_open_usable_ms?.count ?? 0).toBe(transcriptUsableDurations.length);
   expect(backendMetricBuckets.sessions_list_finish_ms?.p95 ?? Infinity).toBeLessThanOrEqual(20);
   expect(backendMetricBuckets.sessions_list_finish_ms?.p99 ?? Infinity).toBeLessThanOrEqual(50);
 });
