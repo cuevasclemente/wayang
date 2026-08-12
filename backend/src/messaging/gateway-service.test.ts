@@ -96,7 +96,7 @@ class FakeAttestations implements MessagingConnectorAttestationPort {
 }
 
 class FakeSessions implements WayangMessagingSessionPort {
-  runs: Array<{ sessionId: string; eventId: string }> = [];
+  runs: Array<{ sessionId: string; eventId: string; body: string; timeoutMs?: number }> = [];
   origins = new Set<string>();
 
   constructor(
@@ -169,9 +169,9 @@ class FakeSessions implements WayangMessagingSessionPort {
     options.authorizeDispatch();
     assert.match(options.canonicalEventSha256, /^[a-f0-9]{64}$/u);
     assert.ok(binding.activeWayangSessionId);
-    this.runs.push({ sessionId: binding.activeWayangSessionId!, eventId: event.connectorEventId });
+    this.runs.push({ sessionId: binding.activeWayangSessionId!, eventId: event.connectorEventId, body: event.body, timeoutMs: options.timeoutMs });
     this.origins.add(event.connectorEventId);
-    return { resultSummary: `answer for ${event.body}`, messages: [] };
+    return { resultSummary: `answer for ${event.body}`, finalAssistantText: `answer for ${event.body}`, messages: [] };
   }
 }
 
@@ -212,10 +212,27 @@ test("prompt admission re-attests at execution, creates one active session, and 
   await f.gateway.drain(f.declaration.endpointId);
   assert.equal(f.attestations.calls, 2, "admission and execution each require fresh attestation");
   assert.equal(f.sessions.runs.length, 1);
+  assert.equal(f.sessions.runs[0]?.timeoutMs, 10 * 60 * 1000);
   const endpoint = getMessagingEndpoint(f.declaration.endpointId)!;
   assert.ok(endpoint.active_session_id);
   assert.equal(getStore().messagingEvents[0]?.state, "completed");
   assert.deepEqual(getStore().messagingDeliveries[0]?.payload, { kind: "final", text: "answer for hello" });
+}));
+
+test("escaped commands dispatch the parsed prompt and deliver full final assistant text", () => withStore(async (dir) => {
+  const f = setup(dir);
+  const fullReply = `First paragraph.\n\n${"x".repeat(700)}`;
+  f.sessions.runTurn = async (_declaration, binding, event, options) => {
+    options.authorizeDispatch();
+    f.sessions.runs.push({ sessionId: binding.activeWayangSessionId!, eventId: event.connectorEventId, body: event.body, timeoutMs: options.timeoutMs });
+    return { resultSummary: fullReply.replace(/\s+/gu, " ").slice(0, 500), finalAssistantText: fullReply, messages: [] };
+  };
+  await f.gateway.start();
+  await f.gateway.admit(f.declaration.endpointId, inbound("$escaped", "!!status"));
+  await f.gateway.drain(f.declaration.endpointId);
+  assert.equal(f.sessions.runs[0]?.body, "!status");
+  assert.equal(f.sessions.runs[0]?.timeoutMs, 10 * 60 * 1000);
+  assert.deepEqual(getStore().messagingDeliveries[0]?.payload, { kind: "final", text: fullReply });
 }));
 
 test("duplicate ingress never creates a second turn and accepted commands preserve sequence", () => withStore(async (dir) => {
@@ -250,7 +267,7 @@ test("close quiesces new claims and awaits the one active endpoint turn", () => 
     enteredResolve();
     await release;
     f.sessions.origins.add(event.connectorEventId);
-    return { resultSummary: "finished during close", messages: [] };
+    return { resultSummary: "finished during close", finalAssistantText: "finished during close", messages: [] };
   };
   await f.gateway.start();
   await f.gateway.admit(f.declaration.endpointId, inbound("$closing-active", "first"));

@@ -113,6 +113,8 @@ function safeErrorCode(error: unknown): MessagingErrorCode {
   return "turn_failed";
 }
 
+const DEFAULT_MESSAGING_TURN_TIMEOUT_MS = 10 * 60 * 1000;
+
 export class MessagingGatewayService {
   private readonly declarations: Map<string, MessagingEndpointDeclaration>;
   private readonly drains = new Map<string, Promise<void>>();
@@ -126,7 +128,11 @@ export class MessagingGatewayService {
     private readonly attestations: MessagingConnectorAttestationPort,
     private readonly sessions: WayangMessagingSessionPort,
     private readonly ephemeralEffects?: MessagingGatewayEphemeralEffectPort,
+    private readonly turnTimeoutMs = DEFAULT_MESSAGING_TURN_TIMEOUT_MS,
   ) {
+    if (!Number.isSafeInteger(turnTimeoutMs) || turnTimeoutMs <= 0 || turnTimeoutMs > 60 * 60 * 1000) {
+      throw new WorkspaceStoreError("Messaging turn timeout is invalid");
+    }
     const compiled = compileMessagingEndpointDeclarations(declarations);
     this.declarations = new Map(compiled.map((row) => [row.endpointId, row]));
     reconcileMessagingEndpointDeclarations(compiled);
@@ -359,8 +365,9 @@ export class MessagingGatewayService {
         claimId: row.claim_id!,
         sessionId: currentBinding.activeWayangSessionId!,
       });
-      const result = await this.sessions.runTurn(declaration, currentBinding, event, {
+      const result = await this.sessions.runTurn(declaration, currentBinding, { ...event, body: parsed.text }, {
         canonicalEventSha256: row.canonical_event_sha256,
+        timeoutMs: this.turnTimeoutMs,
         authorizeDispatch: () => assertMessagingEventClaimBinding({
           connectorId: row.connector_id,
           connectorEventId: row.connector_event_id,
@@ -373,7 +380,7 @@ export class MessagingGatewayService {
       });
       const finalPayload: MessagingDeliveryPayload = {
         kind: "final",
-        text: result.resultSummary?.trim() || "The agent completed the turn without a textual final response.",
+        text: result.finalAssistantText?.trim() || "The agent completed the turn without a textual final response.",
       };
       try {
         this.complete(row, currentBinding.activeWayangSessionId, [finalPayload]);

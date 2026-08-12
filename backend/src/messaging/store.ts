@@ -47,19 +47,34 @@ export interface MessagingHistoryCompactionResult {
 
 function compactMessagingHistoryDraft(draft: StoreData, now: number): MessagingHistoryCompactionResult {
   const cutoff = now - MESSAGING_HISTORY_RETENTION_MS;
+  const eventByKey = new Map(draft.messagingEvents.map((event) => [
+    `${event.connector_id}\0${event.connector_event_id}`,
+    event,
+  ]));
+  const eventGraphIsRemovable = (connectorId: string, connectorEventId: string): boolean => {
+    const event = eventByKey.get(`${connectorId}\0${connectorEventId}`);
+    if (!event?.completed_at || event.completed_at > cutoff
+      || !["completed", "failed", "rejected"].includes(event.state)) return false;
+    const deliveries = draft.messagingDeliveries.filter((row) => row.connector_id === connectorId
+      && row.connector_event_id === connectorEventId);
+    return deliveries.every((row) => ["delivered", "failed", "withheld"].includes(row.state)
+      && row.updated_at <= cutoff);
+  };
+  const removableTransactionKeys = new Set(draft.messagingTransactions.filter((transaction) => (
+    transaction.completed_at <= cutoff
+    && transaction.child_manifest.every((entry) => eventGraphIsRemovable(
+      transaction.connector_id,
+      entry.connector_event_id,
+    ))
+  )).map((transaction) => `${transaction.connector_id}\0${transaction.transaction_id}`));
   const priorTransactions = draft.messagingTransactions.length;
-  draft.messagingTransactions = draft.messagingTransactions.filter((row) => row.completed_at > cutoff);
+  draft.messagingTransactions = draft.messagingTransactions.filter((row) =>
+    !removableTransactionKeys.has(`${row.connector_id}\0${row.transaction_id}`));
   const retainedEventKeys = new Set(draft.messagingTransactions.flatMap((transaction) =>
     transaction.child_manifest.map((entry) => `${transaction.connector_id}\0${entry.connector_event_id}`)));
   const removableEventKeys = new Set(draft.messagingEvents.filter((event) => {
-    if (!event.completed_at || event.completed_at > cutoff
-      || !["completed", "failed", "rejected"].includes(event.state)) return false;
     const key = `${event.connector_id}\0${event.connector_event_id}`;
-    if (retainedEventKeys.has(key)) return false;
-    const deliveries = draft.messagingDeliveries.filter((row) => row.connector_id === event.connector_id
-      && row.connector_event_id === event.connector_event_id);
-    return deliveries.every((row) => ["delivered", "failed", "withheld"].includes(row.state)
-      && row.updated_at <= cutoff);
+    return !retainedEventKeys.has(key) && eventGraphIsRemovable(event.connector_id, event.connector_event_id);
   }).map((event) => `${event.connector_id}\0${event.connector_event_id}`));
   const priorEvents = draft.messagingEvents.length;
   const priorDeliveries = draft.messagingDeliveries.length;

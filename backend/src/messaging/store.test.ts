@@ -676,6 +676,30 @@ test("graph-aware retention removes only expired completed transaction/event/del
   assert.equal(getStore().messagingDeliveries.length, 0);
 }));
 
+test("retention keeps an expired transaction atomically while any child graph is still active", () => withStore((dir) => {
+  const f = fixture(dir);
+  const { digest } = provision(f.declaration);
+  const old = 1_000;
+  admitMessagingTransactionManifest({
+    connectorId: "matrix", transactionId: "mixed-txn", canonicalTransactionSha256: sha("mixed-txn"),
+    children: [
+      admission(f.declaration, digest, event({ connectorEventId: "$done" }), old),
+      admission(f.declaration, digest, event({ connectorEventId: "$active" }), old),
+    ], acceptedAt: old,
+  });
+  const completedClaim = claimNextMessagingEvent({ endpointId: f.declaration.endpointId, declarationSha256: digest })!;
+  completeMessagingEventWithDeliveries({
+    connectorId: "matrix", connectorEventId: completedClaim.connector_event_id,
+    canonicalEventSha256: completedClaim.canonical_event_sha256, claimId: completedClaim.claim_id!,
+    sessionId: null, payloads: [{ kind: "notice", text: "done" }], now: old,
+  });
+  assert.deepEqual(compactMessagingHistory(old + MESSAGING_HISTORY_RETENTION_MS + 1), {
+    transactions: 0, events: 0, deliveries: 0,
+  });
+  assert.equal(getStore().messagingTransactions.some((row) => row.transaction_id === "mixed-txn"), true);
+  assert.equal(getStore().messagingEvents.filter((row) => ["$done", "$active"].includes(row.connector_event_id)).length, 2);
+}));
+
 test("Project and Profile deletion cannot transfer or orphan messaging endpoint authority", () => withStore((dir) => {
   const f = fixture(dir);
   provision(f.declaration);

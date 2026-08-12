@@ -3587,6 +3587,8 @@ export async function resendMessage(id: string, messageId: string): Promise<Rese
 
 export interface RunPromptResult {
   resultSummary: string | null;
+  /** Full final assistant text for connector delivery; never scheduler-truncated. */
+  finalAssistantText: string | null;
   messages: SerializedMessage[];
 }
 
@@ -3791,7 +3793,11 @@ export async function runMessagingPromptAndWait(
 
     const outcome = classifyScheduledPromptResult(handle.session.messages.slice(firstNewMessageIndex));
     if (outcome.error) throw new Error(outcome.error);
-    return { resultSummary: outcome.resultSummary, messages: getMessageHistory(id) };
+    return {
+      resultSummary: outcome.resultSummary,
+      finalAssistantText: extractLastAssistantText(handle.session.messages.slice(firstNewMessageIndex)),
+      messages: getMessageHistory(id),
+    };
   } finally {
     try {
       if (priorToolNames) handle.session.setActiveToolsByName(priorToolNames);
@@ -3821,6 +3827,7 @@ export async function runPromptAndWait(
 
   return {
     resultSummary: outcome.resultSummary,
+    finalAssistantText: extractLastAssistantText(handle.session.messages),
     messages: getMessageHistory(id),
   };
 }
@@ -4117,7 +4124,7 @@ function getLastAssistantError(messages: any[]): string | null {
   return null;
 }
 
-function summarizeLastAssistantMessage(messages: any[]): string | null {
+function extractLastAssistantText(messages: any[]): string | null {
   const assistant = [...messages].reverse().find((m) => m.role === "assistant");
   if (!assistant) return null;
   const content = assistant.content;
@@ -4137,7 +4144,12 @@ function summarizeLastAssistantMessage(messages: any[]): string | null {
   } else if (content !== undefined && content !== null) {
     text = String(content);
   }
-  const normalized = text.replace(/\s+/g, " ").trim();
+  const trimmed = text.trim();
+  return trimmed || null;
+}
+
+function summarizeLastAssistantMessage(messages: any[]): string | null {
+  const normalized = extractLastAssistantText(messages)?.replace(/\s+/g, " ").trim() ?? "";
   return normalized ? normalized.slice(0, 500) : null;
 }
 
