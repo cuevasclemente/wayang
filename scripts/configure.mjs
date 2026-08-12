@@ -234,8 +234,14 @@ async function main() {
 
   let displayHost = isLoopbackHost(host) || host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
   if (displayHost.includes(":") && !displayHost.startsWith("[")) displayHost = `[${displayHost}]`;
-  console.log("\nNext: make start");
-  console.log(`Open http://${displayHost}:${portNumber}`);
+  if (publicOrigin) {
+    console.log("\nNext: make start");
+    console.log(`Open ${publicOrigin} through your HTTPS reverse proxy.`);
+    console.log("For Wayang's optional foreground Caddy path, run make local-https-check, then make local-https in a separate terminal.");
+  } else {
+    console.log("\nNext: make start");
+    console.log(`Open http://${displayHost}:${portNumber}`);
+  }
 }
 
 main().catch((error) => {

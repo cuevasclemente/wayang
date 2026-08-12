@@ -44,6 +44,8 @@ Rerun `make configure` to rotate the password. Do not hand-edit or paste a plain
 
 Remote passwordless requests may use ordinary Wayang features according to the deployment network boundary, but they cannot own PIN-backed capability approvals unless the trusted proxy identity bridge above resolves an authenticated owner. Capability Settings requires a built-in authenticated session, a configured trusted-proxy identity, or a direct loopback peer with a loopback browser origin. An SSH tunnel to `127.0.0.1:WAYANG_PORT` provides the loopback administration path without treating the 8-digit command-guard PIN as a network-login password.
 
+For a single-user private LAN without an existing reverse proxy, Wayang includes an optional generated **foreground Caddy** path using built-in auth, loopback upstream, an exact HTTPS origin on an unprivileged port, forwarding-header replacement, no request logs, and Caddy's local CA. See [Local HTTPS remote administration](local-https.md). It does not install Caddy, configure DNS/CA trust, change `.env`, enter a password, or install a service.
+
 ## Pi provider authentication
 
 Wayang uses pi 0.80.6's standard authentication and model registry.
@@ -106,7 +108,7 @@ Default loopback use needs no proxy. Wayang authorizes browser origins from expl
 5. set the upstream `Host` header to the exact public-origin authority, and replace client-supplied `Forwarded` and `X-Forwarded-*` headers rather than appending or passing them through;
 6. prevent direct access to an unprotected alternate bind/port.
 
-Built-in auth and external forward auth can protect the deployment independently or together. The optional proxy identity bridge is narrower: it is mutually exclusive with built-in auth and converts one explicitly configured, sanitized header into an owner identity only at the loopback-proxy/exact-origin boundary described above. VPN membership alone grants network reachability; it does not sandbox what the agent can do.
+Built-in auth and external forward auth can protect the deployment independently or together. The optional proxy identity bridge is narrower: it is mutually exclusive with built-in auth and converts one explicitly configured, sanitized header into an owner identity only at the loopback-proxy/exact-origin boundary described above. VPN membership alone grants network reachability; it does not sandbox what the agent can do. `make local-https-check` and `make local-https` implement the foreground Caddy/built-in-auth reference path documented in [Local HTTPS remote administration](local-https.md); they accept no identity header and never daemonize the proxy.
 
 The configuration wizard requires the exact acknowledgement `I UNDERSTAND` before saving a non-loopback, passwordless bind. This is a warning, not proof that the proxy is correct.
 

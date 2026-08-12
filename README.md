@@ -29,6 +29,7 @@ Read [SECURITY.md](SECURITY.md) before changing the bind address or exposing Way
 - optional Chromium browser workbench with capability-gated backend-owned interactive agent tools
 - optional text-to-speech integration
 - optional shared-password login using an HttpOnly session cookie
+- optional foreground Caddy local-HTTPS path for authenticated non-localhost administration
 - responsive desktop and mobile web UI
 
 Some agent-side conveniences, such as tools that create or focus apps, require optional pi extensions. Core chat and the web UI do not require a global pi installation; the checkout includes pi through the backend dependency.
@@ -81,6 +82,8 @@ make doctor          Check prerequisites and configuration metadata only
 make bootstrap       Install, build, configure, and smoke-test
 make install         Run npm ci in backend, frontend, and e2e
 make configure       Update private configuration interactively
+make local-https-check  Validate optional Caddy HTTPS proxy settings
+make local-https     Run optional Caddy HTTPS proxy in the foreground
 make setup-capability-approval  Optional capability-approval state preflight/migration
 make pi-login        Open the checkout's pi CLI for /login
 make build           Build backend and frontend
@@ -121,6 +124,7 @@ See [docs/configuration.md](docs/configuration.md#data-locations) for exact file
 
 - Installation: [docs/installation.md](docs/installation.md)
 - Configuration: [docs/configuration.md](docs/configuration.md)
+- Local HTTPS remote administration: [docs/local-https.md](docs/local-https.md)
 - Agent-assisted installation: [docs/agent-install.md](docs/agent-install.md)
 - Projects and agent profiles: [docs/agents-and-project-settings.md](docs/agents-and-project-settings.md)
 - Project-local apps: [docs/apps-framework.md](docs/apps-framework.md)
