@@ -13,6 +13,7 @@ import {
   classifyScheduledPromptResult,
   cleanupPiSessionCapabilityDenial,
   closePiSessionAuthorities,
+  createModelContext,
   createPiSession,
   fileAudioExperimentRuntimeIsEligible,
   getPiSession,
@@ -725,6 +726,31 @@ test("Pi bridge browser turns mint the exact persisted current-branch boundary a
     }
   } finally {
     f.cleanup();
+  }
+});
+
+test("restricted model runtimes exclude global models.json provider configuration", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-model-context-isolation-"));
+  const agentDir = path.join(dir, "agent");
+  fs.mkdirSync(agentDir, { recursive: true });
+  fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({
+    providers: {
+      "synthetic-standard-only": {
+        baseUrl: "https://models.invalid/v1",
+        api: "openai-completions",
+        apiKey: "synthetic-placeholder",
+        models: [{ id: "synthetic-model" }],
+      },
+    },
+  }), { mode: 0o600 });
+
+  try {
+    const standard = await createModelContext({ agentDir });
+    const restricted = await createModelContext({ agentDir, includeModelConfig: false });
+    assert.ok(standard.registry.find("synthetic-standard-only", "synthetic-model"));
+    assert.equal(restricted.registry.find("synthetic-standard-only", "synthetic-model"), undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

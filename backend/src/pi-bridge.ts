@@ -534,13 +534,14 @@ export function installWayangRawSudoFailClosedGuard(session: AgentSession, sessi
   };
 }
 
-type ModelContext = { runtime: ModelRuntime; registry: ModelRegistry };
+export type ModelContext = { runtime: ModelRuntime; registry: ModelRegistry };
 
-async function createModelContext(options: { agentDir?: string } = {}): Promise<ModelContext> {
+/** @internal Exported for synthetic provider-isolation regression tests. */
+export async function createModelContext(options: { agentDir?: string; includeModelConfig?: boolean } = {}): Promise<ModelContext> {
   const agentDir = options.agentDir ?? getAgentDirPath();
   const runtime = await ModelRuntime.create({
     authPath: path.join(agentDir, "auth.json"),
-    modelsPath: path.join(agentDir, "models.json"),
+    modelsPath: options.includeModelConfig === false ? null : path.join(agentDir, "models.json"),
     allowModelNetwork: false,
   });
   return { runtime, registry: new ModelRegistry(runtime) };
@@ -1432,7 +1433,7 @@ async function getSessionModelSelectionRegistry(id: string): Promise<ModelRegist
 }
 
 async function getSessionModelContext(restricted: boolean): Promise<ModelContext> {
-  return restricted ? createModelContext() : getModelContext();
+  return restricted ? createModelContext({ includeModelConfig: false }) : getModelContext();
 }
 
 /** Deny the old runtime synchronously, then wait until every old surface and
@@ -3713,6 +3714,15 @@ export async function abortSession(
  * Subscribe to pi session events and forward serialized messages
  * to a callback. Returns an unsubscribe function.
  */
+function persistOverflowRetryMarker(handle: PiSessionHandle, event: AgentSessionEvent): void {
+  if (event.type !== "compaction_end" || event.reason !== "overflow" || !event.result || !event.willRetry) return;
+  const branch = handle.session.sessionManager.getBranch();
+  const leaf = branch[branch.length - 1] as any;
+  if (leaf?.type === "custom" && leaf.customType === OVERFLOW_RETRY_MARKER) return;
+  if (leaf?.type !== "compaction" || typeof leaf.id !== "string") return;
+  handle.session.sessionManager.appendCustomEntry(OVERFLOW_RETRY_MARKER, { compactionEntryId: leaf.id });
+}
+
 export function subscribeToSession(
   id: string,
   onMessage: (msg: SerializedMessage) => void,
@@ -3727,6 +3737,7 @@ export function subscribeToSession(
     // No queued or future result is released from a denied handle. A fresh
     // runtime/handle is required after cleanup.
     if (handle.capabilityAuthorityDenied) return;
+    persistOverflowRetryMarker(handle, event);
     if (event.type === "queue_update" && handle.queuedBrowserMessages.size > 0) {
       for (const [clientMessageId, record] of handle.queuedBrowserMessages) {
         if (queuedChatMessageState(record.capture) === "claimed") handle.queuedBrowserMessages.delete(clientMessageId);
@@ -4022,16 +4033,29 @@ function customHistoryMessage(customType: string, content: unknown, timestamp?: 
   };
 }
 
+const OVERFLOW_RETRY_MARKER = "wayang-overflow-retry-v1";
+
 export function serializeHistoryEntries(entries: any[]): SerializedMessage[] {
   const serialized: SerializedMessage[] = [];
-  // Pi persists the provider's overflow error before appending the successful
-  // recovery compaction. Keep the canonical JSONL audit trail intact, but do
-  // not render that recovered intermediate failure as a terminal chat error.
-  const recoveredOverflowEntryIds = new Set(
-    entries
-      .filter((entry) => entry?.type === "compaction" && typeof entry.parentId === "string")
-      .map((entry) => entry.parentId),
-  );
+  // Compaction entries do not persist their reason or retry intent. Suppress a
+  // provider overflow only when Wayang recorded Pi's authoritative successful
+  // overflow-compaction event with willRetry=true. Manual compaction and older
+  // sessions without that marker retain the terminal error for audit truth.
+  const recoveredOverflowEntryIds = new Set<string>();
+  for (let index = 0; index < entries.length; index++) {
+    const compaction = entries[index];
+    const marker = entries[index + 1];
+    if (
+      compaction?.type === "compaction"
+      && typeof compaction.parentId === "string"
+      && marker?.type === "custom"
+      && marker.customType === OVERFLOW_RETRY_MARKER
+      && marker.parentId === compaction.id
+      && marker.data?.compactionEntryId === compaction.id
+    ) {
+      recoveredOverflowEntryIds.add(compaction.parentId);
+    }
+  }
 
   for (const entry of entries) {
     if (entry.type === "message") {
