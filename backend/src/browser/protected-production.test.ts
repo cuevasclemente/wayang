@@ -410,7 +410,9 @@ test("production uses one pair realm with exclusive route/tool/viewer leases, or
     assert.equal(managed!.starts, 2);
     await assert.rejects(controls!.pasteText("synthetic rejected text"), /requires human control/i);
 
+    const bindingBeforeHandoff = live.binding;
     await live.browser.beginCredentialHandoff();
+    assert.ok(live.binding.controlGeneration > bindingBeforeHandoff.controlGeneration, "runtime binding remains live across control transitions");
     const pastedState = await controls!.pasteText("synthetic owner-only text");
     assert.equal(pastedState.controlMode, "user");
     assert.ok(managed!.cdp.calls.includes("Input.insertText"));

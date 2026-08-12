@@ -81,8 +81,17 @@ import {
 import {
   INTERACTIVE_BROWSER_TOOL_NAMES,
   PROTECTED_BROWSER_TOOL_NAME,
+  isProtectedBrowserToolRuntime,
   type ProtectedBrowserToolRuntime,
 } from "./browser/protected-tools.js";
+import {
+  assertInteractiveBrowserToolCatalog,
+  type AgentLeaseDetachReason,
+  type BrowserAuthorityRevokeReason,
+  type CapabilityBoundInteractiveBrowserToolRuntime,
+  type InteractiveBrowserSessionLifecyclePort,
+  type SessionWorkspaceCloseReason,
+} from "./browser/interactive-runtime.js";
 import { exactProtectedBrowserBindingEqual } from "./browser/protected-browser.js";
 import { getBrowserExecutableDiagnostic } from "./browser/manager.js";
 import {
@@ -156,7 +165,7 @@ export interface PiSessionHandle {
   /** In-flight bounded TERM/KILL teardown started by the denial latch. */
   hostBashTeardown?: Promise<void>;
   restrictedMcpRuntime?: RestrictedMcpRuntime;
-  protectedBrowserRuntime?: ProtectedBrowserToolRuntime;
+  protectedBrowserRuntime?: CapabilityBoundInteractiveBrowserToolRuntime;
   protectedBrowserFactory?: CreatePiSessionRuntimeOptions["protectedBrowserFactory"];
   protectedAutomationRuntime?: ProtectedAutomationToolRuntime;
   protectedAutomationFactory?: CreatePiSessionRuntimeOptions["protectedAutomationFactory"];
@@ -263,6 +272,8 @@ const sessionCreations = new Map<string, Promise<PiSessionHandle>>();
 /** Monotonic process-local denial epoch. A creation may publish only while the
  * exact epoch captured before its first await remains current. */
 const sessionCapabilityDenialGenerations = new Map<string, bigint>();
+/** Strongest browser teardown requested while a runtime may still be starting. */
+const sessionBrowserTeardownIntents = new Map<string, PiSessionBrowserTeardown>();
 const agentSwitches = new Map<string, Promise<AgentSwitchResult>>();
 const runtimeEvents = new EventEmitter();
 const runtimeUnavailableNotifiedHandles = new WeakSet<object>();
@@ -931,9 +942,9 @@ export function getPiSessionRuntimeState(id: string): PiSessionRuntimeState {
 }
 
 export function protectedBrowserIdleRetentionIsRequired(
-  runtime: Pick<ProtectedBrowserToolRuntime, "browser" | "preflight"> | undefined,
+  runtime: CapabilityBoundInteractiveBrowserToolRuntime | Pick<ProtectedBrowserToolRuntime, "browser" | "preflight"> | undefined,
 ): boolean {
-  if (!runtime || runtime.browser.isRevoked || runtime.browser.mode === "agent") return false;
+  if (!runtime || !("browser" in runtime) || runtime.browser.isRevoked || runtime.browser.mode === "agent") return false;
   try { return runtime.preflight().allowed; }
   catch { return false; }
 }
@@ -947,7 +958,7 @@ export async function stopIdlePiSessions(now = Date.now()): Promise<string[]> {
     // agent change, and shutdown paths still revoke it directly.
     if (protectedBrowserIdleRetentionIsRequired(handle.protectedBrowserRuntime)) continue;
     if (now - handle.lastActivityAt < SESSION_IDLE_TIMEOUT_MS) continue;
-    await destroyPiSession(id);
+    await destroyPiSession(id, { kind: "detach", reason: "pi_idle" });
     stopped.push(id);
   }
   maybeStopIdleCleanupTimer();
@@ -1600,8 +1611,9 @@ async function stopRuntimeForModelChange(
   if (handle?.session.isStreaming || (handle?.session.pendingMessageCount ?? 0) > 0) {
     throw new WorkspaceStoreError("Live model changes require an idle session; stop the session and retry", 409);
   }
-  latchPiSessionCapabilityDenial([id]);
-  await stopPiSession(id);
+  const browserTeardown: PiSessionBrowserTeardown = { kind: "detach", reason: "model_or_agent_switch" };
+  latchPiSessionCapabilityDenial([id], sessions, browserTeardown);
+  await stopPiSession(id, browserTeardown);
   return true;
 }
 
@@ -1809,6 +1821,10 @@ export interface AgentSwitchResult {
   preview: AgentSwitchPreview;
 }
 
+export type InteractiveBrowserFactory = (
+  binding: ProtectedBrowserBinding,
+) => CapabilityBoundInteractiveBrowserToolRuntime | Promise<CapabilityBoundInteractiveBrowserToolRuntime>;
+/** Protected production remains a concrete subtype of the neutral factory. */
 export type ProtectedBrowserFactory = (binding: ProtectedBrowserBinding) => ProtectedBrowserToolRuntime | Promise<ProtectedBrowserToolRuntime>;
 export type ProtectedAutomationFactory = (options: {
   binding: ProtectedAutomationBinding;
@@ -1850,7 +1866,7 @@ export interface CreatePiSessionRuntimeOptions {
   forceInMemorySettings?: boolean;
   /** Synthetic/internal override. Interactive production sessions normally use
    * the factory installed once during application bootstrap. */
-  protectedBrowserFactory?: ProtectedBrowserFactory;
+  protectedBrowserFactory?: InteractiveBrowserFactory;
   /** Synthetic/internal exact-return factory seam. Production uses the inert built-in factory. */
   protectedAutomationFactory?: ProtectedAutomationFactory;
   /** Synthetic/internal seam. Production remains inert until dependencies are installed. */
@@ -1862,7 +1878,8 @@ export interface CreatePiSessionRuntimeOptions {
   };
 }
 
-let productionProtectedBrowserFactory: ProtectedBrowserFactory | undefined;
+let productionProtectedBrowserFactory: InteractiveBrowserFactory | undefined;
+let productionInteractiveBrowserSessionLifecycle: InteractiveBrowserSessionLifecyclePort | undefined;
 let productionFileAudioExperimentDependencies: FileAudioExperimentDependencies | undefined;
 
 /** Adapter/media/DSP integration seam. Installation performs no file read,
@@ -1889,7 +1906,7 @@ export function installProductionFileAudioExperimentDependencies(
 /** Install the inert production composition seam. Installing a factory never
  * creates a runtime or starts Chromium; only an eligible interactive session
  * construction may invoke it. */
-export function installProductionProtectedBrowserFactory(factory: ProtectedBrowserFactory): () => void {
+export function installProductionProtectedBrowserFactory(factory: InteractiveBrowserFactory): () => void {
   if (typeof factory !== "function") throw new WorkspaceStoreError("Protected browser factory is invalid", 500);
   if (productionProtectedBrowserFactory && productionProtectedBrowserFactory !== factory) {
     throw new WorkspaceStoreError("Protected browser production factory is already installed", 409);
@@ -1897,6 +1914,24 @@ export function installProductionProtectedBrowserFactory(factory: ProtectedBrows
   productionProtectedBrowserFactory = factory;
   return () => {
     if (productionProtectedBrowserFactory === factory) productionProtectedBrowserFactory = undefined;
+  };
+}
+
+/** Install the process-level owner for Standard workspaces that may outlive Pi. */
+export function installInteractiveBrowserSessionLifecyclePort(
+  port: InteractiveBrowserSessionLifecyclePort,
+): () => void {
+  if (!port || typeof port.closeSessionWorkspaces !== "function"
+    || typeof port.revokeAuthority !== "function" || typeof port.blocksPiIdleDetach !== "function"
+    || typeof port.close !== "function") {
+    throw new WorkspaceStoreError("Interactive browser session lifecycle port is invalid", 500);
+  }
+  if (productionInteractiveBrowserSessionLifecycle && productionInteractiveBrowserSessionLifecycle !== port) {
+    throw new WorkspaceStoreError("Interactive browser session lifecycle port is already installed", 409);
+  }
+  productionInteractiveBrowserSessionLifecycle = port;
+  return () => {
+    if (productionInteractiveBrowserSessionLifecycle === port) productionInteractiveBrowserSessionLifecycle = undefined;
   };
 }
 
@@ -1928,7 +1963,8 @@ export function piSessionHandleRequiresFreshRuntime(
   if (handle.capabilityAuthorityDenied) return true;
   const browser = handle.protectedBrowserRuntime;
   if (browser) {
-    if (browser.browser.isRevoked) return true;
+    const protectedBrowser = (browser as { browser?: { isRevoked?: boolean } }).browser;
+    if (protectedBrowser?.isRevoked) return true;
     try { if (!browser.preflight().allowed) return true; }
     catch { return true; }
   }
@@ -1971,7 +2007,7 @@ export async function createPiSession(
   const assertCreationCurrent = () => assertPiSessionCreationGeneration(id, denialGeneration);
   const creationStartedAt = performance.now();
   let pendingRestrictedMcpRuntime: RestrictedMcpRuntime | undefined;
-  let pendingProtectedBrowserRuntime: ProtectedBrowserToolRuntime | undefined;
+  let pendingProtectedBrowserRuntime: CapabilityBoundInteractiveBrowserToolRuntime | undefined;
   let pendingProtectedAutomationRuntime: ProtectedAutomationToolRuntime | undefined;
   let pendingFileAudioExperimentRuntime: FileAudioExperimentRuntime | undefined;
   let pendingAgentSession: AgentSession | undefined;
@@ -2156,7 +2192,8 @@ export async function createPiSession(
         assertCreationCurrent();
         pendingProtectedBrowserRuntime = await selectedProtectedBrowserFactory(protectedBinding);
         assertCreationCurrent();
-        const returnedBinding = pendingProtectedBrowserRuntime?.browser.currentBinding;
+        if (pendingProtectedBrowserRuntime) assertInteractiveBrowserToolCatalog(pendingProtectedBrowserRuntime);
+        const returnedBinding = pendingProtectedBrowserRuntime?.binding;
         if (!pendingProtectedBrowserRuntime || !returnedBinding
           || returnedBinding.capabilityId !== protectedBinding.capabilityId
           || returnedBinding.sourceSessionId !== protectedBinding.sourceSessionId
@@ -2434,7 +2471,7 @@ export async function createPiSession(
       tools: pendingProtectedBrowserRuntime || pendingProtectedAutomationRuntime || pendingFileAudioExperimentRuntime
         ? [
             ...(includeRestrictedMcpActiveTool(runtimeResources.tools, pendingRestrictedMcpRuntime) ?? []),
-            ...(pendingProtectedBrowserRuntime ? [...INTERACTIVE_BROWSER_TOOL_NAMES] : []),
+            ...(pendingProtectedBrowserRuntime ? pendingProtectedBrowserRuntime.tools.map((tool) => tool.name) : []),
             ...(pendingProtectedAutomationRuntime ? [PROTECTED_AUTOMATION_TOOL_NAME] : []),
             ...(pendingFileAudioExperimentRuntime ? [FILE_AUDIO_EXPERIMENT_TOOL_NAME] : []),
           ]
@@ -2665,7 +2702,10 @@ export async function createPiSession(
     pendingAgentSession = undefined;
     await pendingRestrictedMcpRuntime?.close().catch(() => undefined);
     pendingRestrictedMcpRuntime = undefined;
-    await pendingProtectedBrowserRuntime?.detachAgentLease("runtime_replaced").catch(() => undefined);
+    if (pendingProtectedBrowserRuntime) {
+      const teardown = sessionBrowserTeardownIntents.get(id) ?? DEFAULT_BROWSER_TEARDOWN;
+      await invokeBrowserTeardown(pendingProtectedBrowserRuntime, teardown).catch(() => undefined);
+    }
     pendingProtectedBrowserRuntime = undefined;
     await pendingProtectedAutomationRuntime?.close().catch(() => undefined);
     pendingProtectedAutomationRuntime = undefined;
@@ -2727,8 +2767,9 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
     const authorityLifecycle = new AgentSwitchAuthorityLifecycle();
     beginAgentSwitch(id, pending);
 
+    const browserSwitchTeardown: PiSessionBrowserTeardown = { kind: "detach", reason: "model_or_agent_switch" };
     try {
-      await destroyPiSession(id);
+      await destroyPiSession(id, browserSwitchTeardown);
       authorityLifecycle.oldRuntimeRevoked();
       authorityLifecycle.authorizeProvisionalTargetConstruction();
       const handle = await createPiSession(
@@ -2773,7 +2814,7 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
       // The pending-switch runtime is deliberately ineligible for host bash.
       // Rebuild only after the durable target identity is committed so a
       // A restricted-to-standard transition cannot widen authority in the transaction gap.
-      await destroyPiSession(id);
+      await destroyPiSession(id, browserSwitchTeardown);
       authorityLifecycle.provisionalTargetDestroyed();
       authorityLifecycle.authorizeFreshTargetConstruction();
       const freshHandle = await createPiSession(
@@ -2798,7 +2839,7 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
       runtimeEvents.emit("event", { type: "agent_switched", sessionId: id, switchId: pending.switch_id } satisfies PiSessionRuntimeEvent);
       return { switch_id: pending.switch_id, session: completed, preview };
     } catch (error) {
-      await destroyPiSession(id);
+      await destroyPiSession(id, browserSwitchTeardown);
       let recovered = getSessionById(id);
       if (recovered?.pending_agent_switch?.switch_id === pending.switch_id) {
         recovered = reconcilePendingAgentSwitch(recovered);
@@ -2874,8 +2915,8 @@ export function getLiveProtectedBrowserRuntime(
 ): ProtectedBrowserToolRuntime | undefined {
   const handle = sessions.get(sourceSessionId);
   const runtime = handle?.protectedBrowserRuntime;
-  if (!handle || handle.capabilityAuthorityDenied || !runtime || runtime.browser.isRevoked) return undefined;
-  const current = runtime.browser.currentBinding;
+  if (!handle || handle.capabilityAuthorityDenied || !isProtectedBrowserToolRuntime(runtime) || runtime.browser.isRevoked) return undefined;
+  const current = runtime.binding;
   if (current.sourceSessionId !== sourceSessionId
     || current.runtimeGeneration !== handle.runtimeGeneration
     || current.agentProfileId !== handle.agentProfileId
@@ -3265,54 +3306,96 @@ export function ensureInteractiveCommandGuardEnabled(id: string, reason = "inter
   return state;
 }
 
-const capabilityAuthorityCleanup = new WeakMap<object, Promise<void>>();
+export type PiSessionBrowserTeardown =
+  | { kind: "detach"; reason: AgentLeaseDetachReason }
+  | { kind: "close_session"; reason: SessionWorkspaceCloseReason }
+  | { kind: "revoke"; reason: BrowserAuthorityRevokeReason };
 
-function beginPiSessionAuthorityCleanup(handle: PiSessionHandle): Promise<void> {
-  const existing = capabilityAuthorityCleanup.get(handle);
-  if (existing) return existing;
+const DEFAULT_BROWSER_TEARDOWN: PiSessionBrowserTeardown = Object.freeze({
+  kind: "detach",
+  reason: "runtime_replaced",
+});
 
-  // Invoke every revoker before returning. Their synchronous prefixes latch
-  // agent/process/control denial; process, socket, and browser shutdown may finish later.
-  const restricted = handle.restrictedMcpRuntime;
-  const protectedBrowser = handle.protectedBrowserRuntime;
-  const protectedAutomation = handle.protectedAutomationRuntime;
-  const fileAudioExperiment = handle.fileAudioExperimentRuntime;
-  const hostBashTeardown = handle.hostBashTeardown;
-  handle.restrictedMcpRuntime = undefined;
-  handle.protectedBrowserRuntime = undefined;
-  handle.protectedAutomationRuntime = undefined;
-  handle.fileAudioExperimentRuntime = undefined;
-  handle.hostBashTeardown = undefined;
-  const invokeClose = (runtime: { close(): Promise<void> } | undefined): Promise<void> => {
-    try { return runtime ? Promise.resolve(runtime.close()) : Promise.resolve(); }
-    catch (error) { return Promise.reject(error); }
-  };
-  const detachBrowserLease = (): Promise<void> => {
-    try {
-      return protectedBrowser
-        ? Promise.resolve(protectedBrowser.detachAgentLease("runtime_replaced"))
-        : Promise.resolve();
-    } catch (error) { return Promise.reject(error); }
-  };
-  const invokeAgentAbort = (): Promise<void> => {
-    try {
-      const abort = (handle.session as any)?.abort;
-      return typeof abort === "function" ? Promise.resolve(abort.call(handle.session)) : Promise.resolve();
-    } catch (error) { return Promise.reject(error); }
-  };
-  const cleanup = Promise.allSettled([
-    hostBashTeardown ?? Promise.resolve(),
-    invokeAgentAbort(),
-    invokeClose(restricted),
-    detachBrowserLease(),
-    invokeClose(protectedAutomation),
-    invokeClose(fileAudioExperiment),
-  ]).then(() => undefined);
-  capabilityAuthorityCleanup.set(handle, cleanup);
-  return cleanup;
+interface CapabilityAuthorityCleanupState {
+  browserRuntime?: CapabilityBoundInteractiveBrowserToolRuntime;
+  browserSeverity: 0 | 1 | 2 | 3;
+  promise: Promise<void>;
 }
 
-function latchPiSessionHandleCapabilityDenial(handle: PiSessionHandle): void {
+const capabilityAuthorityCleanup = new WeakMap<object, CapabilityAuthorityCleanupState>();
+
+function browserTeardownSeverity(action: PiSessionBrowserTeardown): 1 | 2 | 3 {
+  return action.kind === "detach" ? 1 : action.kind === "close_session" ? 2 : 3;
+}
+
+function invokeBrowserTeardown(
+  runtime: CapabilityBoundInteractiveBrowserToolRuntime,
+  action: PiSessionBrowserTeardown,
+): Promise<void> {
+  try {
+    if (action.kind === "detach") return Promise.resolve(runtime.detachAgentLease(action.reason));
+    if (action.kind === "close_session") return Promise.resolve(runtime.closeSessionWorkspaces(action.reason));
+    return Promise.resolve(runtime.revokeAuthority(action.reason));
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+function beginPiSessionAuthorityCleanup(
+  handle: PiSessionHandle,
+  browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
+): Promise<void> {
+  let state = capabilityAuthorityCleanup.get(handle);
+  if (!state) {
+    // Invoke every revoker before returning. Their synchronous prefixes latch
+    // agent/process/control denial; process, socket, and browser shutdown may finish later.
+    const restricted = handle.restrictedMcpRuntime;
+    const protectedBrowser = handle.protectedBrowserRuntime;
+    const protectedAutomation = handle.protectedAutomationRuntime;
+    const fileAudioExperiment = handle.fileAudioExperimentRuntime;
+    const hostBashTeardown = handle.hostBashTeardown;
+    handle.restrictedMcpRuntime = undefined;
+    handle.protectedBrowserRuntime = undefined;
+    handle.protectedAutomationRuntime = undefined;
+    handle.fileAudioExperimentRuntime = undefined;
+    handle.hostBashTeardown = undefined;
+    const invokeClose = (runtime: { close(): Promise<void> } | undefined): Promise<void> => {
+      try { return runtime ? Promise.resolve(runtime.close()) : Promise.resolve(); }
+      catch (error) { return Promise.reject(error); }
+    };
+    const invokeAgentAbort = (): Promise<void> => {
+      try {
+        const abort = (handle.session as any)?.abort;
+        return typeof abort === "function" ? Promise.resolve(abort.call(handle.session)) : Promise.resolve();
+      } catch (error) { return Promise.reject(error); }
+    };
+    state = {
+      browserRuntime: protectedBrowser,
+      browserSeverity: 0,
+      promise: Promise.allSettled([
+        hostBashTeardown ?? Promise.resolve(),
+        invokeAgentAbort(),
+        invokeClose(restricted),
+        invokeClose(protectedAutomation),
+        invokeClose(fileAudioExperiment),
+      ]).then(() => undefined),
+    };
+    capabilityAuthorityCleanup.set(handle, state);
+  }
+
+  const severity = browserTeardownSeverity(browserTeardown);
+  if (state.browserRuntime && severity > state.browserSeverity) {
+    state.browserSeverity = severity;
+    const browserCleanup = invokeBrowserTeardown(state.browserRuntime, browserTeardown);
+    state.promise = Promise.allSettled([state.promise, browserCleanup]).then(() => undefined);
+  }
+  return state.promise;
+}
+
+function latchPiSessionHandleCapabilityDenial(
+  handle: PiSessionHandle,
+  browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
+): void {
   if (!handle.capabilityAuthorityDenied) {
     handle.capabilityAuthorityDenied = true;
     // Invalidate every creation-time closure and exact protected binding.
@@ -3334,6 +3417,7 @@ function latchPiSessionHandleCapabilityDenial(handle: PiSessionHandle): void {
   handle.trustedHostBashTool = undefined;
   retireInteractiveTurn(handle);
 
+  const browserToolNames = handle.protectedBrowserRuntime?.tools?.map((tool) => tool.name) ?? [];
   const session = handle.session as any;
   if (session) {
     try { session.clearQueue?.(); } catch { /* synchronous denial remains latched */ }
@@ -3352,18 +3436,18 @@ function latchPiSessionHandleCapabilityDenial(handle: PiSessionHandle): void {
     }
     session._toolRegistry?.delete?.("bash");
     session._toolRegistry?.delete?.(PROTECTED_BROWSER_TOOL_NAME);
-    for (const name of INTERACTIVE_BROWSER_TOOL_NAMES) session._toolRegistry?.delete?.(name);
+    for (const name of new Set([...INTERACTIVE_BROWSER_TOOL_NAMES, ...browserToolNames])) session._toolRegistry?.delete?.(name);
     session._toolRegistry?.delete?.(PROTECTED_AUTOMATION_TOOL_NAME);
     session._toolRegistry?.delete?.(FILE_AUDIO_EXPERIMENT_TOOL_NAME);
     session._toolDefinitions?.delete?.("bash");
     session._toolDefinitions?.delete?.(PROTECTED_BROWSER_TOOL_NAME);
-    for (const name of INTERACTIVE_BROWSER_TOOL_NAMES) session._toolDefinitions?.delete?.(name);
+    for (const name of new Set([...INTERACTIVE_BROWSER_TOOL_NAMES, ...browserToolNames])) session._toolDefinitions?.delete?.(name);
     session._toolDefinitions?.delete?.(PROTECTED_AUTOMATION_TOOL_NAME);
     session._toolDefinitions?.delete?.(FILE_AUDIO_EXPERIMENT_TOOL_NAME);
   }
 
   // Calling these async closers starts their synchronous denial prefixes now.
-  void beginPiSessionAuthorityCleanup(handle);
+  void beginPiSessionAuthorityCleanup(handle, browserTeardown);
   emitRuntimeUnavailableOnce(handle);
 }
 
@@ -3379,13 +3463,20 @@ export interface PiSessionCapabilityDenialLookup {
 export function latchPiSessionCapabilityDenial(
   runtimeIds: readonly string[],
   lookup: PiSessionCapabilityDenialLookup = sessions,
+  browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
 ): void {
   for (const id of new Set(runtimeIds)) {
+    const priorTeardown = sessionBrowserTeardownIntents.get(id);
+    const effectiveTeardown = priorTeardown
+      && browserTeardownSeverity(priorTeardown) >= browserTeardownSeverity(browserTeardown)
+      ? priorTeardown
+      : browserTeardown;
+    sessionBrowserTeardownIntents.set(id, effectiveTeardown);
     // Advance first and without awaiting or requiring a published handle. This
     // is the authoritative starting-runtime revocation latch.
     sessionCapabilityDenialGenerations.set(id, getPiSessionCapabilityDenialGeneration(id) + 1n);
     const handle = lookup.get(id);
-    if (handle) latchPiSessionHandleCapabilityDenial(handle);
+    if (handle) latchPiSessionHandleCapabilityDenial(handle, effectiveTeardown);
     else getActionApprovalBridge().cancelSession(id, "runtime capability authority revoked");
   }
 }
@@ -3398,25 +3489,43 @@ export async function cleanupPiSessionCapabilityDenial(runtimeIds: readonly stri
     if (pending) await pending.catch(() => undefined);
     const handle = sessions.get(id);
     if (!handle) return;
-    latchPiSessionHandleCapabilityDenial(handle);
-    await beginPiSessionAuthorityCleanup(handle);
+    const browserTeardown = sessionBrowserTeardownIntents.get(id) ?? DEFAULT_BROWSER_TEARDOWN;
+    latchPiSessionHandleCapabilityDenial(handle, browserTeardown);
+    await beginPiSessionAuthorityCleanup(handle, browserTeardown);
     await stopPiSessionIfIdle(id).catch(() => false);
   }));
 }
 
-export async function closePiSessionAuthorities(handle: PiSessionHandle): Promise<void> {
-  latchPiSessionHandleCapabilityDenial(handle);
-  await beginPiSessionAuthorityCleanup(handle);
+export async function closePiSessionAuthorities(
+  handle: PiSessionHandle,
+  browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
+): Promise<void> {
+  latchPiSessionHandleCapabilityDenial(handle, browserTeardown);
+  await beginPiSessionAuthorityCleanup(handle, browserTeardown);
 }
 
-export async function destroyPiSession(id: string): Promise<void> {
+export async function destroyPiSession(
+  id: string,
+  browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
+): Promise<void> {
   // Resolve waiting external writes before abort/disposal can block on their
   // extension hooks. This is deliberately safe even when no live handle exists
   // (for example a stop/archive racing a just-finished session).
   getActionApprovalBridge().cancelSession(id, "session destroyed");
   const handle = sessions.get(id);
-  if (!handle) return;
-  await closePiSessionAuthorities(handle);
+  if (!handle) {
+    if (browserTeardown.kind === "close_session") {
+      await productionInteractiveBrowserSessionLifecycle?.closeSessionWorkspaces(id, browserTeardown.reason);
+    }
+    return;
+  }
+  const browserBinding = handle.protectedBrowserRuntime?.binding;
+  await closePiSessionAuthorities(handle, browserTeardown);
+  if (browserTeardown.kind === "close_session") {
+    await productionInteractiveBrowserSessionLifecycle?.closeSessionWorkspaces(id, browserTeardown.reason);
+  } else if (browserTeardown.kind === "revoke" && browserBinding) {
+    await productionInteractiveBrowserSessionLifecycle?.revokeAuthority(browserBinding, browserTeardown.reason);
+  }
   try {
     if (handle.session.isStreaming) {
       await handle.session.abort();
@@ -3436,6 +3545,7 @@ export async function destroyPiSession(id: string): Promise<void> {
   handle.events.removeAllListeners();
   if (handle.sessionFile) invalidateSessionFileSnapshot(handle.sessionFile);
   sessions.delete(id);
+  sessionBrowserTeardownIntents.delete(id);
   maybeStopIdleCleanupTimer();
   // Clean up web-session lookup mappings. Exact object ownership is removed
   // synchronously so a stale tool context cannot fall through to colliding
@@ -3452,20 +3562,23 @@ export async function destroyPiSession(id: string): Promise<void> {
   }
 }
 
-export async function stopPiSession(id: string): Promise<void> {
+export async function stopPiSession(
+  id: string,
+  browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
+): Promise<void> {
   getActionApprovalBridge().cancelSession(id, "session stopped");
   const pending = sessionCreations.get(id);
   if (pending) {
     // Stop is itself a synchronous starting-runtime denial, not permission for
     // the old creation to publish briefly before being destroyed.
-    latchPiSessionCapabilityDenial([id]);
+    latchPiSessionCapabilityDenial([id], sessions, browserTeardown);
     try {
       await pending;
     } catch {
       // A failed creation leaves no live session to stop.
     }
   }
-  await destroyPiSession(id);
+  await destroyPiSession(id, browserTeardown);
 }
 
 export interface InterviewSubmissionDelivery {
@@ -4716,6 +4829,7 @@ export function getSessionFileMessageHistory(
 
 export async function cleanup(): Promise<void> {
   for (const [id] of sessions) {
-    await destroyPiSession(id);
+    await destroyPiSession(id, { kind: "revoke", reason: "service_shutdown" });
   }
+  await productionInteractiveBrowserSessionLifecycle?.close();
 }

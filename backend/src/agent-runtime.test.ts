@@ -397,7 +397,7 @@ test("interactive-browser guard preserves exact backend tool-object authorizatio
     const row = createSession(f.cwd, { agentProfileId: profile.id });
     let detachments = 0;
     let replacements = 0;
-    const definition: any = { name: "browser_status", async execute() { return { content: [] }; } };
+    const definition: any = { name: "browser_workspace_probe", async execute() { return { content: [] }; } };
     const original: any = { name: "browser_status", async execute(...args: unknown[]) { return definition.execute(...args); } };
     const replacement: any = { name: "browser_status", async execute() { replacements++; return { content: [] }; } };
     const runtime: InteractiveBrowserToolRuntime = {

@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
+import { Type } from "@earendil-works/pi-ai";
+import { defineTool } from "@earendil-works/pi-coding-agent";
 import { createAgentProfile } from "./agent-profiles.js";
 import { CapabilityBoundProtectedBrowser } from "./browser/protected-browser.js";
 import { createProtectedBrowserToolRuntime, INTERACTIVE_BROWSER_TOOL_NAMES } from "./browser/protected-tools.js";
@@ -99,6 +101,47 @@ test("approved Standard interactive sessions receive exact explicit browser tool
     agent_profile_id: profile.id,
     operation_digest: "a".repeat(64),
   });
+  const neutralCaptured: ProtectedBrowserBinding[] = [];
+  const neutralProbe = defineTool({
+    name: "browser_workspace_probe",
+    label: "Synthetic browser workspace probe",
+    description: "Synthetic exact-object runtime contract probe.",
+    parameters: Type.Object({}, { additionalProperties: false }),
+    async execute() { return { content: [{ type: "text" as const, text: "neutral-standard-runtime" }], details: {} }; },
+  });
+  const neutralFactory = async (binding: ProtectedBrowserBinding) => {
+    neutralCaptured.push({ ...binding });
+    let detached = false;
+    return {
+      kind: "standard" as const,
+      binding: { ...binding },
+      tools: [neutralProbe],
+      toolForName(name: string) { return name === neutralProbe.name ? neutralProbe : undefined; },
+      preflight: () => detached
+        ? { allowed: false as const, reason: "synthetic detached" }
+        : { allowed: true as const },
+      async detachAgentLease() { detached = true; },
+      async closeSessionWorkspaces() { detached = true; },
+      async revokeAuthority() { detached = true; },
+    };
+  };
+  const neutral = createSession(projectRoot, {
+    agentProfileId: profile.id,
+    provider: "anthropic",
+    model: "claude-sonnet-4-5",
+  });
+  const neutralHandle = await createPiSession(neutral.id, projectRoot, neutral.provider, neutral.model, undefined, {
+    protectedBrowserFactory: neutralFactory,
+  });
+  assert.equal(neutralCaptured.length, 1);
+  assert.equal(neutralCaptured[0].sourceSessionId, neutral.id);
+  assert.equal(getLiveProtectedBrowserRuntime(neutral.id), undefined, "neutral Standard runtime never masquerades as Protected route integration");
+  assert.ok(neutralHandle.session.getActiveToolNames().includes(neutralProbe.name));
+  const neutralRegistry = (neutralHandle.session as any)._toolRegistry as Map<string, any>;
+  const neutralResult = await neutralRegistry.get(neutralProbe.name).execute("synthetic-probe", {});
+  assert.equal(neutralResult.content[0].text, "neutral-standard-runtime");
+  await destroyPiSession(neutral.id);
+
   const approved = createSession(projectRoot, {
     agentProfileId: profile.id,
     provider: "anthropic",

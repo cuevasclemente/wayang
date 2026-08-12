@@ -21,6 +21,7 @@ import {
   getSessionFileMessageHistory,
   getSessionFileSnapshot,
   invalidateSessionFileSnapshot,
+  installInteractiveBrowserSessionLifecyclePort,
   installWayangRawSudoFailClosedGuard,
   latchPiSessionCapabilityDenial,
   interviewSubmissionContent,
@@ -38,7 +39,9 @@ import {
   settleInteractiveTurns,
   setSessionDefaultModel,
   setSessionModel,
+  stopPiSession,
   waitForScheduledPrompt,
+  type PiSessionBrowserTeardown,
   type PiSessionHandle,
   type PiSessionRuntimeEvent,
   type ScheduledPromptSession,
@@ -220,6 +223,73 @@ test("Pi bridge emits one authoritative unavailable event when generic authoriti
     assert.equal(handle.trustedHostBashTool, undefined);
     assert.deepEqual(events, [{ type: "runtime_state_changed", sessionId: handle.id, bashMode: "unavailable" }]);
   } finally { unsubscribe(); }
+});
+
+test("Pi bridge dispatches every typed browser teardown operation and reason without inference", async () => {
+  const cases: Array<{ action: PiSessionBrowserTeardown; expected: string }> = [
+    { action: { kind: "detach", reason: "pi_idle" }, expected: "detach:pi_idle" },
+    { action: { kind: "detach", reason: "runtime_replaced" }, expected: "detach:runtime_replaced" },
+    { action: { kind: "detach", reason: "model_or_agent_switch" }, expected: "detach:model_or_agent_switch" },
+    { action: { kind: "close_session", reason: "archive" }, expected: "close:archive" },
+    { action: { kind: "close_session", reason: "session_delete" }, expected: "close:session_delete" },
+    { action: { kind: "close_session", reason: "owner_close_all" }, expected: "close:owner_close_all" },
+    { action: { kind: "revoke", reason: "capability_revoked" }, expected: "revoke:capability_revoked" },
+    { action: { kind: "revoke", reason: "project_or_profile_denied" }, expected: "revoke:project_or_profile_denied" },
+    { action: { kind: "revoke", reason: "service_shutdown" }, expected: "revoke:service_shutdown" },
+  ];
+  for (const { action, expected } of cases) {
+    const calls: string[] = [];
+    const session: any = {
+      clearQueue() {},
+      setActiveToolsByName() {},
+      abort() {},
+      _toolRegistry: new Map(),
+      _toolDefinitions: new Map(),
+      agent: { state: { tools: [] }, async beforeToolCall() {} },
+    };
+    const handle = {
+      id: `synthetic-browser-teardown-${expected}`,
+      session,
+      runtimeGeneration: "synthetic-runtime-generation",
+      bashMode: "unavailable",
+      events: new EventEmitter(),
+      protectedBrowserRuntime: {
+        kind: "standard",
+        binding: { sourceSessionId: "synthetic" },
+        tools: [],
+        toolForName() { return undefined; },
+        preflight() { return { allowed: true as const }; },
+        detachAgentLease(reason: string) { calls.push(`detach:${reason}`); return Promise.resolve(); },
+        closeSessionWorkspaces(reason: string) { calls.push(`close:${reason}`); return Promise.resolve(); },
+        revokeAuthority(reason: string) { calls.push(`revoke:${reason}`); return Promise.resolve(); },
+      },
+    } as unknown as PiSessionHandle;
+    await closePiSessionAuthorities(handle, action);
+    assert.deepEqual(calls, [expected]);
+  }
+});
+
+test("archive/delete lifecycle reaches detached Standard workspaces without a live Pi handle", async () => {
+  const calls: string[] = [];
+  const uninstall = installInteractiveBrowserSessionLifecyclePort({
+    closeSessionWorkspaces(sourceSessionId, reason) {
+      calls.push(`${sourceSessionId}:${reason}`);
+      return Promise.resolve();
+    },
+    revokeAuthority() { return Promise.resolve(); },
+    blocksPiIdleDetach() { return false; },
+    close() { return Promise.resolve(); },
+  });
+  try {
+    await stopPiSession("synthetic-detached-archive", { kind: "close_session", reason: "archive" });
+    await stopPiSession("synthetic-detached-delete", { kind: "close_session", reason: "session_delete" });
+    assert.deepEqual(calls, [
+      "synthetic-detached-archive:archive",
+      "synthetic-detached-delete:session_delete",
+    ]);
+  } finally {
+    uninstall();
+  }
 });
 
 test("Pi bridge capability denial latches tools and aborts active runtime authority before async cleanup", async () => {

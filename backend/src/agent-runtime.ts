@@ -26,8 +26,11 @@ import { type AgentProfileRow, type ProjectRow } from "./workspace-types.js";
 import { WAYANG_RUNTIME_CONTEXT_TOOL_NAME } from "./wayang-runtime-context.js";
 import { WAYANG_WORKSPACE_CHANGE_TOOL_NAME, WAYANG_WORKSPACE_READ_TOOL_NAME } from "./workspace-control.js";
 import { RESTRICTED_MCP_TOOL_NAME, type RestrictedMcpRuntime } from "./restricted-mcp/index.js";
-import type { InteractiveBrowserToolRuntime } from "./browser/interactive-runtime.js";
-import { INTERACTIVE_BROWSER_TOOL_NAMES } from "./browser/protected-tools.js";
+import {
+  assertInteractiveBrowserToolCatalog,
+  type InteractiveBrowserToolRuntime,
+} from "./browser/interactive-runtime.js";
+import { isInteractiveBrowserToolName } from "./browser/protected-tools.js";
 import { PROTECTED_AUTOMATION_TOOL_NAME, type ProtectedAutomationToolRuntime } from "./protected-automation/tool.js";
 import { FILE_AUDIO_EXPERIMENT_TOOL_NAME, type FileAudioExperimentRuntime } from "./audio-experiment/types.js";
 import {
@@ -219,7 +222,7 @@ export function authorizeAgentToolCall(options: {
       ? { allowed: false, reason: "The restricted MCP proxy requires a source-bound runtime object" }
       : { allowed: true };
   }
-  if ((INTERACTIVE_BROWSER_TOOL_NAMES as readonly string[]).includes(toolName)) {
+  if (isInteractiveBrowserToolName(toolName)) {
     return { allowed: false, reason: "The interactive browser requires its exact source-bound runtime object" };
   }
   if (toolName === PROTECTED_AUTOMATION_TOOL_NAME) {
@@ -407,11 +410,12 @@ function liveToolDecision(
     return { allowed: false, reason: authorization.reason ?? "Session is no longer authorized" };
   }
 
-  if ((INTERACTIVE_BROWSER_TOOL_NAMES as readonly string[]).includes(normalizedToolName)) {
+  if (isInteractiveBrowserToolName(normalizedToolName)) {
+    const declared = options.protectedBrowserRuntime?.toolForName(normalizedToolName);
     const trusted = options.trustedProtectedBrowserTool instanceof Map
       ? options.trustedProtectedBrowserTool.get(normalizedToolName)
       : undefined;
-    if (!options.protectedBrowserRuntime || !exactTrustedToolObject(options.candidateTool, trusted)) {
+    if (!options.protectedBrowserRuntime || !declared || !exactTrustedToolObject(options.candidateTool, trusted)) {
       detachBrowserRuntimeOnToolObjectDrift(options.protectedBrowserRuntime);
       return { allowed: false, reason: "The interactive browser tool object is not authorized for this runtime" };
     }
@@ -635,6 +639,7 @@ export function installAgentToolPolicyGuard(
   } = {},
 ): void {
   const { restrictedMcpRuntime, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, protectedAutomationRuntime, fileAudioExperimentRuntime } = options;
+  if (protectedBrowserRuntime) assertInteractiveBrowserToolCatalog(protectedBrowserRuntime);
   const anySession = session as any;
   const restrictedMcpDefinitionEntry = restrictedMcpRuntime && anySession._toolDefinitions instanceof Map
     ? anySession._toolDefinitions.get(RESTRICTED_MCP_TOOL_NAME)

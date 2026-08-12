@@ -38,6 +38,19 @@ export const INTERACTIVE_BROWSER_TOOL_NAMES = Object.freeze([
 
 export type InteractiveBrowserToolName = typeof INTERACTIVE_BROWSER_TOOL_NAMES[number];
 
+const INTERACTIVE_BROWSER_TOOL_NAMESPACE = /^browser_[a-z0-9_]{1,63}$/u;
+
+/** Reserve the complete backend browser namespace, including future runtime-declared tools. */
+export function isInteractiveBrowserToolName(value: string): boolean {
+  return INTERACTIVE_BROWSER_TOOL_NAMESPACE.test(value);
+}
+
+export function isProtectedBrowserToolRuntime(
+  runtime: CapabilityBoundInteractiveBrowserToolRuntime | undefined,
+): runtime is ProtectedBrowserToolRuntime {
+  return Boolean(runtime && "browser" in runtime && runtime.browser instanceof CapabilityBoundProtectedBrowser);
+}
+
 export interface ProtectedBrowserToolRuntime extends CapabilityBoundInteractiveBrowserToolRuntime {
   readonly browser: CapabilityBoundProtectedBrowser;
   /** @deprecated Incremental compatibility alias for detachAgentLease(). */
@@ -111,7 +124,9 @@ export function createProtectedBrowserToolRuntime(options: {
   };
   const closeSessionWorkspaces = (reason: SessionWorkspaceCloseReason): Promise<void> => {
     void reason;
-    return revokeRealm();
+    // Protected keeps its current pair realm across source-session archive/delete;
+    // only the source lease is closed. Standard hosts will override this method.
+    return detachAgentLease("runtime_replaced");
   };
   const revokeAuthority = (reason: BrowserAuthorityRevokeReason): Promise<void> => {
     void reason;

@@ -131,6 +131,8 @@ export interface CreateAppOptions {
 
 export function createApp(options: CreateAppOptions = {}) {
   const config = getConfig(options.config);
+  // Every exported app-composition entrypoint is fail-closed while M0 is inert.
+  assertStandardBrowserProfileHostsStartupReady(config);
   const auth = options.authService ?? new AuthService(config.auth);
   const credentialBroker = options.credentialBroker ?? new CredentialBroker(config.browser.credentials);
   const unregisterCredentialStopHook = registerBrowserStopHook(() => credentialBroker.lock());

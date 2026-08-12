@@ -91,10 +91,15 @@ test("Protected adapter exposes distinct idempotent neutral lifecycle delegation
   assert.equal(realmRevocations, 0);
 
   const firstWorkspaceClose = runtime.closeSessionWorkspaces("session_delete");
+  assert.equal(firstWorkspaceClose, firstDetach, "Protected workspace closure preserves its lease-only pair realm behavior");
   assert.equal(runtime.closeSessionWorkspaces("session_delete"), firstWorkspaceClose);
-  assert.equal(runtime.revokeAuthority("capability_revoked"), firstWorkspaceClose);
   await firstWorkspaceClose;
   assert.equal(leaseRevocations, 1);
+  assert.equal(realmRevocations, 0);
+
+  const firstAuthorityRevoke = runtime.revokeAuthority("capability_revoked");
+  assert.equal(runtime.revokeAuthority("project_or_profile_denied"), firstAuthorityRevoke);
+  await firstAuthorityRevoke;
   assert.equal(realmRevocations, 1);
   assert.equal(runtime.preflight().allowed, false);
 });

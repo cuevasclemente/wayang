@@ -208,7 +208,7 @@ router.delete("/sessions/:id", async (req: Request, res: Response) => {
       return;
     }
     archiveSession(req.params.id);
-    await stopPiSession(req.params.id);
+    await stopPiSession(req.params.id, { kind: "close_session", reason: "archive" });
     res.status(204).end();
   } catch (err: any) {
     res.status(err?.statusCode || 500).json({ error: err?.message || String(err) });
@@ -237,7 +237,7 @@ router.post("/sessions/:id/delete", async (req: Request, res: Response) => {
       return;
     }
 
-    await stopPiSession(req.params.id);
+    await stopPiSession(req.params.id, { kind: "close_session", reason: "session_delete" });
     await removeSearchSession(req.params.id);
     const deleted = deleteSession(req.params.id);
     if (!deleted) {

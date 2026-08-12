@@ -516,6 +516,7 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
   const settleTimeoutMs = Math.max(1, options.settleTimeoutMs ?? SETTLE_TIMEOUT_MS);
   const settleIntervalMs = Math.max(0, options.settleIntervalMs ?? SETTLE_INTERVAL_MS);
   const created = new Set<ProtectedBrowserToolRuntime>();
+  const leaseCleanupTasks = new Set<Promise<void>>();
   const realmAttachers = new Map<string, (binding: ProtectedBrowserBinding) => Promise<ProtectedBrowserToolRuntime>>();
   const realmTeardowns = new Map<string, () => Promise<void>>();
   const realmKey = (binding: Readonly<ProtectedBrowserBinding>) => `${binding.capabilityId.length}:${binding.capabilityId}${binding.projectId.length}:${binding.projectId}${binding.agentProfileId.length}:${binding.agentProfileId}`;
@@ -852,12 +853,27 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
       };
       const baseRuntime = createProtectedBrowserToolRuntime({ browser: leaseBrowser });
       let leaseRuntime!: ProtectedBrowserToolRuntime;
+      const retire = (operation: () => Promise<void>): Promise<void> => {
+        created.delete(leaseRuntime);
+        const cleanup = operation();
+        leaseCleanupTasks.add(cleanup);
+        void cleanup.then(
+          () => leaseCleanupTasks.delete(cleanup),
+          () => leaseCleanupTasks.delete(cleanup),
+        );
+        return cleanup;
+      };
       leaseRuntime = {
-        ...baseRuntime,
-        async close() {
-          created.delete(leaseRuntime);
-          await baseRuntime.close();
-        },
+        kind: baseRuntime.kind,
+        get binding() { return baseRuntime.binding; },
+        tools: baseRuntime.tools,
+        browser: baseRuntime.browser,
+        toolForName: (name) => baseRuntime.toolForName(name),
+        preflight: () => baseRuntime.preflight(),
+        detachAgentLease: (reason) => retire(() => baseRuntime.detachAgentLease(reason)),
+        closeSessionWorkspaces: (reason) => retire(() => baseRuntime.closeSessionWorkspaces(reason)),
+        revokeAuthority: (reason) => retire(() => baseRuntime.revokeAuthority(reason)),
+        close: () => retire(() => baseRuntime.close()),
       };
       const assertLeaseCurrent = () => {
         const current = leaseBrowser.currentBinding;
@@ -1013,7 +1029,7 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
       uninstall();
       const teardowns = [...realmTeardowns.values()].map((teardown) => teardown());
       const leaseClosures = [...created].map((runtime) => runtime.close());
-      await Promise.allSettled([...teardowns, ...leaseClosures]);
+      await Promise.allSettled([...teardowns, ...leaseClosures, ...leaseCleanupTasks]);
       realmAttachers.clear();
       realmTeardowns.clear();
       created.clear();

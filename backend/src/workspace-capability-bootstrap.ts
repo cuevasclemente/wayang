@@ -32,7 +32,15 @@ class ProductionCapabilityRuntimeDenial implements WorkspaceCapabilityRuntimeDen
     for (const id of input.runtimeIds) this.affectedRuntimeIds.add(id);
     // This call is deliberately synchronous: durable denial already happened,
     // and no await may precede live host/standard/protected authority latching.
-    latchPiSessionCapabilityDenial(input.runtimeIds);
+    const browserCapability = input.association.capabilityId === "wayang.standard-browser.v1"
+      || input.association.capabilityId === "wayang.protected-browser.v1";
+    latchPiSessionCapabilityDenial(
+      input.runtimeIds,
+      undefined,
+      browserCapability
+        ? { kind: "revoke", reason: "capability_revoked" }
+        : { kind: "detach", reason: "runtime_replaced" },
+    );
   }
 
   async cleanupDeniedRuntimeIds(runtimeIds: readonly string[]): Promise<void> {

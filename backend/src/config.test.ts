@@ -32,12 +32,23 @@ test("Standard Browser Profile hosts gate is strict, disabled by default, and ca
 
     process.env.WAYANG_STANDARD_BROWSER_PROFILE_HOSTS = "0";
     assert.equal(getConfig().standardBrowserProfileHosts, false);
+    process.env.WAYANG_STANDARD_BROWSER_PROFILE_HOSTS = "1";
+    assert.equal(
+      getConfig({ standardBrowserProfileHosts: false }).standardBrowserProfileHosts,
+      false,
+      "explicit synthetic composition overrides a valid captured environment value",
+    );
 
     for (const invalid of ["", "true", "01", " 1", "1 "]) {
       process.env.WAYANG_STANDARD_BROWSER_PROFILE_HOSTS = invalid;
       assert.throws(
         () => getConfig(),
         /WAYANG_STANDARD_BROWSER_PROFILE_HOSTS must be 0 or 1/,
+      );
+      assert.throws(
+        () => getConfig({ standardBrowserProfileHosts: false }),
+        /WAYANG_STANDARD_BROWSER_PROFILE_HOSTS must be 0 or 1/,
+        "an override cannot hide malformed startup configuration",
       );
     }
   } finally {

@@ -44,6 +44,25 @@ export interface CapabilityBoundInteractiveBrowserToolRuntime extends Interactiv
   readonly binding: Readonly<ProtectedBrowserBinding>;
 }
 
+const TOOL_NAME_PATTERN = /^browser_[a-z0-9_]{1,63}$/u;
+
+/** Validate the complete backend-owned tool catalog before runtime publication. */
+export function assertInteractiveBrowserToolCatalog(runtime: InteractiveBrowserToolRuntime): void {
+  if (!runtime || (runtime.kind !== "standard" && runtime.kind !== "protected")) {
+    throw new Error("Interactive browser runtime kind is invalid");
+  }
+  const seen = new Set<string>();
+  for (const tool of runtime.tools) {
+    const name = tool?.name;
+    if (typeof name !== "string" || !TOOL_NAME_PATTERN.test(name) || seen.has(name)
+      || runtime.toolForName(name) !== tool) {
+      throw new Error("Interactive browser runtime tool catalog is invalid");
+    }
+    seen.add(name);
+  }
+  if (seen.size === 0) throw new Error("Interactive browser runtime tool catalog is empty");
+}
+
 /**
  * Process-level lifecycle port for workspaces that may outlive a Pi runtime.
  * Archive/delete and authority denial must not depend on a live Pi handle.

@@ -18,7 +18,6 @@ import {
   browserAgentAuthorizationForSourceSession,
   BROWSER_AGENT_SOURCE_SESSION_HEADER,
   BROWSER_AGENT_TOKEN_HEADER,
-  LEGACY_BROWSER_AGENT_ATTRIBUTION_ERROR,
 } from "./request-auth.js";
 
 async function availablePort(): Promise<number> {
@@ -226,47 +225,20 @@ test("legacy generic browser agent tokens are route-scoped but cannot bypass exa
   assert.equal(allowWithoutFill.headers.get("cache-control"), "no-store");
 });
 
-test("enabled Standard Browser Profile hosts reject legacy attribution before JSON parsing", async (t) => {
+test("enabled Standard Browser Profile hosts refuse exported app composition before data or routes exist", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-browser-agent-gate-"));
+  const dataDir = path.join(root, "data");
   const previousDataDir = process.env.WAYANG_DATA_DIR;
-  process.env.WAYANG_DATA_DIR = path.join(root, "data");
-  const port = await availablePort();
-  const baseUrl = `http://127.0.0.1:${port}`;
-  const authConfig: AuthConfig = {
-    enabled: false,
-    passwordHash: "",
-    sessionSecret: "",
-    sessionDays: 30,
-    sessionStorePath: path.join(root, "auth-sessions.json"),
-    trustProxy: false,
-    proxyIdentityHeader: "",
-    cookieSecure: "auto",
-    allowedOrigins: [baseUrl],
-  };
-  const { server } = createApp({
-    config: { standardBrowserProfileHosts: true },
-    authService: new AuthService(authConfig),
-  });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, "127.0.0.1", resolve);
-  });
-  t.after(async () => {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+  process.env.WAYANG_DATA_DIR = dataDir;
+  try {
+    assert.throws(
+      () => createApp({ config: { standardBrowserProfileHosts: true } }),
+      /Standard Browser Profile host\/schema composition is unavailable/,
+    );
+    assert.equal(fs.existsSync(dataDir), false, "inert gate refusal created Wayang/browser data");
+  } finally {
     if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
     else process.env.WAYANG_DATA_DIR = previousDataDir;
     fs.rmSync(root, { recursive: true, force: true });
-  });
-
-  const response = await fetch(`${baseUrl}/api/browser/status`, {
-    method: "POST",
-    headers: {
-      [BROWSER_AGENT_TOKEN_HEADER]: "synthetic-legacy-attribution",
-      "Content-Type": "application/json",
-    },
-    body: "{malformed-json",
-  });
-  assert.equal(response.status, 403);
-  assert.equal(response.headers.get("cache-control"), "no-store");
-  assert.deepEqual(await response.json(), { error: LEGACY_BROWSER_AGENT_ATTRIBUTION_ERROR });
+  }
 });
