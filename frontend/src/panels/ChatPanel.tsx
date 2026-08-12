@@ -1374,10 +1374,12 @@ function normalizeTtsPlaybackUrl(url: string | null | undefined): string {
 
 function AssistantMessage({
   msg,
+  agentName,
   sessionId,
   ttsAllowed = true,
 }: {
   msg: ChatMessage;
+  agentName: string;
   sessionId?: string | null;
   ttsAllowed?: boolean;
 }) {
@@ -1566,7 +1568,7 @@ function AssistantMessage({
     <div data-testid="chat-message" data-role="assistant" className="px-4 py-3 bg-neutral-900 rounded-lg">
       <div className="mb-1 flex items-center justify-between gap-2">
         <div className="text-[10px] uppercase tracking-wider text-neutral-500 font-semibold">
-          Assistant
+          <span data-testid="chat-agent-response-name">{agentName}</span>
           {model && (
             <span className="ml-2 text-neutral-600 normal-case font-normal">
               {model}
@@ -2475,11 +2477,20 @@ function renderMessage(
     onResendUserMessage?: (msg: ChatMessage) => void;
     sessionId?: string | null;
     ttsAllowed?: boolean;
+    agentName?: string;
   } = {},
 ) {
   switch (msg.type) {
     case "assistant":
-      return <AssistantMessage key={index} msg={msg} sessionId={options.sessionId} ttsAllowed={options.ttsAllowed} />;
+      return (
+        <AssistantMessage
+          key={index}
+          msg={msg}
+          agentName={options.agentName ?? "Agent"}
+          sessionId={options.sessionId}
+          ttsAllowed={options.ttsAllowed}
+        />
+      );
     case "user":
       return (
         <UserMessage
@@ -2520,6 +2531,7 @@ const MemoizedMessageRow = memo(function MemoizedMessageRow({
   onResendUserMessage,
   sessionId,
   ttsAllowed,
+  agentName,
 }: {
   msg: ChatMessage;
   canResendUserMessage: boolean;
@@ -2527,6 +2539,7 @@ const MemoizedMessageRow = memo(function MemoizedMessageRow({
   onResendUserMessage: (msg: ChatMessage) => void;
   sessionId: string | null;
   ttsAllowed: boolean;
+  agentName: string;
 }) {
   const messageId = typeof msg.id === "string" ? msg.id : null;
   return (
@@ -2537,6 +2550,7 @@ const MemoizedMessageRow = memo(function MemoizedMessageRow({
         onResendUserMessage,
         sessionId,
         ttsAllowed,
+        agentName,
       })}
     </div>
   );
@@ -5723,6 +5737,7 @@ export function ChatPanel({
                   onResendUserMessage: handleResendMessage,
                   sessionId: activeSessionId,
                   ttsAllowed,
+                  agentName: currentAgentLabel,
                 })}
               </div>
             );
@@ -5736,6 +5751,7 @@ export function ChatPanel({
               onResendUserMessage={handleResendMessage}
               sessionId={activeSessionId}
               ttsAllowed={ttsAllowed}
+              agentName={currentAgentLabel}
             />
           );
         })}
@@ -5744,7 +5760,8 @@ export function ChatPanel({
         {hasStreamingContent && (
           <div data-testid="chat-streaming" data-role="assistant" className="px-4 py-3 bg-neutral-900 rounded-lg border border-blue-900/30">
             <div className="text-[10px] uppercase tracking-wider text-blue-400 mb-1 font-semibold">
-              Streaming...
+              <span data-testid="chat-agent-response-name">{currentAgentLabel}</span>
+              <span className="ml-2 text-neutral-500 normal-case font-normal">Streaming…</span>
             </div>
             <div className="space-y-2">
               {renderAssistantContentBlocks(displayedStreamingBlocks.content)}
