@@ -929,8 +929,14 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
       // source lease authorized after replacement has begun.
       const priorRevocation = priorBrowser.revoke();
       const pendingDownloads = downloadPublisher.pendingGuids();
-      await Promise.allSettled(pendingDownloads.map((guid) => managed.cancelDownload(guid, currentAuthorization)));
+      const canceledDownloads = await Promise.allSettled(
+        pendingDownloads.map((guid) => managed.cancelDownload(guid)),
+      );
       downloadPublisher.cancelPending();
+      if (canceledDownloads.some((result) => result.status === "rejected")) {
+        await priorBrowser.revokeRealm().catch(() => undefined);
+        throw new Error("Protected browser download cleanup failed before replacement publication");
+      }
       const cleanup = await Promise.allSettled([priorRevocation]);
       if (cleanup.some((result) => result.status === "rejected")) {
         void priorBrowser.revokeRealm();
@@ -1015,8 +1021,14 @@ export function bootstrapProtectedBrowserProduction(options: ProtectedBrowserPro
         managed,
         authorize: async () => {
           const current = runtime.browser.currentBinding;
+          const live = liveRuntimeResolver(current.sourceSessionId, current);
           const snapshot = authorityResolver(current);
-          if (!snapshot || !exactProtectedBrowserBindingEqual(snapshot, current)) throw new Error("Protected browser viewer authority is unavailable");
+          let preflightAllowed = false;
+          try { preflightAllowed = runtime.preflight().allowed; } catch { /* denied below */ }
+          if (runtime.browser.isRevoked || live !== runtime || !preflightAllowed
+            || !snapshot || !exactProtectedBrowserBindingEqual(snapshot, current)) {
+            throw new Error("Protected browser viewer authority is unavailable");
+          }
         },
         revoke: () => runtime.browser.revokeRealm(),
         settleTimeoutMs,

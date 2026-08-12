@@ -2056,6 +2056,9 @@ export async function createPiSession(
         || pendingProtectedBrowserRuntime!.toolForName(tool.name) !== tool)) {
       throw new WorkspaceStoreError("Interactive browser runtime tool catalog changed after validation", 409);
     }
+    let allowed = false;
+    try { allowed = pendingProtectedBrowserRuntime.preflight().allowed; } catch { /* denied below */ }
+    if (!allowed) throw new WorkspaceStoreError("Interactive browser runtime was revoked before publication", 409);
   };
   const creation = (async () => {
     assertCreationCurrent();
