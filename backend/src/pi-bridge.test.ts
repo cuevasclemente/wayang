@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
-import { AuthStorage, SessionManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   abortInteractiveTurn,
   appendStreamingMessageToHistory,
@@ -747,7 +747,6 @@ test("listModels does not execute an unrelated installed extension factory", asy
     const result = await listModels({
       cwd,
       agentDir,
-      authStorage: AuthStorage.create(path.join(agentDir, "auth.json")),
       includeDynamicModels: false,
     });
     assert.ok(result.models.length > 0, "built-in models remain discoverable");
