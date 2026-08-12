@@ -32,7 +32,12 @@ import {
   refreshMessagingEventClaimBinding,
   requeueProcessingMessagingEvent,
 } from "./store.js";
-import type { MessagingDeliveryPayload, MessagingEndpointRow, MessagingEventRow } from "./store-types.js";
+import {
+  MAX_MESSAGING_DELIVERY_TEXT_BYTES,
+  type MessagingDeliveryPayload,
+  type MessagingEndpointRow,
+  type MessagingEventRow,
+} from "./store-types.js";
 import type { MessagingEventAdmission } from "./store.js";
 
 export interface MessagingConnectorAttestationPort {
@@ -114,6 +119,25 @@ function safeErrorCode(error: unknown): MessagingErrorCode {
 }
 
 const DEFAULT_MESSAGING_TURN_TIMEOUT_MS = 10 * 60 * 1000;
+
+function splitUtf8DeliveryText(text: string, maximumBytes = MAX_MESSAGING_DELIVERY_TEXT_BYTES): string[] {
+  if (!text || !Number.isSafeInteger(maximumBytes) || maximumBytes <= 0) return [];
+  const chunks: string[] = [];
+  let current = "";
+  let currentBytes = 0;
+  for (const codePoint of text) {
+    const bytes = Buffer.byteLength(codePoint, "utf8");
+    if (current && currentBytes + bytes > maximumBytes) {
+      chunks.push(current);
+      current = "";
+      currentBytes = 0;
+    }
+    current += codePoint;
+    currentBytes += bytes;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
 
 export class MessagingGatewayService {
   private readonly declarations: Map<string, MessagingEndpointDeclaration>;
@@ -378,12 +402,18 @@ export class MessagingGatewayService {
           sessionId: currentBinding.activeWayangSessionId,
         }),
       });
-      const finalPayload: MessagingDeliveryPayload = {
-        kind: "final",
-        text: result.finalAssistantText?.trim() || "The agent completed the turn without a textual final response.",
-      };
+      const finalText = result.finalAssistantText?.trim()
+        || "The agent completed the turn without a textual final response.";
+      const finalPayloads: MessagingDeliveryPayload[] = splitUtf8DeliveryText(finalText)
+        .map((text) => ({ kind: "final", text }));
+      if (finalPayloads.length === 0 || finalPayloads.length > 64) {
+        throw new MessagingSettledTurnCommitError(
+          currentBinding.activeWayangSessionId!,
+          new WorkspaceStoreError("Messaging final response exceeds durable delivery bounds", 409),
+        );
+      }
       try {
-        this.complete(row, currentBinding.activeWayangSessionId, [finalPayload]);
+        this.complete(row, currentBinding.activeWayangSessionId, finalPayloads);
       } catch (error) {
         throw new MessagingSettledTurnCommitError(currentBinding.activeWayangSessionId!, error);
       }

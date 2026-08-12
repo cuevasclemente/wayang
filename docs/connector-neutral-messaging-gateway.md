@@ -1,7 +1,7 @@
 # Connector-neutral messaging gateway and Matrix adapter
 
-**Status:** architecture resolved; foundation implementation begun 2026-08-09  
-**Primary adapter:** Matrix Application Service (Element is the first client)  
+**Status:** architecture resolved; foundation implementation begun 2026-08-09
+**Primary adapter:** Matrix Application Service (Element is the first client)
 **Future adapters:** Slack first, then other chat systems where the same contract fits
 
 ## 1. Goal

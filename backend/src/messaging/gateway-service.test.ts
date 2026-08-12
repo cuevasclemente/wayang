@@ -235,6 +235,23 @@ test("escaped commands dispatch the parsed prompt and deliver full final assista
   assert.deepEqual(getStore().messagingDeliveries[0]?.payload, { kind: "final", text: fullReply });
 }));
 
+test("full replies are split on UTF-8 boundaries instead of truncated or retried ambiguously", () => withStore(async (dir) => {
+  const f = setup(dir);
+  const fullReply = `${"a".repeat(65_530)}🙂${"b".repeat(100)}`;
+  f.sessions.runTurn = async (_declaration, binding, event, options) => {
+    options.authorizeDispatch();
+    f.sessions.runs.push({ sessionId: binding.activeWayangSessionId!, eventId: event.connectorEventId, body: event.body, timeoutMs: options.timeoutMs });
+    return { resultSummary: fullReply.slice(0, 500), finalAssistantText: fullReply, messages: [] };
+  };
+  await f.gateway.start();
+  await f.gateway.admit(f.declaration.endpointId, inbound("$large", "hello"));
+  await f.gateway.drain(f.declaration.endpointId);
+  const payloads = getStore().messagingDeliveries.map((row) => row.payload);
+  assert.equal(payloads.length, 2);
+  assert.equal(payloads.map((payload) => payload.kind === "final" ? payload.text : "").join(""), fullReply);
+  assert.equal(payloads.every((payload) => payload.kind !== "final" || Buffer.byteLength(payload.text, "utf8") <= 64 * 1024), true);
+}));
+
 test("duplicate ingress never creates a second turn and accepted commands preserve sequence", () => withStore(async (dir) => {
   const f = setup(dir);
   await f.gateway.start();
