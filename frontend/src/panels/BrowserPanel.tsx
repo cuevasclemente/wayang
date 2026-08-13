@@ -257,7 +257,10 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
   // Standard support is the existing generic backend contract. Protected
   // support is positive metadata from the exact runtime and is never inferred
   // from a project/profile label or from Protected styling alone.
-  const credentialsSupported = browserMode === "standard" || state?.credentialBroker?.supported === true;
+  const namedRuntime = state?.profile.persistence === "named";
+  const credentialsSupported = state?.credentialBroker?.supported === true;
+  const pasteSupported = !namedRuntime;
+  const resetSupported = !namedRuntime;
   const profileLabel = state?.profile.persistence === "named"
     ? state.profile.name || "Named Browser Profile"
     : state?.profile.persistence === "shared"
@@ -318,6 +321,8 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
         viewerTransport={viewerTransport}
         credentialsOpen={credentialsOpen}
         credentialsSupported={credentialsSupported}
+        pasteSupported={pasteSupported}
+        resetSupported={resetSupported}
         onStart={() => void runAction(() => startBrowser(sessionId, sessionCwd))}
         onStop={() => void runAction(() => stopBrowser(sessionId, sessionCwd))}
         onRestart={() => void runAction(() => restartBrowser(sessionId, sessionCwd))}

@@ -2,8 +2,13 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Check, Loader2, Lock, RefreshCw, Save } from "lucide-react";
 import {
   ApiError,
+  fetchBrowserProfiles,
+  fetchProjectBrowserDefault,
   fetchProjectInstructions,
   updateProject,
+  updateProjectBrowserDefault,
+  type NamedBrowserProfile,
+  type ProjectBrowserDefault,
   updateProjectInstructions,
   type AgentProfileSummary,
   type ModelOption,
@@ -43,6 +48,11 @@ export function ProjectSettingsForm({ project, profiles, models, onSaved }: Proj
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [saved, setSaved] = useState(false);
+  const [browserProfiles, setBrowserProfiles] = useState<NamedBrowserProfile[]>([]);
+  const [browserDefault, setBrowserDefault] = useState<ProjectBrowserDefault | null>(null);
+  const [browserDefaultValue, setBrowserDefaultValue] = useState("");
+  const [browserDefaultSaving, setBrowserDefaultSaving] = useState(false);
+  const [browserDefaultError, setBrowserDefaultError] = useState("");
 
   const [instructions, setInstructions] = useState<ProjectInstructions | null>(null);
   const [instructionText, setInstructionText] = useState("");
@@ -81,6 +91,20 @@ export function ProjectSettingsForm({ project, profiles, models, onSaved }: Proj
       setInstructionsLoading(false);
     }
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all([fetchBrowserProfiles(), fetchProjectBrowserDefault(project.id)]).then(([catalog, current]) => {
+      if (cancelled) return;
+      setBrowserProfiles(catalog.profiles.filter((profile) => profile.state === "active"));
+      setBrowserDefault(current.default);
+      setBrowserDefaultValue(current.default?.profile_id ?? "");
+      setBrowserDefaultError("");
+    }).catch((error: unknown) => {
+      if (!cancelled && (!(error instanceof ApiError) || error.status !== 404)) setBrowserDefaultError(errorMessage(error));
+    });
+    return () => { cancelled = true; };
+  }, [project.id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -218,6 +242,26 @@ export function ProjectSettingsForm({ project, profiles, models, onSaved }: Proj
             </Field>
           </div>
         </SettingsSection>
+
+        {privacyMode === "standard" && (browserProfiles.length > 0 || browserDefault) && (
+          <SettingsSection title="Browser default" description="New or unassigned sessions may use this named Browser Profile. Changing it does not switch the current session or change browser capability authority.">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+              <Field label="Default Browser Profile">
+                <select value={browserDefaultValue} onChange={(event) => setBrowserDefaultValue(event.target.value)} className={inputClass}>
+                  <option value="">No default</option>
+                  {browserProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                </select>
+              </Field>
+              <button type="button" disabled={browserDefaultSaving} onClick={() => {
+                setBrowserDefaultSaving(true); setBrowserDefaultError("");
+                void updateProjectBrowserDefault(project.id, browserDefaultValue || null, browserDefault?.revision ?? null).then((result) => {
+                  setBrowserDefault(result.default); onSaved(project);
+                }).catch((error: unknown) => setBrowserDefaultError(errorMessage(error))).finally(() => setBrowserDefaultSaving(false));
+              }} className={secondaryButtonClass}>{browserDefaultSaving ? "Saving…" : "Save browser default"}</button>
+            </div>
+            {browserDefaultError && <p role="alert" className="text-xs text-red-300">{browserDefaultError}</p>}
+          </SettingsSection>
+        )}
 
         <SettingsSection title="Allowed agents" description="A non-empty allowlist is enforced even when the project is Standard. Removing a profile tombstones only that Project-Agent pair’s capabilities; widening access does not create or restore authority.">
           <div className="flex items-center justify-between gap-3">

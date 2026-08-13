@@ -250,8 +250,14 @@ export function createApp(options: CreateAppOptions = {}) {
   app.use("/api", createBrowserProfilesRouter(config.standardBrowserProfileHosts, options.standardBrowserService));
   app.use("/api", createStandardBrowserRouter(options.standardBrowser));
   app.use("/api", createProtectedBrowserRouter(options.protectedBrowser));
-  app.use("/api", createBrowserCredentialsRouter(auth, credentialBroker));
-  app.use("/api", browserRouter);
+  // Named Standard profiles and the legacy generic manager must never coexist:
+  // migrated `legacy_shared` may resolve to the generic shared root. Protected
+  // credentials are owned by the Protected router above. Gate-on composition
+  // therefore omits every generic browser/credential route entirely.
+  if (!config.standardBrowserProfileHosts) {
+    app.use("/api", createBrowserCredentialsRouter(auth, credentialBroker));
+    app.use("/api", browserRouter);
+  }
 
   // Unknown API routes should return JSON 404, not the frontend SPA shell.
   // Returning index.html for /api/* makes clients parse successful HTML as
@@ -320,14 +326,15 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
 
 export function start() {
   const config = getConfig();
-  // Production composes the complete Standard host/schema stack below. The
-  // immutable startup flag still remains the only activation gate.
-  assertStandardBrowserProfileHostsStartupReady(config, true);
+  // The source tree remains deliberately non-activatable until the remaining
+  // reviewed milestones and independent gate are complete. In particular,
+  // merely deploying this binary with the default gate must not migrate schema.
+  assertStandardBrowserProfileHostsStartupReady(config);
 
   // Initialize the durable store before composing production authority. These
   // bootstraps are inert: they install policy/runtime bridges but do not create
   // an interactive runtime, browser process, CDP connection, or profile.
-  init();
+  init({ browserProfilesEnabled: config.standardBrowserProfileHosts });
   console.log(`[db] Store at ${config.dbPath}`);
   const authService = new AuthService(config.auth);
   const workspaceCapabilities = createProductionWorkspaceCapabilityBootstrap(authService, config);

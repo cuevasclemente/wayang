@@ -125,7 +125,7 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
           <button ref={closeRef} type="button" onClick={onClose} className="rounded p-2 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100" aria-label="Close settings"><X size={17} /></button>
         </header>
 
-        <div className="flex shrink-0 border-b border-neutral-800 px-3 sm:px-5" role="tablist" aria-label="Settings sections">
+        <div className="flex shrink-0 overflow-x-auto border-b border-neutral-800 px-3 sm:px-5" role="tablist" aria-label="Settings sections">
           <TabButton active={tab === "projects"} onClick={() => setTab("projects")} icon={FolderCog}>Projects</TabButton>
           <TabButton active={tab === "agents"} onClick={() => setTab("agents")} icon={Bot}>Agents</TabButton>
           <TabButton active={tab === "capabilities"} onClick={() => setTab("capabilities")} icon={ShieldCheck}>Capabilities</TabButton>
@@ -183,5 +183,5 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
 }
 
 function TabButton({ active, onClick, icon: Icon, children }: { active: boolean; onClick: () => void; icon: typeof Bot; children: React.ReactNode }) {
-  return <button type="button" role="tab" aria-selected={active} onClick={onClick} className={`inline-flex items-center gap-2 border-b-2 px-3 py-2.5 text-xs font-semibold ${active ? "border-blue-500 text-blue-300" : "border-transparent text-neutral-500 hover:text-neutral-200"}`}><Icon size={14} />{children}</button>;
+  return <button type="button" role="tab" aria-selected={active} tabIndex={active ? 0 : -1} onClick={onClick} className={`inline-flex shrink-0 items-center gap-2 border-b-2 px-3 py-2.5 text-xs font-semibold ${active ? "border-blue-500 text-blue-300" : "border-transparent text-neutral-500 hover:text-neutral-200"}`}><Icon size={14} />{children}</button>;
 }

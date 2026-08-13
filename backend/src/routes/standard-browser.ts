@@ -66,7 +66,6 @@ export function createStandardBrowserIntegration(service: StandardBrowserProfile
       const resolved = exactOwner(selection);
       if (!resolved) return null;
       const { workspace } = resolved;
-      workspace.host.ownerSetControlMode(selection.sourceSessionId, selection.workspaceGeneration, "user");
       const authorize = async () => {
         if (!exactOwner(selection)) throw new Error("Standard browser viewer authority is unavailable");
         if (!workspace.host.hasBlockingControl(selection.sourceSessionId)) {

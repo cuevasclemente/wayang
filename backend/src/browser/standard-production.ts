@@ -144,7 +144,11 @@ async function executeExactTargetOperation(
       throw new Error("Standard browser reached a forbidden top-level document");
     }
     await authorize();
-    if (operation.kind === "navigate" && value && typeof value === "object") value = { ...value, url: after.topLevelUrl, title: after.title };
+    if (operation.kind === "navigate" && value && typeof value === "object") {
+      const visible = new URL(after.topLevelUrl);
+      visible.username = ""; visible.password = ""; visible.search = ""; visible.hash = "";
+      value = { ...value, url: visible.toString(), title: after.title.includes(after.topLevelUrl) ? visible.toString() : after.title.slice(0, 512) };
+    }
     return protection.redact(value);
   } finally { attachment.close(); }
 }

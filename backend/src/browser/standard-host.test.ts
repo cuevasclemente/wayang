@@ -116,8 +116,8 @@ test("same-profile sessions own exact independent targets and opener popups", as
   assert.ok(f.backend().closed.includes("restored"), "startup-restored target was not quarantined/closed");
   const stateA = f.host.publicState(a, wa.generation);
   const stateB = f.host.publicState(b, wb.generation);
-  assert.equal(stateA.tabs[0]?.url, "https://a.example");
-  assert.equal(stateB.tabs[0]?.url, "https://b.example");
+  assert.equal(stateA.tabs[0]?.url, "https://a.example/");
+  assert.equal(stateB.tabs[0]?.url, "https://b.example/");
   assert.notEqual(stateA.activeTab, stateB.activeTab);
   assert.notEqual(f.backend().executions[0]?.targetId, f.backend().executions[1]?.targetId);
 
@@ -130,6 +130,20 @@ test("same-profile sessions own exact independent targets and opener popups", as
   f.backend().unassigned("https://human.example");
   assert.equal(f.host.publicState(a, wa.generation).tabs.length, 2, "unattributed target leaked into A");
   assert.equal(f.host.publicState(b, wb.generation).tabs.length, 1, "unattributed target leaked into B");
+  await f.host.close();
+});
+
+test("agent tab projections strip URL credentials, query, fragments, and URL-bearing titles", async () => {
+  const f = hostFixture();
+  const exact = binding("session-a");
+  const workspace = f.host.bindWorkspace(exact);
+  await f.host.execute(exact, workspace.generation, { kind: "navigate", url: "https://example.test/path?code=SECRET#fragment" });
+  const rawTarget = f.backend().executions.at(-1)!.targetId;
+  f.backend().targets.get(rawTarget)!.title = "Login https://example.test/path?code=SECRET#fragment";
+  const state = f.host.publicState(exact, workspace.generation);
+  assert.equal(state.tabs[0]?.url, "https://example.test/path");
+  assert.equal(state.tabs[0]?.title, "https://example.test/path");
+  assert.doesNotMatch(JSON.stringify(state), /SECRET|fragment/);
   await f.host.close();
 });
 

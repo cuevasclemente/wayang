@@ -6,6 +6,8 @@ interface BrowserToolbarProps {
   viewerTransport: BrowserViewerTransport;
   credentialsOpen: boolean;
   credentialsSupported: boolean;
+  pasteSupported: boolean;
+  resetSupported: boolean;
   onStart: () => void;
   onStop: () => void;
   onRestart: () => void;
@@ -23,6 +25,8 @@ export function BrowserToolbar({
   viewerTransport,
   credentialsOpen,
   credentialsSupported,
+  pasteSupported,
+  resetSupported,
   onStart,
   onStop,
   onRestart,
@@ -89,7 +93,7 @@ export function BrowserToolbar({
             Credentials
           </ToolbarButton>
         )}
-        <ToolbarButton
+        {pasteSupported && <ToolbarButton
           disabled={busy || !running}
           title={protectedRuntime
             ? "Enter human control and paste through the authenticated owner-only route; text never becomes an agent tool parameter."
@@ -97,18 +101,18 @@ export function BrowserToolbar({
           onClick={onPasteClipboard}
         >
           Paste…
-        </ToolbarButton>
-        <ToolbarButton disabled={busy} danger onClick={onResetProfile}>Reset profile</ToolbarButton>
+        </ToolbarButton>}
+        {resetSupported && <ToolbarButton disabled={busy} danger onClick={onResetProfile}>Reset profile</ToolbarButton>}
       </div>
 
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-[11px] text-neutral-500">
           <span>Viewer</span>
           <div className="inline-flex rounded-md border border-neutral-800 bg-neutral-900 p-0.5" role="radiogroup" aria-label="Browser viewer">
-            {!protectedRuntime && (
+            {!protectedRuntime && state?.vncReady === true && (
               <ViewerButton
                 checked={viewerTransport === "vnc"}
-                disabled={busy || !running || state?.vncReady === false}
+                disabled={busy || !running}
                 onClick={() => onViewerTransport("vnc")}
                 title="Full browser includes browser chrome and extensions."
               >

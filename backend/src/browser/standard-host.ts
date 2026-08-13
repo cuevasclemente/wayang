@@ -13,6 +13,29 @@ export const MAX_STANDARD_BROWSER_TABS_PER_WORKSPACE = 16;
 export const MAX_STANDARD_BROWSER_TARGETS_PER_HOST = 64;
 export const MAX_STANDARD_BROWSER_UNASSIGNED_TARGETS = 8;
 export const MAX_STANDARD_BROWSER_MUTATION_QUEUE = 32;
+export const MAX_STANDARD_BROWSER_DOWNLOADS_PER_WORKSPACE = 4;
+export const MAX_STANDARD_BROWSER_DOWNLOADS_PER_HOST = 16;
+export const MAX_STANDARD_BROWSER_STAGED_BYTES_PER_HOST = 256 * 1024 * 1024;
+
+function agentVisibleUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return parsed.protocol;
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch { return ""; }
+}
+
+function agentVisibleTitle(value: string | undefined, rawUrl: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const visibleUrl = agentVisibleUrl(rawUrl);
+  if (rawUrl && value.includes(rawUrl)) return visibleUrl;
+  return value.length > 512 ? `${value.slice(0, 512)}…` : value;
+}
 
 export interface StandardBrowserBackendTarget {
   id: string;
@@ -93,6 +116,7 @@ interface StandardDownloadOwner {
   targetGeneration: string;
   binding: ProtectedBrowserBinding;
   publisher: InteractiveBrowserDownloadPublisher;
+  reservedBytes: number;
 }
 
 export interface StandardBrowserHostAuthority {
@@ -285,8 +309,8 @@ export class StandardBrowserProfileHost {
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
     const tabs = [...workspace.targets.values()].map((target) => ({
       tab: target.handle,
-      ...(target.title ? { title: target.title } : {}),
-      ...(target.url ? { url: target.url } : {}),
+      ...(agentVisibleTitle(target.title, target.url) ? { title: agentVisibleTitle(target.title, target.url) } : {}),
+      ...(agentVisibleUrl(target.url) ? { url: agentVisibleUrl(target.url) } : {}),
     }));
     return {
       profileId: this.profile.id,
@@ -455,9 +479,14 @@ export class StandardBrowserProfileHost {
   private onDownloadWillBegin(event: ManagedChromiumDownloadWillBegin, targetId: string | null): void {
     const sourceSessionId = targetId ? this.targetOwners.get(targetId) : undefined;
     const workspace = sourceSessionId ? this.workspaces.get(sourceSessionId) : undefined;
+    const workspaceDownloadCount = sourceSessionId
+      ? [...this.downloads.values()].filter((owner) => owner.sourceSessionId === sourceSessionId).length
+      : 0;
     const target = targetId && workspace ? workspace.targets.get(targetId) : undefined;
     if (!sourceSessionId || !targetId || !workspace || workspace.closed || !target || !this.backend.downloadStagingDir
-      || workspace.runtimeGeneration !== workspace.binding.runtimeGeneration) {
+      || workspace.runtimeGeneration !== workspace.binding.runtimeGeneration
+      || workspaceDownloadCount >= MAX_STANDARD_BROWSER_DOWNLOADS_PER_WORKSPACE
+      || this.downloads.size >= MAX_STANDARD_BROWSER_DOWNLOADS_PER_HOST) {
       this.cancelDownload(event.guid);
       return;
     }
@@ -482,12 +511,22 @@ export class StandardBrowserProfileHost {
       targetGeneration: target.generation,
       binding: { ...workspace.binding },
       publisher,
+      reservedBytes: 0,
     });
   }
 
   private onDownloadProgress(event: ManagedChromiumDownloadProgress): void {
     const owner = this.downloads.get(event.guid);
     if (!owner) { if (event.state === "inProgress") this.cancelDownload(event.guid); return; }
+    const reservedBytes = Number.isSafeInteger(event.receivedBytes) && event.receivedBytes >= 0 ? event.receivedBytes : 0;
+    const otherReserved = [...this.downloads.values()].reduce((total, candidate) => candidate === owner ? total : total + candidate.reservedBytes, 0);
+    if (otherReserved + reservedBytes > MAX_STANDARD_BROWSER_STAGED_BYTES_PER_HOST) {
+      this.cancelDownload(event.guid);
+      owner.publisher.revoke();
+      this.downloads.delete(event.guid);
+      return;
+    }
+    owner.reservedBytes = reservedBytes;
     const authorize = async () => {
       const workspace = this.exactWorkspace(owner.binding, owner.workspaceGeneration);
       const target = workspace.targets.get(owner.targetId);
@@ -526,8 +565,8 @@ export class StandardBrowserProfileHost {
     const workspace = this.exactWorkspace(binding, workspaceGeneration);
     const tabs = [...workspace.targets.values()].map((target) => ({
       tab: target.handle,
-      ...(target.title ? { title: target.title } : {}),
-      ...(target.url ? { url: target.url } : {}),
+      ...(agentVisibleTitle(target.title, target.url) ? { title: agentVisibleTitle(target.title, target.url) } : {}),
+      ...(agentVisibleUrl(target.url) ? { url: agentVisibleUrl(target.url) } : {}),
     }));
     return {
       profileId: this.profile.id,

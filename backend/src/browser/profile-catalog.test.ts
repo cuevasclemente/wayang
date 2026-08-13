@@ -38,7 +38,7 @@ beforeEach(() => {
   projectRoot = path.join(root, "project");
   fs.mkdirSync(projectRoot, { recursive: true });
   process.env.WAYANG_DATA_DIR = dataDir;
-  init();
+  init({ browserProfilesEnabled: true });
 });
 
 afterEach(() => {
@@ -139,7 +139,7 @@ test("schema 5 to 6 migration preserves title provenance and inventories only ex
   delete schemaFive.browserCleanups;
   fs.writeFileSync(storePath, `${JSON.stringify(schemaFive, null, 2)}\n`, { mode: 0o600 });
 
-  init();
+  init({ browserProfilesEnabled: true });
   const store = getStore();
   assert.equal(store.schema_version, 6);
   assert.deepEqual(store.browserProfiles.map((row) => row.storage_source.kind).sort(), ["legacy_shared", "standard_pair_v1"]);

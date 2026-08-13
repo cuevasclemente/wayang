@@ -161,8 +161,29 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
   } | null {
     const state = this.options.catalog.sessionState(sourceSessionId);
     if (!state?.active_profile_id) return null;
-    const workspace = this.workspaceLeases.get(sourceSessionId)?.get(state.active_profile_id);
-    if (!workspace || workspace.sessionStateRevision !== state.revision || workspace.host.isClosed) return null;
+    let workspace = this.workspaceLeases.get(sourceSessionId)?.get(state.active_profile_id);
+    if (!workspace || workspace.sessionStateRevision !== state.revision || workspace.host.isClosed) {
+      const profile = this.profile(state.active_profile_id);
+      const authority = this.options.catalog.ownerAuthority(sourceSessionId, profile);
+      if (!authority || (expectedProjectCwd !== undefined && authority.projectCwd !== expectedProjectCwd)) return null;
+      const ownerBinding: ProtectedBrowserBinding = {
+        capabilityId: "wayang.standard-browser.v1",
+        sourceSessionId,
+        projectId: authority.projectId,
+        projectCwd: authority.projectCwd,
+        agentProfileId: authority.agentProfileId,
+        associationRevision: authority.associationRevision,
+        runtimeGeneration: `owner:${randomUUID()}`,
+        processBootNonce: "owner-without-pi",
+        controlGeneration: 1,
+      };
+      workspace = this.attachWorkspace(ownerBinding, state) ?? undefined;
+      if (!workspace) return null;
+      // Owner-without-Pi workspaces retain no agent lease. The durable owner
+      // path can start/view them, but cannot mint or execute agent tools.
+      void workspace.host.detachAgentLease(sourceSessionId, ownerBinding.runtimeGeneration);
+      return { authority, workspace };
+    }
     const authority = this.options.catalog.ownerAuthority(sourceSessionId, workspace.profile);
     if (!authority || (expectedProjectCwd !== undefined && authority.projectCwd !== expectedProjectCwd)) return null;
     return { authority, workspace };

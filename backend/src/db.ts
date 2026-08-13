@@ -1053,22 +1053,26 @@ export function classifyMigratedSessionTitleSource(title: unknown): SessionTitle
 
 const BROWSER_CATALOG_ARRAY_KEYS = ["browserProfiles", "projectBrowserDefaults", "sessionBrowserStates", "browserCleanups"] as const;
 
-function browserCatalogMigrationFields(data: Pick<StoreData, "workspaceCapabilityAssociations" | "projects" | "agentProfiles">, now = Date.now()) {
+function browserCatalogMigrationFields(
+  data: Pick<StoreData, "workspaceCapabilityAssociations" | "projects" | "agentProfiles">,
+  now = Date.now(),
+  inventory = true,
+) {
   return {
-    browserProfiles: inventoryBrowserProfilesForSchemaFour({
+    browserProfiles: inventory ? inventoryBrowserProfilesForSchemaFour({
       dataDir: getConfig().dataDir,
       associations: data.workspaceCapabilityAssociations,
       projects: data.projects,
       agentProfiles: data.agentProfiles,
       now,
-    }),
+    }) : [],
     projectBrowserDefaults: [] as ProjectBrowserDefaultRow[],
     sessionBrowserStates: [] as SessionBrowserStateRow[],
     browserCleanups: [] as BrowserCleanupRow[],
   };
 }
 
-function normalizeLegacyStore(raw: Record<string, unknown>): StoreData {
+function normalizeLegacyStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
   const now = Date.now();
   const data = emptyStore(now);
   // Schema-0 had no profile control plane. Preserve its former default as
@@ -1179,11 +1183,11 @@ function normalizeLegacyStore(raw: Record<string, unknown>): StoreData {
     });
   }
   backfillLegacySessionProjectIds(data.sessions as SessionRow[], data.projects);
-  Object.assign(data, browserCatalogMigrationFields(data, now));
+  Object.assign(data, browserCatalogMigrationFields(data, now, browserProfilesEnabled));
   return data;
 }
 
-function normalizeSchemaOneStore(raw: Record<string, unknown>): StoreData {
+function normalizeSchemaOneStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
   const now = Date.now();
   const requiredArrays = [
     "sessions", "projects", "agentProfiles", "agentTeams", "teamMembers", "goals",
@@ -1266,11 +1270,11 @@ function normalizeSchemaOneStore(raw: Record<string, unknown>): StoreData {
   // names, descriptions, defaults, and ordinary runtime fields remain intact.
   for (const profile of data.agentProfiles) profile.updated_at = profile.updated_at ?? now;
   backfillLegacySessionProjectIds(data.sessions as SessionRow[], data.projects);
-  Object.assign(data, browserCatalogMigrationFields(data, now));
+  Object.assign(data, browserCatalogMigrationFields(data, now, browserProfilesEnabled));
   return validateCurrentStore(data as unknown as Record<string, unknown>);
 }
 
-function normalizeSchemaTwoStore(raw: Record<string, unknown>): StoreData {
+function normalizeSchemaTwoStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
   const schemaTwoArrayKeys = ARRAY_KEYS.filter((key) => key !== "protectedAutomationJobs" && key !== "protectedAutomationRuns"
     && key !== "messagingEndpoints" && key !== "messagingEvents"
     && key !== "messagingTransactions" && key !== "messagingDeliveries"
@@ -1306,11 +1310,11 @@ function normalizeSchemaTwoStore(raw: Record<string, unknown>): StoreData {
   } as unknown as StoreData;
   for (const session of migrated.sessions) session.title_source = classifyMigratedSessionTitleSource(session.title);
   backfillLegacySessionProjectIds(migrated.sessions as SessionRow[], migrated.projects);
-  Object.assign(migrated, browserCatalogMigrationFields(migrated));
+  Object.assign(migrated, browserCatalogMigrationFields(migrated, Date.now(), browserProfilesEnabled));
   return validateCurrentStore(migrated as unknown as Record<string, unknown>);
 }
 
-function normalizeSchemaThreeStore(raw: Record<string, unknown>): StoreData {
+function normalizeSchemaThreeStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
   const messagingKeys = new Set(["messagingEndpoints", "messagingEvents", "messagingTransactions", "messagingDeliveries"]);
   const schemaThreeArrayKeys = ARRAY_KEYS.filter((key) => !messagingKeys.has(key)
     && !BROWSER_CATALOG_ARRAY_KEYS.includes(key as typeof BROWSER_CATALOG_ARRAY_KEYS[number]));
@@ -1337,11 +1341,11 @@ function normalizeSchemaThreeStore(raw: Record<string, unknown>): StoreData {
   } as unknown as StoreData;
   for (const session of migrated.sessions) session.title_source = classifyMigratedSessionTitleSource(session.title);
   backfillLegacySessionProjectIds(migrated.sessions as SessionRow[], migrated.projects);
-  Object.assign(migrated, browserCatalogMigrationFields(migrated));
+  Object.assign(migrated, browserCatalogMigrationFields(migrated, Date.now(), browserProfilesEnabled));
   return validateCurrentStore(migrated as unknown as Record<string, unknown>);
 }
 
-function normalizeSchemaFourStore(raw: Record<string, unknown>): StoreData {
+function normalizeSchemaFourStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
   const schemaFourArrayKeys = ARRAY_KEYS.filter((key) => !BROWSER_CATALOG_ARRAY_KEYS.includes(key as typeof BROWSER_CATALOG_ARRAY_KEYS[number]));
   const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaFourArrayKeys]);
   for (const key of Object.keys(raw)) {
@@ -1364,7 +1368,7 @@ function normalizeSchemaFourStore(raw: Record<string, unknown>): StoreData {
   for (const session of migrated.sessions) {
     session.title_source = classifyMigratedSessionTitleSource(session.title);
   }
-  Object.assign(migrated, browserCatalogMigrationFields(migrated));
+  Object.assign(migrated, browserCatalogMigrationFields(migrated, Date.now(), browserProfilesEnabled));
   return validateCurrentStore(migrated as unknown as Record<string, unknown>);
 }
 
@@ -1581,10 +1585,22 @@ function canonicalizeCapabilityEligibility(data: StoreData): void {
   }
 }
 
-function saveStoreAtPath(data: StoreData, storePath: string): void {
+function persistedStoreForBrowserMode(data: StoreData, browserProfilesEnabled: boolean): StoreData | Record<string, unknown> {
+  if (browserProfilesEnabled) return data;
+  const persisted = structuredClone(data) as unknown as Record<string, unknown>;
+  persisted.schema_version = 5;
+  delete persisted.browserProfiles;
+  delete persisted.projectBrowserDefaults;
+  delete persisted.sessionBrowserStates;
+  delete persisted.browserCleanups;
+  return persisted;
+}
+
+function saveStoreAtPath(data: StoreData, storePath: string, browserProfilesEnabled = _browserProfilesEnabled): void {
   assertStoreLockOwned(storePath);
   canonicalizeCapabilityEligibility(data);
   validateCurrentStore(data as unknown as Record<string, unknown>);
+  const persisted = persistedStoreForBrowserMode(data, browserProfilesEnabled);
   const dataDir = path.dirname(storePath);
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const tempPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
@@ -1593,7 +1609,7 @@ function saveStoreAtPath(data: StoreData, storePath: string): void {
   try {
     fd = fs.openSync(tempPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
     created = true;
-    fs.writeFileSync(fd, JSON.stringify(data, null, 2), "utf-8");
+    fs.writeFileSync(fd, JSON.stringify(persisted, null, 2), "utf-8");
     fs.fsyncSync(fd);
     fs.fchmodSync(fd, 0o600);
     fs.closeSync(fd);
@@ -1636,10 +1652,10 @@ function saveStoreAtPath(data: StoreData, storePath: string): void {
   }
 }
 
-function loadStore(storePath: string): StoreData {
+function loadStore(storePath: string, browserProfilesEnabled = _browserProfilesEnabled): StoreData {
   if (!fs.existsSync(storePath)) {
     const data = emptyStore();
-    saveStoreAtPath(data, storePath);
+    saveStoreAtPath(data, storePath, browserProfilesEnabled);
     return data;
   }
 
@@ -1654,28 +1670,36 @@ function loadStore(storePath: string): StoreData {
   }
   const raw = requireObject(parsed);
   const version = readSchemaVersion(raw);
+  if (!browserProfilesEnabled && version === STORE_SCHEMA_VERSION) {
+    throw new Error("Wayang store schema 6 requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1");
+  }
   if (version > STORE_SCHEMA_VERSION) {
     throw new Error(`Wayang store schema ${version} is newer than supported schema ${STORE_SCHEMA_VERSION}`);
   }
   if (version === STORE_SCHEMA_VERSION) return validateCurrentStore(raw);
+  // Gate-off production runs schema 5 as its durable format. Add empty Browser
+  // arrays only in memory so current code can operate without inventorying or
+  // publishing schema 6; every save projects back to exact schema 5.
+  if (!browserProfilesEnabled && version === 5) return normalizeSchemaFiveStore(raw);
 
   // Never normalize or replace an old store until its exact bytes have a
   // durable private backup. Any backup error aborts startup.
   createPrivateBackup(storePath, contents, version);
   let migrated: StoreData;
   if (version === 5) migrated = normalizeSchemaFiveStore(raw);
-  else if (version === 4) migrated = normalizeSchemaFourStore(raw);
-  else if (version === 3) migrated = normalizeSchemaThreeStore(raw);
-  else if (version === 2) migrated = normalizeSchemaTwoStore(raw);
-  else if (version === 1) migrated = normalizeSchemaOneStore(raw);
-  else if (version === 0) migrated = normalizeLegacyStore(raw);
+  else if (version === 4) migrated = normalizeSchemaFourStore(raw, browserProfilesEnabled);
+  else if (version === 3) migrated = normalizeSchemaThreeStore(raw, browserProfilesEnabled);
+  else if (version === 2) migrated = normalizeSchemaTwoStore(raw, browserProfilesEnabled);
+  else if (version === 1) migrated = normalizeSchemaOneStore(raw, browserProfilesEnabled);
+  else if (version === 0) migrated = normalizeLegacyStore(raw, browserProfilesEnabled);
   else throw new Error(`Wayang store schema ${version} has no supported migration path`);
-  saveStoreAtPath(migrated, storePath);
+  saveStoreAtPath(migrated, storePath, browserProfilesEnabled);
   return migrated;
 }
 
 let _store: StoreData | null = null;
 let _storePath: string | null = null;
+let _browserProfilesEnabled = false;
 
 function ensureStoreLock(storePath: string): boolean {
   if (_storeLock) {
@@ -1738,11 +1762,12 @@ export function commitStoreMutation<T>(mutate: (draft: StoreData) => T): T {
   return result;
 }
 
-export function init(): void {
+export function init(options: { browserProfilesEnabled?: boolean } = {}): void {
+  _browserProfilesEnabled = options.browserProfilesEnabled === true;
   const storePath = canonicalStorePath();
   const acquiredHere = ensureStoreLock(storePath);
   try {
-    const loaded = loadStore(storePath);
+    const loaded = loadStore(storePath, _browserProfilesEnabled);
     _store = loaded;
     _storePath = storePath;
     console.log(`[db] Store initialized at ${storePath}`);
@@ -1759,6 +1784,7 @@ export function close(): void {
   } finally {
     _store = null;
     _storePath = null;
+    _browserProfilesEnabled = false;
     commitStoreMutationPersistenceFailureForTests = null;
     storeMigrationPersistenceObserverForTests = null;
     releaseStoreLock();

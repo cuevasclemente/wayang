@@ -197,7 +197,7 @@ test("current-schema structural corruption aborts without normalization", () => 
   assert.equal(fs.readFileSync(storePath, "utf-8"), malformedCurrent);
 }));
 
-test("new stores persist one generic restricted workspace default with no capability authority", () => withDataDir((dir) => {
+test("gate-off new stores remain schema 5 with one generic restricted workspace default and no Browser catalog", () => withDataDir((dir) => {
   init();
   const store = getStore();
   assert.equal(store.agentProfiles.length, 1);
@@ -209,7 +209,11 @@ test("new stores persist one generic restricted workspace default with no capabi
   assert.deepEqual(store.workspaceCapabilityAssociations, []);
   assert.deepEqual(store.workspaceCapabilityApprovalEvents, []);
   const persisted = JSON.parse(fs.readFileSync(path.join(dir, "store.json"), "utf-8"));
-  assert.equal(persisted.schema_version, STORE_SCHEMA_VERSION);
+  assert.equal(persisted.schema_version, 5);
+  assert.equal("browserProfiles" in persisted, false);
+  assert.equal("projectBrowserDefaults" in persisted, false);
+  assert.equal("sessionBrowserStates" in persisted, false);
+  assert.equal("browserCleanups" in persisted, false);
   assert.equal(persisted.agentProfiles.length, 1);
   assert.deepEqual(persisted.workspaceCapabilityAssociations, []);
   assert.deepEqual(persisted.workspaceCapabilityApprovalEvents, []);
