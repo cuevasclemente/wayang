@@ -572,12 +572,19 @@ export interface InterviewResponseAckMessage {
   error?: string;
 }
 
+export type InterviewCancelAckErrorCode =
+  | "session_busy"
+  | "not_found"
+  | "persistence_failed";
+
 export interface InterviewCancelAckMessage {
   type: "interview_cancel_ack";
   requestId: string | null;
   sessionId: string;
   status: "cancelled" | "rejected";
-  errorCode?: "session_busy" | "not_found";
+  duplicate?: boolean;
+  errorCode?: InterviewCancelAckErrorCode;
+  error?: string;
 }
 
 export type SudoRequestKind = "password" | "approval";
