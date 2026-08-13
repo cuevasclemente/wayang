@@ -1896,6 +1896,10 @@ export interface CreatePiSessionRuntimeOptions {
 let productionProtectedBrowserFactory: InteractiveBrowserFactory | undefined;
 let productionInteractiveBrowserSessionLifecycle: InteractiveBrowserSessionLifecyclePort | undefined;
 const interactiveBrowserLifecycleCleanupTasks = new Set<Promise<void>>();
+const pendingInteractiveBrowserAuthority = new Map<string, {
+  binding: Readonly<ProtectedBrowserBinding>;
+  isCurrent(): boolean;
+}>();
 let productionFileAudioExperimentDependencies: FileAudioExperimentDependencies | undefined;
 
 /** Adapter/media/DSP integration seam. Installation performs no file read,
@@ -2239,7 +2243,20 @@ export async function createPiSession(
         assertCreationCurrent();
         runtimeOptions.testHooks?.onPrivilegedEffect?.("protected_browser_runtime");
         assertCreationCurrent();
-        pendingProtectedBrowserRuntime = await selectedProtectedBrowserFactory(protectedBinding);
+        pendingInteractiveBrowserAuthority.set(id, {
+          binding: { ...protectedBinding },
+          isCurrent: () => {
+            try { assertCreationCurrent(); return true; } catch { return false; }
+          },
+        });
+        try {
+          pendingProtectedBrowserRuntime = await selectedProtectedBrowserFactory(protectedBinding);
+        } finally {
+          const pendingAuthority = pendingInteractiveBrowserAuthority.get(id);
+          if (pendingAuthority && exactProtectedBrowserBindingEqual(pendingAuthority.binding, protectedBinding)) {
+            pendingInteractiveBrowserAuthority.delete(id);
+          }
+        }
         assertCreationCurrent();
         if (pendingProtectedBrowserRuntime) {
           assertInteractiveBrowserToolCatalog(pendingProtectedBrowserRuntime);
@@ -3047,6 +3064,33 @@ export function resolveProtectedBrowserPairAuthority(
 /** Closed generic authority resolver for app/routes protected-browser ports.
  * Call it at every coordinator checkpoint; a durable row alone never grants
  * browser authority. */
+export function resolveInteractiveBrowserAuthority(
+  binding: Readonly<ProtectedBrowserBinding>,
+): ProtectedBrowserAuthoritySnapshot | null {
+  const pending = pendingInteractiveBrowserAuthority.get(binding.sourceSessionId);
+  if (pending && exactProtectedBrowserBindingEqual(pending.binding, binding) && pending.isCurrent()) {
+    const resolution = resolveWorkspaceCapability({
+      capability_id: binding.capabilityId,
+      project_id: binding.projectId,
+      agent_profile_id: binding.agentProfileId,
+    });
+    if (resolution.authorized && resolution.association.revision === binding.associationRevision
+      && resolution.project.cwd === binding.projectCwd) {
+      return {
+        ...binding,
+        authorized: true,
+        privacyMode: resolution.project.access_policy.privacy_mode,
+        sourceSessionDurable: true,
+        sourceQuarantined: false,
+        profileEnabled: resolution.profile.enabled,
+        projectAllowsProfile: resolution.project.access_policy.allowed_agent_profile_ids === null
+          || resolution.project.access_policy.allowed_agent_profile_ids.includes(resolution.profile.id),
+      };
+    }
+  }
+  return resolveProtectedBrowserAuthority(binding);
+}
+
 export function resolveProtectedBrowserAuthority(
   binding: Readonly<ProtectedBrowserBinding>,
 ): ProtectedBrowserAuthoritySnapshot | null {

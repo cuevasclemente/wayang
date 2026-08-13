@@ -192,6 +192,7 @@ export function attachBrowserWs(
       server.handleUpgrade(req, socket, head, (ws) => {
         if (standardSelection) attachSelectedStandardViewer(ws, standardSelection, kind, standardBrowser!);
         else if (protectedSelection) attachProtected(ws, protectedSelection, kind);
+        else if (standardBrowser) ws.close(1008, "Named Browser Profile selection required");
         else server.emit("connection", ws, req);
       });
     }).catch((error) => {

@@ -4,7 +4,7 @@ import { resolveWorkspaceCapability } from "../workspace-capabilities.js";
 import {
   installInteractiveBrowserSessionLifecyclePort,
   installProductionProtectedBrowserFactory,
-  resolveProtectedBrowserAuthority,
+  resolveInteractiveBrowserAuthority,
   type InteractiveBrowserFactory,
 } from "../pi-bridge.js";
 import type { InteractiveBrowserSessionLifecyclePort } from "./interactive-runtime.js";
@@ -33,7 +33,7 @@ function profileCatalogGeneration(profiles: readonly BrowserProfileRow[]): numbe
 
 function exactStandardAuthority(binding: Readonly<ProtectedBrowserBinding>): boolean {
   if (binding.capabilityId !== STANDARD_BROWSER_CAPABILITY_ID) return false;
-  const authority = resolveProtectedBrowserAuthority(binding);
+  const authority = resolveInteractiveBrowserAuthority(binding);
   return Boolean(authority && authority.privacyMode === "standard");
 }
 
