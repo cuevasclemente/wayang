@@ -1,5 +1,13 @@
 # Concurrent Browser Profile workspaces — implementation handoff (2026-08-13)
 
+## Terminal pre-rebase gate
+
+Browser-only blockers independent of Terra were closed through clean branch head `cbdf13f` (`72e8058` latest functional change). Repeated independent blocker/high reviews now return **GO**. Final remediations cover authenticated named-workspace routing, exact human/agent control barriers, retained per-profile workspaces, recoverable managed-profile cleanup, redacted bounded projections, profile-switch operation fencing, disabled-profile catalog-only recovery, fail-closed production download attribution, and immediate closure of forbidden top-level documents.
+
+Validation: backend **819 passed, 0 failed, 5 skipped**; frontend build passed; frontend lint 0 errors/1 pre-existing warning; scripts unchanged fake-Bitwarden baseline **44/45**; `make doctor` 0 failures/3 expected local warnings.
+
+The branch remains based on provisional Terra `601725f`. Rebase onto the final canonical Terra Wayang head and rerun the gate before integration. Production activation, VNC/credential brokering, migrated-profile cleanup, and named-profile downloads remain deliberately unavailable/fail-closed. No migration, profile access, restart, activation, or deployment occurred.
+
 ## Status
 
 Source implementation is complete on isolated branch `feat/concurrent-browser-profile-workspaces`, worktree `/home/clemente/src/wayang/.worktrees/browser-profile-tab-implementation`, current head `27921ae`.
