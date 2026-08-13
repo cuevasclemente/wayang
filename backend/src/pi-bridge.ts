@@ -3651,6 +3651,9 @@ export async function sendBrowserMessageTurn(
       interactiveTurnLedger(handle).set(turn.token, completedTurn);
       persistAcceptedProvisionalTitle(handle, completedTurn);
       settleInteractiveTurnsQuietly(handle);
+      // agent_settled fires before prompt() resolves, so idle browser sends do
+      // not have their source marker yet in the lifecycle listener above.
+      scheduleWayangAutoTitle(handle.id, { onCommitted: invalidateSessionFileSnapshot });
       return { queued: false, cancellable: false };
     } catch (error) {
       retireInteractiveTurn(handle, turn.token);

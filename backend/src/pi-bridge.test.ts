@@ -53,6 +53,8 @@ import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability, revoke
 import type { PendingAgentSwitch } from "./workspace-types.js";
 import type { ProtectedBrowserToolRuntime } from "./browser/protected-tools.js";
 import { getActionApprovalBridge } from "./action-approval-bridge.js";
+import { setAutoTitleProviderForTests } from "./session-title-service.js";
+import { extractCompletedTitleExchanges } from "./session-title-policy.js";
 
 function syntheticProtectedRuntime(
   mode: "agent" | "user" | "paused",
@@ -775,6 +777,71 @@ test("Pi bridge browser turns mint the exact persisted current-branch boundary a
       handle.interactiveTurns.delete(acceptedTurn.token);
     }
   } finally {
+    f.cleanup();
+  }
+});
+
+test("idle browser prompt completion schedules title generation after its marker is durable", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-idle-title-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: durableRow.id });
+  updatePiSessionFile(durableRow.id, manager.getSessionFile()!);
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    async prompt(content: string) {
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      manager.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: `answer to ${content}` }],
+        provider: "synthetic",
+        model: "synthetic",
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as any);
+    },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "idle-title-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  const previousFlag = process.env.WAYANG_AUTO_SESSION_TITLE;
+  const previousProtectedFlag = process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED;
+  process.env.WAYANG_AUTO_SESSION_TITLE = "on";
+  process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED = "on";
+  let dispatchCalls = 0;
+  setAutoTitleProviderForTests({
+    async prepare() {
+      return { dispatch: async () => { dispatchCalls++; return "Idle prompt title"; } };
+    },
+  });
+  try {
+    for (let index = 1; index <= 3; index++) {
+      await sendBrowserMessageTurn(handle, `idle prompt ${index}`, undefined, `idle-${index}`);
+    }
+    assert.equal(manager.getEntries().filter((entry: any) => entry.customType === "wayang-interactive-turn-source.v1").length, 3);
+    assert.equal(getSessionById(durableRow.id)?.title_source, "provisional");
+    assert.equal(extractCompletedTitleExchanges(manager.getBranch())?.completedExchangeCount, 3);
+    const deadline = Date.now() + 2_000;
+    while (SessionManager.open(manager.getSessionFile()!, undefined, f.cwd).getSessionName() !== "Idle prompt title") {
+      if (Date.now() >= deadline) throw new Error("title generation was not scheduled after idle prompt settlement");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(dispatchCalls, 1);
+  } finally {
+    setAutoTitleProviderForTests(null);
+    if (previousFlag === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE;
+    else process.env.WAYANG_AUTO_SESSION_TITLE = previousFlag;
+    if (previousProtectedFlag === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED;
+    else process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED = previousProtectedFlag;
     f.cleanup();
   }
 });
