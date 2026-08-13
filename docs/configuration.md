@@ -67,7 +67,7 @@ For a single-user private LAN without an existing reverse proxy, Wayang includes
 
 ## Pi provider authentication
 
-Wayang uses pi 0.84.1's standard authentication and model runtime.
+Wayang uses pi 0.84.1's standard authentication and model runtime. The coding-agent package is pinned to the repository-vendored `0.84.1-wayang.529ab5c1` artifact so human and automatic session-name writers share the reviewed lock/CAS implementation.
 
 ### OAuth or pi-managed API key
 
@@ -99,6 +99,19 @@ Inside the pinned local pi CLI, run `/login`, choose the provider, complete the 
 The bundled pi release also supports additional providers, including Azure OpenAI (`AZURE_OPENAI_API_KEY` plus endpoint/resource settings), Cloudflare, Vercel AI Gateway, ZAI, OpenCode, Hugging Face, Kimi, MiniMax, Xiaomi MiMo, Amazon Bedrock/AWS credentials, and Google Vertex application-default credentials. Configure specialized providers through pi `/login`, pi's provider documentation, and model settings rather than extending the wizard with unreviewed cloud fields. Do not use CLI `--api-key` arguments.
 
 Credential resolution in pi prefers a CLI override, then pi `auth.json`, then environment variables, then a custom provider key. Wayang does not accept provider keys in browser storage or URLs.
+
+### Automatic Terra session titles
+
+Automatic titles are disabled unless explicitly enabled:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `WAYANG_AUTO_SESSION_TITLE` | `off` | Exact value `on` enables one-time automatic naming for eligible interactive sessions after three completed exchanges. |
+| `WAYANG_AUTO_SESSION_TITLE_PROTECTED` | `off` | Exact value `on`, together with the general flag, permits the same disclosure for eligible Protected Projects. |
+
+The fixed model is `openai-codex/gpt-5.6-terra`; there is no provider fallback. The request contains only deterministically bounded prose from the first three eligible exchanges: raw browser user text captured before Wayang goal/attachment decoration and assistant text blocks. Wayang does not inject tools, tool results, reasoning, images, attachment metadata/bytes, host paths, project files, profile/system instructions, later turns, or source-session IDs. Conversation prose can itself contain sensitive facts, paths, or credentials written by the human or repeated by the assistant. Enabling either scope authorizes disclosure of that prose to the provider; the Protected flag is a separate explicit decision.
+
+Generation does not delay the source turn. Failure retries only after another completed eligible exchange. Scheduled jobs, connectors/headless work, subagents, interview continuations, resend paths, attachment-only turns, and ambiguous decorated legacy sources are excluded. Human titles use the shared Pi lock and win races. Disable promptly by setting the flags to `off` and restarting through the normal reviewed deployment procedure; already persisted titles are not removed or regenerated.
 
 ### Pi paths and settings
 

@@ -64,6 +64,7 @@ import {
   getLiveMessageHistory,
   getSessionFileTodoState,
   getSessionFileSnapshot,
+  invalidateSessionFileSnapshot,
   getTodoState,
   getCommandGuardState,
   setCommandGuardMode,
@@ -104,6 +105,7 @@ import {
   type ExternalActionRequest,
 } from "../action-approval-bridge.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
+import { scheduleWayangAutoTitle, scheduleWayangAutoTitleFromActivation } from "../session-title-service.js";
 import type {
   ExternalActionTerminalMessage,
   SessionRuntimeStateMessage,
@@ -799,7 +801,20 @@ function handleConnection(
               messages: [],
             });
             wsProfile(nextSessionId, "sent_history", `duration=${elapsedMs(sendHistoryStart)} messages=${messages.length}`);
+            // Catch-up is selected-session-only and starts after history is sent.
+            // It reuses this parse; a second full parse is reserved for commit.
+            if (!quarantined && snapshot?.autoTitle) {
+              scheduleWayangAutoTitleFromActivation(nextSessionId, snapshot.autoTitle, {
+                stillSelected: () => alive && version === setupVersion && currentSessionId === nextSessionId && currentSelectionId === selectionId,
+                onCommitted: invalidateSessionFileSnapshot,
+              });
+            }
             startFilePoll(nextSessionId, sessionInfo.pi_session_file, sessionInfo.cwd, version, selectionId, !quarantined);
+          } else if (!quarantined) {
+            scheduleWayangAutoTitle(nextSessionId, {
+              stillSelected: () => alive && version === setupVersion && currentSessionId === nextSessionId && currentSelectionId === selectionId,
+              onCommitted: invalidateSessionFileSnapshot,
+            });
           }
           if (!quarantined) sendContextUsage(ws, nextSessionId);
           wsProfile(nextSessionId, "deferred_history_done", `duration=${elapsedMs(deferredStart)}`);

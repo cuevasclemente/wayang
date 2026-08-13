@@ -124,6 +124,7 @@ test("stopped quarantined legacy private sessions deny TTS before history, broke
     id: "quarantined-session",
     pi_session_file: sessionFile,
     title: "Stopped legacy private fixture",
+    title_source: "legacy_unknown",
     cwd: project.cwd,
     project_id: project.id,
     provider: "openai-codex",

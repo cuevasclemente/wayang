@@ -67,6 +67,7 @@ function seedSession(opts: {
     id,
     pi_session_file: file,
     title: opts.title,
+    title_source: "explicit",
     cwd: project.cwd,
     project_id: project.id,
     provider: "openrouter",

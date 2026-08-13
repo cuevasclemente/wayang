@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type APIResponse, type Page } from "@playwright/test";
 import { createE2eSession, openSessionInUi } from "./helpers/sessions";
 
 interface AutoTitleFixture {
@@ -53,9 +53,19 @@ async function installAutoTitleFixture(
       await route.continue();
       return;
     }
-    const response = await route.fetch();
+    let response: APIResponse;
+    let payload: unknown;
+    try {
+      response = await route.fetch();
+      payload = await response.json() as unknown;
+    } catch {
+      // A catalog refresh can still be unwinding while Playwright closes the
+      // test context. Do not turn that disposed response into an unhandled
+      // route error; completed in-test reads are asserted below.
+      await route.abort().catch(() => undefined);
+      return;
+    }
     catalogReadsAtCompletion.push(completedExchanges);
-    const payload = await response.json() as unknown;
     const catalog = Array.isArray(payload)
       ? payload.map((value) => {
           if (

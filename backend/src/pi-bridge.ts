@@ -32,7 +32,9 @@ import {
   beginAgentSwitch,
   completeAgentSwitch,
   getSessionById,
+  normalizeProvisionalSessionTitle,
   rollbackAgentSwitch,
+  setPiSessionTitle,
   setProvisionalSessionTitle,
   updatePiSessionFile,
   updateSessionAgentProfile,
@@ -65,6 +67,8 @@ import { WorkspaceStoreError, type AgentProfileRow, type PendingAgentSwitch, typ
 import { REVIEWED_PROVIDER_EXTENSION_PATHS } from "./reviewed-provider-extensions.js";
 import { getSudoBridge } from "./sudo-bridge.js";
 import { getCommandGuardIdentityBridge } from "./command-guard-bridge.js";
+import { scheduleWayangAutoTitle, type AutoTitleActivationSnapshot } from "./session-title-service.js";
+import { extractCompletedTitleExchanges, titleTextBlocks } from "./session-title-policy.js";
 import { createWayangSessionCustomTools } from "./wayang-runtime-context.js";
 import { createWorkspaceToolDefinitions, workspaceToolsAllowedForRuntime } from "./workspace-tools.js";
 import { AgentSwitchAuthorityLifecycle } from "./agent-switch-authority-lifecycle.js";
@@ -2469,6 +2473,12 @@ export async function createPiSession(
     // controllers such as the command guard status/toggle bridge.
     const extensionBindStartedAt = performance.now();
     assertCreationCurrent();
+    // Identity-neutral Pi auto-title extensions defer to Wayang for these exact
+    // manager objects, avoiding duplicate provider calls in the web runtime.
+    const ownershipKey = Symbol.for("wayang.owned-session-managers.v1");
+    const globals = globalThis as any;
+    (globals[ownershipKey] ??= new WeakSet<object>()).add(session.sessionManager);
+    assertCreationCurrent();
     runtimeOptions.testHooks?.onPrivilegedEffect?.("extension_lifecycle");
     assertCreationCurrent();
     await session.bindExtensions({
@@ -2546,6 +2556,20 @@ export async function createPiSession(
     }
 
     assertCreationCurrent();
+    // A title supplied before the Pi file existed is human intent. Seed it
+    // canonically before automatic naming can observe this manager.
+    const titleSeedRow = getSessionById(id);
+    const titleSeedState = sessionManager.getSessionNameState();
+    if (
+      titleSeedRow?.title_source === "explicit"
+      && titleSeedRow.title.trim()
+      && titleSeedState.name === undefined
+      && titleSeedState.entryId === undefined
+    ) {
+      session.setSessionName(titleSeedRow.title);
+      setPiSessionTitle(id, titleSeedRow.title);
+    }
+    assertCreationCurrent();
     const handle: PiSessionHandle = {
       id,
       session,
@@ -2580,6 +2604,7 @@ export async function createPiSession(
       if (event.type === "agent_settled") {
         markClaimedQueuedBrowserTurnsReady(handle);
         settleInteractiveTurnsQuietly(handle);
+        scheduleWayangAutoTitle(handle.id, { onCommitted: invalidateSessionFileSnapshot });
       }
       if (event.type === "message_start" || event.type === "message_update") {
         handle.liveStreamingMessage = event.message;
@@ -4553,6 +4578,7 @@ export function getTodoState(id: string): SerializedTodoState {
 
 export interface SessionFileSnapshot {
   fingerprint: FileFingerprint;
+  autoTitle: AutoTitleActivationSnapshot;
   messages: SerializedMessage[];
   todoState: SerializedTodoState;
   approximateBytes: number;
@@ -4627,9 +4653,20 @@ export function getSessionFileSnapshot(
     const activeEntries = branch.length > 0 ? branch : manager.getEntries();
     const messages = serializeHistoryEntries(activeEntries);
     const todoState = extractTodoStateFromEntries(activeEntries);
+    const firstUser = activeEntries.find((entry: any) => entry?.type === "message" && entry.message?.role === "user");
     const payloadBytes = Buffer.byteLength(JSON.stringify(messages));
     const snapshot: SessionFileSnapshot = {
       fingerprint,
+      autoTitle: {
+        sessionId: manager.getSessionId(),
+        cwd: manager.getHeader()?.cwd ?? "",
+        sessionFile,
+        fingerprint,
+        nameState: manager.getSessionNameState(),
+        markedProjection: extractCompletedTitleExchanges(activeEntries),
+        legacyProjection: extractCompletedTitleExchanges(activeEntries, { allowSafeLegacyUserText: true }),
+        normalizedFirstUserFallback: normalizeProvisionalSessionTitle(titleTextBlocks((firstUser as any)?.message?.content)),
+      },
       messages,
       todoState,
       approximateBytes: fingerprint.size,
