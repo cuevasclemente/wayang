@@ -1,6 +1,6 @@
 import { SessionManager, type SessionNameState } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
-import { getSessionById, normalizeProvisionalSessionTitle, setPiSessionTitle, type SessionRow } from "./sessions.js";
+import { getSessionById, normalizeProvisionalSessionTitle, setAutomaticPiSessionTitle, type SessionRow } from "./sessions.js";
 import { authorizeProjectAction } from "./policy.js";
 import {
   extractCompletedTitleExchanges,
@@ -175,11 +175,14 @@ async function performAttempt(
     return;
   }
   try {
-    setPiSessionTitle(sessionId, title);
-    onCommitted?.(commitCandidate.row.pi_session_file!);
+    setAutomaticPiSessionTitle(sessionId, title);
   } catch {
     // Pi is canonical. A later targeted catalog reconciliation repairs the
     // Wayang mirror; never retry the provider request after durable success.
+  } finally {
+    // The physical Pi file changed even if Wayang's mirror write failed or a
+    // concurrent explicit human title correctly made it non-replaceable.
+    onCommitted?.(commitCandidate.row.pi_session_file!);
   }
   record("success");
 }

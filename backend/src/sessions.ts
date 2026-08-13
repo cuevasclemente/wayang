@@ -765,6 +765,22 @@ export function setPiSessionTitle(id: string, title: string): SessionRow | undef
   return transitionSessionTitle(id, title, "pi");
 }
 
+/**
+ * Mirror an automatic Pi CAS only while Wayang still considers the title
+ * replaceable. A concurrent manual rename persists `explicit` before writing
+ * Pi; this synchronous guard therefore prevents a later automatic mirror from
+ * overwriting that human intent even when the automatic Pi append won first.
+ */
+export function setAutomaticPiSessionTitle(id: string, title: string): SessionRow | undefined {
+  const current = getStore().sessions.find((row) => row.id === id);
+  if (!current) return undefined;
+  if (current.title_source === "pi" && current.title === title) return cloneSession(current);
+  if (current.title_source !== "provisional" && current.title_source !== "legacy_unknown") {
+    return cloneSession(current);
+  }
+  return transitionSessionTitle(id, title, "pi");
+}
+
 export type CanonicalPiNameWriter = (title: string) => void;
 
 /**

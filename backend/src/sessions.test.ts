@@ -33,6 +33,7 @@ import {
   normalizeSessionCwd,
   persistManualSessionTitle,
   reconcileSessionTitleFromCatalog,
+  setAutomaticPiSessionTitle,
   setExplicitSessionTitle,
   setPiSessionTitle,
   setProvisionalSessionTitle,
@@ -745,6 +746,12 @@ test("session title provenance transitions are exact and persistence-failure ato
     assert.deepEqual(
       [getSessionById(provisional.id)?.title, getSessionById(provisional.id)?.title_source],
       ["Human title", "explicit"],
+    );
+    assert.equal(setAutomaticPiSessionTitle(provisional.id, "Automatic must not replace human")?.title, "Human title");
+    assert.deepEqual(
+      [getSessionById(provisional.id)?.title, getSessionById(provisional.id)?.title_source],
+      ["Human title", "explicit"],
+      "an automatic Pi mirror cannot overwrite concurrent explicit human intent",
     );
     setPiSessionTitle(provisional.id, "Canonical Pi title");
     assert.deepEqual(

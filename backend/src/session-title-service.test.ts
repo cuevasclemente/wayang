@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { close, flush, getStore, init } from "./db.js";
+import { close, failNextCommitStoreMutationPersistenceForTests, flush, getStore, init } from "./db.js";
 import { createSession, getSessionById, updatePiSessionFile } from "./sessions.js";
 import { WAYANG_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE } from "./interactive-turn-provenance.js";
 import {
@@ -125,6 +125,27 @@ test("Wayang titles exactly after three completed marked exchanges", async () =>
     assert.equal(physical.getSessionName(), "Three exchange summary");
     assert.equal(physical.getSessionNameState().entryId !== undefined, true);
     assert.deepEqual([getSessionById(f.rowId)?.title, getSessionById(f.rowId)?.title_source], ["Three exchange summary", "pi"]);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a durable Pi success invalidates snapshots even when the Wayang mirror write fails", async () => {
+  const f = fixture();
+  try {
+    const fake = new FakeProvider(() => "Canonical despite mirror failure");
+    setAutoTitleProviderForTests(fake);
+    for (let index = 1; index <= 3; index++) appendExchange(f.manager, index);
+    persistFile(f);
+    failNextCommitStoreMutationPersistenceForTests();
+    let invalidations = 0;
+    await scheduleWayangAutoTitle(f.rowId, { onCommitted: () => { invalidations++; } });
+    assert.equal(
+      SessionManager.open(f.manager.getSessionFile()!, undefined, f.cwd).getSessionName(),
+      "Canonical despite mirror failure",
+    );
+    assert.equal(invalidations, 1);
+    assert.equal(getSessionById(f.rowId)?.title_source, "provisional", "failed mirror leaves the durable pre-CAS row intact");
   } finally {
     f.cleanup();
   }
