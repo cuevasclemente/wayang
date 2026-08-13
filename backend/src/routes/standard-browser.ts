@@ -3,6 +3,7 @@ import type { Request, RequestHandler, Response, Router } from "express";
 import express from "express";
 import type { WebSocket } from "ws";
 import { openStandardCdpViewer } from "../browser/standard-viewer.js";
+import { classifyGenericBrowserTarget } from "../browser/request-auth.js";
 import type { StandardBrowserRuntimeWorkspace, StandardBrowserProfileHostService } from "../browser/standard-service.js";
 import type { ProtectedBrowserOperation } from "../browser/types.js";
 import type { ProtectedBrowserViewerTransport } from "./protected-browser.js";
@@ -116,7 +117,15 @@ export function createStandardBrowserSelectionMiddleware(integration?: StandardB
     let selection: StandardBrowserRouteSelection | null;
     try { selection = integration.select(input); }
     catch { sendError(res, error("Standard browser selection is unavailable")); return; }
-    if (!selection) { next(); return; }
+    if (!selection) {
+      const classification = classifyGenericBrowserTarget({ sessionId: input.targetSessionId ?? null, projectCwd: input.projectCwd ?? null });
+      if (classification === "standard") {
+        sendError(res, error("This session has no active named Browser Profile workspace; assign a profile in Settings or with browser_switch_profile", 409));
+        return;
+      }
+      next();
+      return;
+    }
     if (input.sourceSessionId) { sendError(res, error("Standard browser agent access requires exact capability-bound tools")); return; }
     selections.set(req, selection);
     res.setHeader("Cache-Control", "no-store");
@@ -132,7 +141,11 @@ export function selectStandardBrowserWebSocket(
   if (!integration) return null;
   const input = selectionInput(request, transport);
   const selection = integration.select(input);
-  if (!selection) return null;
+  if (!selection) {
+    const classification = classifyGenericBrowserTarget({ sessionId: input.targetSessionId ?? null, projectCwd: input.projectCwd ?? null });
+    if (classification === "standard") throw error("This session has no active named Browser Profile workspace", 409);
+    return null;
+  }
   if (input.sourceSessionId) throw error("Standard browser agent access requires exact capability-bound tools");
   if (transport === "vnc") throw error("Standard browser VNC transport is not available in this build", 404);
   return selection;
