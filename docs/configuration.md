@@ -275,7 +275,7 @@ Startup installs only inert closures. Disabled startup, preview, and invalid/sta
 
 | Variable | Default | Meaning |
 |---|---:|---|
-| `WAYANG_STANDARD_BROWSER_PROFILE_HOSTS` | `0` | Startup-immutable M0 integration gate. Accepts only unset/`0` or `1`. Production startup with `1` fails before store initialization, browser startup, or profile access until full Standard Browser Profile host/schema composition is implemented. |
+| `WAYANG_STANDARD_BROWSER_PROFILE_HOSTS` | `0` | Startup-immutable integration gate. Accepts only unset/`0` or `1`. When `1`, production requires the complete schema-6 named-profile host, exact session-workspace tools, authenticated owner routes, and viewer composition before listening; custom/incomplete app composition still fails closed. Leave `0` until the schema-6 migration and deployment are separately reviewed. |
 | `WAYANG_CHROMIUM_PATH` | auto-detect | Absolute path to Chromium/Chrome. `CHROME_PATH` and `CHROMIUM_PATH` are fallback aliases. |
 | `WAYANG_BROWSER_TRANSPORT` | `auto` | Viewer selection: `auto` prefers Full browser (VNC) when Xvfb/x11vnc are available; `vnc` requires them; `cdp` selects Fast page screencasting. Both viewers control the same headed Chromium when VNC support is installed. |
 | `WAYANG_BITWARDEN_CLI_PATH` | auto-detect | Optional absolute path to the official `bw` executable. It is invoked from a neutral temporary cwd with exact argv, `shell: false`, and a strict environment allowlist; vault output is never returned by credential routes. |
