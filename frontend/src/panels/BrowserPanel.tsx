@@ -486,6 +486,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
             sessionId={sessionId}
             projectCwd={sessionCwd}
             running
+            key={`${viewerTransport}:${state?.controlMode ?? "unknown"}:${state?.activeTab ?? "none"}`}
             transport={viewerTransport}
             onStatus={refresh}
             onPageChange={handlePageChange}
