@@ -4162,8 +4162,14 @@ export function ChatPanel({
         if (msg.type === "interview_response_ack") {
           const ack = msg as InterviewResponseAck;
           const requestId = typeof ack.requestId === "string" ? ack.requestId : null;
-          const sessionId = typeof ack.sessionId === "string" ? ack.sessionId : activeSessionIdRef.current;
-          if (!requestId || !sessionId) return;
+          const sessionId = typeof ack.sessionId === "string" ? ack.sessionId : null;
+          if (
+            !requestId
+            || !sessionId
+            || sessionId !== activeSessionIdRef.current
+            || ws !== wsRef.current
+            || transportGeneration !== transportGenerationRef.current
+          ) return;
           const matching = interviewQueueRef.current.find((item) => item.requestId === requestId && item.sessionId === sessionId);
           if (!matching?.submission) return;
 
@@ -4186,7 +4192,13 @@ export function ChatPanel({
           const ack = msg as InterviewCancelAck;
           const requestId = typeof ack.requestId === "string" ? ack.requestId : null;
           const sessionId = typeof ack.sessionId === "string" ? ack.sessionId : null;
-          if (!requestId || !sessionId) return;
+          if (
+            !requestId
+            || !sessionId
+            || sessionId !== activeSessionIdRef.current
+            || ws !== wsRef.current
+            || transportGeneration !== transportGenerationRef.current
+          ) return;
           const matching = interviewQueueRef.current.find((item) => (
             item.requestId === requestId && item.sessionId === sessionId
           ));

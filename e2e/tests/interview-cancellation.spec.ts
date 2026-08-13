@@ -140,6 +140,10 @@ async function installSyntheticBackend(page: Page): Promise<void> {
       configurable: true,
       value: (ack: unknown) => sockets.at(-1)?.deliver(ack),
     });
+    Object.defineProperty(window, "__sendSyntheticCancelAckOnSocket", {
+      configurable: true,
+      value: (index: number, ack: unknown) => sockets[index]?.deliver(ack),
+    });
     Object.defineProperty(window, "__disconnectSyntheticChat", {
       configurable: true,
       value: () => sockets.at(-1)?.disconnect(),
@@ -186,6 +190,13 @@ test("interview form survives cancel send, mismatched/rejected ack, and disconne
 
   await expect(page.getByTestId("chat-input")).toBeEnabled();
   await form.getByRole("button", { name: "Retry cancellation" }).click();
+  await page.evaluate(({ request }) => {
+    (window as unknown as { __sendSyntheticCancelAckOnSocket(index: number, value: unknown): void })
+      .__sendSyntheticCancelAckOnSocket(0, {
+        type: "interview_cancel_ack", requestId: request, sessionId: "synthetic-cancellation-session", status: "cancelled",
+      });
+  }, { request: requestId });
+  await expect(page.getByTestId("interview-cancellation-status")).toContainText("waiting for acknowledgement");
   await page.evaluate(({ request }) => {
     (window as unknown as { __sendSyntheticCancelAck(value: unknown): void }).__sendSyntheticCancelAck({
       type: "interview_cancel_ack", requestId: request, sessionId: "synthetic-cancellation-session", status: "cancelled",

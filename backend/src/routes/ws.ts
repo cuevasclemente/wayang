@@ -1450,7 +1450,22 @@ export function handleInterviewCancel(ws: WebSocket, sessionId: string, msg: any
     sendSafe(ws, { type: "interview_cancel_ack", requestId: null, sessionId, status: "rejected", errorCode: "not_found", error: "Interview request was not found or is no longer open" });
     return;
   }
-  const cancelled = cancelInterview(sessionId, requestId);
+  let cancelled;
+  try {
+    cancelled = cancelInterview(sessionId, requestId);
+  } catch {
+    // The form remains authoritative until this exact terminal rejection. Do
+    // not expose store paths or persistence diagnostics over the transport.
+    sendSafe(ws, {
+      type: "interview_cancel_ack",
+      requestId,
+      sessionId,
+      status: "rejected",
+      errorCode: "persistence_failed",
+      error: "Cancellation could not be persisted. Retry when ready.",
+    });
+    return;
+  }
   if (!cancelled) {
     const existing = getInterviewForSession(sessionId, requestId);
     if (existing?.status === "cancelled") {

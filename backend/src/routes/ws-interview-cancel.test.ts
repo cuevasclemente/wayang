@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { WebSocket } from "ws";
-import { close, init } from "../db.js";
+import { close, failNextCommitStoreMutationPersistenceForTests, init } from "../db.js";
 import { createOpenInterview, getInterviewForSession } from "../interviews.js";
 import { handleInterviewCancel } from "./ws.js";
 
@@ -83,4 +83,28 @@ test("interview cancellation acknowledges only the exact open session/request", 
     duplicate: true,
   }]);
   assert.equal(getInterviewForSession("owner-session", "cancel-exact")?.status, "cancelled");
+}));
+
+test("interview cancellation rejects persistence failure without resolving the gate", () => withStore(() => {
+  createOpenInterview({
+    requestId: "cancel-persistence-failure",
+    sessionId: "owner-session",
+    toolName: "questionnaire",
+    questions: QUESTIONS,
+  });
+  failNextCommitStoreMutationPersistenceForTests(new Error("private synthetic path detail"));
+
+  const response = wire();
+  assert.doesNotThrow(() => handleInterviewCancel(response.ws, "owner-session", {
+    requestId: "cancel-persistence-failure",
+  }));
+  assert.deepEqual(response.messages, [{
+    type: "interview_cancel_ack",
+    requestId: "cancel-persistence-failure",
+    sessionId: "owner-session",
+    status: "rejected",
+    errorCode: "persistence_failed",
+    error: "Cancellation could not be persisted. Retry when ready.",
+  }]);
+  assert.equal(getInterviewForSession("owner-session", "cancel-persistence-failure")?.status, "open");
 }));
