@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import type { CdpConnection, ChromeTarget } from "./cdp.js";
+import { InteractiveBrowserDownloadPublisher, type InteractiveBrowserDownloadState } from "./interactive-downloads.js";
+import type { ManagedChromiumDownloadProgress, ManagedChromiumDownloadWillBegin } from "./manager.js";
+import { isProtectedBrowserAllowedTopLevelUrl } from "./protected-browser.js";
 import type { ProtectedBrowserBinding, ProtectedBrowserOperation } from "./types.js";
 import type { BrowserProfileRow } from "./profile-catalog-store.js";
 import type { BrowserProfileStorageDescriptor, BrowserStorageOpenerLease } from "./profile-storage-registry.js";
@@ -22,16 +26,21 @@ export interface StandardBrowserHostBackendCallbacks {
   targetChanged(target: StandardBrowserBackendTarget): void;
   targetDestroyed(targetId: string): void;
   unexpectedExit(): void;
+  downloadWillBegin(event: ManagedChromiumDownloadWillBegin, targetId: string | null): void;
+  downloadProgress(event: ManagedChromiumDownloadProgress): void;
 }
 
 export interface StandardBrowserHostBackend {
   readonly running: boolean;
+  readonly downloadStagingDir?: string;
   start(authorize: () => Promise<void>): Promise<void>;
   stop(): Promise<void>;
   listTargets(): Promise<StandardBrowserBackendTarget[]>;
   createTarget(url: string): Promise<StandardBrowserBackendTarget>;
   closeTarget(targetId: string): Promise<void>;
+  cancelDownload?(guid: string): Promise<void>;
   execute(targetId: string, operation: ProtectedBrowserOperation, authorize: () => Promise<void>): Promise<unknown>;
+  attachViewer?(targetId: string): Promise<{ cdp: Pick<CdpConnection, "send" | "on" | "close">; target: ChromeTarget; close(): void }>;
 }
 
 export type StandardBrowserHostBackendFactory = (input: {
@@ -50,6 +59,7 @@ export interface StandardBrowserWorkspacePublicState {
   tabs: Array<{ tab: string; title?: string; url?: string }>;
   running: boolean;
   updatedAt: number;
+  download?: InteractiveBrowserDownloadState;
 }
 
 interface TargetRecord {
@@ -71,7 +81,18 @@ interface WorkspaceRecord {
   lastActivityAt: number;
   queueDepth: number;
   queueTail: Promise<void>;
+  binding: ProtectedBrowserBinding;
+  latestDownload?: InteractiveBrowserDownloadState;
   closed: boolean;
+}
+
+interface StandardDownloadOwner {
+  sourceSessionId: string;
+  workspaceGeneration: string;
+  targetId: string;
+  targetGeneration: string;
+  binding: ProtectedBrowserBinding;
+  publisher: InteractiveBrowserDownloadPublisher;
 }
 
 export interface StandardBrowserHostAuthority {
@@ -82,6 +103,7 @@ export class StandardBrowserProfileHost {
   private readonly workspaces = new Map<string, WorkspaceRecord>();
   private readonly targetOwners = new Map<string, string>();
   private readonly unassignedTargets = new Map<string, StandardBrowserBackendTarget>();
+  private readonly downloads = new Map<string, StandardDownloadOwner>();
   private backend: StandardBrowserHostBackend;
   private openerLease: BrowserStorageOpenerLease;
   private startPromise: Promise<void> | null = null;
@@ -106,6 +128,8 @@ export class StandardBrowserProfileHost {
         targetChanged: (target) => this.onTargetChanged(target),
         targetDestroyed: (targetId) => this.onTargetDestroyed(targetId),
         unexpectedExit: () => this.onUnexpectedExit(),
+        downloadWillBegin: (event, targetId) => this.onDownloadWillBegin(event, targetId),
+        downloadProgress: (event) => this.onDownloadProgress(event),
       },
     });
   }
@@ -120,13 +144,14 @@ export class StandardBrowserProfileHost {
     }
   }
 
-  private async ensureStarted(binding: Readonly<ProtectedBrowserBinding>): Promise<void> {
-    this.assertAuthority(binding);
+  private async ensureStartedAuthorized(authorize: () => void | Promise<void>): Promise<void> {
+    if (this.closed) throw new Error("Standard Browser Profile host is closed");
+    await authorize();
     if (this.backend.running && this.startupReconciled) return;
     if (!this.startPromise) {
       this.startPromise = (async () => {
-        await this.backend.start(async () => this.assertAuthority(binding));
-        this.assertAuthority(binding);
+        await this.backend.start(async () => { await authorize(); });
+        await authorize();
         if (!this.startupReconciled) {
           // Unknown/restored targets never acquire an owner by URL, visibility,
           // tab order, title, or profile state. Close before workspace attach.
@@ -138,7 +163,11 @@ export class StandardBrowserProfileHost {
       })().finally(() => { this.startPromise = null; });
     }
     await this.startPromise;
-    this.assertAuthority(binding);
+    await authorize();
+  }
+
+  private ensureStarted(binding: Readonly<ProtectedBrowserBinding>): Promise<void> {
+    return this.ensureStartedAuthorized(() => this.assertAuthority(binding));
   }
 
   bindWorkspace(binding: Readonly<ProtectedBrowserBinding>): { generation: string; reused: boolean } {
@@ -146,6 +175,7 @@ export class StandardBrowserProfileHost {
     let workspace = this.workspaces.get(binding.sourceSessionId);
     if (workspace && !workspace.closed) {
       workspace.runtimeGeneration = binding.runtimeGeneration;
+      workspace.binding = { ...binding };
       workspace.controlGeneration += 1;
       workspace.lastActivityAt = Date.now();
       return { generation: workspace.generation, reused: true };
@@ -164,6 +194,7 @@ export class StandardBrowserProfileHost {
       lastActivityAt: Date.now(),
       queueDepth: 0,
       queueTail: Promise.resolve(),
+      binding: { ...binding },
       closed: false,
     };
     this.workspaces.set(binding.sourceSessionId, workspace);
@@ -219,6 +250,18 @@ export class StandardBrowserProfileHost {
     return record;
   }
 
+  private async ensureActiveTargetAuthorized(workspace: WorkspaceRecord, authorize: () => void | Promise<void>): Promise<TargetRecord> {
+    await this.ensureStartedAuthorized(authorize);
+    if (workspace.closed) throw new Error("Standard browser workspace is closed");
+    if (workspace.activeTargetId) {
+      const active = workspace.targets.get(workspace.activeTargetId);
+      if (active) return active;
+    }
+    const target = await this.backend.createTarget("about:blank");
+    await authorize();
+    return this.adoptTarget(workspace, target);
+  }
+
   private async ensureActiveTarget(binding: Readonly<ProtectedBrowserBinding>, workspace: WorkspaceRecord): Promise<TargetRecord> {
     await this.ensureStarted(binding);
     if (workspace.activeTargetId) {
@@ -227,6 +270,141 @@ export class StandardBrowserProfileHost {
     }
     const target = await this.backend.createTarget("about:blank");
     return this.adoptTarget(workspace, target);
+  }
+
+  private exactOwnerWorkspace(sourceSessionId: string, workspaceGeneration: string): WorkspaceRecord {
+    if (this.closed) throw new Error("Standard Browser Profile host is closed");
+    const workspace = this.workspaces.get(sourceSessionId);
+    if (!workspace || workspace.closed || workspace.generation !== workspaceGeneration) {
+      throw new Error("Standard browser owner workspace is stale");
+    }
+    return workspace;
+  }
+
+  ownerPublicState(sourceSessionId: string, workspaceGeneration: string): StandardBrowserWorkspacePublicState {
+    const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    const tabs = [...workspace.targets.values()].map((target) => ({
+      tab: target.handle,
+      ...(target.title ? { title: target.title } : {}),
+      ...(target.url ? { url: target.url } : {}),
+    }));
+    return {
+      profileId: this.profile.id,
+      sourceSessionId,
+      workspaceGeneration,
+      controlGeneration: workspace.controlGeneration,
+      controlMode: workspace.controlMode,
+      activeTab: workspace.activeTargetId ? workspace.targets.get(workspace.activeTargetId)?.handle ?? null : null,
+      tabs,
+      running: this.backend.running,
+      updatedAt: workspace.lastActivityAt,
+      ...(workspace.latestDownload ? { download: { ...workspace.latestDownload } } : {}),
+    };
+  }
+
+  ownerSetControlMode(sourceSessionId: string, workspaceGeneration: string, mode: "user" | "paused"): void {
+    this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    this.setControlMode(sourceSessionId, mode);
+  }
+
+  async ownerResumeAgent(sourceSessionId: string, workspaceGeneration: string): Promise<void> {
+    const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    await this.cancelWorkspaceDownloads(sourceSessionId, workspaceGeneration);
+    const targets = [...workspace.targets.keys()];
+    workspace.targets.clear();
+    workspace.activeTargetId = null;
+    for (const targetId of targets) {
+      this.targetOwners.delete(targetId);
+      await this.backend.closeTarget(targetId).catch(() => undefined);
+    }
+    workspace.controlMode = "agent";
+    workspace.controlGeneration += 1;
+    workspace.lastActivityAt = Date.now();
+  }
+
+  async ownerStart(sourceSessionId: string, workspaceGeneration: string, authorize: () => void | Promise<void>): Promise<void> {
+    const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    await this.ensureActiveTargetAuthorized(workspace, authorize);
+    this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration).lastActivityAt = Date.now();
+  }
+
+  async ownerExecute(
+    sourceSessionId: string,
+    workspaceGeneration: string,
+    operation: ProtectedBrowserOperation,
+    authorize: () => void | Promise<void>,
+  ): Promise<unknown> {
+    const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    return this.queueWorkspace(workspace, async () => {
+      await authorize();
+      if (operation.kind === "status") return this.ownerPublicState(sourceSessionId, workspaceGeneration);
+      if (operation.kind === "start") {
+        await this.ensureActiveTargetAuthorized(workspace, authorize);
+        return this.ownerPublicState(sourceSessionId, workspaceGeneration);
+      }
+      if (operation.kind === "stop") {
+        await this.closeWorkspace(sourceSessionId, "owner_stop");
+        return { closed: true, profileId: this.profile.id };
+      }
+      if (workspace.controlMode === "agent") throw new Error("Standard browser owner operation requires human control");
+      const target = await this.ensureActiveTargetAuthorized(workspace, authorize);
+      const value = await this.backend.execute(target.rawId, operation, async () => { await authorize(); });
+      await authorize();
+      this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration).lastActivityAt = Date.now();
+      return value;
+    });
+  }
+
+  async ownerListTabs(sourceSessionId: string, workspaceGeneration: string, authorize: () => void | Promise<void>): Promise<StandardBrowserWorkspacePublicState> {
+    const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    await this.ensureActiveTargetAuthorized(workspace, authorize);
+    return this.ownerPublicState(sourceSessionId, workspaceGeneration);
+  }
+
+  async ownerOpenTab(sourceSessionId: string, workspaceGeneration: string, url: string, authorize: () => void | Promise<void>): Promise<StandardBrowserWorkspacePublicState> {
+    if (url !== "about:blank" && !isProtectedBrowserAllowedTopLevelUrl(url)) throw new Error("Standard browser tab requires an absolute HTTPS URL");
+    const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    await this.ensureStartedAuthorized(authorize);
+    const target = await this.backend.createTarget(url);
+    await authorize();
+    const record = this.adoptTarget(workspace, target);
+    workspace.activeTargetId = record.rawId;
+    return this.ownerPublicState(sourceSessionId, workspaceGeneration);
+  }
+
+  ownerSelectTab(sourceSessionId: string, workspaceGeneration: string, handle: string): StandardBrowserWorkspacePublicState {
+    const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
+    if (!target) throw new Error("Standard browser tab choice is stale");
+    workspace.activeTargetId = target.rawId;
+    workspace.lastActivityAt = Date.now();
+    return this.ownerPublicState(sourceSessionId, workspaceGeneration);
+  }
+
+  async ownerCloseTab(sourceSessionId: string, workspaceGeneration: string, handle: string): Promise<StandardBrowserWorkspacePublicState> {
+    const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
+    if (!target) throw new Error("Standard browser tab choice is stale");
+    this.targetOwners.delete(target.rawId);
+    workspace.targets.delete(target.rawId);
+    await this.backend.closeTarget(target.rawId);
+    if (workspace.activeTargetId === target.rawId) workspace.activeTargetId = workspace.targets.keys().next().value ?? null;
+    return this.ownerPublicState(sourceSessionId, workspaceGeneration);
+  }
+
+  async ownerAttachActiveViewer(
+    sourceSessionId: string,
+    workspaceGeneration: string,
+    authorize: () => void | Promise<void>,
+  ): Promise<{ cdp: Pick<CdpConnection, "send" | "on" | "close">; target: ChromeTarget; close(): void }> {
+    const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    if (workspace.controlMode === "agent") throw new Error("Standard browser viewer requires human control");
+    const target = await this.ensureActiveTargetAuthorized(workspace, authorize);
+    if (!this.backend.attachViewer) throw new Error("Standard browser viewer transport is unavailable");
+    const attachment = await this.backend.attachViewer(target.rawId);
+    await authorize();
+    this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    return attachment;
   }
 
   private onTargetCreated(target: StandardBrowserBackendTarget): void {
@@ -270,6 +448,67 @@ export class StandardBrowserProfileHost {
     workspace.lastActivityAt = Date.now();
   }
 
+  private cancelDownload(guid: string): void {
+    void this.backend.cancelDownload?.(guid).catch(() => undefined);
+  }
+
+  private onDownloadWillBegin(event: ManagedChromiumDownloadWillBegin, targetId: string | null): void {
+    const sourceSessionId = targetId ? this.targetOwners.get(targetId) : undefined;
+    const workspace = sourceSessionId ? this.workspaces.get(sourceSessionId) : undefined;
+    const target = targetId && workspace ? workspace.targets.get(targetId) : undefined;
+    if (!sourceSessionId || !targetId || !workspace || workspace.closed || !target || !this.backend.downloadStagingDir
+      || workspace.runtimeGeneration !== workspace.binding.runtimeGeneration) {
+      this.cancelDownload(event.guid);
+      return;
+    }
+    let publisher: InteractiveBrowserDownloadPublisher;
+    try {
+      publisher = new InteractiveBrowserDownloadPublisher(this.backend.downloadStagingDir, workspace.binding.projectCwd, { cleanStaging: false });
+    } catch {
+      this.cancelDownload(event.guid);
+      return;
+    }
+    const decision = publisher.begin(event);
+    workspace.latestDownload = publisher.latest;
+    workspace.lastActivityAt = Date.now();
+    if (!decision.accepted) {
+      this.cancelDownload(event.guid);
+      return;
+    }
+    this.downloads.set(event.guid, {
+      sourceSessionId,
+      workspaceGeneration: workspace.generation,
+      targetId,
+      targetGeneration: target.generation,
+      binding: { ...workspace.binding },
+      publisher,
+    });
+  }
+
+  private onDownloadProgress(event: ManagedChromiumDownloadProgress): void {
+    const owner = this.downloads.get(event.guid);
+    if (!owner) { if (event.state === "inProgress") this.cancelDownload(event.guid); return; }
+    const authorize = async () => {
+      const workspace = this.exactWorkspace(owner.binding, owner.workspaceGeneration);
+      const target = workspace.targets.get(owner.targetId);
+      if (!target || target.generation !== owner.targetGeneration || this.targetOwners.get(owner.targetId) !== owner.sourceSessionId) {
+        throw new Error("Standard browser download owner changed");
+      }
+    };
+    void owner.publisher.progress(event, authorize).then((result) => {
+      const workspace = this.workspaces.get(owner.sourceSessionId);
+      if (workspace?.generation === owner.workspaceGeneration) {
+        workspace.latestDownload = result.state;
+        workspace.lastActivityAt = Date.now();
+      }
+      if (result.cancel) this.cancelDownload(event.guid);
+      if (event.state !== "inProgress") this.downloads.delete(event.guid);
+    }).catch(() => {
+      this.cancelDownload(event.guid);
+      this.downloads.delete(event.guid);
+    });
+  }
+
   private onUnexpectedExit(): void {
     this.startupReconciled = false;
     for (const workspace of this.workspaces.values()) {
@@ -279,6 +518,8 @@ export class StandardBrowserProfileHost {
     }
     this.targetOwners.clear();
     this.unassignedTargets.clear();
+    for (const owner of this.downloads.values()) owner.publisher.revoke();
+    this.downloads.clear();
   }
 
   publicState(binding: Readonly<ProtectedBrowserBinding>, workspaceGeneration: string): StandardBrowserWorkspacePublicState {
@@ -298,6 +539,7 @@ export class StandardBrowserProfileHost {
       tabs,
       running: this.backend.running,
       updatedAt: workspace.lastActivityAt,
+      ...(workspace.latestDownload ? { download: { ...workspace.latestDownload } } : {}),
     };
   }
 
@@ -329,6 +571,19 @@ export class StandardBrowserProfileHost {
     });
   }
 
+  async attachActiveViewer(
+    binding: Readonly<ProtectedBrowserBinding>,
+    workspaceGeneration: string,
+  ): Promise<{ cdp: Pick<CdpConnection, "send" | "on" | "close">; target: ChromeTarget; close(): void }> {
+    const workspace = this.exactWorkspace(binding, workspaceGeneration);
+    if (workspace.controlMode === "agent") throw new Error("Standard browser viewer requires human control");
+    const target = await this.ensureActiveTarget(binding, workspace);
+    if (!this.backend.attachViewer) throw new Error("Standard browser viewer transport is unavailable");
+    const attachment = await this.backend.attachViewer(target.rawId);
+    this.exactWorkspace(binding, workspaceGeneration);
+    return attachment;
+  }
+
   async listTabs(binding: Readonly<ProtectedBrowserBinding>, workspaceGeneration: string): Promise<StandardBrowserWorkspacePublicState> {
     const workspace = this.exactWorkspace(binding, workspaceGeneration);
     await this.ensureActiveTarget(binding, workspace);
@@ -336,6 +591,7 @@ export class StandardBrowserProfileHost {
   }
 
   async openTab(binding: Readonly<ProtectedBrowserBinding>, workspaceGeneration: string, url = "about:blank"): Promise<StandardBrowserWorkspacePublicState> {
+    if (url !== "about:blank" && !isProtectedBrowserAllowedTopLevelUrl(url)) throw new Error("Standard browser tab requires an absolute HTTPS URL");
     const workspace = this.exactWorkspace(binding, workspaceGeneration);
     return this.queueWorkspace(workspace, async () => {
       await this.ensureStarted(binding);
@@ -381,12 +637,13 @@ export class StandardBrowserProfileHost {
     return Boolean(workspace && !workspace.closed && workspace.controlMode !== "agent");
   }
 
-  detachAgentLease(sourceSessionId: string, runtimeGeneration: string): void {
+  async detachAgentLease(sourceSessionId: string, runtimeGeneration: string): Promise<void> {
     const workspace = this.workspaces.get(sourceSessionId);
     if (!workspace || workspace.runtimeGeneration !== runtimeGeneration) return;
     workspace.runtimeGeneration = null;
     workspace.controlGeneration += 1;
     workspace.lastActivityAt = Date.now();
+    await this.cancelWorkspaceDownloads(sourceSessionId, workspace.generation);
   }
 
   idleWorkspaceSessionIds(now: number, idleMs: number): string[] {
@@ -400,12 +657,23 @@ export class StandardBrowserProfileHost {
     return this.workspaces.size === 0 ? this.emptySince : null;
   }
 
+  private async cancelWorkspaceDownloads(sourceSessionId: string, workspaceGeneration: string): Promise<void> {
+    const owned = [...this.downloads.entries()].filter(([, owner]) => owner.sourceSessionId === sourceSessionId
+      && owner.workspaceGeneration === workspaceGeneration);
+    for (const [guid, owner] of owned) {
+      owner.publisher.revoke();
+      this.downloads.delete(guid);
+      await this.backend.cancelDownload?.(guid).catch(() => undefined);
+    }
+  }
+
   async closeWorkspace(sourceSessionId: string, _reason: string, closedAt = Date.now()): Promise<void> {
     const workspace = this.workspaces.get(sourceSessionId);
     if (!workspace || workspace.closed) return;
     workspace.closed = true;
     workspace.runtimeGeneration = null;
     workspace.controlGeneration += 1;
+    await this.cancelWorkspaceDownloads(sourceSessionId, workspace.generation);
     const targets = [...workspace.targets.keys()];
     workspace.targets.clear();
     workspace.activeTargetId = null;

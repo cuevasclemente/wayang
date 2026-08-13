@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ChromeTarget } from "./cdp.js";
 import {
@@ -31,7 +32,26 @@ export interface StandardManagedChromiumPort {
   listPageTargets(): Promise<ChromeTarget[]>;
   createPageTarget(url?: string): Promise<ChromeTarget>;
   closePageTarget(targetId: string): Promise<void>;
+  cancelDownload(guid: string): Promise<void>;
   attachTargetCdpViewer(targetId: string): Promise<ManagedChromiumPageAttachment>;
+}
+
+async function targetIdForFrame(managed: StandardManagedChromiumPort, frameId: string): Promise<string | null> {
+  if (!frameId) return null;
+  let matched: string | null = null;
+  for (const target of await managed.listPageTargets()) {
+    const attachment = await managed.attachTargetCdpViewer(target.id);
+    try {
+      await attachment.cdp.send("Page.enable");
+      const tree = await attachment.cdp.send<any>("Page.getFrameTree");
+      const contains = (node: any): boolean => Boolean(node?.frame?.id === frameId
+        || (Array.isArray(node?.childFrames) && node.childFrames.some(contains)));
+      if (!contains(tree?.frameTree)) continue;
+      if (matched !== null) return null;
+      matched = target.id;
+    } finally { attachment.close(); }
+  }
+  return matched;
 }
 
 function publicTarget(target: ChromeTarget): StandardBrowserBackendTarget {
@@ -137,23 +157,55 @@ export function createStandardBrowserHostBackendFactory(options: {
   return ({ profile, storage, callbacks }): StandardBrowserHostBackend => {
     const protections = new Map<string, ProtectedCredentialProtection>();
     let managed!: StandardManagedChromiumPort;
+    const downloadStagingDir = path.join(options.dataDir, "browser-profiles", "v1", "download-staging", profile.id);
+    let stagingCleaned = false;
+    const cleanStaging = () => {
+      if (stagingCleaned) return;
+      fs.mkdirSync(downloadStagingDir, { recursive: true, mode: 0o700 });
+      const directory = fs.lstatSync(downloadStagingDir);
+      if (!directory.isDirectory() || directory.isSymbolicLink()
+        || (typeof process.getuid === "function" && directory.uid !== process.getuid())) {
+        throw new Error("Standard browser download staging directory is unsafe");
+      }
+      fs.chmodSync(downloadStagingDir, 0o700);
+      for (const name of fs.readdirSync(downloadStagingDir)) {
+        if (!/^[A-Za-z0-9_-]{1,128}$/u.test(name)) throw new Error("Standard browser download staging entry is unsafe");
+        const candidate = path.join(downloadStagingDir, name);
+        const metadata = fs.lstatSync(candidate);
+        if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
+          throw new Error("Standard browser download staging entry is unsafe");
+        }
+        fs.unlinkSync(candidate);
+      }
+      stagingCleaned = true;
+    };
     managed = managedFactory({
       profileDir: storage.root,
-      downloadsDir: path.join(options.dataDir, "browser-profiles", "v1", "download-staging", profile.id),
+      downloadsDir: downloadStagingDir,
       downloadBehavior: "allowAndName",
       workingDirectory: options.dataDir,
       onTargetCreated: (target) => callbacks.targetCreated(publicTarget(target)),
       onTargetChanged: (target) => callbacks.targetChanged(publicTarget(target)),
       onTargetDestroyed: (targetId) => { protections.delete(targetId); callbacks.targetDestroyed(targetId); },
+      onDownloadWillBegin(event) {
+        void targetIdForFrame(managed, event.frameId).then((targetId) => {
+          callbacks.downloadWillBegin(event, targetId);
+          if (!targetId) return managed.cancelDownload(event.guid).catch(() => undefined);
+        }).catch(() => managed.cancelDownload(event.guid).catch(() => undefined));
+      },
+      onDownloadProgress: callbacks.downloadProgress,
       onUnexpectedExit: callbacks.unexpectedExit,
     });
     return {
       get running() { return managed.running; },
-      start: (authorize) => managed.start(authorize),
+      downloadStagingDir,
+      start: async (authorize) => { cleanStaging(); await managed.start(authorize); },
       stop: () => managed.stop(),
       listTargets: async () => (await managed.listPageTargets()).map(publicTarget),
       createTarget: async (url) => publicTarget(await managed.createPageTarget(url)),
       closeTarget: (targetId) => managed.closePageTarget(targetId),
+      cancelDownload: (guid) => managed.cancelDownload(guid),
+      attachViewer: (targetId) => managed.attachTargetCdpViewer(targetId),
       execute: (targetId, operation, authorize) => {
         let protection = protections.get(targetId);
         if (!protection) { protection = new ProtectedCredentialProtection(); protections.set(targetId, protection); }

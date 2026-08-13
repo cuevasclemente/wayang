@@ -199,11 +199,10 @@ export function createStandardBrowserSessionRuntime(options: {
       } catch { return { allowed: false, reason: "Standard Browser Profile authority is unavailable" }; }
     },
     latchRevoked,
-    detachAgentLease(_reason: AgentLeaseDetachReason) {
+    async detachAgentLease(_reason: AgentLeaseDetachReason) {
       latchRevoked();
-      if (workspace) workspace.host.detachAgentLease(options.binding.sourceSessionId, options.binding.runtimeGeneration);
+      if (workspace) await workspace.host.detachAgentLease(options.binding.sourceSessionId, options.binding.runtimeGeneration);
       options.service.runtimeDetached(runtime);
-      return Promise.resolve();
     },
     closeSessionWorkspaces(reason: SessionWorkspaceCloseReason) {
       latchRevoked();

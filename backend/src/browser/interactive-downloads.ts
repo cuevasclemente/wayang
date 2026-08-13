@@ -134,6 +134,7 @@ export class InteractiveBrowserDownloadPublisher {
   constructor(
     private readonly stagingDir: string,
     projectCwd: string,
+    options: { cleanStaging?: boolean } = {},
   ) {
     this.projectRoot = fs.realpathSync.native(projectCwd);
     this.publicationDir = path.join(this.projectRoot, ".wayang", "browser-downloads");
@@ -141,6 +142,7 @@ export class InteractiveBrowserDownloadPublisher {
       ? publicationUsage(this.publicationDir, this.projectRoot).count
       : 0;
     privateDirectory(stagingDir);
+    if (options.cleanStaging === false) return;
     for (const name of fs.readdirSync(stagingDir)) {
       if (!safeGuid(name)) throw downloadError("Interactive browser download staging contains an unsafe entry");
       const target = path.join(stagingDir, name);

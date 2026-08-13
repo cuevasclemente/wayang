@@ -52,6 +52,13 @@ function fixture(configured: Record<string, string | null>) {
   let generation = 1;
   const catalog: StandardBrowserCatalogPort = {
     authorize: (exactBinding, profile) => exactBinding.capabilityId === "wayang.standard-browser.v1" && profile.state === "active",
+    ownerAuthority: (sourceSessionId, profile) => profile.state === "active" ? {
+      sourceSessionId,
+      projectId: "project",
+      projectCwd: "/synthetic/project",
+      agentProfileId: "agent",
+      associationRevision: 1,
+    } : null,
     catalog: () => ({ generation, profiles }),
     materializeSessionState: (exactBinding) => structuredClone(states.get(exactBinding.sourceSessionId) ?? { session_id: exactBinding.sourceSessionId, active_profile_id: null, revision: 1, updated_at: 1 }),
     sessionState: (session) => states.has(session) ? structuredClone(states.get(session)!) : null,

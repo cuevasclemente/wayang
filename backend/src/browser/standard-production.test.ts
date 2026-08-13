@@ -19,6 +19,7 @@ class FakeManaged implements StandardManagedChromiumPort {
   async listPageTargets() { return this.targets.map((target) => ({ ...target })); }
   async createPageTarget(url = "about:blank") { const target = { id: "created", type: "page", url, webSocketDebuggerUrl: "ws://synthetic" }; this.targets.push(target); return target; }
   async closePageTarget(targetId: string) { this.closed.push(targetId); this.targets = this.targets.filter((target) => target.id !== targetId); }
+  async cancelDownload() {}
   async attachTargetCdpViewer(): Promise<ManagedChromiumPageAttachment> { this.attaches += 1; throw new Error("synthetic attachment should not run"); }
 }
 
@@ -50,6 +51,8 @@ test("Standard production binds one exact profile root and explicit target lifec
         targetChanged: (target) => events.push(`changed:${target.id}`),
         targetDestroyed: (targetId) => events.push(`destroyed:${targetId}`),
         unexpectedExit: () => events.push("exit"),
+        downloadWillBegin: () => undefined,
+        downloadProgress: () => undefined,
       },
     });
     assert.equal(fs.existsSync(path.join(root, "profile")), false, "factory opened profile storage before host start");

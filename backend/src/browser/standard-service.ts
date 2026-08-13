@@ -25,8 +25,17 @@ export interface StandardBrowserCatalogSnapshot {
   profiles: readonly BrowserProfileRow[];
 }
 
+export interface StandardBrowserOwnerAuthority {
+  sourceSessionId: string;
+  projectId: string;
+  projectCwd: string;
+  agentProfileId: string;
+  associationRevision: number;
+}
+
 export interface StandardBrowserCatalogPort {
   authorize(binding: Readonly<ProtectedBrowserBinding>, profile: Readonly<BrowserProfileRow>): boolean;
+  ownerAuthority(sourceSessionId: string, profile: Readonly<BrowserProfileRow>): StandardBrowserOwnerAuthority | null;
   catalog(): StandardBrowserCatalogSnapshot;
   materializeSessionState(binding: Readonly<ProtectedBrowserBinding>): SessionBrowserStateRow;
   sessionState(sourceSessionId: string): SessionBrowserStateRow | null;
@@ -64,6 +73,7 @@ export interface StandardBrowserProfileHostServiceOptions {
 export class StandardBrowserProfileHostService implements InteractiveBrowserSessionLifecyclePort {
   private readonly hosts = new Map<string, StandardBrowserProfileHost>();
   private readonly runtimes = new Map<string, Set<StandardBrowserSessionRuntime>>();
+  private readonly workspaceLeases = new Map<string, Map<string, StandardBrowserRuntimeWorkspace>>();
   private readonly storageRegistry: BrowserStorageOwnershipRegistry;
   private closed = false;
 
@@ -121,12 +131,16 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     if (!this.options.catalog.authorize(binding, profile)) throw new Error("Standard Browser Profile authority is unavailable");
     const host = this.host(profile);
     const workspace = host.bindWorkspace(binding);
-    return {
+    const exact = {
       profile,
       host,
       workspaceGeneration: workspace.generation,
       sessionStateRevision: state.revision,
     };
+    let leases = this.workspaceLeases.get(binding.sourceSessionId);
+    if (!leases) { leases = new Map(); this.workspaceLeases.set(binding.sourceSessionId, leases); }
+    leases.set(profile.id, exact);
+    return exact;
   }
 
   resolveWorkspace(
@@ -139,6 +153,27 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
       throw new Error("Standard Browser Profile assignment changed");
     }
     return expected;
+  }
+
+  resolveOwnerWorkspace(sourceSessionId: string, expectedProjectCwd?: string): {
+    authority: StandardBrowserOwnerAuthority;
+    workspace: StandardBrowserRuntimeWorkspace;
+  } | null {
+    const state = this.options.catalog.sessionState(sourceSessionId);
+    if (!state?.active_profile_id) return null;
+    const workspace = this.workspaceLeases.get(sourceSessionId)?.get(state.active_profile_id);
+    if (!workspace || workspace.sessionStateRevision !== state.revision || workspace.host.isClosed) return null;
+    const authority = this.options.catalog.ownerAuthority(sourceSessionId, workspace.profile);
+    if (!authority || (expectedProjectCwd !== undefined && authority.projectCwd !== expectedProjectCwd)) return null;
+    return { authority, workspace };
+  }
+
+  resolveLiveWorkspace(binding: Readonly<ProtectedBrowserBinding>): StandardBrowserRuntimeWorkspace | null {
+    const state = this.options.catalog.sessionState(binding.sourceSessionId);
+    if (!state?.active_profile_id) return null;
+    const workspace = this.workspaceLeases.get(binding.sourceSessionId)?.get(state.active_profile_id);
+    if (!workspace) return null;
+    return this.resolveWorkspace(binding, workspace);
   }
 
   listProfiles(binding: Readonly<ProtectedBrowserBinding>): StandardBrowserCatalogSnapshot {
@@ -196,12 +231,24 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     const runtimes = this.runtimes.get(sourceSessionId);
     if (runtimes) for (const runtime of [...runtimes]) runtime.latchRevoked();
     await Promise.allSettled([...this.hosts.values()].map((host) => host.closeWorkspace(sourceSessionId, reason)));
+    this.workspaceLeases.delete(sourceSessionId);
   }
 
   async revokeAuthority(scope: Readonly<InteractiveBrowserAuthorityScope>, reason: BrowserAuthorityRevokeReason): Promise<void> {
     const sessions = this.options.catalog.sourceSessionsForAuthority(scope);
     await Promise.allSettled(sessions.map((sourceSessionId) => this.closeSessionWorkspaces(sourceSessionId, "owner_close_all")));
     void reason;
+  }
+
+  async invalidateProfile(profileId: string): Promise<void> {
+    const host = this.hosts.get(profileId);
+    if (!host) return;
+    for (const [sourceSessionId, leases] of this.workspaceLeases) {
+      leases.delete(profileId);
+      if (leases.size === 0) this.workspaceLeases.delete(sourceSessionId);
+    }
+    await host.close();
+    if (this.hosts.get(profileId) === host) this.hosts.delete(profileId);
   }
 
   async sweepIdle(
@@ -214,6 +261,9 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     for (const [profileId, host] of [...this.hosts]) {
       for (const sourceSessionId of host.idleWorkspaceSessionIds(now, workspaceIdleMs)) {
         await host.closeWorkspace(sourceSessionId, "workspace_idle", now);
+        const leases = this.workspaceLeases.get(sourceSessionId);
+        leases?.delete(profileId);
+        if (leases?.size === 0) this.workspaceLeases.delete(sourceSessionId);
         workspacesClosed += 1;
       }
       const emptySince = host.emptySinceTimestamp();
@@ -237,6 +287,7 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     this.closed = true;
     for (const runtimes of this.runtimes.values()) for (const runtime of runtimes) runtime.latchRevoked();
     this.runtimes.clear();
+    this.workspaceLeases.clear();
     await Promise.allSettled([...this.hosts.values()].map((host) => host.close()));
     this.hosts.clear();
     this.storageRegistry.close();
