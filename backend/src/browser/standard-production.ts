@@ -100,6 +100,10 @@ async function executeExactTargetOperation(
     await guardedSend(cdp, authorize, "Page.enable");
     await guardedSend(cdp, authorize, "Runtime.enable");
     const before = await settledTopLevelDocument(cdp, target, authorize, SETTLE_TIMEOUT_MS, SETTLE_INTERVAL_MS);
+    if (!isProtectedBrowserAllowedTopLevelUrl(before.topLevelUrl) && before.topLevelUrl !== "about:blank") {
+      await managed.closePageTarget(targetId).catch(() => undefined);
+      throw new Error("Standard browser target has a forbidden top-level document");
+    }
     protection.assertOperation(operation, before.documentIdentity);
     let value: unknown;
     switch (operation.kind) {
@@ -161,6 +165,7 @@ async function executeExactTargetOperation(
     }
     const after = await settledTopLevelDocument(cdp, target, authorize, SETTLE_TIMEOUT_MS, SETTLE_INTERVAL_MS);
     if (!isProtectedBrowserAllowedTopLevelUrl(after.topLevelUrl) && after.topLevelUrl !== "about:blank") {
+      await managed.closePageTarget(targetId).catch(() => undefined);
       throw new Error("Standard browser reached a forbidden top-level document");
     }
     await authorize();
