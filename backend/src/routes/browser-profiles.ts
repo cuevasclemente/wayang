@@ -129,9 +129,9 @@ export function createBrowserProfilesRouter(
     const expectedRevision = body.expectedRevision === null ? null : revision(body.expectedRevision);
     if ((existing?.revision ?? null) !== expectedRevision) throw new WorkspaceStoreError("Session Browser state changed; refresh and retry", 409);
     const current = existing ?? materializeSessionBrowserState(req.params.sessionId);
+    service?.assertOwnerSwitchAllowed(req.params.sessionId);
     const next = setSessionBrowserProfile({ sessionId: req.params.sessionId, profileId, expectedRevision: current.revision });
     await stopPiSession(req.params.sessionId, { kind: "detach", reason: "runtime_replaced" });
-    await service?.closeSessionWorkspaces(req.params.sessionId, "owner_close_all");
     res.json({ state: next });
   }));
   return router;

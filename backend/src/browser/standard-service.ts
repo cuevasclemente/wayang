@@ -224,6 +224,12 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     return { state, workspace };
   }
 
+  assertOwnerSwitchAllowed(sourceSessionId: string): void {
+    for (const host of this.hosts.values()) {
+      if (host.hasBlockingControl(sourceSessionId)) throw new Error("Cannot switch Browser Profile during human or credential control");
+    }
+  }
+
   setProjectDefault(
     binding: Readonly<ProtectedBrowserBinding>,
     profileId: string,
