@@ -149,6 +149,22 @@ test("agent tab projections strip URL credentials, query, fragments, and URL-bea
   await f.host.close();
 });
 
+test("human handoff hides agent tab metadata and denies every agent tab mutation", async () => {
+  const f = hostFixture();
+  const exact = binding("session-a");
+  const workspace = f.host.bindWorkspace(exact);
+  await f.host.execute(exact, workspace.generation, { kind: "navigate", url: "https://sensitive.example/path?token=SECRET" });
+  f.host.setControlMode(exact.sourceSessionId, "paused");
+  const status = f.host.publicState(exact, workspace.generation);
+  assert.deepEqual(status.tabs, []);
+  assert.equal(status.activeTab, null);
+  await assert.rejects(() => f.host.listTabs(exact, workspace.generation), /human control/);
+  await assert.rejects(() => f.host.openTab(exact, workspace.generation), /human control/);
+  assert.throws(() => f.host.selectTab(exact, workspace.generation, "stale"), /human control/);
+  await assert.rejects(() => f.host.closeTab(exact, workspace.generation, "stale"), /human control/);
+  await f.host.close();
+});
+
 test("downloads freeze exact target/workspace ownership and detach cancels before publication", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-standard-download-owner-"));
   const projectDir = path.join(root, "project");
