@@ -6,7 +6,8 @@ import * as path from "node:path";
 import { WebSocket } from "ws";
 import { close, failNextCommitStoreMutationPersistenceForTests, init } from "../db.js";
 import { createOpenInterview, getInterviewForSession } from "../interviews.js";
-import { handleInterviewCancel } from "./ws.js";
+import { WAYANG_WEBSOCKET_SUBMISSION_CONTEXT } from "../interview-provenance.js";
+import { handleInterviewCancel, handleInterviewResponse } from "./ws.js";
 
 const QUESTIONS = [{
   id: "q1",
@@ -83,6 +84,31 @@ test("interview cancellation acknowledges only the exact open session/request", 
     duplicate: true,
   }]);
   assert.equal(getInterviewForSession("owner-session", "cancel-exact")?.status, "cancelled");
+}));
+
+test("interview response rejects persistence failure without resolving the gate", () => withStore(() => {
+  createOpenInterview({
+    requestId: "response-persistence-failure",
+    sessionId: "owner-session",
+    toolName: "questionnaire",
+    questions: QUESTIONS,
+  });
+  failNextCommitStoreMutationPersistenceForTests(new Error("private synthetic path detail"));
+
+  const response = wire();
+  assert.doesNotThrow(() => handleInterviewResponse(response.ws, "owner-session", {
+    requestId: "response-persistence-failure",
+    answers: [{ id: "q1", value: "yes", label: "Yes", wasCustom: false }],
+  }, WAYANG_WEBSOCKET_SUBMISSION_CONTEXT));
+  assert.deepEqual(response.messages, [{
+    type: "interview_response_ack",
+    requestId: "response-persistence-failure",
+    sessionId: "owner-session",
+    status: "rejected",
+    errorCode: "persistence_failed",
+    error: "Response could not be persisted. Retry when ready.",
+  }]);
+  assert.equal(getInterviewForSession("owner-session", "response-persistence-failure")?.status, "open");
 }));
 
 test("interview cancellation rejects persistence failure without resolving the gate", () => withStore(() => {

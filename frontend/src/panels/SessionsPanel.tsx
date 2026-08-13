@@ -193,7 +193,9 @@ export function SessionsPanel({
   const [deleteError, setDeleteError] = useState("");
 
   const projectListSessions = useMemo(
-    () => (showScheduledProjectRuns ? sessions : sessions.filter((s) => !isScheduledRunSession(s))),
+    () => (showScheduledProjectRuns
+      ? sessions
+      : sessions.filter((session) => !isScheduledRunSession(session) || session.humanAttention.length > 0)),
     [sessions, showScheduledProjectRuns],
   );
   const projects = useMemo(

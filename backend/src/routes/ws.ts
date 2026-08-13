@@ -1383,7 +1383,8 @@ function normalizeCommandGuardMode(value: unknown): CommandGuardMode | null {
  * The acknowledgement is the browser durability boundary and is sent for both
  * first submit and same-payload retries.
  */
-function handleInterviewResponse(
+/** @internal Exported for focused durable acknowledgement contract tests. */
+export function handleInterviewResponse(
   ws: WebSocket,
   sessionId: string,
   msg: any,
@@ -1399,7 +1400,20 @@ function handleInterviewResponse(
     return;
   }
 
-  const submitted = submitInterview(sessionId, requestId, msg.answers, submissionContext);
+  let submitted: ReturnType<typeof submitInterview>;
+  try {
+    submitted = submitInterview(sessionId, requestId, msg.answers, submissionContext);
+  } catch {
+    sendSafe(ws, {
+      type: "interview_response_ack",
+      requestId,
+      sessionId,
+      status: "rejected",
+      errorCode: "persistence_failed",
+      error: "Response could not be persisted. Retry when ready.",
+    });
+    return;
+  }
   if (!submitted.ok) {
     sendSafe(ws, { type: "interview_response_ack", requestId, sessionId, status: "rejected", errorCode: submitted.code, error: submitted.message });
     return;
@@ -1450,7 +1464,7 @@ export function handleInterviewCancel(ws: WebSocket, sessionId: string, msg: any
     sendSafe(ws, { type: "interview_cancel_ack", requestId: null, sessionId, status: "rejected", errorCode: "not_found", error: "Interview request was not found or is no longer open" });
     return;
   }
-  let cancelled;
+  let cancelled: ReturnType<typeof cancelInterview>;
   try {
     cancelled = cancelInterview(sessionId, requestId);
   } catch {

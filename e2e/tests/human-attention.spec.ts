@@ -27,7 +27,7 @@ function attention(sourceId: string): SyntheticAttention {
   };
 }
 
-function syntheticSession(humanAttention: unknown[]) {
+function syntheticSession(humanAttention: unknown[], scheduledRun = false) {
   const now = Date.now();
   return {
     id: sessionId,
@@ -43,8 +43,8 @@ function syntheticSession(humanAttention: unknown[]) {
     archived: 0,
     goal: null,
     goal_status: null,
-    scheduled_job_id: null,
-    scheduled_run_id: null,
+    scheduled_job_id: scheduledRun ? "synthetic-scheduled-job" : null,
+    scheduled_run_id: scheduledRun ? "synthetic-scheduled-run" : null,
     error: null,
     runtime_status: "active",
     runtime_is_streaming: true,
@@ -124,7 +124,7 @@ interface SyntheticApi {
 async function installSyntheticApi(
   page: Page,
   initialAttention: unknown[],
-  options: { failSettingsLoads?: boolean; archiveConflict?: boolean } = {},
+  options: { failSettingsLoads?: boolean; archiveConflict?: boolean; scheduledRun?: boolean } = {},
 ): Promise<SyntheticApi> {
   let humanAttention = initialAttention;
   let archiveConflict = options.archiveConflict === true;
@@ -154,8 +154,8 @@ async function installSyntheticApi(
     if (path === "/api/agent-profiles") return options.failSettingsLoads
       ? route.fulfill({ status: 503, json: { error: "Synthetic profile load failure" } })
       : route.fulfill({ json: [] });
-    if (path === "/api/sessions" && request.method() === "GET") return route.fulfill({ json: [syntheticSession(humanAttention)] });
-    if (path === `/api/sessions/${sessionId}` && request.method() === "GET") return route.fulfill({ json: syntheticSession(humanAttention) });
+    if (path === "/api/sessions" && request.method() === "GET") return route.fulfill({ json: [syntheticSession(humanAttention, options.scheduledRun)] });
+    if (path === `/api/sessions/${sessionId}` && request.method() === "GET") return route.fulfill({ json: syntheticSession(humanAttention, options.scheduledRun) });
     if (path === `/api/sessions/${sessionId}` && request.method() === "DELETE") return archiveConflict
       ? route.fulfill({ status: 409, json: { error: "Resolve or cancel the pending human-input request before archiving this session." } })
       : route.fulfill({ status: 204, body: "" });
@@ -241,6 +241,16 @@ test("projects and sessions project valid pending attention without automaticall
   await openNotificationSettings(page);
   await expect(page.getByTestId("browser-notification-state")).toContainText("permission has not been requested");
   expect((await notificationSnapshot(page)).requestCount).toBe(0);
+});
+
+test("scheduled-run attention remains visible while ordinary scheduled runs are hidden", async ({ page }) => {
+  await installCatalogEvents(page);
+  await installSyntheticApi(page, [attention("scheduled-question-source")], { scheduledRun: true });
+
+  await page.goto("/");
+  await page.getByText(projectName, { exact: true }).click();
+  await expect(page.getByText(sensitiveSessionTitle, { exact: true })).toBeVisible();
+  await expect(page.getByTestId("session-human-attention-badge")).toBeVisible();
 });
 
 test("explicit opt-in deduplicates source replay, uses minimal content, and clicks canonical routing", async ({ page }) => {

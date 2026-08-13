@@ -558,7 +558,8 @@ export type InterviewResponseAckErrorCode =
   | "not_found"
   | "wrong_session"
   | "cancelled"
-  | "conflict";
+  | "conflict"
+  | "persistence_failed";
 
 /** Durable receipt boundary for `interview_response`; also sent for retries. */
 export interface InterviewResponseAckMessage {
