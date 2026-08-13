@@ -1075,6 +1075,7 @@ export function deleteSession(id: string): DeleteSessionResult | null {
     // Archive intentionally retains durable submissions. Permanent deletion
     // removes them atomically with the session row in the store transaction.
     draft.interviews = draft.interviews.filter((record) => record.session_id !== target.id);
+    draft.sessionBrowserStates = draft.sessionBrowserStates.filter((record) => record.session_id !== target.id);
     draft.sessions.splice(draftIndex, 1);
     return cloneSession(target);
   });

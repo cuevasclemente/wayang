@@ -22,6 +22,7 @@ import { router as searchRouter } from "./routes/search.js";
 import { router as ttsRouter } from "./routes/tts.js";
 import { router as browserRouter } from "./routes/browser.js";
 import { createBrowserCredentialsRouter } from "./routes/browser-credentials.js";
+import { createBrowserProfilesRouter } from "./routes/browser-profiles.js";
 import {
   attachProtectedAutomationWs,
   createProtectedAutomationsRouter,
@@ -31,6 +32,12 @@ import {
   createProtectedBrowserSelectionMiddleware,
   type ProtectedBrowserIntegration,
 } from "./routes/protected-browser.js";
+import {
+  createStandardBrowserIntegration,
+  createStandardBrowserRouter,
+  createStandardBrowserSelectionMiddleware,
+  type StandardBrowserIntegration,
+} from "./routes/standard-browser.js";
 import {
   createWorkspaceCapabilitiesRouter,
   type WorkspaceCapabilitiesRouterOptions,
@@ -63,6 +70,8 @@ import {
   bootstrapProtectedBrowserProduction,
   type ProtectedBrowserOwnerPort,
 } from "./browser/protected-production.js";
+import { bootstrapStandardBrowserProduction } from "./browser/standard-bootstrap.js";
+import type { StandardBrowserProfileHostService } from "./browser/standard-service.js";
 import {
   bootstrapProtectedAutomationProduction,
   type ProtectedAutomationProductionIntegration,
@@ -123,16 +132,23 @@ export interface CreateAppOptions {
   protectedBrowser?: ProtectedBrowserIntegration;
   /** Exact authenticated Settings owner plus workspace/PIN service. Missing means the Settings capability API fails closed. */
   workspaceCapabilities?: WorkspaceCapabilitiesRouterOptions;
+  /** Exact Standard named-profile selection/viewer integration when the startup gate is enabled. */
+  standardBrowser?: StandardBrowserIntegration;
+  standardBrowserService?: StandardBrowserProfileHostService;
   /** App-owned deterministic automation metadata/preparation/purge integration. Missing means these routes fail closed. */
   protectedAutomation?: ProtectedAutomationProductionIntegration;
   /** Optional server-to-server Matrix AS integration. Missing installs an explicit unavailable Matrix router. */
   matrixMessaging?: Pick<MatrixProductionBootstrap, "router">;
+  /** Production-only proof that enabled Standard host/schema composition was installed before createApp. */
+  standardBrowserProfileHostsReady?: boolean;
 }
 
 export function createApp(options: CreateAppOptions = {}) {
   const config = getConfig(options.config);
-  // Every exported app-composition entrypoint is fail-closed while M0 is inert.
-  assertStandardBrowserProfileHostsStartupReady(config);
+  // Custom composition remains fail-closed unless it explicitly proves that
+  // the complete Standard host/schema integration has been installed.
+  assertStandardBrowserProfileHostsStartupReady(config, options.standardBrowserProfileHostsReady === true
+    && Boolean(options.standardBrowser) && Boolean(options.standardBrowserService));
   const auth = options.authService ?? new AuthService(config.auth);
   const credentialBroker = options.credentialBroker ?? new CredentialBroker(config.browser.credentials);
   const unregisterCredentialStopHook = registerBrowserStopHook(() => credentialBroker.lock());
@@ -182,6 +198,7 @@ export function createApp(options: CreateAppOptions = {}) {
   // browser-agent attribution before target lookup, authentication, or parsing.
   // The disabled middleware delegates immediately for legacy compatibility.
   app.use("/api/browser", createLegacyBrowserAgentAttributionRejection(config.standardBrowserProfileHosts));
+  app.use("/api/browser", createStandardBrowserSelectionMiddleware(options.standardBrowser));
 
   // Durable Protected/capability selection runs before generic agent-token,
   // credential, or browser-registry lookup. Standard browser requests pass
@@ -230,6 +247,8 @@ export function createApp(options: CreateAppOptions = {}) {
   app.use("/api", appsRouter);
   app.use("/api", scheduledAgentJobsRouter);
   app.use("/api", ttsRouter);
+  app.use("/api", createBrowserProfilesRouter(config.standardBrowserProfileHosts, options.standardBrowserService));
+  app.use("/api", createStandardBrowserRouter(options.standardBrowser));
   app.use("/api", createProtectedBrowserRouter(options.protectedBrowser));
   app.use("/api", createBrowserCredentialsRouter(auth, credentialBroker));
   app.use("/api", browserRouter);
@@ -259,7 +278,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
   // All WebSocket transports use the same authentication/origin decision.
   attachWs(server, auth);
-  attachBrowserWs(server, auth, options.protectedBrowser);
+  attachBrowserWs(server, auth, options.protectedBrowser, options.standardBrowser);
   if (options.protectedAutomation) {
     serverProtectedAutomationWsClosers.set(
       server,
@@ -301,9 +320,9 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
 
 export function start() {
   const config = getConfig();
-  // M0 is deliberately startup-inert until full host/schema composition lands.
-  // Fail before durable-store initialization or any browser/profile bootstrap.
-  assertStandardBrowserProfileHostsStartupReady(config);
+  // Production composes the complete Standard host/schema stack below. The
+  // immutable startup flag still remains the only activation gate.
+  assertStandardBrowserProfileHostsStartupReady(config, true);
 
   // Initialize the durable store before composing production authority. These
   // bootstraps are inert: they install policy/runtime bridges but do not create
@@ -319,6 +338,14 @@ export function start() {
     dataDir: config.dataDir,
     owner,
     credentialBroker,
+    // The combined bootstrap below owns the one process-wide interactive
+    // browser factory registration.
+    installFactory: () => () => undefined,
+  });
+  const standardBrowser = bootstrapStandardBrowserProduction({
+    enabled: config.standardBrowserProfileHosts,
+    dataDir: config.dataDir,
+    protectedFactory: protectedBrowser.factory,
   });
   const protectedAutomation = bootstrapProtectedAutomationProduction({
     dataDir: config.dataDir,
@@ -363,13 +390,19 @@ export function start() {
     authService,
     workspaceCapabilities: workspaceCapabilities.routerOptions,
     protectedBrowser: protectedBrowser.integration,
+    ...(standardBrowser.service ? {
+      standardBrowser: createStandardBrowserIntegration(standardBrowser.service),
+      standardBrowserService: standardBrowser.service,
+    } : {}),
     protectedAutomation: protectedAutomation.integration,
     credentialBroker,
     matrixMessaging,
+    standardBrowserProfileHostsReady: true,
   });
   bindProductionBootstraps(
     server,
     workspaceCapabilities,
+    standardBrowser,
     protectedBrowser,
     protectedAutomation,
     fileAudioExperiment,

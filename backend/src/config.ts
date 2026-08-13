@@ -219,8 +219,9 @@ export const STANDARD_BROWSER_PROFILE_HOSTS_STARTUP_ERROR =
 
 export function assertStandardBrowserProfileHostsStartupReady(
   config: Pick<Config, "standardBrowserProfileHosts">,
+  compositionReady = false,
 ): void {
-  if (config.standardBrowserProfileHosts) {
+  if (config.standardBrowserProfileHosts && !compositionReady) {
     throw new Error(STANDARD_BROWSER_PROFILE_HOSTS_STARTUP_ERROR);
   }
 }

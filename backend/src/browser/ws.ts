@@ -13,6 +13,11 @@ import {
   type ProtectedBrowserIntegration,
   type ProtectedBrowserRouteSelection,
 } from "../routes/protected-browser.js";
+import {
+  attachSelectedStandardViewer,
+  selectStandardBrowserWebSocket,
+  type StandardBrowserIntegration,
+} from "../routes/standard-browser.js";
 
 function sendSafe(ws: WebSocket, msg: unknown): void {
   try {
@@ -140,7 +145,12 @@ export class BrowserInputCoalescer {
   }
 }
 
-export function attachBrowserWs(httpServer: Server, auth: AuthService, protectedBrowser?: ProtectedBrowserIntegration): void {
+export function attachBrowserWs(
+  httpServer: Server,
+  auth: AuthService,
+  protectedBrowser?: ProtectedBrowserIntegration,
+  standardBrowser?: StandardBrowserIntegration,
+): void {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
   const vncWss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
 
@@ -165,9 +175,14 @@ export function attachBrowserWs(httpServer: Server, auth: AuthService, protected
     const kind = pathname === "/ws/browser" ? "cdp" : pathname === "/ws/browser-vnc" ? "vnc" : null;
     if (!kind) return;
 
-    // Exact durable Protected/capability selection occurs before auth-session
-    // lookup and before either protected or standard browser registries.
-    void selectProtectedBrowserWebSocket(req, kind, protectedBrowser).then((selection) => {
+    // Exact durable capability selection occurs before auth-session lookup and
+    // before any legacy browser registry. Standard selection is enabled only
+    // with the startup-immutable named-profile composition.
+    void Promise.resolve().then(async () => {
+      const standardSelection = selectStandardBrowserWebSocket(req, kind, standardBrowser);
+      const protectedSelection = standardSelection
+        ? null
+        : await selectProtectedBrowserWebSocket(req, kind, protectedBrowser);
       const decision = auth.authorizeWebSocket(req);
       if (!decision.allowed) {
         auth.rejectWebSocket(socket, decision);
@@ -175,7 +190,8 @@ export function attachBrowserWs(httpServer: Server, auth: AuthService, protected
       }
       const server = kind === "cdp" ? wss : vncWss;
       server.handleUpgrade(req, socket, head, (ws) => {
-        if (selection) attachProtected(ws, selection, kind);
+        if (standardSelection) attachSelectedStandardViewer(ws, standardSelection, kind, standardBrowser!);
+        else if (protectedSelection) attachProtected(ws, protectedSelection, kind);
         else server.emit("connection", ws, req);
       });
     }).catch((error) => {

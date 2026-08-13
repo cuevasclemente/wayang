@@ -51,6 +51,7 @@ export interface ProjectRegistrationReferences {
   protected_automation_jobs: string[];
   protected_automation_runs: string[];
   messaging_endpoints: string[];
+  browser_defaults: string[];
   apps: string[];
   app_states: string[];
   app_events: string[];
@@ -285,6 +286,8 @@ export function getProjectRegistrationReferences(id: string): ProjectRegistratio
       .filter((run) => run.project_id === project.id).map((run) => run.id).sort(),
     messaging_endpoints: store.messagingEndpoints
       .filter((endpoint) => endpoint.project_id === project.id).map((endpoint) => endpoint.endpoint_id).sort(),
+    browser_defaults: store.projectBrowserDefaults
+      .filter((value) => value.project_id === project.id).map((value) => String(value.revision)).sort(),
     apps: store.apps.filter((app) => app.project_cwd === project.cwd).map((app) => app.id).sort(),
     app_states: store.appStates.filter((state) => state.project_cwd === project.cwd).map((state) => state.app_id).sort(),
     app_events: store.appEvents.filter((event) => event.projectCwd === project.cwd).map((event) => event.id).sort(),
