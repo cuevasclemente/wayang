@@ -4,7 +4,8 @@ import {
   ModelRegistry,
   ModelRuntime,
 } from "@earendil-works/pi-coding-agent";
-import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
+import { getModel } from "@earendil-works/pi-ai/compat";
+import { streamSimple } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import type { AssistantMessageEvent, Context, Model } from "@earendil-works/pi-ai";
 import {
   AUTO_TITLE_MODEL_ID,
@@ -71,8 +72,9 @@ export class TerraTitleProvider implements TitleProvider {
           systemPrompt: AUTO_TITLE_SYSTEM_PROMPT,
           messages: [{ role: "user", content: input, timestamp: Date.now() }],
         };
-        // streamSimple constructs the reviewed provider request in this same
-        // synchronous call. The caller deliberately performs no await between
+        // The API-specific immutable dispatcher constructs the reviewed provider
+        // request in this same synchronous call. It deliberately bypasses the
+        // mutable compatibility registry, and the caller performs no await between
         // its final disclosure gate and this invocation.
         const stream = streamSimple(model, context, {
           apiKey: requestAuth.apiKey,
