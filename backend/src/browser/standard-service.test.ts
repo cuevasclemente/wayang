@@ -124,6 +124,18 @@ test("catalog-only runtime lists profiles, switches by opaque choice, and change
   } finally { await f.cleanup(); }
 });
 
+test("workspace and empty-host idle thresholds are independent", async () => {
+  const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+  try {
+    const runtime = f.service.createRuntime(binding("session-a"));
+    await execute(runtime, "browser_open");
+    const future = Date.now() + 61 * 60 * 1000;
+    assert.deepEqual(await f.service.sweepIdle(future), { workspacesClosed: 1, hostsStopped: 0 });
+    assert.deepEqual(await f.service.sweepIdle(future + 14 * 60 * 1000), { workspacesClosed: 0, hostsStopped: 0 });
+    assert.deepEqual(await f.service.sweepIdle(future + 15 * 60 * 1000), { workspacesClosed: 0, hostsStopped: 1 });
+  } finally { await f.cleanup(); }
+});
+
 test("profile switching is denied while any retained source workspace is paused", async () => {
   const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
   try {

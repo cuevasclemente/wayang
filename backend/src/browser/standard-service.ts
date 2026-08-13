@@ -51,6 +51,9 @@ export interface StandardBrowserRuntimeWorkspace {
   sessionStateRevision: number;
 }
 
+export const STANDARD_BROWSER_WORKSPACE_IDLE_MS = 60 * 60 * 1000;
+export const STANDARD_BROWSER_EMPTY_HOST_IDLE_MS = 15 * 60 * 1000;
+
 export interface StandardBrowserProfileHostServiceOptions {
   dataDir: string;
   catalog: StandardBrowserCatalogPort;
@@ -199,6 +202,28 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     const sessions = this.options.catalog.sourceSessionsForAuthority(scope);
     await Promise.allSettled(sessions.map((sourceSessionId) => this.closeSessionWorkspaces(sourceSessionId, "owner_close_all")));
     void reason;
+  }
+
+  async sweepIdle(
+    now = Date.now(),
+    workspaceIdleMs = STANDARD_BROWSER_WORKSPACE_IDLE_MS,
+    hostIdleMs = STANDARD_BROWSER_EMPTY_HOST_IDLE_MS,
+  ): Promise<{ workspacesClosed: number; hostsStopped: number }> {
+    let workspacesClosed = 0;
+    let hostsStopped = 0;
+    for (const [profileId, host] of [...this.hosts]) {
+      for (const sourceSessionId of host.idleWorkspaceSessionIds(now, workspaceIdleMs)) {
+        await host.closeWorkspace(sourceSessionId, "workspace_idle", now);
+        workspacesClosed += 1;
+      }
+      const emptySince = host.emptySinceTimestamp();
+      if (emptySince !== null && now - emptySince >= hostIdleMs) {
+        await host.close();
+        if (this.hosts.get(profileId) === host) this.hosts.delete(profileId);
+        hostsStopped += 1;
+      }
+    }
+    return { workspacesClosed, hostsStopped };
   }
 
   blocksPiIdleDetach(): boolean {

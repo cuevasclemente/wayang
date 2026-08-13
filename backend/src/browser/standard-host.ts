@@ -88,6 +88,7 @@ export class StandardBrowserProfileHost {
   private stopPromise: Promise<void> | null = null;
   private startupReconciled = false;
   private closed = false;
+  private emptySince: number | null = Date.now();
 
   constructor(
     readonly profile: Readonly<BrowserProfileRow>,
@@ -166,6 +167,7 @@ export class StandardBrowserProfileHost {
       closed: false,
     };
     this.workspaces.set(binding.sourceSessionId, workspace);
+    this.emptySince = null;
     return { generation: workspace.generation, reused: false };
   }
 
@@ -387,7 +389,18 @@ export class StandardBrowserProfileHost {
     workspace.lastActivityAt = Date.now();
   }
 
-  async closeWorkspace(sourceSessionId: string, _reason: string): Promise<void> {
+  idleWorkspaceSessionIds(now: number, idleMs: number): string[] {
+    return [...this.workspaces.values()]
+      .filter((workspace) => !workspace.closed && workspace.controlMode === "agent"
+        && workspace.queueDepth === 0 && now - workspace.lastActivityAt >= idleMs)
+      .map((workspace) => workspace.sourceSessionId);
+  }
+
+  emptySinceTimestamp(): number | null {
+    return this.workspaces.size === 0 ? this.emptySince : null;
+  }
+
+  async closeWorkspace(sourceSessionId: string, _reason: string, closedAt = Date.now()): Promise<void> {
     const workspace = this.workspaces.get(sourceSessionId);
     if (!workspace || workspace.closed) return;
     workspace.closed = true;
@@ -397,6 +410,7 @@ export class StandardBrowserProfileHost {
     workspace.targets.clear();
     workspace.activeTargetId = null;
     this.workspaces.delete(sourceSessionId);
+    if (this.workspaces.size === 0) this.emptySince = closedAt;
     for (const targetId of targets) {
       this.targetOwners.delete(targetId);
       await this.backend.closeTarget(targetId).catch(() => undefined);
