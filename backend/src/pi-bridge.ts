@@ -2570,6 +2570,11 @@ export async function createPiSession(
       setPiSessionTitle(id, titleSeedRow.title);
     }
     assertCreationCurrent();
+    // Wayang durably publishes this path immediately after runtime creation.
+    // Materialize first so restart/rebuild cannot reopen an absent proposed path
+    // under a new Pi identity or lose buffered title/audit metadata.
+    sessionManager.materialize();
+    assertCreationCurrent();
     const handle: PiSessionHandle = {
       id,
       session,
