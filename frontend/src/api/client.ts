@@ -1468,7 +1468,7 @@ export interface NamedBrowserProfile {
   id: string;
   name: string;
   state: BrowserProfileState;
-  storage_source: "managed" | "legacy_shared_v1" | "standard_pair_v1" | "legacy_candidate_v1";
+  storage_source: "managed" | "legacy_shared" | "standard_pair_v1" | "legacy_scoped";
   revision: number;
   created_at: number;
   updated_at: number;

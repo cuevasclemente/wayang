@@ -8,6 +8,7 @@ interface BrowserToolbarProps {
   credentialsSupported: boolean;
   pasteSupported: boolean;
   resetSupported: boolean;
+  restartSupported: boolean;
   onStart: () => void;
   onStop: () => void;
   onRestart: () => void;
@@ -27,6 +28,7 @@ export function BrowserToolbar({
   credentialsSupported,
   pasteSupported,
   resetSupported,
+  restartSupported,
   onStart,
   onStop,
   onRestart,
@@ -56,7 +58,7 @@ export function BrowserToolbar({
       <div className="mb-2 flex min-w-0 flex-wrap items-center gap-1.5">
         <ToolbarButton disabled={busy || running} onClick={onStart}>Start</ToolbarButton>
         <ToolbarButton disabled={busy || !running} onClick={onStop}>Stop</ToolbarButton>
-        <ToolbarButton disabled={busy} onClick={onRestart}>Restart</ToolbarButton>
+        {restartSupported && <ToolbarButton disabled={busy} onClick={onRestart}>Restart</ToolbarButton>}
         {cooperative ? (
           <ToolbarButton
             disabled={busy || !running}

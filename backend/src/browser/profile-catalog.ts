@@ -221,6 +221,7 @@ export function requestBrowserProfileTrash(profileId: string, expectedRevision: 
     const row = exactProfile(draft, profileId);
     assertExpectedRevision(row.revision, expectedRevision);
     if (hasProfileReferences(draft, profileId)) throw new WorkspaceStoreError("Browser Profile is still referenced", 409);
+    if (row.storage_source.kind !== "managed") throw new WorkspaceStoreError("Migrated Browser Profiles cannot be moved to recovery yet", 409);
     if (!["active", "disabled"].includes(row.state)) throw new WorkspaceStoreError("Browser Profile is already in cleanup", 409);
     const trashCount = draft.browserProfiles.filter((candidate) => ["trash_pending", "trashed", "purge_pending"].includes(candidate.state)).length;
     if (trashCount >= MAX_BROWSER_PROFILE_TRASH_ROWS) throw new WorkspaceStoreError("Browser Profile trash limit reached", 409);

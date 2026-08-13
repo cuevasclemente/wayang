@@ -261,6 +261,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
   const credentialsSupported = state?.credentialBroker?.supported === true;
   const pasteSupported = !namedRuntime;
   const resetSupported = !namedRuntime;
+  const restartSupported = !namedRuntime;
   const profileLabel = state?.profile.persistence === "named"
     ? state.profile.name || "Named Browser Profile"
     : state?.profile.persistence === "shared"
@@ -323,6 +324,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
         credentialsSupported={credentialsSupported}
         pasteSupported={pasteSupported}
         resetSupported={resetSupported}
+        restartSupported={restartSupported}
         onStart={() => void runAction(() => startBrowser(sessionId, sessionCwd))}
         onStop={() => void runAction(() => stopBrowser(sessionId, sessionCwd))}
         onRestart={() => void runAction(() => restartBrowser(sessionId, sessionCwd))}
@@ -482,7 +484,11 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
 
       <div className="min-h-0 flex-1">
         {running ? (
-          <BrowserViewer
+          namedRuntime && cooperative ? (
+            <div className="flex h-full items-center justify-center p-6 text-center text-sm text-neutral-500">
+              <div><div className="mb-2 text-base text-neutral-300">Viewer paused during agent control</div><div>Choose Pause agent to take explicit human control and attach the exact session tab viewer.</div></div>
+            </div>
+          ) : <BrowserViewer
             sessionId={sessionId}
             projectCwd={sessionCwd}
             running
@@ -490,7 +496,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
             transport={viewerTransport}
             onStatus={refresh}
             onPageChange={handlePageChange}
-            onPasteText={(text) => void handleViewerPasteText(text)}
+            onPasteText={pasteSupported ? (text) => void handleViewerPasteText(text) : undefined}
           />
         ) : (
           <div className="flex h-full items-center justify-center p-6 text-center text-sm text-neutral-500">
