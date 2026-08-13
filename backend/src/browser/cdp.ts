@@ -120,6 +120,7 @@ export interface ChromeTarget {
   type: string;
   title?: string;
   url?: string;
+  openerId?: string;
   webSocketDebuggerUrl?: string;
 }
 

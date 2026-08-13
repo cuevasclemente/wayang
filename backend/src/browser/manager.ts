@@ -1774,6 +1774,9 @@ export interface ManagedChromiumRuntimeOptions {
   onDownloadProgress?: (event: ManagedChromiumDownloadProgress) => void;
   /** Browser-lifetime observation of every top-level page target URL. */
   onTopLevelNavigation?: (url: string) => void;
+  onTargetCreated?: (target: ChromeTarget) => void;
+  onTargetChanged?: (target: ChromeTarget) => void;
+  onTargetDestroyed?: (targetId: string) => void;
   onUnexpectedExit?: () => void;
 }
 
@@ -1858,15 +1861,34 @@ export class ManagedChromiumRuntime {
         if (child.exitCode !== null) throw new Error("Managed Chromium exited during startup");
         const browserCdp = await connectBrowserCdp(port);
         this.browserCdp = browserCdp;
-        if (this.options.onTopLevelNavigation) {
-          const observeTarget = (event: any) => {
+        if (this.options.onTopLevelNavigation || this.options.onTargetCreated
+          || this.options.onTargetChanged || this.options.onTargetDestroyed) {
+          const targetInfo = (event: any): ChromeTarget | undefined => {
             const target = event?.targetInfo;
-            if (target?.type === "page" && typeof target.url === "string") {
-              this.options.onTopLevelNavigation?.(target.url);
-            }
+            if (!target || typeof target.targetId !== "string" || typeof target.type !== "string") return undefined;
+            return {
+              id: target.targetId,
+              type: target.type,
+              ...(typeof target.title === "string" ? { title: target.title } : {}),
+              ...(typeof target.url === "string" ? { url: target.url } : {}),
+              ...(typeof target.openerId === "string" ? { openerId: target.openerId } : {}),
+            };
           };
-          browserCdp.on("Target.targetCreated", observeTarget);
-          browserCdp.on("Target.targetInfoChanged", observeTarget);
+          browserCdp.on("Target.targetCreated", (event: any) => {
+            const target = targetInfo(event);
+            if (!target) return;
+            if (target.type === "page" && typeof target.url === "string") this.options.onTopLevelNavigation?.(target.url);
+            this.options.onTargetCreated?.(target);
+          });
+          browserCdp.on("Target.targetInfoChanged", (event: any) => {
+            const target = targetInfo(event);
+            if (!target) return;
+            if (target.type === "page" && typeof target.url === "string") this.options.onTopLevelNavigation?.(target.url);
+            this.options.onTargetChanged?.(target);
+          });
+          browserCdp.on("Target.targetDestroyed", (event: any) => {
+            if (typeof event?.targetId === "string") this.options.onTargetDestroyed?.(event.targetId);
+          });
           await assertAuthorized();
           await browserCdp.send("Target.setDiscoverTargets", { discover: true });
         }
@@ -1964,6 +1986,47 @@ export class ManagedChromiumRuntime {
     const target = selectPageTarget(targets) ?? await createPageTarget(port);
     if (!target.webSocketDebuggerUrl) throw new Error("Chrome target did not expose a debugger connection");
     return target;
+  }
+
+  async listPageTargets(): Promise<ChromeTarget[]> {
+    const port = this.cdpPort;
+    if (!this.running || !port) throw new Error("Managed Chromium is not running");
+    return (await fetchJson<ChromeTarget[]>(`http://127.0.0.1:${port}/json/list`))
+      .filter((target) => target.type === "page");
+  }
+
+  async createPageTarget(url = "about:blank"): Promise<ChromeTarget> {
+    const browserCdp = this.browserCdp;
+    if (!this.running || !browserCdp) throw new Error("Managed Chromium is not running");
+    const created = await browserCdp.send<{ targetId?: string }>("Target.createTarget", { url });
+    if (!created?.targetId) throw new Error("Managed Chromium did not create a page target");
+    const targets = await this.listPageTargets();
+    const target = targets.find((candidate) => candidate.id === created.targetId);
+    if (!target?.webSocketDebuggerUrl) throw new Error("Managed Chromium target is unavailable");
+    return target;
+  }
+
+  async closePageTarget(targetId: string): Promise<void> {
+    const browserCdp = this.browserCdp;
+    if (!this.running || !browserCdp || !targetId) throw new Error("Managed Chromium is not running");
+    await browserCdp.send("Target.closeTarget", { targetId });
+  }
+
+  async attachTargetCdpViewer(targetId: string): Promise<ManagedChromiumPageAttachment> {
+    if (!this.running) throw new Error("Managed Chromium is not running");
+    const target = (await this.listPageTargets()).find((candidate) => candidate.id === targetId);
+    if (!target?.webSocketDebuggerUrl) throw new Error("Managed Chromium target is unavailable");
+    const cdp = await CdpConnection.connect(target.webSocketDebuggerUrl);
+    let closed = false;
+    return {
+      cdp,
+      target,
+      close() {
+        if (closed) return;
+        closed = true;
+        cdp.close();
+      },
+    };
   }
 
   async attachPageCdpViewer(): Promise<ManagedChromiumPageAttachment> {
