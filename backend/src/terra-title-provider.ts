@@ -22,6 +22,34 @@ export interface TitleProvider {
   prepare(): Promise<PreparedTitleRequest>;
 }
 
+const PINNED_TERRA_BASE_URL = "https://chatgpt.com/backend-api";
+const PINNED_TERRA_MODEL: Readonly<Model<"openai-codex-responses">> = Object.freeze({
+  id: AUTO_TITLE_MODEL_ID,
+  name: "GPT-5.6 Terra",
+  api: "openai-codex-responses",
+  provider: AUTO_TITLE_MODEL_PROVIDER,
+  baseUrl: PINNED_TERRA_BASE_URL,
+  reasoning: true,
+  input: Object.freeze(["text", "image"]) as ("text" | "image")[],
+  cost: Object.freeze({
+    input: 2,
+    output: 12,
+    cacheRead: 0.2,
+    cacheWrite: 2.5,
+    tiers: Object.freeze([Object.freeze({
+      inputTokensAbove: 272_000,
+      input: 4,
+      output: 18,
+      cacheRead: 0.4,
+      cacheWrite: 5,
+    })]) as unknown as Model<"openai-codex-responses">["cost"]["tiers"],
+  }),
+  contextWindow: 272_000,
+  maxTokens: 128_000,
+  thinkingLevelMap: Object.freeze({ xhigh: "xhigh", max: "max", minimal: "low" }),
+  compat: Object.freeze({ supportsOpenAIGrammarTools: true, supportsToolSearch: true }),
+});
+
 let contextPromise: Promise<{ runtime: ModelRuntime; registry: ModelRegistry }> | null = null;
 
 async function titleModelContext(): Promise<{ runtime: ModelRuntime; registry: ModelRegistry }> {
@@ -33,21 +61,30 @@ async function titleModelContext(): Promise<{ runtime: ModelRuntime; registry: M
   return contextPromise;
 }
 
-function reviewedTerraModel(registry: ModelRegistry): Model<"openai-codex-responses"> | null {
-  const builtIn = getModel(AUTO_TITLE_MODEL_PROVIDER, AUTO_TITLE_MODEL_ID);
+function isPinnedTerraDescriptor(model: Model<any> | undefined): boolean {
+  return Boolean(model)
+    && model!.provider === AUTO_TITLE_MODEL_PROVIDER
+    && model!.id === AUTO_TITLE_MODEL_ID
+    && model!.api === "openai-codex-responses"
+    && model!.baseUrl === PINNED_TERRA_BASE_URL
+    && model!.headers === undefined;
+}
+
+function reviewedTerraModel(registry: ModelRegistry): Readonly<Model<"openai-codex-responses">> | null {
+  const catalog = getModel(AUTO_TITLE_MODEL_PROVIDER, AUTO_TITLE_MODEL_ID);
   const selected = registry.find(AUTO_TITLE_MODEL_PROVIDER, AUTO_TITLE_MODEL_ID);
-  if (!builtIn || !selected) return null;
   if (
-    builtIn.provider !== AUTO_TITLE_MODEL_PROVIDER
-    || builtIn.id !== AUTO_TITLE_MODEL_ID
-    || builtIn.api !== "openai-codex-responses"
-    || selected.provider !== builtIn.provider
-    || selected.id !== builtIn.id
-    || selected.api !== builtIn.api
-    || selected.baseUrl !== builtIn.baseUrl
+    !isPinnedTerraDescriptor(catalog)
+    || !isPinnedTerraDescriptor(selected)
+    || !registry.isUsingOAuth(PINNED_TERRA_MODEL as Model<"openai-codex-responses">)
     || registry.getRegisteredProviderConfig(AUTO_TITLE_MODEL_PROVIDER) !== undefined
+    || registry.getRegisteredNativeProvider(AUTO_TITLE_MODEL_PROVIDER) !== undefined
   ) return null;
-  return builtIn as Model<"openai-codex-responses">;
+  return PINNED_TERRA_MODEL;
+}
+
+function hasEntries(value: object | undefined): boolean {
+  return value !== undefined && Object.keys(value).length > 0;
 }
 
 function assistantText(event: AssistantMessageEvent): string {
@@ -59,9 +96,16 @@ export class TerraTitleProvider implements TitleProvider {
     const { registry } = await titleModelContext();
     const model = reviewedTerraModel(registry);
     if (!model) throw new Error("title_model_unavailable");
-    const auth = await registry.getApiKeyAndHeaders(model);
-    if (!auth.ok || (auth.baseUrl && auth.baseUrl !== model.baseUrl)) throw new Error("title_model_unavailable");
-    const requestAuth = { apiKey: auth.apiKey, headers: auth.headers, env: auth.env };
+    const auth = await registry.getApiKeyAndHeaders(model as Model<"openai-codex-responses">);
+    if (
+      !auth.ok
+      || typeof auth.apiKey !== "string"
+      || auth.apiKey.length === 0
+      || auth.baseUrl !== undefined
+      || hasEntries(auth.headers)
+      || hasEntries(auth.env)
+    ) throw new Error("title_model_unavailable");
+    const apiKey = auth.apiKey;
 
     return {
       dispatch(input: string): Promise<string> {
@@ -76,10 +120,8 @@ export class TerraTitleProvider implements TitleProvider {
         // request in this same synchronous call. It deliberately bypasses the
         // mutable compatibility registry, and the caller performs no await between
         // its final disclosure gate and this invocation.
-        const stream = streamSimple(model, context, {
-          apiKey: requestAuth.apiKey,
-          headers: requestAuth.headers,
-          env: requestAuth.env,
+        const stream = streamSimple(model as Model<"openai-codex-responses">, context, {
+          apiKey,
           signal: controller.signal,
           timeoutMs: 20_000,
           maxRetries: 0,
