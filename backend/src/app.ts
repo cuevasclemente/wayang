@@ -72,6 +72,7 @@ import {
 } from "./browser/protected-production.js";
 import { bootstrapStandardBrowserProduction } from "./browser/standard-bootstrap.js";
 import type { StandardBrowserProfileHostService } from "./browser/standard-service.js";
+import { BrowserProfileCleanupCoordinator } from "./browser/profile-cleanup.js";
 import {
   bootstrapProtectedAutomationProduction,
   type ProtectedAutomationProductionIntegration,
@@ -135,6 +136,7 @@ export interface CreateAppOptions {
   /** Exact Standard named-profile selection/viewer integration when the startup gate is enabled. */
   standardBrowser?: StandardBrowserIntegration;
   standardBrowserService?: StandardBrowserProfileHostService;
+  browserProfileCleanup?: BrowserProfileCleanupCoordinator;
   /** App-owned deterministic automation metadata/preparation/purge integration. Missing means these routes fail closed. */
   protectedAutomation?: ProtectedAutomationProductionIntegration;
   /** Optional server-to-server Matrix AS integration. Missing installs an explicit unavailable Matrix router. */
@@ -247,7 +249,7 @@ export function createApp(options: CreateAppOptions = {}) {
   app.use("/api", appsRouter);
   app.use("/api", scheduledAgentJobsRouter);
   app.use("/api", ttsRouter);
-  app.use("/api", createBrowserProfilesRouter(config.standardBrowserProfileHosts, options.standardBrowserService));
+  app.use("/api", createBrowserProfilesRouter(config.standardBrowserProfileHosts, options.standardBrowserService, options.browserProfileCleanup));
   app.use("/api", createStandardBrowserRouter(options.standardBrowser));
   app.use("/api", createProtectedBrowserRouter(options.protectedBrowser));
   // Named Standard profiles and the legacy generic manager must never coexist:
@@ -354,6 +356,9 @@ export function start() {
     dataDir: config.dataDir,
     protectedFactory: protectedBrowser.factory,
   });
+  const browserProfileCleanup = standardBrowser.service
+    ? new BrowserProfileCleanupCoordinator(config.dataDir, standardBrowser.service)
+    : undefined;
   const protectedAutomation = bootstrapProtectedAutomationProduction({
     dataDir: config.dataDir,
     credentialBroker,
@@ -400,6 +405,7 @@ export function start() {
     ...(standardBrowser.service ? {
       standardBrowser: createStandardBrowserIntegration(standardBrowser.service),
       standardBrowserService: standardBrowser.service,
+      browserProfileCleanup,
     } : {}),
     protectedAutomation: protectedAutomation.integration,
     credentialBroker,
@@ -416,6 +422,7 @@ export function start() {
     matrixMessaging,
   );
   protectedAutomation.start();
+  void browserProfileCleanup?.resumePending();
   // Valid configuration plus homeserver/provisioning outage must not take down
   // the Wayang browser workbench. The Matrix route remains 503/not-ready and
   // the bootstrap retains bounded retry/attention state.

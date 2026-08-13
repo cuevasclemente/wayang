@@ -1,6 +1,7 @@
 import express, { type RequestHandler, type Router } from "express";
 import {
   createManagedBrowserProfile,
+  getBrowserProfile,
   getProjectBrowserDefault,
   getSessionBrowserState,
   listBrowserProfiles,
@@ -16,6 +17,7 @@ import { getSessionById } from "../sessions.js";
 import { getProject } from "../projects.js";
 import { WorkspaceStoreError } from "../workspace-types.js";
 import type { StandardBrowserProfileHostService } from "../browser/standard-service.js";
+import type { BrowserProfileCleanupCoordinator } from "../browser/profile-cleanup.js";
 
 function exactObject(value: unknown, keys: readonly string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new WorkspaceStoreError("Invalid Browser Profile request", 400);
@@ -44,7 +46,11 @@ function asyncHandler(handler: (req: express.Request, res: express.Response) => 
   };
 }
 
-export function createBrowserProfilesRouter(enabled: boolean, service?: StandardBrowserProfileHostService): Router {
+export function createBrowserProfilesRouter(
+  enabled: boolean,
+  service?: StandardBrowserProfileHostService,
+  cleanupCoordinator?: BrowserProfileCleanupCoordinator,
+): Router {
   const router = express.Router();
   router.use("/browser-profiles", (_req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
@@ -79,11 +85,18 @@ export function createBrowserProfilesRouter(enabled: boolean, service?: Standard
     const body = exactObject(req.body, ["expectedRevision"]);
     const result = requestBrowserProfileTrash(req.params.profileId, revision(body.expectedRevision));
     await service?.invalidateProfile(req.params.profileId);
+    if (cleanupCoordinator) await cleanupCoordinator.executeTrash(req.params.profileId, result.cleanup.id);
     res.status(202).json(result);
   }));
-  router.post("/browser-profiles/:profileId/restore", asyncHandler((req, res) => {
+  router.post("/browser-profiles/:profileId/restore", asyncHandler(async (req, res) => {
     const body = exactObject(req.body, ["expectedRevision"]);
-    res.json({ profile: restoreTrashedBrowserProfile(req.params.profileId, revision(body.expectedRevision)) });
+    const expectedRevision = revision(body.expectedRevision);
+    if (cleanupCoordinator) {
+      await cleanupCoordinator.restore(req.params.profileId, expectedRevision);
+      res.json({ profile: getBrowserProfile(req.params.profileId) });
+      return;
+    }
+    res.json({ profile: restoreTrashedBrowserProfile(req.params.profileId, expectedRevision) });
   }));
   router.get("/browser-profiles/projects/:projectId/default", asyncHandler((req, res) => {
     if (!getProject(req.params.projectId)) throw new WorkspaceStoreError("Project not found", 404);

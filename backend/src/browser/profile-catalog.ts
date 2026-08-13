@@ -247,6 +247,35 @@ export function requestBrowserProfileTrash(profileId: string, expectedRevision: 
   });
 }
 
+export function claimBrowserProfileCleanupAttempt(profileId: string, cleanupId: string, now = Date.now()): BrowserCleanupRow {
+  return commitStoreMutation((draft) => {
+    const profile = exactProfile(draft, profileId);
+    const cleanup = draft.browserCleanups.find((candidate) => candidate.id === cleanupId && candidate.profile_id === profileId);
+    if (profile.state !== "trash_pending" || !cleanup || !["pending", "cleanup_failed"].includes(cleanup.state)
+      || cleanup.attempts >= 10 || cleanup.recovery_entry_id === null) {
+      throw new WorkspaceStoreError("Browser Profile cleanup attempt is stale", 409);
+    }
+    cleanup.state = "pending";
+    cleanup.attempts += 1;
+    cleanup.last_attempt_at = now;
+    cleanup.updated_at = now;
+    return structuredClone(cleanup);
+  });
+}
+
+export function markBrowserProfileCleanupFailed(profileId: string, cleanupId: string, now = Date.now()): BrowserCleanupRow {
+  return commitStoreMutation((draft) => {
+    const profile = exactProfile(draft, profileId);
+    const cleanup = draft.browserCleanups.find((candidate) => candidate.id === cleanupId && candidate.profile_id === profileId);
+    if (profile.state !== "trash_pending" || !cleanup || cleanup.state !== "pending") {
+      throw new WorkspaceStoreError("Browser Profile cleanup failure is stale", 409);
+    }
+    cleanup.state = "cleanup_failed";
+    cleanup.updated_at = now;
+    return structuredClone(cleanup);
+  });
+}
+
 export function markBrowserProfileTrashed(profileId: string, cleanupId: string, now = Date.now()): PublicBrowserProfile {
   return commitStoreMutation((draft) => {
     const row = exactProfile(draft, profileId);
@@ -255,10 +284,26 @@ export function markBrowserProfileTrashed(profileId: string, cleanupId: string, 
       throw new WorkspaceStoreError("Browser Profile trash transition is stale", 409);
     }
     cleanup.state = "verified";
-    cleanup.attempts += 1;
-    cleanup.last_attempt_at = now;
+    cleanup.last_attempt_at ??= now;
     cleanup.updated_at = now;
     row.state = "trashed";
+    row.revision += 1;
+    row.updated_at = now;
+    return publicProfile(row);
+  });
+}
+
+export function markBrowserProfileRestored(profileId: string, cleanupId: string, expectedRevision: number, now = Date.now()): PublicBrowserProfile {
+  return commitStoreMutation((draft) => {
+    const row = exactProfile(draft, profileId);
+    assertExpectedRevision(row.revision, expectedRevision);
+    const cleanup = draft.browserCleanups.find((candidate) => candidate.id === cleanupId && candidate.profile_id === profileId);
+    if (row.state !== "trashed" || !cleanup || cleanup.state !== "verified" || cleanup.recovery_entry_id === null) {
+      throw new WorkspaceStoreError("Browser Profile restore transition is stale", 409);
+    }
+    cleanup.recovery_entry_id = null;
+    cleanup.updated_at = now;
+    row.state = "disabled";
     row.revision += 1;
     row.updated_at = now;
     return publicProfile(row);
