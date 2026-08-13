@@ -144,6 +144,7 @@ export class StandardBrowserProfileHost {
   private readonly targetOwners = new Map<string, string>();
   private readonly unassignedTargets = new Map<string, StandardBrowserBackendTarget>();
   private readonly downloads = new Map<string, StandardDownloadOwner>();
+  private readonly viewerClosers = new Map<string, Set<() => Promise<void>>>();
   private observedDownloadCount = 0;
   private backend: StandardBrowserHostBackend;
   private openerLease: BrowserStorageOpenerLease;
@@ -362,6 +363,7 @@ export class StandardBrowserProfileHost {
     if (workspace.controlTransition) throw new Error("Standard browser control transition is busy");
     workspace.controlTransition = true;
     workspace.controlGeneration += 1;
+    await this.closeWorkspaceViewers(sourceSessionId);
     await workspace.queueTail.catch(() => undefined);
     await this.cancelWorkspaceDownloads(sourceSessionId, workspaceGeneration);
     const targets = [...workspace.targets.keys()];
@@ -747,7 +749,24 @@ export class StandardBrowserProfileHost {
 
   hasBlockingControl(sourceSessionId: string): boolean {
     const workspace = this.workspaces.get(sourceSessionId);
-    return Boolean(workspace && !workspace.closed && workspace.controlMode !== "agent");
+    return Boolean(workspace && !workspace.closed && (workspace.controlTransition || workspace.controlMode !== "agent"));
+  }
+
+  registerViewer(sourceSessionId: string, workspaceGeneration: string, close: () => Promise<void>): () => void {
+    this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    let closers = this.viewerClosers.get(sourceSessionId);
+    if (!closers) { closers = new Set(); this.viewerClosers.set(sourceSessionId, closers); }
+    closers.add(close);
+    return () => {
+      closers!.delete(close);
+      if (closers!.size === 0) this.viewerClosers.delete(sourceSessionId);
+    };
+  }
+
+  private async closeWorkspaceViewers(sourceSessionId: string): Promise<void> {
+    const closers = [...(this.viewerClosers.get(sourceSessionId) ?? [])];
+    this.viewerClosers.delete(sourceSessionId);
+    await Promise.allSettled(closers.map((close) => close()));
   }
 
   async detachAgentLease(sourceSessionId: string, runtimeGeneration: string): Promise<void> {
@@ -785,6 +804,7 @@ export class StandardBrowserProfileHost {
     if (!workspace || workspace.closed) return;
     workspace.closed = true;
     workspace.runtimeGeneration = null;
+    await this.closeWorkspaceViewers(sourceSessionId);
     workspace.controlGeneration += 1;
     await this.cancelWorkspaceDownloads(sourceSessionId, workspace.generation);
     const targets = [...workspace.targets.keys()];

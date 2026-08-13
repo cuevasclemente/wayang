@@ -73,11 +73,20 @@ export function createStandardBrowserIntegration(service: StandardBrowserProfile
         }
       };
       const attachment = await workspace.host.ownerAttachActiveViewer(selection.sourceSessionId, selection.workspaceGeneration, authorize);
-      return openStandardCdpViewer({
+      const viewer = await openStandardCdpViewer({
         attachment,
         authorize,
         revoke: () => workspace.host.closeWorkspace(selection.sourceSessionId, "viewer_policy"),
       });
+      const unregister = workspace.host.registerViewer(selection.sourceSessionId, selection.workspaceGeneration, async () => {
+        unregister();
+        await viewer.close();
+      });
+      return {
+        dispatch: (message, binary) => viewer.dispatch(message, binary),
+        close: async () => { unregister(); await viewer.close(); },
+        onMessage: (listener) => viewer.onMessage(listener),
+      };
     },
   };
 }
