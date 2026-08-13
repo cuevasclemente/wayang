@@ -215,6 +215,11 @@ function operation(req: Request): ProtectedBrowserOperation {
 export function createStandardBrowserRouter(integration?: StandardBrowserIntegration): Router {
   const router = express.Router();
   router.use("/browser", (req, _res, next) => selections.has(req) ? next() : next("router"));
+  router.get("/browser/status", asyncHandler((req, res) => {
+    const selection = selections.get(req)!;
+    const runtime = exactRuntime(req, integration!);
+    res.json(publicState(selection, runtime));
+  }));
   router.post("/browser/control-mode", asyncHandler(async (req, res) => {
     const selection = selections.get(req)!;
     const runtime = exactRuntime(req, integration!);
