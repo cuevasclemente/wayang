@@ -26,9 +26,11 @@ const CAPABILITIES: Readonly<Record<WorkspaceCapabilityId, CompiledWorkspaceCapa
     compatiblePrivacyMode: "standard",
     activationAvailable: true,
     title: "Standard browser",
-    riskSummary: "Allows broad agent-controlled browsing in a managed browser for this exact Standard Project-Agent association.",
+    riskSummary: "Allows broad agent-controlled browsing across every named Standard Browser Profile for this exact Standard Project-Agent association.",
     consequences: Object.freeze([
-      "The agent may navigate, inspect pages, click, type public non-secret text, download files, and cause remote mutations or network egress.",
+      "The agent may enumerate and enter every current or future named Standard Browser Profile, including profiles authenticated by other approved Standard projects.",
+      "Profiles intentionally share cookies, storage, service workers, browser history, and remote-account effects across session-owned tabs; tab routing is not login-state isolation.",
+      "The agent may switch its session profile, change this project's default profile for future or unassigned sessions, navigate, inspect pages, click, type public non-secret text, download files, and cause remote mutations or network egress.",
       "Authenticated cookies can enable purchases, deletions, settings changes, exports, logout, or browser-mediated passkey flows.",
       "Passwords, MFA, CAPTCHA, payments, recovery, and other sensitive input remain human-controlled, but later agent actions are not read-only.",
       "Completed bounded downloads become ordinary untrusted project files governed by normal project/profile policy.",
