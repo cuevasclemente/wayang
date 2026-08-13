@@ -56,24 +56,6 @@ export interface StandardManagedChromiumPort {
   attachTargetCdpViewer(targetId: string): Promise<ManagedChromiumPageAttachment>;
 }
 
-async function targetIdForFrame(managed: StandardManagedChromiumPort, frameId: string): Promise<string | null> {
-  if (!frameId) return null;
-  let matched: string | null = null;
-  for (const target of await managed.listPageTargets()) {
-    const attachment = await managed.attachTargetCdpViewer(target.id);
-    try {
-      await attachment.cdp.send("Page.enable");
-      const tree = await attachment.cdp.send<any>("Page.getFrameTree");
-      const contains = (node: any): boolean => Boolean(node?.frame?.id === frameId
-        || (Array.isArray(node?.childFrames) && node.childFrames.some(contains)));
-      if (!contains(tree?.frameTree)) continue;
-      if (matched !== null) return null;
-      matched = target.id;
-    } finally { attachment.close(); }
-  }
-  return matched;
-}
-
 function redactNavigationTitle(title: string, rawUrl: string): string {
   let output = title;
   try {
@@ -235,10 +217,12 @@ export function createStandardBrowserHostBackendFactory(options: {
       onTargetChanged: (target) => callbacks.targetChanged(publicTarget(target)),
       onTargetDestroyed: (targetId) => { protections.delete(targetId); callbacks.targetDestroyed(targetId); },
       onDownloadWillBegin(event) {
-        void targetIdForFrame(managed, event.frameId).then((targetId) => {
-          callbacks.downloadWillBegin(event, targetId);
-          if (!targetId) return managed.cancelDownload(event.guid).catch(() => undefined);
-        }).catch(() => managed.cancelDownload(event.guid).catch(() => undefined));
+        // Browser.downloadWillBegin does not carry a page target ID, and an
+        // asynchronous frame lookup can race detach/rebind. Until Managed
+        // Chromium provides a synchronously maintained frame→target index,
+        // Standard host downloads fail closed rather than reattribute later.
+        callbacks.downloadWillBegin(event, null);
+        void managed.cancelDownload(event.guid).catch(() => undefined);
       },
       onDownloadProgress: callbacks.downloadProgress,
       onUnexpectedExit: callbacks.unexpectedExit,

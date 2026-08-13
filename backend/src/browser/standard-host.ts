@@ -353,6 +353,7 @@ export class StandardBrowserProfileHost {
     try {
       await workspace.queueTail.catch(() => undefined);
       this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+      await this.cancelWorkspaceDownloads(sourceSessionId, workspaceGeneration);
       workspace.controlMode = mode;
       workspace.lastActivityAt = Date.now();
     } finally { workspace.controlTransition = false; }
@@ -675,9 +676,12 @@ export class StandardBrowserProfileHost {
       if (current.controlMode !== "agent" || current.controlGeneration !== controlGeneration) throw new Error("Standard browser workspace control changed");
     };
     assertControl();
-    await this.ensureActiveTarget(binding, workspace);
-    assertControl();
-    return this.publicState(binding, workspaceGeneration);
+    return this.queueWorkspace(workspace, async () => {
+      assertControl();
+      await this.ensureActiveTarget(binding, workspace);
+      assertControl();
+      return this.publicState(binding, workspaceGeneration);
+    });
   }
 
   async openTab(binding: Readonly<ProtectedBrowserBinding>, workspaceGeneration: string, url = "about:blank"): Promise<StandardBrowserWorkspacePublicState> {
@@ -720,16 +724,23 @@ export class StandardBrowserProfileHost {
       if (current.controlMode !== "agent" || current.controlGeneration !== controlGeneration) throw new Error("Standard browser workspace control changed");
     };
     assertControl();
-    const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
-    if (!target) throw new Error("Standard browser tab choice is stale");
-    await this.backend.closeTarget(target.rawId);
-    assertControl();
-    this.onTargetDestroyed(target.rawId);
-    if (workspace.targets.size === 0) {
-      await this.closeWorkspace(binding.sourceSessionId, "final_tab");
-      return null;
-    }
-    return this.publicState(binding, workspaceGeneration);
+    return this.queueWorkspace(workspace, async () => {
+      assertControl();
+      const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
+      if (!target) throw new Error("Standard browser tab choice is stale");
+      // Remove agent ownership before the irreversible close. A concurrent
+      // handoff can no longer expose this target as human-owned after close.
+      this.targetOwners.delete(target.rawId);
+      workspace.targets.delete(target.rawId);
+      if (workspace.activeTargetId === target.rawId) workspace.activeTargetId = workspace.targets.keys().next().value ?? null;
+      await this.backend.closeTarget(target.rawId);
+      assertControl();
+      if (workspace.targets.size === 0) {
+        await this.closeWorkspace(binding.sourceSessionId, "final_tab");
+        return null;
+      }
+      return this.publicState(binding, workspaceGeneration);
+    });
   }
 
   setControlMode(sourceSessionId: string, mode: "agent" | "user" | "paused"): void {
