@@ -179,15 +179,15 @@ export function attachBrowserWs(
     // before any legacy browser registry. Standard selection is enabled only
     // with the startup-immutable named-profile composition.
     void Promise.resolve().then(async () => {
-      const standardSelection = selectStandardBrowserWebSocket(req, kind, standardBrowser);
-      const protectedSelection = standardSelection
-        ? null
-        : await selectProtectedBrowserWebSocket(req, kind, protectedBrowser);
       const decision = auth.authorizeWebSocket(req);
       if (!decision.allowed) {
         auth.rejectWebSocket(socket, decision);
         return;
       }
+      const standardSelection = selectStandardBrowserWebSocket(req, kind, standardBrowser);
+      const protectedSelection = standardSelection
+        ? null
+        : await selectProtectedBrowserWebSocket(req, kind, protectedBrowser);
       const server = kind === "cdp" ? wss : vncWss;
       server.handleUpgrade(req, socket, head, (ws) => {
         if (standardSelection) attachSelectedStandardViewer(ws, standardSelection, kind, standardBrowser!);

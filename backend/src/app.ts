@@ -200,7 +200,6 @@ export function createApp(options: CreateAppOptions = {}) {
   // browser-agent attribution before target lookup, authentication, or parsing.
   // The disabled middleware delegates immediately for legacy compatibility.
   app.use("/api/browser", createLegacyBrowserAgentAttributionRejection(config.standardBrowserProfileHosts));
-  app.use("/api/browser", createStandardBrowserSelectionMiddleware(options.standardBrowser));
 
   // Durable Protected/capability selection runs before generic agent-token,
   // credential, or browser-registry lookup. Standard browser requests pass
@@ -211,6 +210,9 @@ export function createApp(options: CreateAppOptions = {}) {
   const isInternalAgentRequest = (req: express.Request) => isBrowserAgentRequest(req) || isAppsAgentRequest(req);
   app.use("/api", (req, res, next) => isInternalAgentRequest(req) ? next() : auth.requireAuthentication(req, res, next));
   app.use("/api", (req, res, next) => isInternalAgentRequest(req) ? next() : auth.requireValidOrigin(req, res, next));
+  // Standard owner selection may lazily materialize a detached workspace, so
+  // it must run only after exact web authentication and Origin validation.
+  app.use("/api/browser", createStandardBrowserSelectionMiddleware(options.standardBrowser));
   app.use(express.json({ limit: "10mb" }));
 
   // API info
