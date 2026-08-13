@@ -49,6 +49,9 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
 
   const applyState = useCallback((next: BrowserSessionState) => {
     setState(next);
+    if (next.profile.persistence === "named" && sessionId) {
+      void fetchSessionBrowserProfileState(sessionId).then((current) => setSessionProfileState(current.state)).catch(() => undefined);
+    }
     setViewerTransport((current) => {
       // CDP is the default for this release. A user may still select a
       // backend-advertised generic VNC viewer, but Protected always remains CDP.
@@ -58,7 +61,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
       if (current === "cdp-screencast" && next.cdpReady === false && next.vncReady) return "vnc";
       return current;
     });
-  }, []);
+  }, [sessionId]);
 
   const refresh = useCallback(async () => {
     if (browserMode === "unavailable" || (!sessionId && !sessionCwd)) return;
