@@ -71,6 +71,7 @@ function fixture(): { root: string; facts: HostExecutionAuthorizationFacts } {
     id: "session-id",
     pi_session_file: null,
     title: "Synthetic",
+    title_source: "explicit",
     cwd,
     provider: "synthetic-provider",
     model: "synthetic-model",

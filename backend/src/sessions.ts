@@ -7,7 +7,7 @@ import { commitStoreMutation, getStore, flush, type SessionRow } from "./db.js";
 import { SessionCatalog, type CatalogScanCommit, type CatalogScanResult } from "./session-catalog.js";
 import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
 import { ensureProjectForCwd, ensureProjectForCwdDraft, resolveEffectiveSessionDefaults } from "./projects.js";
-import { WorkspaceStoreError, type PendingAgentSwitch } from "./workspace-types.js";
+import { WorkspaceStoreError, type PendingAgentSwitch, type SessionTitleSource } from "./workspace-types.js";
 import { isProjectableOpenInterview } from "./interview-attention-policy.js";
 
 export type { SessionRow };
@@ -83,7 +83,8 @@ export function createSession(
     const created: SessionRow = {
       id: deterministicId ?? randomUUID(),
       pi_session_file: null,
-      title: options.title || "",
+      title: options.title?.trim() ? options.title : "",
+      title_source: options.title?.trim() ? "explicit" : "provisional",
       cwd: project.cwd,
       project_id: project.id,
       provider: effective.provider,
@@ -220,6 +221,41 @@ const missingSince = new Map<string, number>();
 let sessionCatalog: SessionCatalog | null = null;
 let legacyCatalogTimer: NodeJS.Timeout | null = null;
 
+export function normalizeProvisionalSessionTitle(content: string): string {
+  return Array.from(content.replace(/\s+/gu, " ").trim()).slice(0, 80).join("");
+}
+
+export interface CatalogSessionTitleProjection {
+  piName?: string;
+  firstMessage: string;
+}
+
+/** Mutate only the exact catalog-owned title transitions; callers own persistence. */
+export function reconcileSessionTitleFromCatalog(
+  row: Pick<SessionRow, "title" | "title_source">,
+  projection: CatalogSessionTitleProjection,
+): boolean {
+  const fallback = normalizeProvisionalSessionTitle(projection.firstMessage) || "(empty session)";
+  const canonicalPiTitle = projection.piName?.trim()
+    ? Array.from(projection.piName.trim()).slice(0, 120).join("")
+    : "";
+  if (canonicalPiTitle) {
+    const replaceable = row.title_source === "provisional"
+      || row.title_source === "pi"
+      || (row.title_source === "explicit" && row.title === canonicalPiTitle)
+      // Accepted narrow legacy ambiguity: pre-schema-5 human intent identical
+      // to the normalized fallback is unknowable and may be replaced once.
+      || (row.title_source === "legacy_unknown" && row.title === fallback);
+    if (!replaceable || (row.title === canonicalPiTitle && row.title_source === "pi")) return false;
+    row.title = canonicalPiTitle;
+    row.title_source = "pi";
+    return true;
+  }
+  if (row.title_source !== "provisional" || row.title.trim()) return false;
+  row.title = fallback;
+  return true;
+}
+
 function rowMutationVersion(row: SessionRow): number {
   return row.catalog_mutation_version ?? 0;
 }
@@ -233,7 +269,7 @@ function incrementDirectMutation(row: SessionRow): void {
  * row moves, preserve that fact only by making its historical Project binding
  * unresolved; never adopt the Project currently registered at the new cwd.
  */
-function updateTranscriptCwd(row: SessionRow, cwd: string): boolean {
+function updateTranscriptCwd(row: SessionRow, cwd: string, store = getStore()): boolean {
   if (row.cwd === cwd) return false;
   row.cwd = cwd;
   row.project_id = null;
@@ -241,7 +277,7 @@ function updateTranscriptCwd(row: SessionRow, cwd: string): boolean {
   // Keep the same durable write valid and denial-first if a catalog update
   // discovers the move while this session is selected by an endpoint.
   const now = Date.now();
-  for (const endpoint of getStore().messagingEndpoints) {
+  for (const endpoint of store.messagingEndpoints) {
     if (endpoint.active_session_id !== row.id) continue;
     endpoint.active_session_id = null;
     endpoint.revision++;
@@ -266,7 +302,7 @@ function markDirectMutation(row: SessionRow, triggerScan = false): void {
 }
 
 function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; updated: number; archivedLegacy: number; changed: boolean } {
-  const store = getStore();
+  return commitStoreMutation((store) => {
   const byPath = new Map<string, SessionRow>();
   const byId = new Map<string, SessionRow>();
   for (const row of store.sessions) {
@@ -318,15 +354,20 @@ function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; upda
     row ??= byId.get(info.id);
     if (matchedByPath && row && rowMutationVersion(row) !== parsed.expectedMutationVersion) continue;
 
-    const projectResult = ensureProjectForCwd(normalizeSessionCwd(info.cwd), false);
+    const projectResult = ensureProjectForCwdDraft(store, normalizeSessionCwd(info.cwd));
     if (projectResult.created) changed = true;
     const cwd = projectResult.project.cwd;
-    const derivedTitle = (info.name || info.firstMessage || "(empty session)").slice(0, 120);
+    const firstMessage = info.firstMessage || "(empty session)";
+    const canonicalName = info.name?.trim()
+      ? Array.from(info.name.trim()).slice(0, 120).join("")
+      : "";
+    const derivedTitle = canonicalName || normalizeProvisionalSessionTitle(firstMessage) || "(empty session)";
     if (!row) {
       row = {
         id: info.id,
         pi_session_file: info.path,
         title: derivedTitle,
+        title_source: canonicalName ? "pi" : "provisional",
         cwd,
         project_id: projectResult.project.id,
         provider: info.provider,
@@ -362,9 +403,8 @@ function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; upda
       byPath.set(info.path, row);
       rowChanged = true;
     }
-    if (updateTranscriptCwd(row, cwd)) rowChanged = true;
-    // Explicit, non-empty Wayang titles win over transcript-derived titles.
-    if (!row.title && row.title !== derivedTitle) { row.title = derivedTitle; rowChanged = true; }
+    if (updateTranscriptCwd(row, cwd, store)) rowChanged = true;
+    if (reconcileSessionTitleFromCatalog(row, { piName: info.name, firstMessage })) rowChanged = true;
     if (row.created_at !== info.createdAt) { row.created_at = info.createdAt; rowChanged = true; }
     if (row.last_active !== info.lastInteractionAt) { row.last_active = info.lastInteractionAt; rowChanged = true; }
     if ((info.lastInteractionAt > previousLastActive || !row.provider || !row.model)
@@ -394,8 +434,8 @@ function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; upda
     }
   }
 
-  if (changed) flush();
   return { imported, updated, archivedLegacy, changed };
+  });
 }
 
 function getSessionCatalog(): SessionCatalog {
@@ -509,7 +549,11 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
     const projectResult = ensureProjectForCwd(normalizeSessionCwd(info.cwd), false);
     if (projectResult.created) projectsCreated = true;
     const cwd = projectResult.project.cwd;
-    const title = (info.name || info.firstMessage || "(empty session)").slice(0, 120);
+    const firstMessage = info.firstMessage || "(empty session)";
+    const canonicalName = info.name?.trim()
+      ? Array.from(info.name.trim()).slice(0, 120).join("")
+      : "";
+    const title = canonicalName || normalizeProvisionalSessionTitle(firstMessage) || "(empty session)";
     const rawCreated = info.created instanceof Date ? info.created.getTime() : Date.now();
     const createdAt = Number.isFinite(rawCreated) ? rawCreated : Date.now();
     const rawModified = info.modified instanceof Date ? info.modified.getTime() : createdAt;
@@ -525,7 +569,6 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
 
     let row = store.sessions.find((candidate) => candidate.pi_session_file === sessionFile);
     if (row) {
-      const nextTitle = row.title || title;
       const previousLastActive = row.last_active || 0;
       const hasNewFileActivity = lastInteractionAt > previousLastActive;
       let changed = updateTranscriptCwd(row, cwd);
@@ -543,11 +586,10 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
       }
 
       if (
-        row.title !== nextTitle ||
+        reconcileSessionTitleFromCatalog(row, { piName: info.name, firstMessage }) ||
         row.last_active !== lastInteractionAt ||
         row.created_at !== createdAt
       ) {
-        row.title = nextTitle;
         row.created_at = createdAt;
         row.last_active = lastInteractionAt;
         changed = true;
@@ -570,7 +612,7 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
       const hasNewFileActivity = lastInteractionAt > previousLastActive;
       row.pi_session_file = sessionFile;
       updateTranscriptCwd(row, cwd);
-      if (!row.title) row.title = title;
+      reconcileSessionTitleFromCatalog(row, { piName: info.name, firstMessage });
       row.created_at = createdAt;
       row.last_active = lastInteractionAt;
       if (row.archived) {
@@ -601,6 +643,7 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
       id: info.id,
       pi_session_file: sessionFile,
       title,
+      title_source: canonicalName ? "pi" : "provisional",
       cwd,
       project_id: projectResult.project.id,
       provider: currentModel?.provider ?? null,
@@ -676,17 +719,86 @@ export function syncPiSessionFilesInBackground(force = false): Promise<SyncPiSes
   return syncInFlight;
 }
 
-export function updateSessionTitle(id: string, title: string): void {
-  const store = getStore();
-  for (const row of store.sessions) {
-    if (row.id === id) {
-      if (row.title === title) return;
-      row.title = title;
-      markDirectMutation(row);
-      flush();
-      return;
-    }
+function transitionSessionTitle(id: string, title: string, source: SessionTitleSource): SessionRow | undefined {
+  if (typeof title !== "string") throw new WorkspaceStoreError("Session title must be a string");
+  const current = getStore().sessions.find((row) => row.id === id);
+  if (!current || (current.title === title && current.title_source === source)) return current ? cloneSession(current) : undefined;
+  const committed = commitStoreMutation((draft) => {
+    const row = draft.sessions.find((candidate) => candidate.id === id);
+    if (!row) return undefined;
+    row.title = title;
+    row.title_source = source;
+    incrementDirectMutation(row);
+    return cloneSession(row);
+  });
+  if (committed) publishDirectMutation(false);
+  return committed;
+}
+
+/** Set the first-message fallback only while the durable row remains provisional and empty. */
+export function setProvisionalSessionTitle(id: string, content: string): SessionRow | undefined {
+  const title = normalizeProvisionalSessionTitle(content);
+  const current = getStore().sessions.find((row) => row.id === id);
+  if (!current || current.title_source !== "provisional" || current.title.trim() || !title) {
+    return current ? cloneSession(current) : undefined;
   }
+  return transitionSessionTitle(id, title, "provisional");
+}
+
+export function validateManualSessionTitle(title: unknown): string {
+  if (typeof title !== "string") throw new WorkspaceStoreError("Session title must be a string");
+  const normalized = title.trim();
+  if (!normalized) throw new WorkspaceStoreError("Session title must not be blank");
+  if (Array.from(normalized).length > 120 || /[\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/u.test(normalized)) {
+    throw new WorkspaceStoreError("Session title is invalid");
+  }
+  return normalized;
+}
+
+/** Human-authored Wayang title. Seeding it into Pi is a separate caller-owned operation. */
+export function setExplicitSessionTitle(id: string, title: string): SessionRow | undefined {
+  return transitionSessionTitle(id, validateManualSessionTitle(title), "explicit");
+}
+
+/** Mirror a canonical Pi session_info name, whether human or automatic. */
+export function setPiSessionTitle(id: string, title: string): SessionRow | undefined {
+  return transitionSessionTitle(id, title, "pi");
+}
+
+/**
+ * Mirror an automatic Pi CAS only while Wayang still considers the title
+ * replaceable. A concurrent manual rename persists `explicit` before writing
+ * Pi; this synchronous guard therefore prevents a later automatic mirror from
+ * overwriting that human intent even when the automatic Pi append won first.
+ */
+export function setAutomaticPiSessionTitle(id: string, title: string): SessionRow | undefined {
+  const current = getStore().sessions.find((row) => row.id === id);
+  if (!current) return undefined;
+  if (current.title_source === "pi" && current.title === title) return cloneSession(current);
+  if (current.title_source !== "provisional" && current.title_source !== "legacy_unknown") {
+    return cloneSession(current);
+  }
+  return transitionSessionTitle(id, title, "pi");
+}
+
+export type CanonicalPiNameWriter = (title: string) => void;
+
+/**
+ * Persist human intent before touching Pi. The two stores are deliberately not
+ * presented as atomic: Pi failure leaves exact explicit intent for later seed;
+ * Wayang failure prevents the Pi write entirely.
+ */
+export function persistManualSessionTitle(
+  id: string,
+  title: string,
+  writeCanonicalPiName?: CanonicalPiNameWriter,
+): SessionRow {
+  const normalized = validateManualSessionTitle(title);
+  const explicit = setExplicitSessionTitle(id, normalized);
+  if (!explicit) throw new WorkspaceStoreError("Session not found", 404);
+  if (!writeCanonicalPiName) return explicit;
+  writeCanonicalPiName(normalized);
+  return setPiSessionTitle(id, normalized) ?? explicit;
 }
 
 function cloneSession(row: SessionRow): SessionRow {

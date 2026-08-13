@@ -47,6 +47,7 @@ test("legacy Wren flag, UUID, name, and kind grant no host authority", () => {
     id: "legacy-session",
     pi_session_file: null,
     title: "Synthetic",
+    title_source: "explicit",
     cwd,
     provider: "synthetic-provider",
     model: "synthetic-model",

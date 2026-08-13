@@ -41,7 +41,7 @@ test("schema 2 migrates explicitly to current schema with empty inert authority 
   init();
   const store = getStore();
   assert.equal(store.schema_version, STORE_SCHEMA_VERSION);
-  assert.equal(STORE_SCHEMA_VERSION, 4);
+  assert.equal(STORE_SCHEMA_VERSION, 5);
   assert.deepEqual(store.protectedAutomationJobs, []);
   assert.deepEqual(store.protectedAutomationRuns, []);
   assert.deepEqual(store.workspaceCapabilityAssociations, []);
@@ -79,7 +79,7 @@ test("schema 2 cannot seed protected automation authority that did not exist in 
 test("fresh current-schema stores create no automation or messaging authority", () => {
   init();
   const store = getStore();
-  assert.equal(store.schema_version, 4);
+  assert.equal(store.schema_version, STORE_SCHEMA_VERSION);
   assert.deepEqual(store.protectedAutomationJobs, []);
   assert.deepEqual(store.protectedAutomationRuns, []);
   assert.equal(store.workspaceCapabilityAssociations.some((row) => row.capability_id === "wayang.protected-automation.v1"), false);
