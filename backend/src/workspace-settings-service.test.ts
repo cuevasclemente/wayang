@@ -656,6 +656,7 @@ test("project registration deletion checks every central reference class and nev
       protected_automation_jobs: [],
       protected_automation_runs: [],
       messaging_endpoints: [],
+      browser_defaults: [],
       apps: ["app-ref"],
       app_states: ["state-ref"],
       app_events: ["event-ref"],
@@ -665,6 +666,7 @@ test("project registration deletion checks every central reference class and nev
     assert.equal(fs.readFileSync(canary, "utf8"), "SYNTHETIC_KEEP\n");
 
     store.sessions = store.sessions.filter((row) => row.id !== "archived-ref") as typeof store.sessions;
+    store.sessionBrowserStates = store.sessionBrowserStates.filter((row) => row.session_id !== "archived-ref");
     store.scheduledJobs = store.scheduledJobs.filter((row) => row.id !== "job-ref");
     store.scheduledRuns = store.scheduledRuns.filter((row) => row.id !== "run-ref");
     store.apps = store.apps.filter((row) => row.id !== "app-ref");

@@ -346,6 +346,10 @@ test("schema-1 migration creates zero positive authority and removes subject aut
   delete initial.messagingEvents;
   delete initial.messagingTransactions;
   delete initial.messagingDeliveries;
+  delete initial.browserProfiles;
+  delete initial.projectBrowserDefaults;
+  delete initial.sessionBrowserStates;
+  delete initial.browserCleanups;
   initial.schema_version = 1;
   initial.agentProfiles = (initial.agentProfiles as Array<Record<string, unknown>>).map((profile) => ({
     ...profile, name: "Finance", capability_grants: [{ provider: "legacy", model: "legacy", active: true }], authorization_revision: 99,
@@ -370,7 +374,7 @@ test("schema-1 migration creates zero positive authority and removes subject aut
 
   init();
   const migrated = getStore();
-  assert.equal(migrated.schema_version, 5);
+  assert.equal(migrated.schema_version, 6);
   assert.deepEqual(migrated.workspaceCapabilityAssociations, []);
   assert.deepEqual(migrated.workspaceCapabilityApprovalEvents, []);
   assert.deepEqual(migrated.protectedAutomationJobs, []);
