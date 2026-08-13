@@ -51,6 +51,7 @@ function pendingHostFacts(): { root: string; facts: HostExecutionAuthorizationFa
     id: "synthetic-session",
     pi_session_file: null,
     title: "Synthetic",
+    title_source: "explicit",
     cwd,
     provider: "synthetic-provider",
     model: "synthetic-model",

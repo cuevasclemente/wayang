@@ -21,6 +21,7 @@ export type BashMode = "host" | "sandboxed" | "sandboxed-wren" | "unavailable";
 export type BrowserSurfaceMode = "standard" | "protected" | "unavailable";
 
 export type SessionRuntimeStatus = "active" | "starting" | "stopped";
+export type SessionTitleSource = "provisional" | "explicit" | "pi" | "legacy_unknown";
 
 // ---------------------------------------------------------------------------
 // Sessions
@@ -64,6 +65,7 @@ export interface Session {
   id: string;
   pi_session_file: string | null;
   title: string;
+  title_source: SessionTitleSource;
   cwd: string;
   provider: string | null;
   model: string | null;

@@ -49,7 +49,7 @@ test("Pi bridge authority-close seam closes the exact browser and automation run
     bashMode: "sandboxed",
     protectedBrowserRuntime: browserRuntime,
     protectedAutomationRuntime: automationRuntime,
-    activeInteractiveTurn: null,
+    interactiveTurns: new Map(),
   } as unknown as PiSessionHandle;
 
   await closePiSessionAuthorities(handle);

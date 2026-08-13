@@ -9,6 +9,7 @@ function stoppedSessionRow(id: string): SessionRow {
     id,
     pi_session_file: null,
     title: "Synthetic stopped Wren-shaped session",
+    title_source: "explicit",
     cwd: "/synthetic/standard-project",
     provider: null,
     model: null,

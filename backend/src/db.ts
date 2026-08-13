@@ -54,6 +54,7 @@ import {
   type AgentProfileRow,
   type PendingAgentSwitch,
   type ProjectRow,
+  type SessionTitleSource,
   type WorkspaceCapabilityApprovalEventRow,
   type WorkspaceCapabilityAssociationRow,
   type WorkspaceSettingsRow,
@@ -63,6 +64,7 @@ export interface SessionRow {
   id: string;
   pi_session_file: string | null;
   title: string;
+  title_source: SessionTitleSource;
   cwd: string;
   /** Immutable Project authority; null is reserved for unresolved legacy rows. */
   project_id?: string | null;
@@ -179,7 +181,7 @@ export type StoredScheduledJobRow = ScheduledJobRow & {
 
 // Transitional input compatibility for pre-schema synthetic callers that push
 // rows directly into getStore(). Persisted schema-1 rows are always SessionRow.
-type LegacySessionRowInput = Omit<SessionRow, "pending_agent_switch">;
+type LegacySessionRowInput = Omit<SessionRow, "pending_agent_switch" | "title_source">;
 type SessionRowCollection = Omit<SessionRow[], "push"> & {
   push(...items: Array<SessionRow | LegacySessionRowInput>): number;
 };
@@ -834,7 +836,10 @@ function validateCurrentStore(raw: Record<string, unknown>): StoreData {
   for (const [index, session] of (raw.sessions as unknown[]).entries()) {
     if (
       !session || typeof session !== "object" || typeof (session as SessionRow).id !== "string"
-      || typeof (session as SessionRow).cwd !== "string" || !("project_id" in session)
+      || typeof (session as SessionRow).title !== "string"
+      || typeof (session as SessionRow).cwd !== "string"
+      || !["provisional", "explicit", "pi", "legacy_unknown"].includes((session as SessionRow).title_source)
+      || !("project_id" in session)
       || !((session as SessionRow).project_id === null || validStableId((session as SessionRow).project_id))
       || !("agent_profile_id" in session) || !("pending_agent_switch" in session)
       || "finance_private_data_taint" in session
@@ -1012,6 +1017,10 @@ function validateCurrentStore(raw: Record<string, unknown>): StoreData {
   return raw as unknown as StoreData;
 }
 
+export function classifyMigratedSessionTitleSource(title: unknown): SessionTitleSource {
+  return typeof title === "string" && title.trim() ? "legacy_unknown" : "provisional";
+}
+
 function normalizeLegacyStore(raw: Record<string, unknown>): StoreData {
   const now = Date.now();
   const data = emptyStore(now);
@@ -1062,6 +1071,7 @@ function normalizeLegacyStore(raw: Record<string, unknown>): StoreData {
     }
     const privateQuarantine = session.finance_private_data_taint === true;
     delete session.finance_private_data_taint;
+    session.title_source = classifyMigratedSessionTitleSource(session.title);
     session.agent_profile_id = null;
     session.pending_agent_switch = null;
     session.legacy_private_session_quarantine = privateQuarantine;
@@ -1154,6 +1164,7 @@ function normalizeSchemaOneStore(raw: Record<string, unknown>): StoreData {
     const session = { ...(candidate as SessionRow) };
     const privateQuarantine = session.finance_private_data_taint === true;
     delete session.finance_private_data_taint;
+    session.title_source = classifyMigratedSessionTitleSource(session.title);
     session.legacy_private_session_quarantine = privateQuarantine;
     session.legacy_capability_ineligible = privateQuarantine
       || session.agent_profile_id === null || session.agent_profile_id === undefined;
@@ -1234,6 +1245,7 @@ function normalizeSchemaTwoStore(raw: Record<string, unknown>): StoreData {
     messagingTransactions: [],
     messagingDeliveries: [],
   } as unknown as StoreData;
+  for (const session of migrated.sessions) session.title_source = classifyMigratedSessionTitleSource(session.title);
   backfillLegacySessionProjectIds(migrated.sessions as SessionRow[], migrated.projects);
   return validateCurrentStore(migrated as unknown as Record<string, unknown>);
 }
@@ -1258,7 +1270,29 @@ function normalizeSchemaThreeStore(raw: Record<string, unknown>): StoreData {
     messagingTransactions: [],
     messagingDeliveries: [],
   } as unknown as StoreData;
+  for (const session of migrated.sessions) session.title_source = classifyMigratedSessionTitleSource(session.title);
   backfillLegacySessionProjectIds(migrated.sessions as SessionRow[], migrated.projects);
+  return validateCurrentStore(migrated as unknown as Record<string, unknown>);
+}
+
+function normalizeSchemaFourStore(raw: Record<string, unknown>): StoreData {
+  const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...ARRAY_KEYS]);
+  for (const key of Object.keys(raw)) {
+    if (!allowedKeys.has(key)) throw new Error(`Schema-4 Wayang store contains unsupported field ${key}`);
+  }
+  for (const key of ARRAY_KEYS) {
+    if (!Array.isArray(raw[key])) throw new Error(`Schema-4 Wayang store field ${key} must be an array`);
+  }
+  // Schema 4 already owns messaging, interview/human-attention, automation,
+  // and capability state. Add only title provenance; never inspect transcripts.
+  // Blank titles are provably still provisional; nonblank provenance is unknown.
+  const migrated = {
+    ...structuredClone(raw),
+    schema_version: STORE_SCHEMA_VERSION,
+  } as unknown as StoreData;
+  for (const session of migrated.sessions) {
+    session.title_source = classifyMigratedSessionTitleSource(session.title);
+  }
   return validateCurrentStore(migrated as unknown as Record<string, unknown>);
 }
 
@@ -1286,6 +1320,16 @@ function backupName(storePath: string, sourceVersion: number): string {
   return `${storePath}.backup-v${sourceVersion}-${stamp}`;
 }
 
+export type StoreMigrationPersistencePhase = "backup_durable" | "store_published";
+let storeMigrationPersistenceObserverForTests: ((phase: StoreMigrationPersistencePhase) => void) | null = null;
+
+/** One-migration synthetic ordering seam; never used for persistence decisions. */
+export function observeNextStoreMigrationPersistenceForTests(
+  observer: (phase: StoreMigrationPersistencePhase) => void,
+): void {
+  storeMigrationPersistenceObserverForTests = observer;
+}
+
 function createPrivateBackup(storePath: string, contents: Buffer, sourceVersion: number): string {
   const destination = backupName(storePath, sourceVersion);
   let fd: number | null = null;
@@ -1298,6 +1342,15 @@ function createPrivateBackup(storePath: string, contents: Buffer, sourceVersion:
     fs.fchmodSync(fd, 0o600);
     fs.closeSync(fd);
     fd = null;
+    // The backup inode is not durable until its directory entry is durable.
+    // Migration must establish this boundary before replacing the store.
+    const directoryFd = fs.openSync(path.dirname(destination), fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0));
+    try {
+      fs.fsyncSync(directoryFd);
+    } finally {
+      fs.closeSync(directoryFd);
+    }
+    storeMigrationPersistenceObserverForTests?.("backup_durable");
     return destination;
   } catch (error) {
     if (fd !== null) {
@@ -1451,6 +1504,11 @@ function saveStoreAtPath(data: StoreData, storePath: string): void {
     fs.closeSync(fd);
     fd = null;
     fs.renameSync(tempPath, storePath);
+    if (storeMigrationPersistenceObserverForTests) {
+      const observer = storeMigrationPersistenceObserverForTests;
+      storeMigrationPersistenceObserverForTests = null;
+      observer("store_published");
+    }
     // A scheduled occurrence claim and its cursor advance share this rename.
     // Persist the directory entry before reporting the transaction committed,
     // so a power loss cannot retain the old cursor after external effects.
@@ -1510,7 +1568,8 @@ function loadStore(storePath: string): StoreData {
   // durable private backup. Any backup error aborts startup.
   createPrivateBackup(storePath, contents, version);
   let migrated: StoreData;
-  if (version === 3) migrated = normalizeSchemaThreeStore(raw);
+  if (version === 4) migrated = normalizeSchemaFourStore(raw);
+  else if (version === 3) migrated = normalizeSchemaThreeStore(raw);
   else if (version === 2) migrated = normalizeSchemaTwoStore(raw);
   else if (version === 1) migrated = normalizeSchemaOneStore(raw);
   else if (version === 0) migrated = normalizeLegacyStore(raw);
@@ -1592,6 +1651,7 @@ export function init(): void {
     _storePath = storePath;
     console.log(`[db] Store initialized at ${storePath}`);
   } catch (error) {
+    storeMigrationPersistenceObserverForTests = null;
     if (acquiredHere) releaseStoreLock();
     throw error;
   }
@@ -1604,6 +1664,7 @@ export function close(): void {
     _store = null;
     _storePath = null;
     commitStoreMutationPersistenceFailureForTests = null;
+    storeMigrationPersistenceObserverForTests = null;
     releaseStoreLock();
   }
 }

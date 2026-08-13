@@ -25,6 +25,7 @@ import {
   latchPiSessionCapabilityDenial,
   interviewSubmissionContent,
   listModels,
+  markClaimedQueuedBrowserTurnsReady,
   onPiSessionRuntimeEvent,
   persistSettledSessionError,
   trackOverflowRecovery,
@@ -34,6 +35,7 @@ import {
   reconcilePendingAgentSwitch,
   resolveInteractiveTurn,
   sendBrowserMessageTurn,
+  settleInteractiveTurns,
   setSessionDefaultModel,
   setSessionModel,
   waitForScheduledPrompt,
@@ -42,7 +44,7 @@ import {
   type ScheduledPromptSession,
 } from "./pi-bridge.js";
 import { createAgentProfile } from "./agent-profiles.js";
-import { close, init } from "./db.js";
+import { close, getStore, init } from "./db.js";
 import { createProject } from "./projects.js";
 import { beginAgentSwitch, createSession, getSessionById, updatePiSessionFile } from "./sessions.js";
 import { browserTurnContentHash } from "./interactive-turn-provenance.js";
@@ -208,7 +210,7 @@ test("Pi bridge stopped projections never infer host authority from durable iden
 test("Pi bridge emits one authoritative unavailable event when generic authorities close", async () => {
   const events: PiSessionRuntimeEvent[] = [];
   const unsubscribe = onPiSessionRuntimeEvent((event) => events.push(event));
-  const handle = { id: "synthetic-runtime-event-session", bashMode: "sandboxed", activeInteractiveTurn: null } as unknown as PiSessionHandle;
+  const handle = { id: "synthetic-runtime-event-session", bashMode: "sandboxed", interactiveTurns: new Map() } as unknown as PiSessionHandle;
   try {
     await closePiSessionAuthorities(handle);
     await closePiSessionAuthorities(handle);
@@ -252,7 +254,7 @@ test("Pi bridge capability denial latches tools and aborts active runtime author
     fileAudioExperimentRuntime: {
       close() { order.push("audio-latched"); return cleanupRelease.promise; },
     },
-    activeInteractiveTurn: { token: "stale" },
+    interactiveTurns: new Map([["stale", { token: "stale" }]]),
   } as unknown as PiSessionHandle;
   const actionBridge = getActionApprovalBridge();
   const detachApprovalClient = actionBridge.attachClient(handle.id, "synthetic-denial-client");
@@ -274,7 +276,7 @@ test("Pi bridge capability denial latches tools and aborts active runtime author
   assert.equal(handle.trustedHostBashTool, undefined);
   assert.equal(handle.protectedBrowserRuntime, undefined);
   assert.equal(handle.fileAudioExperimentRuntime, undefined);
-  assert.equal(handle.activeInteractiveTurn, null);
+  assert.equal(handle.interactiveTurns.size, 0);
   assert.equal(queueClears, 1);
   assert.equal(agentAborts, 1, "Pi abort starts synchronously after authority denial");
   assert.deepEqual(fakeSession.agent.state.tools, []);
@@ -336,7 +338,7 @@ test("capability invalidation TERM/KILLs an active host process group before del
     id: "synthetic-active-host-revocation",
     runtimeGeneration: "active-generation",
     bashMode: "host",
-    activeInteractiveTurn: null,
+    interactiveTurns: new Map(),
     trustedHostBashTool: {
       revoked: false,
       revokeActiveExecutions: () => operations.revoke(),
@@ -667,6 +669,7 @@ test("Pi bridge raw-sudo guard blocks its promised direct lexical matrix without
 
 test("Pi bridge browser turns mint the exact persisted current-branch boundary and clear on completion or abort", async () => {
   const f = currentTurnFixture("wayang-pi-bridge-current-turn-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
   const manager = SessionManager.create(f.cwd, f.sessionDir);
   const content = "submit this bounded synthetic proposal";
   manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
@@ -697,7 +700,7 @@ test("Pi bridge browser turns mint the exact persisted current-branch boundary a
     },
   };
   const handle = {
-    id: "protected-session",
+    id: durableRow.id,
     session: fakeSession,
     cwd: f.cwd,
     model: fakeSession.model.id,
@@ -707,26 +710,27 @@ test("Pi bridge browser turns mint the exact persisted current-branch boundary a
     lastActivityAt: Date.now(),
     agentProfileId: f.profile.id,
     runtimeGeneration: "runtime-generation",
-    activeInteractiveTurn: null,
+    interactiveTurns: new Map(),
   } as unknown as PiSessionHandle;
 
   try {
     const firstSend = sendBrowserMessageTurn(handle, content);
     await starts[0].promise;
-    assert.equal(handle.activeInteractiveTurn?.acceptedEntryCount, acceptedEntryCount, "the boundary is captured before Pi persists the browser message");
-    assert.equal(handle.activeInteractiveTurn?.sourceKind, "browser_send_message");
-    assert.equal(handle.activeInteractiveTurn?.contentSha256, browserTurnContentHash(content));
-    assert.match(handle.activeInteractiveTurn?.token ?? "", /^[0-9a-f-]{36}$/);
-    assert.equal(handle.activeInteractiveTurn?.piUserEntryId, null);
+    const activeTurn = [...handle.interactiveTurns.values()][0];
+    assert.equal(activeTurn?.acceptedEntryCount, acceptedEntryCount, "the boundary is captured before Pi persists the browser message");
+    assert.equal(activeTurn?.sourceKind, "browser_send_message");
+    assert.equal(activeTurn?.contentSha256, browserTurnContentHash(content));
+    assert.match(activeTurn?.token ?? "", /^[0-9a-f-]{36}$/);
+    assert.equal(activeTurn?.piUserEntryId, null);
     assert.deepEqual(
       {
-        session: handle.activeInteractiveTurn?.sourceSessionId,
-        generation: handle.activeInteractiveTurn?.runtimeGeneration,
-        profile: handle.activeInteractiveTurn?.agentProfileId,
-        project: handle.activeInteractiveTurn?.projectId,
-        cwd: handle.activeInteractiveTurn?.projectCwd,
-        provider: handle.activeInteractiveTurn?.provider,
-        model: handle.activeInteractiveTurn?.model,
+        session: activeTurn?.sourceSessionId,
+        generation: activeTurn?.runtimeGeneration,
+        profile: activeTurn?.agentProfileId,
+        project: activeTurn?.projectId,
+        cwd: activeTurn?.projectCwd,
+        provider: activeTurn?.provider,
+        model: activeTurn?.model,
       },
       {
         session: handle.id,
@@ -744,7 +748,16 @@ test("Pi bridge browser turns mint the exact persisted current-branch boundary a
 
     finishes[0].resolve();
     await firstSend;
-    assert.equal(handle.activeInteractiveTurn, null, "normal prompt completion clears mutation authority");
+    assert.equal(handle.interactiveTurns.size, 0, "normal prompt settlement retires persisted source evidence");
+    assert.equal(handle.interactiveMutationTurnToken, undefined, "normal prompt settlement clears mutation authority");
+    const marker = manager.getEntries().find((entry: any) => entry.customType === "wayang-interactive-turn-source.v1") as any;
+    assert.equal(marker?.data.user_entry_id, resolved.piUserEntryId);
+    assert.equal(marker?.data.raw_user_text, content);
+    assert.deepEqual(
+      [getSessionById(durableRow.id)?.title, getSessionById(durableRow.id)?.title_source],
+      [content, "provisional"],
+      "fallback is populated only after exact durable user-entry settlement",
+    );
 
     const secondSend = sendBrowserMessageTurn(handle, "abort this synthetic turn");
     await starts[1].promise;
@@ -752,15 +765,347 @@ test("Pi bridge browser turns mint the exact persisted current-branch boundary a
     await abortInteractiveTurn(handle);
     await secondSend;
     assert.equal(abortCalls, 1);
-    assert.equal(handle.activeInteractiveTurn, null, "abort clears mutation authority before interrupting Pi");
+    assert.equal(handle.interactiveTurns.size, 0, "abort clears mutation authority before interrupting Pi");
 
-    for (const source of ["resend", "interview_submission"] as const) {
-      const staleTurn = beginInteractiveTurn(handle, `stale authority before ${source}`);
-      const staleToken = staleTurn.token;
+    for (const source of ["resend", "interview_submission", "scheduled_prompt", "messaging_prompt"] as const) {
+      const acceptedTurn = beginInteractiveTurn(handle, `accepted source before ${source}`);
       beginNonBrowserTurn(handle, source);
-      assert.equal(handle.activeInteractiveTurn, null, `${source} revokes stale authority without minting a replacement`);
-      assert.ok(staleToken);
+      assert.equal(resolveInteractiveTurn(handle), null, `${source} revokes current-turn mutation authority`);
+      assert.equal(handle.interactiveTurns.has(acceptedTurn.token), true, `${source} preserves accepted browser-source evidence`);
+      handle.interactiveTurns.delete(acceptedTurn.token);
     }
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("non-browser interview steering preserves an accepted queued browser source until its own settlement", () => {
+  const f = currentTurnFixture("wayang-pi-bridge-interview-queued-source-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const queuedMessage = { role: "user", content: "queued browser after interview" };
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    _steeringMessages: ["queued browser after interview"],
+    _emitQueueUpdate() {},
+    agent: { steeringQueue: { messages: [queuedMessage] } },
+  };
+  const capture = { session: fakeSession, text: "queued browser after interview", message: queuedMessage };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "interview-queued-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    const turn = beginInteractiveTurn(handle, "queued browser after interview", {
+      rawUserText: "queued browser after interview",
+      clientMessageId: "queued-after-interview",
+    });
+    handle.queuedBrowserMessages.set("queued-after-interview", {
+      capture,
+      content: "queued browser after interview",
+      attachmentNames: [],
+      turnToken: turn.token,
+      clientVisible: true,
+    } as any);
+    beginNonBrowserTurn(handle, "interview_submission");
+    assert.equal(handle.interactiveTurns.has(turn.token), true);
+    assert.equal(resolveInteractiveTurn(handle), null, "interview continuation has no browser mutation authority");
+    assert.equal(settleInteractiveTurns(handle).length, 0, "unclaimed queued browser turn is not this interview settlement");
+    assert.equal(handle.interactiveTurns.has(turn.token), true);
+
+    manager.appendMessage({ role: "user", content: "queued browser after interview", timestamp: Date.now() } as any);
+    fakeSession._steeringMessages = [];
+    fakeSession.agent.steeringQueue.messages = [];
+    markClaimedQueuedBrowserTurnsReady(handle);
+    assert.equal(settleInteractiveTurns(handle).length, 1);
+    assert.equal(handle.interactiveTurns.size, 0);
+    assert.equal(manager.getEntries().some((entry: any) => entry.customType === "wayang-interactive-turn-source.v1"), true);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("queued browser provenance remains durable when a legacy client omits its message ID", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-legacy-queued-source-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const queuedMessage = { role: "user", content: "legacy queued browser turn" };
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: true,
+    _steeringMessages: [],
+    _emitQueueUpdate() {},
+    agent: { steeringQueue: { messages: [] as any[] } },
+    steer(content: string) {
+      this._steeringMessages.push(content);
+      this.agent.steeringQueue.messages.push(queuedMessage);
+      return Promise.resolve();
+    },
+    getSteeringMessages() { return [...this._steeringMessages]; },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "legacy-queued-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    const result = await sendBrowserMessageTurn(handle, "legacy queued browser turn");
+    assert.deepEqual(result, { queued: true, cancellable: false });
+    assert.equal(handle.queuedBrowserMessages.size, 1, "an internal capture is retained without exposing a cancellable client ID");
+    assert.equal([...handle.queuedBrowserMessages.values()][0]?.clientVisible, false, "the internal record is not browser-visible");
+
+    manager.appendMessage({ role: "user", content: "legacy queued browser turn", timestamp: Date.now() } as any);
+    fakeSession._steeringMessages = [];
+    fakeSession.agent.steeringQueue.messages = [];
+    markClaimedQueuedBrowserTurnsReady(handle);
+    assert.equal(settleInteractiveTurns(handle).length, 1);
+    assert.equal(handle.interactiveTurns.size, 0);
+    const marker = manager.getEntries().find((entry: any) => entry.customType === "wayang-interactive-turn-source.v1") as any;
+    assert.equal(marker?.data.raw_user_text, "legacy queued browser turn");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("queued browser ledger persists distinct source markers exactly once and excludes blank raw text", () => {
+  const f = currentTurnFixture("wayang-pi-bridge-source-ledger-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const handle = {
+    id: durableRow.id,
+    session: {
+      model: { provider: "synthetic-provider", id: "synthetic-model" },
+      sessionManager: manager,
+    },
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "ledger-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+  } as unknown as PiSessionHandle;
+  try {
+    const firstPending = beginInteractiveTurn(handle, "repeated decorated content", { rawUserText: "raw first", clientMessageId: "queued-first" });
+    const secondPending = beginInteractiveTurn(handle, "repeated decorated content", { rawUserText: "raw second", clientMessageId: "queued-second" });
+    const attachmentPending = beginInteractiveTurn(handle, "<file synthetic attachment instruction>", { rawUserText: "", clientMessageId: "queued-attachment" });
+    const first = Object.freeze({ ...firstPending, settlementReady: true });
+    const second = Object.freeze({ ...secondPending, settlementReady: true });
+    const attachmentOnly = Object.freeze({ ...attachmentPending, settlementReady: true });
+    handle.interactiveTurns.set(first.token, first);
+    handle.interactiveTurns.set(second.token, second);
+    handle.interactiveTurns.set(attachmentOnly.token, attachmentOnly);
+    manager.appendMessage({ role: "user", content: "repeated decorated content", timestamp: Date.now() } as any);
+    manager.appendMessage({ role: "assistant", content: "first response", provider: "offline", model: "fixture", stopReason: "stop", timestamp: Date.now() } as any);
+    manager.appendMessage({ role: "user", content: "repeated decorated content", timestamp: Date.now() } as any);
+    manager.appendMessage({ role: "assistant", content: "second response", provider: "offline", model: "fixture", stopReason: "stop", timestamp: Date.now() } as any);
+    manager.appendMessage({ role: "user", content: "<file synthetic attachment instruction>", timestamp: Date.now() } as any);
+    manager.appendMessage({ role: "assistant", content: "attachment response", provider: "offline", model: "fixture", stopReason: "stop", timestamp: Date.now() } as any);
+
+    const settled = settleInteractiveTurns(handle);
+    assert.deepEqual(settled.map((turn) => turn.token), [first.token, second.token, attachmentOnly.token]);
+    assert.equal(settleInteractiveTurns(handle).length, 0, "settled ledger entries cannot append twice");
+    let markers = manager.getEntries().filter((entry: any) => entry.customType === "wayang-interactive-turn-source.v1") as any[];
+    assert.equal(markers.length, 2, "blank attachment-only raw text has no eligible marker");
+    assert.deepEqual(markers.map((entry) => entry.data.raw_user_text), ["raw first", "raw second"]);
+    assert.deepEqual(markers.map((entry) => entry.data.client_message_id), ["queued-first", "queued-second"]);
+    assert.notEqual(markers[0]?.data.user_entry_id, markers[1]?.data.user_entry_id);
+
+    handle.interactiveTurns.set(settled[0]!.token, settled[0]!);
+    assert.equal(settleInteractiveTurns(handle).length, 1, "a process retry may rediscover the exact resolved turn");
+    markers = manager.getEntries().filter((entry: any) => entry.customType === "wayang-interactive-turn-source.v1") as any[];
+    assert.equal(markers.length, 2, "persisted user_entry_id identity prevents duplicate markers across retries");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("marker append failure retains the exact resolved ledger item for retry", () => {
+  const f = currentTurnFixture("wayang-pi-bridge-source-append-retry-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const handle = {
+    id: durableRow.id,
+    session: { model: { provider: "synthetic-provider", id: "synthetic-model" }, sessionManager: manager },
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "append-retry-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+  } as unknown as PiSessionHandle;
+  const originalAppend = manager.appendCustomEntry.bind(manager);
+  try {
+    const pendingTurn = beginInteractiveTurn(handle, "retryable exact content", {
+      rawUserText: "retryable raw content",
+      clientMessageId: "append-retry",
+    });
+    const turn = Object.freeze({ ...pendingTurn, settlementReady: true });
+    handle.interactiveTurns.set(turn.token, turn);
+    manager.appendMessage({ role: "user", content: "retryable exact content", timestamp: Date.now() } as any);
+    const exactUserId = manager.getLeafId();
+    let fail = true;
+    manager.appendCustomEntry = ((...args: Parameters<typeof manager.appendCustomEntry>) => {
+      if (fail) {
+        fail = false;
+        throw new Error("synthetic append failure");
+      }
+      return originalAppend(...args);
+    }) as typeof manager.appendCustomEntry;
+
+    assert.throws(() => settleInteractiveTurns(handle), /synthetic append failure/);
+    assert.equal(handle.interactiveTurns.has(turn.token), true, "resolvable failed marker remains retryable");
+    assert.equal(handle.interactiveTurns.get(turn.token)?.piUserEntryId, exactUserId);
+    assert.equal(settleInteractiveTurns(handle).length, 1);
+    assert.equal(handle.interactiveTurns.size, 0);
+    const markers = manager.getEntries().filter((entry: any) => entry.customType === "wayang-interactive-turn-source.v1") as any[];
+    assert.equal(markers.length, 1);
+    assert.equal(markers[0]?.data.raw_user_text, "retryable raw content");
+  } finally {
+    manager.appendCustomEntry = originalAppend as typeof manager.appendCustomEntry;
+    f.cleanup();
+  }
+});
+
+test("settlement retires unresolved hash mismatches before later matching text appears", () => {
+  const f = currentTurnFixture("wayang-pi-bridge-source-mismatch-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const handle = {
+    id: durableRow.id,
+    session: { model: { provider: "synthetic-provider", id: "synthetic-model" }, sessionManager: manager },
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "mismatch-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+  } as unknown as PiSessionHandle;
+  try {
+    const pendingMismatch = beginInteractiveTurn(handle, "/template original", { rawUserText: "/template original", clientMessageId: "template-mismatch" });
+    handle.interactiveTurns.set(pendingMismatch.token, Object.freeze({ ...pendingMismatch, settlementReady: true }));
+    manager.appendMessage({ role: "user", content: "expanded template content", timestamp: Date.now() } as any);
+    assert.deepEqual(settleInteractiveTurns(handle), []);
+    assert.equal(handle.interactiveTurns.size, 0, "unresolved accepted turns retire at authoritative settlement");
+
+    manager.appendMessage({ role: "user", content: "/template original", timestamp: Date.now() } as any);
+    assert.deepEqual(settleInteractiveTurns(handle), []);
+    assert.equal(manager.getEntries().some((entry: any) => entry.customType === "wayang-interactive-turn-source.v1"), false);
+    assert.equal(getSessionById(durableRow.id)?.title, "", "an unresolved command does not consume provisional fallback");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("rejected browser prompts do not consume provisional title fallback", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-rejected-title-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const handle = {
+    id: durableRow.id,
+    session: {
+      model: { provider: "synthetic-provider", id: "synthetic-model" },
+      sessionManager: manager,
+      isStreaming: false,
+      async prompt(content: string) {
+        manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+        throw new Error("synthetic prompt rejection");
+      },
+    },
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "rejected-generation",
+    interactiveTurns: new Map(),
+  } as unknown as PiSessionHandle;
+  try {
+    await assert.rejects(
+      sendBrowserMessageTurn(handle, "Rejected first message", undefined, "rejected-first", {
+        content: "Rejected first message",
+        rawUserText: "Rejected first message",
+        provisionalTitleText: "Rejected first message",
+      }),
+      /synthetic prompt rejection/,
+    );
+    assert.equal(handle.interactiveTurns.size, 0);
+    assert.deepEqual(
+      [getSessionById(durableRow.id)?.title, getSessionById(durableRow.id)?.title_source],
+      ["", "provisional"],
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("browser source eligibility requires exact durable Project identity and capability eligibility", () => {
+  const f = currentTurnFixture("wayang-pi-bridge-source-eligibility-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const handle = {
+    id: durableRow.id,
+    session: { model: { provider: "synthetic-provider", id: "synthetic-model" }, sessionManager: manager },
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "eligibility-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+  } as unknown as PiSessionHandle;
+  try {
+    const stored = getStore().sessions.find((row) => row.id === durableRow.id)!;
+    const correctProjectId = stored.project_id;
+    for (const [label, mutate] of [
+      ["project mismatch", () => { stored.project_id = "different-project"; stored.legacy_capability_ineligible = false; }],
+      ["capability ineligible", () => { stored.project_id = correctProjectId; stored.legacy_capability_ineligible = true; }],
+    ] as const) {
+      mutate();
+      const content = `synthetic ${label}`;
+      const pending = beginInteractiveTurn(handle, content, { clientMessageId: label.replace(/ /g, "-") });
+      assert.equal(pending.sourceMarkerEligible, false, `${label} must fail source-marker eligibility`);
+      handle.interactiveTurns.set(pending.token, Object.freeze({ ...pending, settlementReady: true }));
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      assert.equal(settleInteractiveTurns(handle).length, 1);
+    }
+    stored.project_id = correctProjectId;
+    stored.legacy_capability_ineligible = false;
+    assert.equal(manager.getEntries().some((entry: any) => entry.customType === "wayang-interactive-turn-source.v1"), false);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("scheduled rows never persist browser interactive-source markers", () => {
+  const f = currentTurnFixture("wayang-pi-bridge-scheduled-source-");
+  const durableRow = createSession(f.cwd, {
+    agentProfileId: f.profile.id,
+    scheduledJobId: "synthetic-job",
+    scheduledRunId: "synthetic-run",
+  });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const handle = {
+    id: durableRow.id,
+    session: { model: { provider: "synthetic-provider", id: "synthetic-model" }, sessionManager: manager },
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "scheduled-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+  } as unknown as PiSessionHandle;
+  try {
+    const pending = beginInteractiveTurn(handle, "synthetic scheduled browser text", { clientMessageId: "scheduled-browser" });
+    handle.interactiveTurns.set(pending.token, Object.freeze({ ...pending, settlementReady: true }));
+    manager.appendMessage({ role: "user", content: "synthetic scheduled browser text", timestamp: Date.now() } as any);
+    assert.equal(settleInteractiveTurns(handle).length, 1);
+    assert.equal(manager.getEntries().some((entry: any) => entry.customType === "wayang-interactive-turn-source.v1"), false);
   } finally {
     f.cleanup();
   }

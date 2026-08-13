@@ -290,14 +290,14 @@ test("pair runtime query resolves cwd from immutable Project ID", () => {
   const input = pair();
   const store = getStore();
   store.sessions.push({
-    id: "matching", pi_session_file: null, title: "Matching", cwd: projectRoot, project_id: input.project_id, provider: "p", model: "m",
+    id: "matching", pi_session_file: null, title: "Matching", title_source: "explicit", cwd: projectRoot, project_id: input.project_id, provider: "p", model: "m",
     agent_profile_id: input.agent_profile_id, pending_agent_switch: null,
     legacy_private_session_quarantine: false, legacy_capability_ineligible: false,
     created_at: 1, last_active: 1, archived: 0, archived_at: null, goal: null, goal_status: null,
     scheduled_job_id: null, scheduled_run_id: null, error: null,
   });
   store.sessions.push({
-    id: "wrong-profile", pi_session_file: null, title: "Wrong", cwd: projectRoot, project_id: input.project_id, provider: "p", model: "m",
+    id: "wrong-profile", pi_session_file: null, title: "Wrong", title_source: "explicit", cwd: projectRoot, project_id: input.project_id, provider: "p", model: "m",
     agent_profile_id: getStore().workspaceSettings.default_agent_profile_id, pending_agent_switch: null,
     legacy_private_session_quarantine: false, legacy_capability_ineligible: false,
     created_at: 1, last_active: 1, archived: 0, archived_at: null, goal: null, goal_status: null,
@@ -321,7 +321,7 @@ test("pair projection contains association revision and no tuple evidence", () =
 
 test("missing legacy eligibility state and quarantine fail closed", () => {
   const base = {
-    id: "legacy", pi_session_file: null, title: "Legacy", cwd: projectRoot, provider: "p", model: "m",
+    id: "legacy", pi_session_file: null, title: "Legacy", title_source: "legacy_unknown", cwd: projectRoot, provider: "p", model: "m",
     agent_profile_id: "profile", pending_agent_switch: null,
     created_at: 1, last_active: 1, archived: 0, archived_at: null, goal: null, goal_status: null,
     scheduled_job_id: null, scheduled_run_id: null, error: null,
@@ -359,12 +359,18 @@ test("schema-1 migration creates zero positive authority and removes subject aut
     pending_agent_switch: null, finance_private_data_taint: true, created_at: 1, last_active: 1,
     archived: 0, archived_at: null, goal: null, goal_status: null, scheduled_job_id: null,
     scheduled_run_id: null, error: null,
+  }, {
+    id: "blank-legacy", pi_session_file: null, title: " \n\t ", cwd: projectRoot,
+    provider: null, model: null, agent_profile_id: defaultProfileId,
+    pending_agent_switch: null, finance_private_data_taint: false, created_at: 1, last_active: 1,
+    archived: 0, archived_at: null, goal: null, goal_status: null, scheduled_job_id: null,
+    scheduled_run_id: null, error: null,
   }];
   fs.writeFileSync(path.join(dataDir, "store.json"), JSON.stringify(initial), { mode: 0o600 });
 
   init();
   const migrated = getStore();
-  assert.equal(migrated.schema_version, 4);
+  assert.equal(migrated.schema_version, 5);
   assert.deepEqual(migrated.workspaceCapabilityAssociations, []);
   assert.deepEqual(migrated.workspaceCapabilityApprovalEvents, []);
   assert.deepEqual(migrated.protectedAutomationJobs, []);
@@ -373,6 +379,8 @@ test("schema-1 migration creates zero positive authority and removes subject aut
   assert.deepEqual(migrated.messagingEvents, []);
   assert.ok(migrated.agentProfiles.every((profile) => !("capability_grants" in profile) && !("authorization_revision" in profile)));
   assert.ok(migrated.projects.every((project) => !("capability_grants" in project) && !("authorization_revision" in project)));
+  assert.equal(migrated.sessions[0]!.title_source, "legacy_unknown");
+  assert.equal(migrated.sessions[1]!.title_source, "provisional");
   assert.equal(migrated.sessions[0]!.legacy_private_session_quarantine, true);
   assert.equal(migrated.sessions[0]!.legacy_capability_ineligible, true);
   assert.equal("finance_private_data_taint" in migrated.sessions[0]!, false);

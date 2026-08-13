@@ -33,6 +33,7 @@ import {
   completeAgentSwitch,
   getSessionById,
   rollbackAgentSwitch,
+  setProvisionalSessionTitle,
   updatePiSessionFile,
   updateSessionAgentProfile,
   updateSessionError,
@@ -96,8 +97,11 @@ import {
   type RestrictedMcpRuntime,
 } from "./restricted-mcp/index.js";
 import {
+  interactiveTurnSourceDetails,
   issueBrowserTurnProvenance,
-  resolveBrowserTurnPiUserEntry,
+  resolveBrowserTurnLedger,
+  wayangInteractiveTurnSourceFromEntry,
+  WAYANG_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE,
   type BrowserTurnProvenance,
 } from "./interactive-turn-provenance.js";
 import { getActionApprovalBridge } from "./action-approval-bridge.js";
@@ -121,6 +125,14 @@ import { createFileAudioExperimentRuntime } from "./audio-experiment/tools.js";
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+interface QueuedBrowserMessageRecord {
+  capture: QueuedChatMessageCapture;
+  content: string;
+  attachmentNames: string[];
+  turnToken: string;
+  clientVisible: boolean;
+}
 
 export interface PiSessionHandle {
   id: string; // Same as our DB session ID
@@ -146,7 +158,10 @@ export interface PiSessionHandle {
   protectedAutomationFactory?: CreatePiSessionRuntimeOptions["protectedAutomationFactory"];
   fileAudioExperimentRuntime?: FileAudioExperimentRuntime;
   fileAudioExperimentFactory?: CreatePiSessionRuntimeOptions["fileAudioExperimentFactory"];
-  activeInteractiveTurn?: BrowserTurnProvenance | null;
+  /** Accepted browser turns retained independently until exact settlement. */
+  interactiveTurns: Map<string, BrowserTurnProvenance>;
+  /** Current-turn mutation authority; non-browser continuations revoke only this token. */
+  interactiveMutationTurnToken?: string;
   /** Browser-local IDs bound to exact pending pi steering message objects. */
   queuedBrowserMessages: Map<string, QueuedBrowserMessageRecord>;
   /** Latest in-progress Pi message, retained across the pre-persistence message_end gap. */
@@ -620,10 +635,24 @@ function assertCapabilityAuthorityAvailable(handle: PiSessionHandle): void {
   }
 }
 
-export function beginInteractiveTurn(handle: PiSessionHandle, content: string): BrowserTurnProvenance {
+function interactiveTurnLedger(handle: PiSessionHandle): Map<string, BrowserTurnProvenance> {
+  return handle.interactiveTurns ??= new Map<string, BrowserTurnProvenance>();
+}
+
+export function beginInteractiveTurn(
+  handle: PiSessionHandle,
+  content: string,
+  options: {
+    rawUserText?: string;
+    provisionalTitleText?: string;
+    clientMessageId?: string;
+    acceptedAt?: number;
+  } = {},
+): BrowserTurnProvenance {
   assertCapabilityAuthorityAvailable(handle);
   const project = getProjectByCwd(handle.cwd);
   const model = handle.session.model;
+  const durable = getSessionById(handle.id);
   if (!project || !model) throw new WorkspaceStoreError("Interactive turn runtime binding is unavailable", 409);
   const turn = issueBrowserTurnProvenance({
     sourceSessionId: handle.id,
@@ -634,38 +663,143 @@ export function beginInteractiveTurn(handle: PiSessionHandle, content: string): 
     provider: String(model.provider),
     model: model.id,
     acceptedEntryCount: handle.session.sessionManager.getEntries().length,
-  }, content);
-  handle.activeInteractiveTurn = turn;
+  }, content, options.acceptedAt ?? Date.now(), {
+    rawUserText: options.rawUserText,
+    provisionalTitleText: options.provisionalTitleText,
+    clientMessageId: options.clientMessageId,
+    sourceMarkerEligible: Boolean(
+      durable
+      && durable.project_id === project.id
+      && durable.cwd === project.cwd
+      && durable.agent_profile_id === handle.agentProfileId
+      && durable.legacy_capability_ineligible === false
+      && durable.scheduled_job_id === null
+      && durable.scheduled_run_id === null
+      && durable.pending_agent_switch === null
+      && durable.legacy_private_session_quarantine === false
+    ),
+  });
+  interactiveTurnLedger(handle).set(turn.token, turn);
+  handle.interactiveMutationTurnToken = turn.token;
   return turn;
 }
 
-export function resolveInteractiveTurn(handle: PiSessionHandle): BrowserTurnProvenance | null {
-  const turn = handle.activeInteractiveTurn;
-  if (!turn) return null;
-  const branchIds = new Set(handle.session.sessionManager.getBranch().map((entry: any) => entry?.id).filter((id: unknown): id is string => typeof id === "string"));
-  const resolved = resolveBrowserTurnPiUserEntry(turn, handle.session.sessionManager.getEntries(), branchIds);
-  if (!resolved) return null;
-  handle.activeInteractiveTurn = resolved;
+function resolveInteractiveTurnLedger(handle: PiSessionHandle): Map<string, BrowserTurnProvenance> {
+  const manager = handle.session.sessionManager;
+  const branchIds = new Set(manager.getBranch().map((entry: any) => entry?.id).filter((id: unknown): id is string => typeof id === "string"));
+  const ledger = interactiveTurnLedger(handle);
+  const resolved = resolveBrowserTurnLedger(ledger, manager.getEntries(), branchIds);
+  for (const [token, turn] of resolved) ledger.set(token, turn);
   return resolved;
 }
 
-function clearInteractiveTurn(handle: PiSessionHandle, token: string): void {
-  if (handle.activeInteractiveTurn?.token === token) handle.activeInteractiveTurn = null;
+export function resolveInteractiveTurn(handle: PiSessionHandle): BrowserTurnProvenance | null {
+  const token = handle.interactiveMutationTurnToken;
+  if (!token) return null;
+  return resolveInteractiveTurnLedger(handle).get(token) ?? null;
 }
 
-function revokeInteractiveTurn(handle: PiSessionHandle): void {
-  handle.activeInteractiveTurn = null;
+function resolveTurnAgainstCurrentBranch(
+  handle: PiSessionHandle,
+  turn: BrowserTurnProvenance,
+): BrowserTurnProvenance | null {
+  const manager = handle.session.sessionManager;
+  const branchIds = new Set(manager.getBranch().map((entry: any) => entry?.id)
+    .filter((id: unknown): id is string => typeof id === "string"));
+  return resolveBrowserTurnLedger(new Map([[turn.token, turn]]), manager.getEntries(), branchIds).get(turn.token) ?? null;
+}
+
+function persistAcceptedProvisionalTitle(handle: PiSessionHandle, turn: BrowserTurnProvenance): void {
+  if (!turn.sourceMarkerEligible || !turn.provisionalTitleText.trim()) return;
+  if (!resolveTurnAgainstCurrentBranch(handle, turn)) return;
+  try { setProvisionalSessionTitle(handle.id, turn.provisionalTitleText); }
+  catch { /* title persistence never changes source-turn success */ }
+}
+
+/**
+ * Persist every exactly-bound source marker, then retire the complete accepted
+ * ledger for this top-level settlement. Unresolved template/command/hash turns
+ * can never survive and bind to later coincidentally matching text.
+ */
+export function settleInteractiveTurns(handle: PiSessionHandle): BrowserTurnProvenance[] {
+  const ledger = interactiveTurnLedger(handle);
+  const allResolved = resolveInteractiveTurnLedger(handle);
+  const readyTokens = new Set([...ledger]
+    .filter(([, turn]) => turn.settlementReady)
+    .map(([token]) => token));
+  const resolved = new Map([...allResolved].filter(([token]) => readyTokens.has(token)));
+  handle.interactiveMutationTurnToken = undefined;
+  // Only turns claimed by this top-level run have an authoritative mismatch.
+  // Accepted-but-unclaimed queued turns remain for their own later settlement.
+  for (const token of readyTokens) {
+    if (resolved.has(token)) continue;
+    ledger.delete(token);
+    for (const [clientMessageId, record] of handle.queuedBrowserMessages) {
+      if (record.turnToken === token) handle.queuedBrowserMessages.delete(clientMessageId);
+    }
+  }
+  const manager = handle.session.sessionManager;
+  const markedUserEntryIds = new Set(manager.getEntries()
+    .map((entry: unknown) => wayangInteractiveTurnSourceFromEntry(entry)?.user_entry_id)
+    .filter((id: string | undefined): id is string => typeof id === "string"));
+  const settled: BrowserTurnProvenance[] = [];
+  for (const [token, turn] of resolved) {
+    if (turn.provisionalTitleAccepted) persistAcceptedProvisionalTitle(handle, turn);
+    const details = interactiveTurnSourceDetails(turn);
+    if (!details || markedUserEntryIds.has(details.user_entry_id)) {
+      ledger.delete(token);
+      for (const [clientMessageId, record] of handle.queuedBrowserMessages) {
+        if (record.turnToken === token) handle.queuedBrowserMessages.delete(clientMessageId);
+      }
+      settled.push(turn);
+      continue;
+    }
+    // Delete only after Pi durably accepts the append. A throw leaves this
+    // exact resolved turn in the ledger for the next settlement retry.
+    manager.appendCustomEntry(WAYANG_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE, details);
+    markedUserEntryIds.add(details.user_entry_id);
+    ledger.delete(token);
+    for (const [clientMessageId, record] of handle.queuedBrowserMessages) {
+      if (record.turnToken === token) handle.queuedBrowserMessages.delete(clientMessageId);
+    }
+    settled.push(turn);
+  }
+  return settled;
+}
+
+function settleInteractiveTurnsQuietly(handle: PiSessionHandle): void {
+  try { settleInteractiveTurns(handle); }
+  catch { /* source-marker persistence must never change source-turn settlement */ }
+}
+
+/** @internal Synthetic lifecycle seam: mark exact claimed queued objects before settlement. */
+export function markClaimedQueuedBrowserTurnsReady(handle: PiSessionHandle): void {
+  for (const record of handle.queuedBrowserMessages.values()) {
+    if (queuedChatMessageState(record.capture) !== "claimed") continue;
+    const turn = interactiveTurnLedger(handle).get(record.turnToken);
+    if (turn && !turn.settlementReady) {
+      interactiveTurnLedger(handle).set(turn.token, Object.freeze({ ...turn, settlementReady: true }));
+    }
+  }
+}
+
+function retireInteractiveTurn(handle: PiSessionHandle, token?: string): void {
+  if (token) interactiveTurnLedger(handle).delete(token);
+  else interactiveTurnLedger(handle).clear();
+  if (!token || handle.interactiveMutationTurnToken === token) {
+    handle.interactiveMutationTurnToken = undefined;
+  }
+}
+
+function revokeInteractiveMutationAuthority(handle: PiSessionHandle): void {
+  handle.interactiveMutationTurnToken = undefined;
 }
 
 export type NonBrowserTurnSource = "resend" | "interview_submission" | "scheduled_prompt" | "messaging_prompt";
 
-/** Non-browser continuations may run the agent, but can never mint mutation provenance. */
+/** Non-browser continuations revoke mutation authority without erasing already accepted browser-source evidence. */
 export function beginNonBrowserTurn(handle: PiSessionHandle, _source: NonBrowserTurnSource): void {
-  revokeInteractiveTurn(handle);
-}
-
-function clearInteractiveTurnWhenIdle(handle: PiSessionHandle, token: string): void {
-  void handle.session.waitForIdle().finally(() => clearInteractiveTurn(handle, token));
+  revokeInteractiveMutationAuthority(handle);
 }
 
 export type PiSessionRuntimeEvent =
@@ -2437,12 +2571,16 @@ export async function createPiSession(
         fileAudioExperimentRuntime: pendingFileAudioExperimentRuntime,
         fileAudioExperimentFactory: selectedFileAudioExperimentFactory,
       } : {}),
-      activeInteractiveTurn: null,
+      interactiveTurns: new Map(),
       queuedBrowserMessages: new Map(),
     };
     handle.liveStreamingMessageUnsubscribe = session.subscribe((event: AgentSessionEvent) => {
       trackOverflowRecovery(handle, event);
       persistSettledSessionError(handle, event);
+      if (event.type === "agent_settled") {
+        markClaimedQueuedBrowserTurnsReady(handle);
+        settleInteractiveTurnsQuietly(handle);
+      }
       if (event.type === "message_start" || event.type === "message_update") {
         handle.liveStreamingMessage = event.message;
         return;
@@ -3157,7 +3295,7 @@ function latchPiSessionHandleCapabilityDenial(handle: PiSessionHandle): void {
   }
   handle.bashMode = "unavailable";
   handle.trustedHostBashTool = undefined;
-  revokeInteractiveTurn(handle);
+  retireInteractiveTurn(handle);
 
   const session = handle.session as any;
   if (session) {
@@ -3411,48 +3549,67 @@ export interface QueuedBrowserMessageProjection {
   attachment_names: string[];
 }
 
-interface QueuedBrowserMessageRecord {
-  capture: QueuedChatMessageCapture;
-  content: string;
-  attachmentNames: string[];
-}
-
 export async function sendBrowserMessageTurn(
   handle: PiSessionHandle,
   content: string,
   images?: ImageContent[],
   clientMessageId?: string,
-  queuedDisplay?: { content: string; attachmentNames?: string[] },
+  queuedDisplay?: {
+    content: string;
+    attachmentNames?: string[];
+    rawUserText?: string;
+    provisionalTitleText?: string;
+    acceptedAt?: number;
+  },
 ): Promise<BrowserMessageTurnResult> {
   assertCapabilityAuthorityAvailable(handle);
-  const turn = beginInteractiveTurn(handle, content);
+  if (clientMessageId && [...interactiveTurnLedger(handle).values()].some((candidate) => candidate.clientMessageId === clientMessageId)) {
+    throw new Error("Duplicate browser message ID");
+  }
+  const turn = beginInteractiveTurn(handle, content, {
+    rawUserText: queuedDisplay?.rawUserText ?? queuedDisplay?.content ?? content,
+    provisionalTitleText: queuedDisplay?.provisionalTitleText ?? queuedDisplay?.content ?? content,
+    clientMessageId,
+    acceptedAt: queuedDisplay?.acceptedAt,
+  });
   const isStreaming = handle.session.isStreaming;
   if (isStreaming) {
     try {
-      if (clientMessageId && handle.queuedBrowserMessages.has(clientMessageId)) {
+      const queueRecordId = clientMessageId ?? turn.clientMessageId;
+      if (handle.queuedBrowserMessages.has(queueRecordId)) {
         throw new Error("Duplicate queued browser message ID");
       }
-      const queueBefore = clientMessageId ? snapshotQueuedChatMessages(handle.session) : undefined;
+      const queueBefore = snapshotQueuedChatMessages(handle.session);
       // In pi 0.84.1 steer() mutates the queue synchronously before returning
       // its promise. Capture in this same event-loop turn so concurrent browser
       // messages cannot collapse two registrations into one ambiguous delta.
+      // Provenance capture is required even for legacy clients that omit a
+      // client_message_id; those internal records are never projected to the UI.
       const steering = handle.session.steer(content, images);
-      const capture = clientMessageId ? captureQueuedChatMessage(handle.session, queueBefore) : undefined;
-      if (clientMessageId && capture) {
-        handle.queuedBrowserMessages.set(clientMessageId, {
+      const capture = captureQueuedChatMessage(handle.session, queueBefore);
+      if (capture) {
+        handle.queuedBrowserMessages.set(queueRecordId, {
           capture,
           content: queuedDisplay?.content ?? content,
           attachmentNames: [...(queuedDisplay?.attachmentNames ?? [])],
+          turnToken: turn.token,
+          clientVisible: Boolean(clientMessageId),
         });
       }
       await steering;
-      clearInteractiveTurnWhenIdle(handle, turn.token);
+      const pendingTurn = interactiveTurnLedger(handle).get(turn.token);
+      if (pendingTurn) {
+        interactiveTurnLedger(handle).set(turn.token, Object.freeze({
+          ...pendingTurn,
+          provisionalTitleAccepted: true,
+        }));
+      }
       return {
         queued: capture ? isQueuedChatMessagePending(capture) : handle.session.getSteeringMessages().includes(content),
-        cancellable: Boolean(capture && isQueuedChatMessagePending(capture)),
+        cancellable: Boolean(clientMessageId && capture && isQueuedChatMessagePending(capture)),
       };
     } catch (error) {
-      clearInteractiveTurn(handle, turn.token);
+      retireInteractiveTurn(handle, turn.token);
       throw error;
     }
   } else {
@@ -3461,9 +3618,18 @@ export async function sendBrowserMessageTurn(
         expandPromptTemplates: true,
         images,
       });
+      const completedTurn = Object.freeze({
+        ...turn,
+        provisionalTitleAccepted: true,
+        settlementReady: true,
+      });
+      interactiveTurnLedger(handle).set(turn.token, completedTurn);
+      persistAcceptedProvisionalTitle(handle, completedTurn);
+      settleInteractiveTurnsQuietly(handle);
       return { queued: false, cancellable: false };
-    } finally {
-      clearInteractiveTurn(handle, turn.token);
+    } catch (error) {
+      retireInteractiveTurn(handle, turn.token);
+      throw error;
     }
   }
 }
@@ -3473,7 +3639,13 @@ export async function sendMessage(
   content: string,
   images?: ImageContent[],
   clientMessageId?: string,
-  queuedDisplay?: { content: string; attachmentNames?: string[] },
+  queuedDisplay?: {
+    content: string;
+    attachmentNames?: string[];
+    rawUserText?: string;
+    provisionalTitleText?: string;
+    acceptedAt?: number;
+  },
 ): Promise<BrowserMessageTurnResult> {
   assertRuntimeMutationUnlocked(id);
   const handle = sessions.get(id);
@@ -3490,14 +3662,16 @@ export function getQueuedBrowserMessages(id: string): QueuedBrowserMessageProjec
   for (const [clientMessageId, record] of handle.queuedBrowserMessages) {
     const state = queuedChatMessageState(record.capture);
     if (state === "claimed") {
-      handle.queuedBrowserMessages.delete(clientMessageId);
+      record.clientVisible = false;
       continue;
     }
-    messages.push({
-      client_message_id: clientMessageId,
-      content: record.content,
-      attachment_names: [...record.attachmentNames],
-    });
+    if (record.clientVisible) {
+      messages.push({
+        client_message_id: clientMessageId,
+        content: record.content,
+        attachment_names: [...record.attachmentNames],
+      });
+    }
   }
   return messages;
 }
@@ -3512,12 +3686,15 @@ export function cancelQueuedBrowserMessage(id: string, clientMessageId: string):
   const cancelled = cancelCapturedQueuedChatMessage(record.capture);
   if (cancelled) {
     handle.queuedBrowserMessages.delete(clientMessageId);
+    retireInteractiveTurn(handle, record.turnToken);
     markSessionActivity(id);
     return true;
   }
   const state = queuedChatMessageState(record.capture);
   if (state === "claimed") {
-    handle.queuedBrowserMessages.delete(clientMessageId);
+    // Pi already claimed the exact object. Keep its source ledger record until
+    // authoritative settlement; this browser item is simply not cancellable.
+    record.clientVisible = false;
     return false;
   }
   throw new Error("The pi queued-message layout changed; cancellation was refused without changing the queue");
@@ -3836,7 +4013,7 @@ export async function abortInteractiveTurn(
   handle: PiSessionHandle,
   options: { clearQueue?: boolean } = {},
 ): Promise<{ steering: string[]; followUp: string[] }> {
-  revokeInteractiveTurn(handle);
+  retireInteractiveTurn(handle);
   const clearedQueue = options.clearQueue
     ? handle.session.clearQueue()
     : { steering: [], followUp: [] };
@@ -3933,11 +4110,6 @@ export function subscribeToSession(
     // No queued or future result is released from a denied handle. A fresh
     // runtime/handle is required after cleanup.
     if (handle.capabilityAuthorityDenied) return;
-    if (event.type === "queue_update" && handle.queuedBrowserMessages.size > 0) {
-      for (const [clientMessageId, record] of handle.queuedBrowserMessages) {
-        if (queuedChatMessageState(record.capture) === "claimed") handle.queuedBrowserMessages.delete(clientMessageId);
-      }
-    }
     const serialized = serializeEvent(event);
     if (serialized) {
       markSessionActivity(id);

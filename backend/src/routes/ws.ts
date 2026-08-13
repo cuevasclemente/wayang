@@ -77,11 +77,11 @@ import {
 import {
   getSessionById,
   isLegacyPrivateSessionQuarantined,
+  persistManualSessionTitle,
   touchSession,
   updateGoal,
   updatePiSessionFile,
   updateSessionError,
-  updateSessionTitle,
 } from "../sessions.js";
 import { getInterviewBridge } from "../interview-bridge.js";
 import {
@@ -867,10 +867,7 @@ function handleConnection(
     }
 
     if (!ready) {
-      if (msg.type === "message" && typeof msg.content === "string") {
-        touchSession(currentSessionId);
-        updateTitleFromFirstMessage(currentSessionId, msg.content);
-      }
+      if (msg.type === "message" && typeof msg.content === "string") touchSession(currentSessionId);
       pendingMessages.push(msg);
       wsProfile(currentSessionId, "client_message_queued", `type=${String(msg?.type || "unknown")} queueLength=${pendingMessages.length}`);
       return;
@@ -1037,8 +1034,9 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
         sendSafe(ws, { type: "error", error: "Usage: /name <name>" });
         return true;
       }
-      handle.session.setSessionName(name);
-      updateSessionTitle(sessionId, name);
+      persistManualSessionTitle(sessionId, name, (canonicalName) => {
+        handle.session.setSessionName(canonicalName);
+      });
       sendCommandNotice(ws, `Session name set to ${name}`);
       return true;
     }
@@ -1147,13 +1145,10 @@ async function handleClientMessage(
         const trimmedContent = rawContent.trim();
         const clientMessageId = optionalClientMessageId(msg.client_message_id);
         const preparedAttachments = prepareAttachments(sessionId, msg.attachments);
+        const acceptedAt = Date.now();
         if (!trimmedContent && preparedAttachments.count === 0) return;
 
         touchSession(sessionId);
-        updateTitleFromFirstMessage(
-          sessionId,
-          trimmedContent || (preparedAttachments.count > 0 ? "File attachment" : rawContent),
-        );
 
         try {
           await ensureLiveSession();
@@ -1196,7 +1191,13 @@ async function handleClientMessage(
           fullContent,
           preparedAttachments.images.length > 0 ? preparedAttachments.images : undefined,
           clientMessageId,
-          { content: trimmedContent, attachmentNames: queuedAttachmentNames(msg.attachments) },
+          {
+            content: trimmedContent,
+            attachmentNames: queuedAttachmentNames(msg.attachments),
+            rawUserText: rawContent,
+            provisionalTitleText: trimmedContent || (preparedAttachments.count > 0 ? "File attachment" : rawContent),
+            acceptedAt,
+          },
         ).then((result) => {
           if (clientMessageId) {
             sendSafe(ws, {
@@ -1360,14 +1361,6 @@ async function handleClientMessage(
     updateSessionError(sessionId, error);
     sendSafe(ws, { type: "error", session_id: sessionId, ...(selectionId ? { selection_id: selectionId } : {}), error });
   }
-}
-
-function updateTitleFromFirstMessage(sessionId: string, content: string): void {
-  const session = getSessionById(sessionId);
-  if (!session || session.title?.trim()) return;
-
-  const title = content.replace(/\s+/g, " ").trim().slice(0, 80);
-  if (title) updateSessionTitle(sessionId, title);
 }
 
 function normalizeCommandGuardMode(value: unknown): CommandGuardMode | null {
