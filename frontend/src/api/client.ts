@@ -1521,7 +1521,7 @@ export async function fetchSessionBrowserProfileState(sessionId: string): Promis
   return apiGet(`/api/browser-profiles/sessions/${encodeURIComponent(sessionId)}/state`);
 }
 
-export async function updateSessionBrowserProfileState(sessionId: string, profileId: string | null, expectedRevision: number): Promise<{ state: SessionBrowserProfileState }> {
+export async function updateSessionBrowserProfileState(sessionId: string, profileId: string | null, expectedRevision: number | null): Promise<{ state: SessionBrowserProfileState }> {
   return apiPut(`/api/browser-profiles/sessions/${encodeURIComponent(sessionId)}/state`, { profileId, expectedRevision });
 }
 

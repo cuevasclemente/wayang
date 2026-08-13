@@ -124,10 +124,11 @@ export function createBrowserProfilesRouter(
     const body = exactObject(req.body, ["profileId", "expectedRevision"]);
     const profileId = body.profileId === null ? null : typeof body.profileId === "string" ? body.profileId : undefined;
     if (profileId === undefined) throw new WorkspaceStoreError("Browser Profile selection is invalid", 400);
-    const current = getSessionBrowserState(req.params.sessionId) ?? materializeSessionBrowserState(req.params.sessionId);
-    const expectedRevision = revision(body.expectedRevision);
-    if (current.revision !== expectedRevision) throw new WorkspaceStoreError("Session Browser state changed; refresh and retry", 409);
-    res.json({ state: setSessionBrowserProfile({ sessionId: req.params.sessionId, profileId, expectedRevision }) });
+    const existing = getSessionBrowserState(req.params.sessionId);
+    const expectedRevision = body.expectedRevision === null ? null : revision(body.expectedRevision);
+    if ((existing?.revision ?? null) !== expectedRevision) throw new WorkspaceStoreError("Session Browser state changed; refresh and retry", 409);
+    const current = existing ?? materializeSessionBrowserState(req.params.sessionId);
+    res.json({ state: setSessionBrowserProfile({ sessionId: req.params.sessionId, profileId, expectedRevision: current.revision }) });
   }));
   return router;
 }

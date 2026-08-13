@@ -7,8 +7,13 @@ import {
   type BrowserSurfaceMode,
   type BrowserViewerTransport,
   closeBrowserTab,
+  fetchBrowserProfiles,
   fetchBrowserStatus,
+  fetchSessionBrowserProfileState,
   navigateBrowser,
+  updateSessionBrowserProfileState,
+  type NamedBrowserProfile,
+  type SessionBrowserProfileState,
   openBrowserTab,
   selectBrowserTab,
   pasteTextBrowser,
@@ -37,6 +42,8 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
   const [notice, setNotice] = useState<string | null>(null);
   const [clipboardCaptureOpen, setClipboardCaptureOpen] = useState(false);
   const [credentialsOpen, setCredentialsOpen] = useState(false);
+  const [profileChoices, setProfileChoices] = useState<NamedBrowserProfile[]>([]);
+  const [sessionProfileState, setSessionProfileState] = useState<SessionBrowserProfileState | null>(null);
   const clipboardCaptureRef = useRef<HTMLTextAreaElement | null>(null);
   const viewerChosenRef = useRef(false);
 
@@ -67,6 +74,18 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
       setError(err?.message || String(err));
     }
   }, [sessionId, sessionCwd, browserMode, applyState]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (browserMode === "standard" && sessionId) {
+      void Promise.all([fetchBrowserProfiles(), fetchSessionBrowserProfileState(sessionId)]).then(([catalog, current]) => {
+        if (cancelled) return;
+        setProfileChoices(catalog.profiles.filter((profile) => profile.state === "active"));
+        setSessionProfileState(current.state);
+      }).catch(() => { if (!cancelled) setProfileChoices([]); });
+    }
+    return () => { cancelled = true; };
+  }, [browserMode, sessionId]);
 
   useEffect(() => {
     viewerChosenRef.current = false;
@@ -295,6 +314,27 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-neutral-950 text-neutral-100">
+      {browserMode === "standard" && sessionId && profileChoices.length > 0 && !state && (
+        <div className="shrink-0 border-b border-blue-900/50 bg-blue-950/25 px-3 py-3 text-xs text-blue-100">
+          <label className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <span className="font-medium">This session needs a named Browser Profile.</span>
+            <select className="rounded border border-blue-800 bg-neutral-950 px-2 py-1.5 text-neutral-100" defaultValue={sessionProfileState?.active_profile_id ?? ""} onChange={(event) => {
+              const profileId = event.target.value;
+              if (!profileId) return;
+              void runAction(async () => {
+                const result = await updateSessionBrowserProfileState(sessionId, profileId, sessionProfileState?.revision ?? null);
+                setSessionProfileState(result.state);
+                await refresh();
+              });
+            }}>
+              <option value="">Choose profile…</option>
+              {profileChoices.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+            </select>
+            <span className="text-blue-200/70">This switches only this session; authenticated profile state is shared across approved Standard-browser pairs.</span>
+          </label>
+        </div>
+      )}
+
       {browserAgent && (
         <div
           data-testid="browser-agent-diagnostic"
