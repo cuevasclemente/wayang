@@ -4,7 +4,15 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager, type SessionInfo } from "@earendil-works/pi-coding-agent";
-import { close, failNextCommitStoreMutationPersistenceForTests, flush, getStore, init } from "./db.js";
+import {
+  classifyMigratedSessionTitleSource,
+  close,
+  failNextCommitStoreMutationPersistenceForTests,
+  flush,
+  getStore,
+  init,
+  observeNextStoreMigrationPersistenceForTests,
+} from "./db.js";
 import { createOpenInterview, getInterviewForSession } from "./interviews.js";
 import { createAgentProfile } from "./agent-profiles.js";
 import type { MessagingEndpointDeclaration } from "./messaging/contracts.js";
@@ -23,6 +31,12 @@ import {
   isLegacyPrivateSessionQuarantined,
   listSessions,
   normalizeSessionCwd,
+  persistManualSessionTitle,
+  reconcileSessionTitleFromCatalog,
+  setAutomaticPiSessionTitle,
+  setExplicitSessionTitle,
+  setPiSessionTitle,
+  setProvisionalSessionTitle,
   syncPiSessionFiles,
   updatePiSessionFile,
   updateSessionAgentProfile,
@@ -37,6 +51,14 @@ process.env.WAYANG_LEGACY_SESSION_SCAN = "1";
 after(() => {
   if (previousLegacyScan === undefined) delete process.env.WAYANG_LEGACY_SESSION_SCAN;
   else process.env.WAYANG_LEGACY_SESSION_SCAN = previousLegacyScan;
+});
+
+test("every supported pre-title-provenance schema classifies blank titles as provisional", () => {
+  for (const sourceSchema of [0, 1, 2, 3, 4]) {
+    assert.equal(classifyMigratedSessionTitleSource(""), "provisional", `schema ${sourceSchema} empty`);
+    assert.equal(classifyMigratedSessionTitleSource(" \n\t "), "provisional", `schema ${sourceSchema} whitespace`);
+    assert.equal(classifyMigratedSessionTitleSource("Historical title"), "legacy_unknown", `schema ${sourceSchema} nonblank`);
+  }
 });
 
 test("normalizeSessionCwd expands tilde project paths before pi sees them", () => {
@@ -497,11 +519,54 @@ test("schema-0 migration binds generated Projects by exact canonical cwd", () =>
         created_at: 1,
         last_active: 1,
         archived: 0,
+      }, {
+        id: "legacy-blank-session",
+        title: " \t ",
+        cwd: projectDir,
+        created_at: 1,
+        last_active: 1,
+        archived: 0,
       }],
     }), { mode: 0o600 });
     init();
     const migrated = getSessionById("legacy-session")!;
     assert.equal(migrated.project_id, getStore().projects.find((project) => project.cwd === projectDir)?.id);
+    assert.equal(migrated.title_source, "legacy_unknown");
+    assert.equal(getSessionById("legacy-blank-session")?.title_source, "provisional");
+  } finally {
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("schema-2 migration classifies blank and nonblank historical titles", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-title-source-v2-migration-"));
+  const projectDir = path.join(dir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = dir;
+  try {
+    init();
+    const named = createSession(projectDir, "Historical schema two title");
+    const blank = createSession(projectDir);
+    close();
+    const storePath = path.join(dir, "store.json");
+    const raw = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, any>;
+    raw.schema_version = 2;
+    delete raw.protectedAutomationJobs;
+    delete raw.protectedAutomationRuns;
+    delete raw.messagingEndpoints;
+    delete raw.messagingEvents;
+    delete raw.messagingTransactions;
+    delete raw.messagingDeliveries;
+    for (const row of raw.sessions) delete row.title_source;
+    fs.writeFileSync(storePath, JSON.stringify(raw), { mode: 0o600 });
+
+    init();
+    assert.equal(getSessionById(named.id)?.title_source, "legacy_unknown");
+    assert.equal(getSessionById(blank.id)?.title_source, "provisional");
   } finally {
     close();
     if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
@@ -522,6 +587,7 @@ test("schema-3 migration binds only exact Project cwd matches", () => {
     init();
     const resolved = createSession(projectDir, "Resolved legacy row");
     const unresolved = createSession(projectDir, "Unresolved legacy row");
+    const blank = createSession(projectDir);
     const projectId = resolved.project_id;
     close();
 
@@ -532,7 +598,10 @@ test("schema-3 migration binds only exact Project cwd matches", () => {
     delete raw.messagingEvents;
     delete raw.messagingTransactions;
     delete raw.messagingDeliveries;
-    for (const session of raw.sessions as Record<string, any>[]) delete session.project_id;
+    for (const session of raw.sessions as Record<string, any>[]) {
+      delete session.project_id;
+      delete session.title_source;
+    }
     (raw.sessions as Record<string, any>[]).find((session) => session.id === unresolved.id)!.cwd = unresolvedDir;
     fs.writeFileSync(storePath, JSON.stringify(raw), { mode: 0o600 });
 
@@ -540,6 +609,8 @@ test("schema-3 migration binds only exact Project cwd matches", () => {
     assert.equal(getSessionById(resolved.id)?.project_id, projectId);
     assert.equal(getSessionById(unresolved.id)?.project_id, null);
     assert.equal(getSessionById(unresolved.id)?.legacy_capability_ineligible, true);
+    assert.equal(getSessionById(resolved.id)?.title_source, "legacy_unknown");
+    assert.equal(getSessionById(blank.id)?.title_source, "provisional");
   } finally {
     close();
     if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
@@ -632,6 +703,217 @@ test("new sessions carry explicit capability eligibility markers", () => {
     assert.equal(session.project_id, getStore().projects.find((project) => project.cwd === projectDir)?.id);
     assert.equal(session.legacy_private_session_quarantine, false);
     assert.equal(session.legacy_capability_ineligible, false);
+  } finally {
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("session title provenance transitions are exact and persistence-failure atomic", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-title-provenance-"));
+  const projectDir = path.join(dir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = dir;
+  try {
+    init();
+    const provisional = createSession(projectDir);
+    const explicit = createSession(projectDir, { title: "Supplied title" });
+    assert.deepEqual([provisional.title, provisional.title_source], ["", "provisional"]);
+    assert.deepEqual([explicit.title, explicit.title_source], ["Supplied title", "explicit"]);
+    assert.throws(() => setExplicitSessionTitle(explicit.id, "  \n\t "), /must not be blank/);
+    assert.deepEqual(
+      [getSessionById(explicit.id)?.title, getSessionById(explicit.id)?.title_source],
+      ["Supplied title", "explicit"],
+    );
+
+    failNextCommitStoreMutationPersistenceForTests();
+    assert.throws(() => setProvisionalSessionTitle(provisional.id, "First browser message"), /Synthetic store persistence failure/);
+    assert.deepEqual(
+      [getSessionById(provisional.id)?.title, getSessionById(provisional.id)?.title_source],
+      ["", "provisional"],
+    );
+
+    setProvisionalSessionTitle(provisional.id, "  First   browser message  ");
+    assert.deepEqual(
+      [getSessionById(provisional.id)?.title, getSessionById(provisional.id)?.title_source],
+      ["First browser message", "provisional"],
+    );
+    setExplicitSessionTitle(provisional.id, "Human title");
+    assert.equal(setProvisionalSessionTitle(provisional.id, "must not replace")?.title, "Human title");
+    assert.deepEqual(
+      [getSessionById(provisional.id)?.title, getSessionById(provisional.id)?.title_source],
+      ["Human title", "explicit"],
+    );
+    assert.equal(setAutomaticPiSessionTitle(provisional.id, "Automatic must not replace human")?.title, "Human title");
+    assert.deepEqual(
+      [getSessionById(provisional.id)?.title, getSessionById(provisional.id)?.title_source],
+      ["Human title", "explicit"],
+      "an automatic Pi mirror cannot overwrite concurrent explicit human intent",
+    );
+    setPiSessionTitle(provisional.id, "Canonical Pi title");
+    assert.deepEqual(
+      [getSessionById(provisional.id)?.title, getSessionById(provisional.id)?.title_source],
+      ["Canonical Pi title", "pi"],
+    );
+  } finally {
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("manual naming persists explicit intent before Pi and converges without claiming cross-store atomicity", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-manual-title-convergence-"));
+  const projectDir = path.join(dir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = dir;
+  try {
+    init();
+    const storeFailure = createSession(projectDir, { title: "Old store title" });
+    let piWrites = 0;
+    assert.throws(
+      () => persistManualSessionTitle(storeFailure.id, "   ", () => { piWrites++; }),
+      /must not be blank/,
+    );
+    assert.equal(piWrites, 0);
+    failNextCommitStoreMutationPersistenceForTests();
+    assert.throws(
+      () => persistManualSessionTitle(storeFailure.id, "Must not reach Pi", () => { piWrites++; }),
+      /Synthetic store persistence failure/,
+    );
+    assert.equal(piWrites, 0, "a failed Wayang intent write cannot mutate Pi");
+    assert.deepEqual(
+      [getSessionById(storeFailure.id)?.title, getSessionById(storeFailure.id)?.title_source],
+      ["Old store title", "explicit"],
+    );
+
+    const piFailure = createSession(projectDir, { title: "Before Pi failure" });
+    assert.throws(
+      () => persistManualSessionTitle(piFailure.id, "Durable human intent", () => { throw new Error("synthetic Pi failure"); }),
+      /synthetic Pi failure/,
+    );
+    assert.deepEqual(
+      [getSessionById(piFailure.id)?.title, getSessionById(piFailure.id)?.title_source],
+      ["Durable human intent", "explicit"],
+      "Pi failure retains explicit Wayang intent for later seeding",
+    );
+
+    const webOnly = createSession(projectDir);
+    persistManualSessionTitle(webOnly.id, "Web-only explicit title");
+    assert.deepEqual(
+      [getSessionById(webOnly.id)?.title, getSessionById(webOnly.id)?.title_source],
+      ["Web-only explicit title", "explicit"],
+    );
+
+    const success = createSession(projectDir, { title: "Before success" });
+    persistManualSessionTitle(success.id, "Canonical manual title", (title) => {
+      piWrites++;
+      assert.equal(title, "Canonical manual title");
+    });
+    assert.deepEqual(
+      [getSessionById(success.id)?.title, getSessionById(success.id)?.title_source],
+      ["Canonical manual title", "pi"],
+    );
+  } finally {
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("catalog title reconciliation respects explicit and narrow legacy fallback provenance", () => {
+  const projection = { piName: "Canonical Pi title", firstMessage: "First message" };
+  for (const source of ["provisional", "pi"] as const) {
+    const row = { title: "Old title", title_source: source };
+    assert.equal(reconcileSessionTitleFromCatalog(row, projection), true);
+    assert.deepEqual(row, { title: "Canonical Pi title", title_source: "pi" });
+  }
+  const explicit = { title: "Human title", title_source: "explicit" as const };
+  assert.equal(reconcileSessionTitleFromCatalog(explicit, projection), false);
+  assert.equal(explicit.title, "Human title");
+  const seededExplicit = { title: "Canonical Pi title", title_source: "explicit" as const };
+  assert.equal(reconcileSessionTitleFromCatalog(seededExplicit, projection), true);
+  assert.deepEqual(seededExplicit, { title: "Canonical Pi title", title_source: "pi" });
+  // Accepted legacy ambiguity: a historical human title exactly equal to the
+  // normalized fallback is indistinguishable and may be replaced once.
+  const legacyFallback = { title: "First message", title_source: "legacy_unknown" as const };
+  assert.equal(reconcileSessionTitleFromCatalog(legacyFallback, projection), true);
+  assert.deepEqual(legacyFallback, { title: "Canonical Pi title", title_source: "pi" });
+  const legacyHuman = { title: "Different historical title", title_source: "legacy_unknown" as const };
+  assert.equal(reconcileSessionTitleFromCatalog(legacyHuman, projection), false);
+  assert.equal(legacyHuman.title, "Different historical title");
+});
+
+test("schema-4 to schema-5 migration is backup-first and preserves schema-4 attention state", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-title-schema5-migration-"));
+  const projectDir = path.join(dir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = dir;
+  try {
+    init();
+    const session = createSession(projectDir, "Historical title");
+    const emptySession = createSession(projectDir);
+    const whitespaceSession = createSession(projectDir);
+    createOpenInterview({
+      requestId: "schema-five-interview",
+      sessionId: session.id,
+      toolName: "interview",
+      questions: [{ id: "q", label: "Question", prompt: "Question?", options: [{ value: "yes", label: "Yes" }], allowOther: false }],
+    });
+    close();
+
+    const storePath = path.join(dir, "store.json");
+    const schemaFour = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, any>;
+    schemaFour.schema_version = 4;
+    for (const row of schemaFour.sessions) delete row.title_source;
+    schemaFour.sessions.find((row: any) => row.id === whitespaceSession.id)!.title = "  \n\t ";
+    const schemaFourBytes = Buffer.from(JSON.stringify(schemaFour));
+    fs.writeFileSync(storePath, schemaFourBytes, { mode: 0o600 });
+
+    const persistencePhases: string[] = [];
+    observeNextStoreMigrationPersistenceForTests((phase) => persistencePhases.push(phase));
+    init();
+    assert.deepEqual(persistencePhases, ["backup_durable", "store_published"]);
+    assert.equal(getStore().schema_version, 5);
+    assert.equal(getSessionById(session.id)?.title_source, "legacy_unknown");
+    assert.equal(getSessionById(emptySession.id)?.title_source, "provisional");
+    assert.equal(getSessionById(whitespaceSession.id)?.title_source, "provisional");
+    assert.equal(setProvisionalSessionTitle(emptySession.id, "Empty fallback")?.title, "Empty fallback");
+    assert.equal(setProvisionalSessionTitle(whitespaceSession.id, "Whitespace fallback")?.title, "Whitespace fallback");
+    assert.equal(getInterviewForSession(session.id, "schema-five-interview")?.status, "open");
+    const backup = fs.readdirSync(dir).find((name) => name.startsWith("store.json.backup-v4-"));
+    assert.ok(backup, "schema-4 bytes are backed up before migration publication");
+    assert.deepEqual(fs.readFileSync(path.join(dir, backup!)), schemaFourBytes);
+  } finally {
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("current schema rejects a session missing durable title provenance", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-title-source-validation-"));
+  const projectDir = path.join(dir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = dir;
+  try {
+    init();
+    createSession(projectDir, "Current title");
+    close();
+    const storePath = path.join(dir, "store.json");
+    const current = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, any>;
+    delete current.sessions[0].title_source;
+    fs.writeFileSync(storePath, JSON.stringify(current), { mode: 0o600 });
+    assert.throws(() => init(), /malformed session/);
   } finally {
     close();
     if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;

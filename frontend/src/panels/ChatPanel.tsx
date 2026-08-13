@@ -10,7 +10,6 @@ import {
   fetchSlashCommands,
   previewSessionAgentSwitch,
   recordSessionOpenLatency,
-  refreshSessionTitle,
   switchSessionAgent,
   synthesizeTts,
   updateSessionGoal,
@@ -4861,7 +4860,6 @@ export function ChatPanel({
     if (isCompacting || (!trimmed && attachments.length === 0) || wsStatus !== "connected" || !activeSessionId) return;
 
     clearRuntimeError();
-    const isFirstMessage = messages.length === 0;
     const queuedMessageId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const queuedAttachments: PendingAttachment[] = attachments;
     const turnAnchorText = trimmed || (attachments.length > 0 ? "File attachment" : "");
@@ -4918,15 +4916,6 @@ export function ChatPanel({
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
-
-    // Auto-title after first message
-    if (isFirstMessage && activeSessionId) {
-      setTimeout(() => {
-        refreshSessionTitle(activeSessionId)
-          .then(() => onSessionChange?.())
-          .catch(() => {});
-      }, 2000);
-    }
   }, [
     inputText,
     pendingAttachments,
@@ -4934,7 +4923,6 @@ export function ChatPanel({
     wsStatus,
     sendWs,
     activeSessionId,
-    messages.length,
     onSessionChange,
     hasActiveAssistantOutput,
     setQueuedMessagesSynced,

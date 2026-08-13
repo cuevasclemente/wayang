@@ -951,13 +951,6 @@ export function updateSessionTitle(id: string, title: string): Promise<null> {
   });
 }
 
-export function refreshSessionTitle(id: string): Promise<string | null> {
-  return request<string | null>(
-    "PATCH",
-    `/api/sessions/${encodeURIComponent(id)}/title`,
-  );
-}
-
 export function updateSessionGoal(
   id: string,
   goal: string | null,

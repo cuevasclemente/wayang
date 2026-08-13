@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from "express";
-import { createSession, listSessions, syncPiSessionFiles, updateSessionTitle, archiveSession, deleteSession, getSessionById, updateGoal, getSessionCatalogGeneration, onSessionCatalogGeneration, type SessionRow } from "../sessions.js";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { createSession, listSessions, syncPiSessionFiles, persistManualSessionTitle, archiveSession, deleteSession, getSessionById, updateGoal, getSessionCatalogGeneration, onSessionCatalogGeneration, validateManualSessionTitle, type SessionRow } from "../sessions.js";
 import { classifyAssistantErrorKind, getPiSession, getPiSessionBashMode, getPiSessionBrowserAgentDiagnostic, getPiSessionBrowserMode, getPiSessionRuntimeState, listModels, listSlashCommands, previewSessionAgentSwitch, setSessionDefaultModel, setSessionModel, stopPiSession, switchSessionAgent } from "../pi-bridge.js";
 import { validateCommandGuardIdentityPin } from "../command-guard-pin.js";
 import { removeSession as removeSearchSession } from "../search/indexer.js";
@@ -109,8 +110,13 @@ router.post("/sessions", async (req: Request, res: Response) => {
       res.status(400).json({ error: "agent_profile_id must be a string" });
       return;
     }
+    // Older frontend clients represented an omitted provisional title as the
+    // empty string. Preserve that wire compatibility without accepting other
+    // blank manual titles (for example whitespace-only names).
+    const requestedTitle = title === "" ? undefined : title;
+    if (requestedTitle !== undefined) validateManualSessionTitle(requestedTitle);
     const session = createSession(cwd, {
-      title,
+      title: requestedTitle,
       model: model || undefined,
       provider: provider || undefined,
       agentProfileId: agent_profile_id,
@@ -164,13 +170,29 @@ router.get("/sessions/:id", (req: Request, res: Response) => {
 // Update session title
 // ---------------------------------------------------------------------------
 
+export function writeStoppedPiSessionName(session: SessionRow, name: string): void {
+  if (!session.pi_session_file) return;
+  SessionManager.open(session.pi_session_file, undefined, session.cwd).appendSessionInfo(name);
+}
+
 router.put("/sessions/:id/title", (req: Request, res: Response) => {
   try {
-    const { title } = req.body;
-    updateSessionTitle(req.params.id, title);
+    const title = validateManualSessionTitle(req.body?.title);
+    const session = getSessionById(req.params.id);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    const live = getPiSession(session.id);
+    const writePiName = live
+      ? (name: string) => live.session.setSessionName(name)
+      : session.pi_session_file
+        ? (name: string) => writeStoppedPiSessionName(session, name)
+        : undefined;
+    persistManualSessionTitle(session.id, title, writePiName);
     res.status(204).end();
-  } catch (err) {
-    res.status(500).json({ error: String(err) });
+  } catch (err: any) {
+    res.status(err?.statusCode || 500).json({ error: err?.message || String(err) });
   }
 });
 
@@ -343,27 +365,9 @@ router.patch("/sessions/:id/title", (req: Request, res: Response) => {
       return;
     }
 
-    const handle = getPiSession(session.id);
-    if (handle && handle.session.messages.length > 0) {
-      const firstUser = handle.session.messages.find((m) => m.role === "user");
-      if (firstUser) {
-        const content = Array.isArray(firstUser.content)
-          ? firstUser.content
-              .filter((c: any) => c.type === "text")
-              .map((c: any) => c.text)
-              .join(" ")
-          : typeof firstUser.content === "string"
-            ? firstUser.content
-            : String(firstUser.content);
-        const title = content.slice(0, 80).trim();
-        if (title) {
-          updateSessionTitle(session.id, title);
-          res.json(title);
-          return;
-        }
-      }
-    }
-
+    // Legacy clients may still call this endpoint, but a transcript snapshot
+    // cannot prove that the browser send was accepted and settled. Exact live
+    // settlement owns provisional fallback mutation; this route is read-only.
     res.json(null);
   } catch (err) {
     res.status(500).json({ error: String(err) });

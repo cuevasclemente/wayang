@@ -1,4 +1,7 @@
-export const STORE_SCHEMA_VERSION = 4;
+export const STORE_SCHEMA_VERSION = 5;
+
+export const SESSION_TITLE_SOURCES = ["provisional", "explicit", "pi", "legacy_unknown"] as const;
+export type SessionTitleSource = typeof SESSION_TITLE_SOURCES[number];
 
 /**
  * Legacy stable IDs retained so schema-1 stores keep their references. Names
