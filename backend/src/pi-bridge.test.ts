@@ -514,6 +514,8 @@ test("fluid model changes preserve pair authority while destroying every old run
     assert.equal(resolveWorkspaceCapability(capabilityBase).authorized, true);
     const row = createSession(cwd, { ...source, agentProfileId: profile.id });
     const handle = await createPiSession(row.id, cwd, source.provider, source.model);
+    assert.equal(handle.session.sessionManager.getSessionId(), row.id,
+      "a newly created Pi transcript is bound to its already-durable Wayang session ID");
     const exactSudoOwners = (globalThis as any).__pi_sudo_session_managers as WeakMap<object, string> | undefined;
     assert.equal(exactSudoOwners?.get(handle.session.sessionManager), row.id,
       "the exact SessionManager object retains its owning web session even if ID/file maps later collide");

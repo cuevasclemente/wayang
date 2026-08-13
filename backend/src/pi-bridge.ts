@@ -2310,7 +2310,7 @@ export async function createPiSession(
     const transcriptStartedAt = performance.now();
     const sessionManager = sessionFile
       ? SessionManager.open(sessionFile, undefined, cwd)
-      : SessionManager.create(cwd);
+      : SessionManager.create(cwd, undefined, { id });
     recordLatencyMetric("lazy_transcript_open_ms", performance.now() - transcriptStartedAt);
 
     const agentCreateStartedAt = performance.now();

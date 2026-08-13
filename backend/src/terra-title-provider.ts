@@ -55,7 +55,9 @@ let contextPromise: Promise<{ runtime: ModelRuntime; registry: ModelRegistry }> 
 async function titleModelContext(): Promise<{ runtime: ModelRuntime; registry: ModelRegistry }> {
   contextPromise ??= ModelRuntime.create({
     authPath: path.join(getAgentDir(), "auth.json"),
-    modelsPath: path.join(getAgentDir(), "models.json"),
+    // Title disclosure uses only the reviewed built-in OpenAI provider. Never
+    // compose user-configurable models.json OAuth/provider substitutions here.
+    modelsPath: null,
     allowModelNetwork: false,
   }).then((runtime) => ({ runtime, registry: new ModelRegistry(runtime) }));
   return contextPromise;
