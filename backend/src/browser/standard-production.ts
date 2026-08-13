@@ -24,6 +24,26 @@ import type {
 
 const SETTLE_TIMEOUT_MS = 10_000;
 const SETTLE_INTERVAL_MS = 50;
+const MAX_STANDARD_OBSERVATION_BYTES = 2 * 1024 * 1024;
+const MAX_STANDARD_AX_STRING_BYTES = 2_048;
+
+function boundedUtf8(value: unknown, maxBytes = MAX_STANDARD_AX_STRING_BYTES): string {
+  const input = String(value ?? "");
+  if (Buffer.byteLength(input, "utf8") <= maxBytes) return input;
+  let output = "";
+  for (const scalar of input) {
+    if (Buffer.byteLength(output + scalar, "utf8") > maxBytes) break;
+    output += scalar;
+  }
+  return `${output}…`;
+}
+
+function assertBoundedObservation(value: unknown): void {
+  const serialized = JSON.stringify(value);
+  if (Buffer.byteLength(serialized, "utf8") > MAX_STANDARD_OBSERVATION_BYTES) {
+    throw new Error("Standard browser observation exceeded its bounded result size");
+  }
+}
 
 export interface StandardManagedChromiumPort {
   readonly running: boolean;
@@ -148,8 +168,10 @@ async function executeExactTargetOperation(
         const secrets = await evaluateGuardedPage<string[]>(cdp, authorize, compileGuardedDomOperation({ kind: "secrets" }));
         await guardedSend(cdp, authorize, "Accessibility.enable");
         const tree = await guardedSend<any>(cdp, authorize, "Accessibility.getFullAXTree");
-        const redact = (input: unknown) => secrets.reduce((text, secret) => text.split(secret).join("[REDACTED]"), String(input ?? ""));
-        value = { nodes: (Array.isArray(tree?.nodes) ? tree.nodes : []).filter((node: any) => !node.ignored).slice(0, limit).map((node: any) => ({ role: node.role?.value, name: redact(node.name?.value), value: redact(node.value?.value), description: redact(node.description?.value) })) };
+        const rawNodes = Array.isArray(tree?.nodes) ? tree.nodes : [];
+        if (rawNodes.length > 20_000) throw new Error("Standard browser accessibility tree exceeded its node bound");
+        const redact = (input: unknown) => boundedUtf8(secrets.reduce((text, secret) => text.split(secret).join("[REDACTED]"), String(input ?? "")));
+        value = { nodes: rawNodes.filter((node: any) => !node.ignored).slice(0, limit).map((node: any) => ({ role: redact(node.role?.value), name: redact(node.name?.value), value: redact(node.value?.value), description: redact(node.description?.value) })) };
         break;
       }
       default:
@@ -160,12 +182,17 @@ async function executeExactTargetOperation(
       throw new Error("Standard browser reached a forbidden top-level document");
     }
     await authorize();
+    if (value && typeof value === "object" && "title" in value && typeof (value as { title?: unknown }).title === "string") {
+      (value as { title: string }).title = redactNavigationTitle((value as { title: string }).title, after.topLevelUrl);
+    }
     if (operation.kind === "navigate" && value && typeof value === "object") {
       const visible = new URL(after.topLevelUrl);
       visible.username = ""; visible.password = ""; visible.search = ""; visible.hash = "";
       value = { ...value, url: visible.toString(), title: redactNavigationTitle(after.title, after.topLevelUrl) };
     }
-    return protection.redact(value);
+    const redacted = protection.redact(value);
+    assertBoundedObservation(redacted);
+    return redacted;
   } finally { attachment.close(); }
 }
 
