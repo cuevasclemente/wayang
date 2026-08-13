@@ -91,7 +91,7 @@ test("legacy migration is private, canonical, seeded, and idempotent", () => wit
   assert.deepEqual(backups(dir), firstBackupNames);
 }));
 
-test("schema 3 migrates to schema 4 with no messaging endpoint or authority", () => withDataDir((dir) => {
+test("schema 3 migrates through current schema with no messaging or browser authority", () => withDataDir((dir) => {
   init();
   const storePath = path.join(dir, "store.json");
   close();
@@ -101,6 +101,10 @@ test("schema 3 migrates to schema 4 with no messaging endpoint or authority", ()
   delete schemaThree.messagingEvents;
   delete schemaThree.messagingTransactions;
   delete schemaThree.messagingDeliveries;
+  delete schemaThree.browserProfiles;
+  delete schemaThree.projectBrowserDefaults;
+  delete schemaThree.sessionBrowserStates;
+  delete schemaThree.browserCleanups;
   fs.writeFileSync(storePath, JSON.stringify(schemaThree));
 
   init();
@@ -110,6 +114,10 @@ test("schema 3 migrates to schema 4 with no messaging endpoint or authority", ()
   assert.deepEqual(migrated.messagingEvents, []);
   assert.deepEqual(migrated.messagingTransactions, []);
   assert.deepEqual(migrated.messagingDeliveries, []);
+  assert.deepEqual(migrated.browserProfiles, []);
+  assert.deepEqual(migrated.projectBrowserDefaults, []);
+  assert.deepEqual(migrated.sessionBrowserStates, []);
+  assert.deepEqual(migrated.browserCleanups, []);
   assert.equal(backups(dir).filter((name) => name.includes("backup-v3-")).length, 1);
 }));
 

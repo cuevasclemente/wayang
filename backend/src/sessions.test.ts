@@ -561,6 +561,10 @@ test("schema-2 migration classifies blank and nonblank historical titles", () =>
     delete raw.messagingEvents;
     delete raw.messagingTransactions;
     delete raw.messagingDeliveries;
+    delete raw.browserProfiles;
+    delete raw.projectBrowserDefaults;
+    delete raw.sessionBrowserStates;
+    delete raw.browserCleanups;
     for (const row of raw.sessions) delete row.title_source;
     fs.writeFileSync(storePath, JSON.stringify(raw), { mode: 0o600 });
 
@@ -598,6 +602,10 @@ test("schema-3 migration binds only exact Project cwd matches", () => {
     delete raw.messagingEvents;
     delete raw.messagingTransactions;
     delete raw.messagingDeliveries;
+    delete raw.browserProfiles;
+    delete raw.projectBrowserDefaults;
+    delete raw.sessionBrowserStates;
+    delete raw.browserCleanups;
     for (const session of raw.sessions as Record<string, any>[]) {
       delete session.project_id;
       delete session.title_source;
@@ -850,7 +858,7 @@ test("catalog title reconciliation respects explicit and narrow legacy fallback 
   assert.equal(legacyHuman.title, "Different historical title");
 });
 
-test("schema-4 to schema-5 migration is backup-first and preserves schema-4 attention state", () => {
+test("schema-4 migration through schema 6 is backup-first and preserves schema-4 attention state", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-title-schema5-migration-"));
   const projectDir = path.join(dir, "project");
   fs.mkdirSync(projectDir, { recursive: true });
@@ -872,6 +880,10 @@ test("schema-4 to schema-5 migration is backup-first and preserves schema-4 atte
     const storePath = path.join(dir, "store.json");
     const schemaFour = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, any>;
     schemaFour.schema_version = 4;
+    delete schemaFour.browserProfiles;
+    delete schemaFour.projectBrowserDefaults;
+    delete schemaFour.sessionBrowserStates;
+    delete schemaFour.browserCleanups;
     for (const row of schemaFour.sessions) delete row.title_source;
     schemaFour.sessions.find((row: any) => row.id === whitespaceSession.id)!.title = "  \n\t ";
     const schemaFourBytes = Buffer.from(JSON.stringify(schemaFour));
@@ -881,7 +893,7 @@ test("schema-4 to schema-5 migration is backup-first and preserves schema-4 atte
     observeNextStoreMigrationPersistenceForTests((phase) => persistencePhases.push(phase));
     init();
     assert.deepEqual(persistencePhases, ["backup_durable", "store_published"]);
-    assert.equal(getStore().schema_version, 5);
+    assert.equal(getStore().schema_version, 6);
     assert.equal(getSessionById(session.id)?.title_source, "legacy_unknown");
     assert.equal(getSessionById(emptySession.id)?.title_source, "provisional");
     assert.equal(getSessionById(whitespaceSession.id)?.title_source, "provisional");

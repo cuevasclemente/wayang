@@ -1,4 +1,13 @@
-export const STORE_SCHEMA_VERSION = 5;
+import type {
+  BrowserCleanupRow,
+  BrowserProfileRow,
+  ProjectBrowserDefaultRow,
+  SessionBrowserStateRow,
+} from "./browser/profile-catalog-store.js";
+
+export type { BrowserCleanupRow, BrowserProfileRow, ProjectBrowserDefaultRow, SessionBrowserStateRow };
+
+export const STORE_SCHEMA_VERSION = 6;
 
 export const SESSION_TITLE_SOURCES = ["provisional", "explicit", "pi", "legacy_unknown"] as const;
 export type SessionTitleSource = typeof SESSION_TITLE_SOURCES[number];

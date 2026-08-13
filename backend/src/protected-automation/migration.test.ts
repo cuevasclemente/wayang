@@ -32,22 +32,30 @@ function rewriteFreshStoreAsSchemaTwo(mutator?: (store: Record<string, unknown>)
   delete store.messagingEvents;
   delete store.messagingTransactions;
   delete store.messagingDeliveries;
+  delete store.browserProfiles;
+  delete store.projectBrowserDefaults;
+  delete store.sessionBrowserStates;
+  delete store.browserCleanups;
   mutator?.(store);
   fs.writeFileSync(storePath, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
 }
 
-test("schema 2 migrates explicitly to current schema with empty inert authority and messaging arrays", () => {
+test("schema 2 migrates explicitly to current schema with empty inert authority, messaging, and browser arrays", () => {
   rewriteFreshStoreAsSchemaTwo();
   init();
   const store = getStore();
   assert.equal(store.schema_version, STORE_SCHEMA_VERSION);
-  assert.equal(STORE_SCHEMA_VERSION, 5);
+  assert.equal(STORE_SCHEMA_VERSION, 6);
   assert.deepEqual(store.protectedAutomationJobs, []);
   assert.deepEqual(store.protectedAutomationRuns, []);
   assert.deepEqual(store.workspaceCapabilityAssociations, []);
   assert.deepEqual(store.workspaceCapabilityApprovalEvents, []);
   assert.deepEqual(store.messagingEndpoints, []);
   assert.deepEqual(store.messagingEvents, []);
+  assert.deepEqual(store.browserProfiles, []);
+  assert.deepEqual(store.projectBrowserDefaults, []);
+  assert.deepEqual(store.sessionBrowserStates, []);
+  assert.deepEqual(store.browserCleanups, []);
   const backups = fs.readdirSync(dataDir).filter((name) => name.startsWith("store.json.backup-v2-"));
   assert.equal(backups.length, 1);
   assert.equal(fs.statSync(path.join(dataDir, backups[0]!)).mode & 0o777, 0o600);
@@ -76,7 +84,7 @@ test("schema 2 cannot seed protected automation authority that did not exist in 
   assert.throws(() => init(), /cannot contain protected automation authority/);
 });
 
-test("fresh current-schema stores create no automation or messaging authority", () => {
+test("fresh current-schema stores create no automation, messaging, or browser authority", () => {
   init();
   const store = getStore();
   assert.equal(store.schema_version, STORE_SCHEMA_VERSION);
@@ -85,4 +93,8 @@ test("fresh current-schema stores create no automation or messaging authority", 
   assert.equal(store.workspaceCapabilityAssociations.some((row) => row.capability_id === "wayang.protected-automation.v1"), false);
   assert.deepEqual(store.messagingEndpoints, []);
   assert.deepEqual(store.messagingEvents, []);
+  assert.deepEqual(store.browserProfiles, []);
+  assert.deepEqual(store.projectBrowserDefaults, []);
+  assert.deepEqual(store.sessionBrowserStates, []);
+  assert.deepEqual(store.browserCleanups, []);
 });
