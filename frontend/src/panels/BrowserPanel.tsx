@@ -314,10 +314,10 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-neutral-950 text-neutral-100">
-      {browserMode === "standard" && sessionId && profileChoices.length > 0 && !state && (
+      {browserMode === "standard" && sessionId && profileChoices.length > 0 && (
         <div className="shrink-0 border-b border-blue-900/50 bg-blue-950/25 px-3 py-3 text-xs text-blue-100">
           <label className="flex flex-col gap-2 sm:flex-row sm:items-center">
-            <span className="font-medium">This session needs a named Browser Profile.</span>
+            <span className="font-medium">{state?.profile.persistence === "named" ? "Session Browser Profile" : "This session needs a named Browser Profile."}</span>
             <select className="rounded border border-blue-800 bg-neutral-950 px-2 py-1.5 text-neutral-100" defaultValue={sessionProfileState?.active_profile_id ?? ""} onChange={(event) => {
               const profileId = event.target.value;
               if (!profileId) return;

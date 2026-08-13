@@ -45,11 +45,14 @@ function existingDirectory(candidate: string): fs.Stats | null {
   }
 }
 
-function reconcileRename(source: string, destination: string): void {
+function reconcileRename(source: string, destination: string, allowBothAbsent = true): void {
   const sourceStat = existingDirectory(source);
   const destinationStat = existingDirectory(destination);
   if (sourceStat && destinationStat) throw new Error("Browser Profile cleanup found both live and recovery payloads");
-  if (!sourceStat) return; // already moved or never materialized
+  if (!sourceStat) {
+    if (!destinationStat && !allowBothAbsent) throw new Error("Browser Profile recovery payload is missing");
+    return; // already moved or never materialized when allowed
+  }
   safeDirectory(path.dirname(destination));
   try { fs.renameSync(source, destination); }
   catch (error) {
@@ -127,7 +130,7 @@ export class BrowserProfileCleanupCoordinator {
         throw new Error("Migrated Browser Profile restore requires source-specific recovery support");
       }
       const descriptor = resolveBrowserProfileStorageDescriptor(this.dataDir, profile);
-      reconcileRename(this.recoveryPath(cleanup.recovery_entry_id!), descriptor.root);
+      reconcileRename(this.recoveryPath(cleanup.recovery_entry_id!), descriptor.root, false);
       markBrowserProfileRestored(profileId, cleanup.id, expectedRevision);
     });
   }

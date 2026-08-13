@@ -31,8 +31,13 @@ export async function openStandardCdpViewer(options: {
     options.attachment.close();
     throw error;
   }
+  let frameAuthorization: Promise<void> = Promise.resolve();
   const offFrame = cdp.on("Page.screencastFrame", (params: any) => {
-    emit({ type: "frame", dataUrl: `data:image/jpeg;base64,${params.data}`, metadata: params.metadata, sessionId: params.sessionId });
+    frameAuthorization = frameAuthorization.then(async () => {
+      await options.authorize();
+      if (closed) return;
+      emit({ type: "frame", dataUrl: `data:image/jpeg;base64,${params.data}`, metadata: params.metadata, sessionId: params.sessionId });
+    }).catch(() => { void options.revoke().catch(() => undefined); });
   });
   const attestAfterInput = async () => {
     const document = await settledTopLevelDocument(cdp, target, options.authorize, SETTLE_TIMEOUT_MS, SETTLE_INTERVAL_MS);
