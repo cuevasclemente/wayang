@@ -6,6 +6,7 @@ import test from "node:test";
 import type { IncomingMessage } from "node:http";
 import type { WebSocket } from "ws";
 import { CapabilityBoundProtectedBrowser } from "../browser/protected-browser.js";
+import { close as closeStore, init as initStore } from "../db.js";
 import { PROTECTED_BROWSER_CAPABILITY_ID, type ProtectedBrowserAuthoritySnapshot, type ProtectedBrowserBinding } from "../browser/types.js";
 import {
   attachSelectedProtectedViewer,
@@ -13,6 +14,17 @@ import {
   validateProtectedBrowserBodySelection,
   validateProtectedBrowserSelection,
 } from "./protected-browser.js";
+
+const syntheticDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-protected-routes-"));
+const previousDataDir = process.env.WAYANG_DATA_DIR;
+process.env.WAYANG_DATA_DIR = syntheticDataDir;
+initStore();
+test.after(() => {
+  closeStore();
+  if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+  else process.env.WAYANG_DATA_DIR = previousDataDir;
+  fs.rmSync(syntheticDataDir, { recursive: true, force: true });
+});
 
 const binding: ProtectedBrowserBinding = {
   capabilityId: PROTECTED_BROWSER_CAPABILITY_ID,
