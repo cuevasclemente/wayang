@@ -6,6 +6,12 @@ import {
   WAYANG_WEBSOCKET_SUBMISSION_CHANNEL,
   type InterviewSubmissionContext,
 } from "./interview-provenance.js";
+import {
+  isBoundedHumanAttentionId,
+  isProjectableOpenInterview,
+  MAX_HUMAN_ATTENTION_SUMMARIES_PER_SESSION,
+} from "./interview-attention-policy.js";
+import { notifySessionSummaryProjectionChanged } from "./sessions.js";
 
 export type InterviewStatus = "open" | "submitted" | "cancelled" | "delivered";
 export type InterviewToolName = "interview" | "questionnaire";
@@ -61,6 +67,12 @@ function clone<T>(value: T): T {
 
 function invalid(message: string): never {
   throw new Error(`Invalid interview request: ${message}`);
+}
+
+function boundedAttentionId(value: string, label: string): string {
+  const normalized = value.trim();
+  if (!isBoundedHumanAttentionId(normalized)) invalid(`${label} is invalid or too long`);
+  return normalized;
 }
 
 export function normalizeQuestions(raw: unknown): InterviewQuestion[] {
@@ -137,9 +149,8 @@ function records(store = getStore()): InterviewRecord[] {
 }
 
 export function createOpenInterview(input: CreateOpenInterviewInput): InterviewRecord {
-  const sessionId = input.sessionId.trim();
-  if (!sessionId) throw new Error("Interview session ID is required");
-  const requestId = input.requestId?.trim() || randomUUID();
+  const sessionId = boundedAttentionId(input.sessionId, "session ID");
+  const requestId = boundedAttentionId(input.requestId?.trim() || randomUUID(), "request ID");
   const record: InterviewRecord = {
     request_id: requestId,
     session_id: sessionId,
@@ -151,11 +162,19 @@ export function createOpenInterview(input: CreateOpenInterviewInput): InterviewR
     status: "open",
     created_at: Date.now(),
   };
-  return interviewMutationCommit((draft) => {
+  const created = interviewMutationCommit((draft) => {
+    const ownerSession = draft.sessions.find((candidate) => candidate.id === sessionId);
+    if (ownerSession?.archived) invalid("session is archived");
     if (records(draft).some((candidate) => candidate.request_id === requestId)) throw new Error("Interview request ID already exists");
+    const pendingForSession = records(draft).filter((candidate) => isProjectableOpenInterview(candidate, sessionId)).length;
+    if (pendingForSession >= MAX_HUMAN_ATTENTION_SUMMARIES_PER_SESSION) {
+      throw new Error("Too many pending interview requests for this session");
+    }
     records(draft).push(clone(record));
     return clone(record);
   });
+  notifySessionSummaryProjectionChanged();
+  return created;
 }
 
 export function getInterviewForSession(sessionId: string, requestId: string): InterviewRecord | undefined {
@@ -251,7 +270,7 @@ export function verifyInterviewSubmissionEntry(sessionId: string, entry: unknown
 
 export function listOpenInterviews(sessionId: string): InterviewRecord[] {
   return records()
-    .filter((record) => record.session_id === sessionId && record.status === "open")
+    .filter((record) => isProjectableOpenInterview(record, sessionId))
     .sort((a, b) => a.created_at - b.created_at)
     .map(clone);
 }
@@ -311,19 +330,22 @@ export function submitInterview(
     target.status = "submitted";
     return clone(target);
   });
+  notifySessionSummaryProjectionChanged();
   return { ok: true, kind: "accepted", record: committed };
 }
 
 export function cancelInterview(sessionId: string, requestId: string): InterviewRecord | undefined {
   const record = records().find((candidate) => candidate.request_id === requestId && candidate.session_id === sessionId);
   if (!record || record.status !== "open") return undefined;
-  return interviewMutationCommit((draft) => {
+  const cancelled = interviewMutationCommit((draft) => {
     const target = records(draft).find((candidate) => candidate.request_id === requestId && candidate.session_id === sessionId);
     if (!target || target.status !== "open") return undefined;
     target.status = "cancelled";
     target.cancelled_at = Date.now();
     return clone(target);
   });
+  if (cancelled) notifySessionSummaryProjectionChanged();
+  return cancelled;
 }
 
 export function markDelivered(requestId: string, mode: "tool_result" | "custom_message", entryId?: string): InterviewRecord | undefined {
@@ -345,9 +367,11 @@ export function markDelivered(requestId: string, mode: "tool_result" | "custom_m
 export function removeInterviewsForSession(sessionId: string, _options: { flush?: boolean } = {}): number {
   const count = records().filter((record) => record.session_id === sessionId).length;
   if (count === 0) return 0;
-  return interviewMutationCommit((draft) => {
+  const removed = interviewMutationCommit((draft) => {
     const before = draft.interviews.length;
     draft.interviews = draft.interviews.filter((record) => record.session_id !== sessionId);
     return before - draft.interviews.length;
   });
+  notifySessionSummaryProjectionChanged();
+  return removed;
 }

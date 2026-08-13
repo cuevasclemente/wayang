@@ -4,14 +4,17 @@ import { classifyAssistantErrorKind, getPiSession, getPiSessionBashMode, getPiSe
 import { validateCommandGuardIdentityPin } from "../command-guard-pin.js";
 import { removeSession as removeSearchSession } from "../search/indexer.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
+import { listHumanAttentionForSession, type HumanAttentionSummary } from "../human-attention.js";
+import type { Session as ProtocolSession } from "@wayang/protocol";
 
 export const router = Router();
 
-type SessionResponse = SessionRow & ReturnType<typeof getPiSessionRuntimeState> & {
+type SessionResponse = ProtocolSession & SessionRow & ReturnType<typeof getPiSessionRuntimeState> & {
   bash_mode: ReturnType<typeof getPiSessionBashMode>;
   browser_mode: ReturnType<typeof getPiSessionBrowserMode>;
   browser_agent: ReturnType<typeof getPiSessionBrowserAgentDiagnostic>;
   error_kind: ReturnType<typeof classifyAssistantErrorKind>;
+  humanAttention: HumanAttentionSummary[];
 };
 
 /** @internal Exported for focused response-projection tests. */
@@ -23,6 +26,7 @@ export function serializeSession(session: SessionRow): SessionResponse {
     browser_mode: getPiSessionBrowserMode(session.id, session),
     browser_agent: getPiSessionBrowserAgentDiagnostic(session.id, session),
     error_kind: classifyAssistantErrorKind(session.error),
+    humanAttention: listHumanAttentionForSession(session.id),
   };
 }
 
@@ -184,8 +188,8 @@ router.delete("/sessions/:id", async (req: Request, res: Response) => {
     archiveSession(req.params.id);
     await stopPiSession(req.params.id);
     res.status(204).end();
-  } catch (err) {
-    res.status(500).json({ error: String(err) });
+  } catch (err: any) {
+    res.status(err?.statusCode || 500).json({ error: err?.message || String(err) });
   }
 });
 

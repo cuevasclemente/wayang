@@ -51,6 +51,15 @@ export interface FileFingerprint {
  * runtime projection. Fields marked "internal" are catalog bookkeeping that
  * happens to ride the wire; consumers should ignore them.
  */
+export interface HumanAttentionSummary {
+  sessionId: string;
+  kind: "question";
+  sourceId: string;
+  createdAt: number;
+  status: "pending";
+  requiresWayang: true;
+}
+
 export interface Session {
   id: string;
   pi_session_file: string | null;
@@ -70,6 +79,7 @@ export interface Session {
   scheduled_job_id: string | null;
   scheduled_run_id: string | null;
   error: string | null;
+  error_kind: "context_overflow" | null;
   /** @deprecated internal: schema-1 input only; migrated to the generic quarantine marker. */
   finance_private_data_taint?: boolean;
   /** internal: permanent quarantine for legacy private sessions. */
@@ -87,6 +97,8 @@ export interface Session {
   runtime_last_activity_at: number | null;
   bash_mode: BashMode;
   browser_mode: BrowserSurfaceMode;
+  /** Minimal read-only projection of unresolved durable human-input gates. */
+  humanAttention: HumanAttentionSummary[];
 }
 
 /** `POST /api/sessions` request body. Responds 201 with a `Session`. */

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
+  BellRing,
   ChevronDown,
   CalendarClock,
   ChevronRight,
@@ -42,6 +43,8 @@ import {
 } from "../api/client";
 import { formatRelativeTime } from "../utils/time";
 import { SessionResultSnippet } from "../components/SessionResultSnippet";
+import { observeHumanAttention } from "../browserNotifications";
+import { humanAttentionAriaLabel } from "../humanAttention";
 
 type LoadState = "loading" | "ready" | "error";
 
@@ -64,6 +67,7 @@ interface SessionsPanelProps {
   onSelectScheduledJob?: (jobId: string | null) => void;
   onSelectProtectedAutomation?: (jobId: string | null) => void;
   onArchiveActive?: () => void;
+  onAttentionCountChange?: (count: number) => void;
   refreshTrigger?: number;
   onNewSession?: () => void;
 }
@@ -85,6 +89,14 @@ function readProjectShowScheduledRuns(): boolean {
   }
 }
 
+function attentionListsEqual(a: Session["humanAttention"], b: Session["humanAttention"]): boolean {
+  return a.length === b.length && a.every((item, index) => {
+    const other = b[index];
+    return item.sourceId === other.sourceId && item.kind === other.kind
+      && item.createdAt === other.createdAt && item.requiresWayang === other.requiresWayang;
+  });
+}
+
 function sessionListsEqual(a: Session[], b: Session[]): boolean {
   if (a.length !== b.length) return false;
   for (let index = 0; index < a.length; index++) {
@@ -102,6 +114,7 @@ function sessionListsEqual(a: Session[], b: Session[]): boolean {
       || left.runtime_subscriber_count !== right.runtime_subscriber_count
       || left.runtime_last_activity_at !== right.runtime_last_activity_at
       || left.bash_mode !== right.bash_mode
+      || !attentionListsEqual(left.humanAttention, right.humanAttention)
     ) return false;
   }
   return true;
@@ -137,6 +150,7 @@ export function SessionsPanel({
   onSelectScheduledJob,
   onSelectProtectedAutomation,
   onArchiveActive,
+  onAttentionCountChange,
   refreshTrigger,
   onNewSession,
 }: SessionsPanelProps) {
@@ -179,7 +193,9 @@ export function SessionsPanel({
   const [deleteError, setDeleteError] = useState("");
 
   const projectListSessions = useMemo(
-    () => (showScheduledProjectRuns ? sessions : sessions.filter((s) => !isScheduledRunSession(s))),
+    () => (showScheduledProjectRuns
+      ? sessions
+      : sessions.filter((session) => !isScheduledRunSession(session) || session.humanAttention.length > 0)),
     [sessions, showScheduledProjectRuns],
   );
   const projects = useMemo(
@@ -204,8 +220,8 @@ export function SessionsPanel({
   const activeRef = useRef(active);
   activeRef.current = active;
 
-  const refresh = useCallback(async () => {
-    if (!activeRef.current || document.visibilityState === "hidden") {
+  const refresh = useCallback(async (allowHidden = false) => {
+    if (!allowHidden && document.visibilityState === "hidden") {
       refreshPendingRef.current = true;
       return;
     }
@@ -225,6 +241,8 @@ export function SessionsPanel({
           const list = await listSessions(controller.signal);
           if (controller.signal.aborted) return;
           const normalized = Array.isArray(list) ? list : [];
+          observeHumanAttention(normalized);
+          onAttentionCountChange?.(normalized.reduce((count, session) => count + session.humanAttention.length, 0));
           setSessions((previous) => sessionListsEqual(previous, normalized) ? previous : normalized);
           setLoadState("ready");
           // Project metadata is independent from the session catalog. A
@@ -237,12 +255,12 @@ export function SessionsPanel({
           setLoadState((prev) => (prev === "ready" ? prev : "error"));
           setErrorMsg(err instanceof ApiError ? `HTTP ${err.status}` : String(err));
         }
-      } while (refreshPendingRef.current && activeRef.current);
+      } while (refreshPendingRef.current);
     } finally {
       refreshAbortRef.current = null;
       refreshInFlightRef.current = false;
     }
-  }, []);
+  }, [onAttentionCountChange]);
 
   const jobsRefreshInFlightRef = useRef(false);
   const refreshJobs = useCallback(async () => {
@@ -276,22 +294,18 @@ export function SessionsPanel({
   }, []);
 
   useEffect(() => {
+    void refresh();
     if (active) {
-      void refresh();
       void refreshJobs();
       void refreshProtectedAutomations();
-    } else {
-      refreshAbortRef.current?.abort();
     }
   }, [active, refresh, refreshJobs, refreshProtectedAutomations]);
 
   useEffect(() => {
     if (refreshTrigger !== undefined && refreshTrigger > 0) {
       refreshPendingRef.current = true;
-      if (active) {
-        void refresh();
-        void refreshProtectedAutomations();
-      }
+      void refresh();
+      if (active) void refreshProtectedAutomations();
     }
   }, [active, refreshTrigger, refresh, refreshProtectedAutomations]);
 
@@ -306,18 +320,19 @@ export function SessionsPanel({
 
   useEffect(() => {
     const onVisibility = () => {
-      if (active && document.visibilityState === "visible") {
+      if (document.visibilityState === "visible") {
         void refresh();
-        void refreshJobs();
-        void refreshProtectedAutomations();
+        if (active) {
+          void refreshJobs();
+          void refreshProtectedAutomations();
+        }
       }
     };
     document.addEventListener("visibilitychange", onVisibility);
-    if (!active) return () => document.removeEventListener("visibilitychange", onVisibility);
     const events = new EventSource("/api/sessions/events");
     events.addEventListener("catalog_generation", () => {
       refreshPendingRef.current = true;
-      if (document.visibilityState === "visible") void refresh();
+      void refresh(true);
     });
     events.onerror = () => {
       void canRetryAuthenticatedTransport().then((canRetry) => {
@@ -327,8 +342,10 @@ export function SessionsPanel({
     const id = window.setInterval(() => {
       if (document.visibilityState === "visible") {
         void refresh();
-        void refreshJobs();
-        void refreshProtectedAutomations();
+        if (active) {
+          void refreshJobs();
+          void refreshProtectedAutomations();
+        }
       }
     }, 60_000);
     return () => {
@@ -439,6 +456,7 @@ export function SessionsPanel({
         runtime_last_activity_at: null,
         bash_mode: "unavailable",
         browser_mode: "unavailable",
+        humanAttention: [],
       };
       if (onSelectSearchResult) {
         onSelectSearchResult(placeholder, result.best_message_id ?? null);
@@ -507,7 +525,7 @@ export function SessionsPanel({
         }
       } catch (err) {
         window.alert(
-          `Archive failed: ${err instanceof ApiError ? `HTTP ${err.status}` : String(err)}`,
+          `Archive failed: ${err instanceof ApiError ? err.message || `HTTP ${err.status}` : String(err)}`,
         );
       }
     },
@@ -806,6 +824,7 @@ export function SessionsPanel({
                     active={isActiveProject}
                     creatingSession={creatingProjectCwd === project.cwd}
                     hiddenScheduledCount={hiddenScheduledRunsByCwd.get(project.cwd) ?? 0}
+                    attentionCount={project.sessions.reduce((count, session) => count + session.humanAttention.length, 0)}
                     onShowScheduledRuns={() => setShowScheduledProjectRuns(true)}
                     onToggle={() => {
                       toggleExpand(project.cwd);
@@ -1142,6 +1161,7 @@ interface ProjectHeaderProps {
   active: boolean;
   creatingSession?: boolean;
   hiddenScheduledCount?: number;
+  attentionCount?: number;
   onShowScheduledRuns?: () => void;
   onToggle: () => void;
   onNewSession?: () => void;
@@ -1154,6 +1174,7 @@ function ProjectHeader({
   active,
   creatingSession = false,
   hiddenScheduledCount = 0,
+  attentionCount = 0,
   onShowScheduledRuns,
   onToggle,
   onNewSession,
@@ -1188,6 +1209,15 @@ function ProjectHeader({
           )}
         </span>
       </div>
+      {attentionCount > 0 && (
+        <span
+          data-testid="project-human-attention-badge"
+          aria-label={`Project needs human input: ${attentionCount} pending ${attentionCount === 1 ? "request" : "requests"}`}
+          className="inline-flex shrink-0 items-center gap-0.5 rounded bg-amber-950/70 px-1.5 py-0.5 text-[10px] font-semibold text-amber-200"
+        >
+          <BellRing size={10} aria-hidden="true" /> {attentionCount}
+        </span>
+      )}
       <span className="text-[10px] text-neutral-600 shrink-0">
         {formatRelativeTime(project.lastActive)}
       </span>
@@ -1438,6 +1468,16 @@ function SessionRow({
             >
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
               {liveLabel}
+            </span>
+          )}
+          {session.humanAttention.length > 0 && (
+            <span
+              data-testid="session-human-attention-badge"
+              aria-label={humanAttentionAriaLabel(session.humanAttention)}
+              className="inline-flex items-center gap-0.5 rounded bg-amber-950/70 px-1 font-semibold text-amber-200"
+            >
+              <BellRing size={9} aria-hidden="true" /> Needs input
+              {session.humanAttention.length > 1 ? ` · ${session.humanAttention.length}` : ""}
             </span>
           )}
           {session.scheduled_job_id && (

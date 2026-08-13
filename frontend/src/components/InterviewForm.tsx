@@ -45,11 +45,14 @@ interface InterviewFormProps {
   submissionState?: InterviewSubmissionState;
   submissionMessage?: string;
   onRetry?: () => void;
+  /** Cancellation is pending until the exact interview_cancel_ack arrives. */
+  cancellationState?: "cancelling" | "retry" | "rejected";
+  cancellationMessage?: string;
   /**
    * Optional per-request key used to keep in-progress answers through mobile
    * orientation changes or websocket/UI remounts. Stored only in this tab's
-   * sessionStorage and cleared when the form is cancelled or the parent gets
-   * the exact durable acknowledgement.
+   * sessionStorage and cleared by the parent only after the exact durable
+   * submission or cancellation acknowledgement.
    */
   storageKey?: string;
 }
@@ -160,10 +163,13 @@ export function InterviewForm({
   submissionState,
   submissionMessage,
   onRetry,
+  cancellationState,
+  cancellationMessage,
   storageKey,
 }: InterviewFormProps) {
   const [initialDraft] = useState(() => loadStoredDraft(storageKey, questions));
   const awaitingAcknowledgement = Boolean(submissionState);
+  const cancellationPending = cancellationState === "cancelling";
   const [currentTab, setCurrentTab] = useState(initialDraft.currentTab);
   const [answers, setAnswers] = useState<Map<string, InterviewAnswer>>(
     initialDraft.answers,
@@ -200,16 +206,6 @@ export function InterviewForm({
     }
   }, [answers, currentTab, customInput, customQuestionId, questions, storageKey]);
 
-  const clearStoredDraft = useCallback(() => {
-    if (!storageKey || typeof window === "undefined") return;
-
-    try {
-      window.sessionStorage.removeItem(storageKey);
-    } catch {
-      // Ignore storage errors.
-    }
-  }, [storageKey]);
-
   const submitAnswers = useCallback(
     (nextAnswers: InterviewAnswer[]) => {
       // The response draft is deliberately retained until the parent receives
@@ -221,10 +217,10 @@ export function InterviewForm({
   );
 
   const cancelInterview = useCallback(() => {
-    if (awaitingAcknowledgement) return;
-    clearStoredDraft();
+    if (awaitingAcknowledgement || cancellationPending) return;
+    // The parent clears the draft only after the exact terminal cancel ack.
     onCancel();
-  }, [awaitingAcknowledgement, clearStoredDraft, onCancel]);
+  }, [awaitingAcknowledgement, cancellationPending, onCancel]);
 
   // Save an answer and advance
   const saveAnswer = useCallback(
@@ -257,7 +253,7 @@ export function InterviewForm({
 
   // Handle option click
   const handleOptionSelect = (opt: QuestionOption & { isOther?: boolean }) => {
-    if (!currentQuestion || awaitingAcknowledgement) return;
+    if (!currentQuestion || awaitingAcknowledgement || cancellationPending) return;
 
     if (opt.isOther) {
       setCustomQuestionId(currentQuestion.id);
@@ -272,7 +268,7 @@ export function InterviewForm({
 
   // Handle custom text submit
   const handleCustomSubmit = () => {
-    if (!customQuestionId || awaitingAcknowledgement) return;
+    if (!customQuestionId || awaitingAcknowledgement || cancellationPending) return;
     const trimmed = customInput.trim() || "(no response)";
     saveAnswer(customQuestionId, trimmed, trimmed, true);
     setCustomInput("");
@@ -281,14 +277,14 @@ export function InterviewForm({
 
   // Submit all
   const handleSubmitAll = () => {
-    if (!awaitingAcknowledgement && allAnswered) {
+    if (!awaitingAcknowledgement && !cancellationPending && allAnswered) {
       submitAnswers(orderInterviewAnswers(questions, answers));
     }
   };
 
   // Tab navigation
   const goToTab = (index: number) => {
-    if (awaitingAcknowledgement) return;
+    if (awaitingAcknowledgement || cancellationPending) return;
     setCustomQuestionId(null);
     setCustomInput("");
     setCurrentTab(index);
@@ -328,6 +324,26 @@ export function InterviewForm({
         </div>
       )}
 
+      {cancellationState && (
+        <div
+          data-testid="interview-cancellation-status"
+          className={`border-b px-4 py-2 text-xs ${
+            cancellationPending
+              ? "border-blue-900/60 bg-blue-950/30 text-blue-200"
+              : "border-amber-900/60 bg-amber-950/30 text-amber-200"
+          }`}
+          role="status"
+        >
+          <div className="font-medium">
+            {cancellationPending
+              ? "Cancellation sent — waiting for acknowledgement."
+              : "Cancellation was not confirmed. The questionnaire remains available."}
+          </div>
+          {cancellationMessage && <div className="mt-1 opacity-80">{cancellationMessage}</div>}
+        </div>
+      )}
+
+      <fieldset disabled={cancellationPending} className="contents">
       {/* ---- Tab bar ---- */}
       {isMulti && (
         <div className="flex items-center gap-1 px-3 py-2 border-b border-neutral-800 overflow-x-auto">
@@ -405,7 +421,7 @@ export function InterviewForm({
               <button
                 type="button"
                 onClick={() => {
-                  if (awaitingAcknowledgement) return;
+                  if (awaitingAcknowledgement || cancellationPending) return;
                   setCustomQuestionId(null);
                   setCustomInput("");
                 }}
@@ -546,9 +562,16 @@ export function InterviewForm({
           disabled={awaitingAcknowledgement}
           className="text-xs text-neutral-500 hover:text-red-400 transition-colors disabled:cursor-not-allowed disabled:opacity-60"
         >
-          {awaitingAcknowledgement ? "Submission pending" : "Cancel"}
+          {awaitingAcknowledgement
+            ? "Submission pending"
+            : cancellationPending
+              ? "Cancellation pending"
+              : cancellationState
+                ? "Retry cancellation"
+                : "Cancel"}
         </button>
       </div>
+      </fieldset>
     </div>
   );
 }

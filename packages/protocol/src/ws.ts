@@ -558,7 +558,8 @@ export type InterviewResponseAckErrorCode =
   | "not_found"
   | "wrong_session"
   | "cancelled"
-  | "conflict";
+  | "conflict"
+  | "persistence_failed";
 
 /** Durable receipt boundary for `interview_response`; also sent for retries. */
 export interface InterviewResponseAckMessage {
@@ -572,12 +573,19 @@ export interface InterviewResponseAckMessage {
   error?: string;
 }
 
+export type InterviewCancelAckErrorCode =
+  | "session_busy"
+  | "not_found"
+  | "persistence_failed";
+
 export interface InterviewCancelAckMessage {
   type: "interview_cancel_ack";
   requestId: string | null;
   sessionId: string;
   status: "cancelled" | "rejected";
-  errorCode?: "session_busy" | "not_found";
+  duplicate?: boolean;
+  errorCode?: InterviewCancelAckErrorCode;
+  error?: string;
 }
 
 export type SudoRequestKind = "password" | "approval";

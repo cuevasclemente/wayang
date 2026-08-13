@@ -11,6 +11,8 @@
  *     { type: "set_goal", goal: string }
  *     { type: "subagent_spawn", agent: string, task: string, mode: "single"|"parallel"|"chain" }
  *     { type: "external_action_response", requestId, sessionId, selection_id, argumentsHash, approved, pin? }
+ *     { type: "interview_response", requestId, answers }
+ *     { type: "interview_cancel", requestId }
  *     { type: "command_guard_pin_response", requestId, sessionId, selection_id, pin? | cancelled }
  *
  *   Server → Client:
@@ -38,6 +40,7 @@
  *     { type: "external_action_response_ack", requestId, sessionId, selection_id, status, errorCode?, retryAt? }
  *     { type: "external_action_terminal", requestId, sessionId, selection_id, status }
  *     { type: "external_action_snapshot", sessionId, selection_id, requests, syncComplete: true }
+ *     { type: "interview_cancel_ack", requestId, sessionId, status: "cancelled"|"rejected", errorCode?, error? }
  *     { type: "command_guard_pin_request", requestId, sessionId, selection_id, ...displayMetadata }
  */
 
@@ -86,7 +89,7 @@ import {
   drainSubmittedInterviews,
   retrySubmittedInterviewDelivery,
 } from "../interview-delivery.js";
-import { cancelInterview, submitInterview } from "../interviews.js";
+import { cancelInterview, getInterviewForSession, submitInterview } from "../interviews.js";
 import {
   WAYANG_WEBSOCKET_SUBMISSION_CONTEXT,
   type InterviewSubmissionContext,
@@ -1380,7 +1383,8 @@ function normalizeCommandGuardMode(value: unknown): CommandGuardMode | null {
  * The acknowledgement is the browser durability boundary and is sent for both
  * first submit and same-payload retries.
  */
-function handleInterviewResponse(
+/** @internal Exported for focused durable acknowledgement contract tests. */
+export function handleInterviewResponse(
   ws: WebSocket,
   sessionId: string,
   msg: any,
@@ -1396,7 +1400,20 @@ function handleInterviewResponse(
     return;
   }
 
-  const submitted = submitInterview(sessionId, requestId, msg.answers, submissionContext);
+  let submitted: ReturnType<typeof submitInterview>;
+  try {
+    submitted = submitInterview(sessionId, requestId, msg.answers, submissionContext);
+  } catch {
+    sendSafe(ws, {
+      type: "interview_response_ack",
+      requestId,
+      sessionId,
+      status: "rejected",
+      errorCode: "persistence_failed",
+      error: "Response could not be persisted. Retry when ready.",
+    });
+    return;
+  }
   if (!submitted.ok) {
     sendSafe(ws, { type: "interview_response_ack", requestId, sessionId, status: "rejected", errorCode: submitted.code, error: submitted.message });
     return;
@@ -1436,23 +1453,44 @@ function handleInterviewResponse(
   });
 }
 
-function handleInterviewCancel(ws: WebSocket, sessionId: string, msg: any): void {
+/** @internal Exported for focused exact cancellation-ack contract tests. */
+export function handleInterviewCancel(ws: WebSocket, sessionId: string, msg: any): void {
   const requestId = typeof msg?.requestId === "string" ? msg.requestId : "";
   if (getRuntimeMutationSessionState(sessionId).mutation_locked) {
     sendSafe(ws, { type: "interview_cancel_ack", requestId: requestId || null, sessionId, status: "rejected", errorCode: "session_busy" });
     return;
   }
   if (!requestId) {
-    sendSafe(ws, { type: "interview_cancel_ack", requestId: null, sessionId, status: "rejected", errorCode: "not_found" });
+    sendSafe(ws, { type: "interview_cancel_ack", requestId: null, sessionId, status: "rejected", errorCode: "not_found", error: "Interview request was not found or is no longer open" });
     return;
   }
-  const cancelled = cancelInterview(sessionId, requestId);
+  let cancelled: ReturnType<typeof cancelInterview>;
+  try {
+    cancelled = cancelInterview(sessionId, requestId);
+  } catch {
+    // The form remains authoritative until this exact terminal rejection. Do
+    // not expose store paths or persistence diagnostics over the transport.
+    sendSafe(ws, {
+      type: "interview_cancel_ack",
+      requestId,
+      sessionId,
+      status: "rejected",
+      errorCode: "persistence_failed",
+      error: "Cancellation could not be persisted. Retry when ready.",
+    });
+    return;
+  }
   if (!cancelled) {
-    sendSafe(ws, { type: "interview_cancel_ack", requestId, sessionId, status: "rejected", errorCode: "not_found" });
+    const existing = getInterviewForSession(sessionId, requestId);
+    if (existing?.status === "cancelled") {
+      sendSafe(ws, { type: "interview_cancel_ack", requestId, sessionId, status: "cancelled", duplicate: true });
+      return;
+    }
+    sendSafe(ws, { type: "interview_cancel_ack", requestId, sessionId, status: "rejected", errorCode: "not_found", error: "Interview request was not found or is no longer open" });
     return;
   }
   getInterviewBridge().cancel(requestId);
-  sendSafe(ws, { type: "interview_cancel_ack", requestId, sessionId, status: "cancelled" });
+  sendSafe(ws, { type: "interview_cancel_ack", requestId, sessionId, status: "cancelled", duplicate: false });
 }
 
 /**
