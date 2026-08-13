@@ -39,6 +39,9 @@ export async function openStandardCdpViewer(options: {
       emit({ type: "frame", dataUrl: `data:image/jpeg;base64,${params.data}`, metadata: params.metadata, sessionId: params.sessionId });
     }).catch(() => { void options.revoke().catch(() => undefined); });
   });
+  let inputTail: Promise<void> = Promise.resolve();
+  let inputDepth = 0;
+  const MAX_VIEWER_INPUT_QUEUE = 64;
   const attestAfterInput = async () => {
     const document = await settledTopLevelDocument(cdp, target, options.authorize, SETTLE_TIMEOUT_MS, SETTLE_INTERVAL_MS);
     if (!isProtectedBrowserAllowedTopLevelUrl(document.topLevelUrl) && document.topLevelUrl !== "about:blank") {
@@ -50,8 +53,15 @@ export async function openStandardCdpViewer(options: {
   return {
     async dispatch(raw, isBinary) {
       if (closed || isBinary) throw new Error("Standard browser viewer message is invalid");
+      if (inputDepth >= MAX_VIEWER_INPUT_QUEUE) throw new Error("Standard browser viewer input queue is full");
       let message: any;
       try { message = JSON.parse(raw.toString("utf8")); } catch { throw new Error("Standard browser viewer message is invalid"); }
+      inputDepth += 1;
+      const prior = inputTail;
+      let release!: () => void;
+      inputTail = new Promise<void>((resolve) => { release = resolve; });
+      await prior.catch(() => undefined);
+      try {
       if (message.type === "frame-ack") {
         const sessionId = Number(message.sessionId);
         if (!Number.isSafeInteger(sessionId) || sessionId < 0) throw new Error("Standard browser frame acknowledgement is invalid");
@@ -69,7 +79,7 @@ export async function openStandardCdpViewer(options: {
           deltaX: Number(message.deltaX) || 0,
           deltaY: Number(message.deltaY) || 0,
         });
-        await attestAfterInput();
+        if (type !== "mouseMoved") await attestAfterInput();
         return;
       }
       if (message.type === "key") {
@@ -91,6 +101,10 @@ export async function openStandardCdpViewer(options: {
         return;
       }
       throw new Error("Standard browser viewer message is unsupported");
+      } finally {
+        inputDepth -= 1;
+        release();
+      }
     },
     async close() {
       if (closed) return;

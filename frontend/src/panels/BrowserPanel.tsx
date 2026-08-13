@@ -78,6 +78,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
   useEffect(() => {
     let cancelled = false;
     if (browserMode === "standard" && sessionId) {
+      setSessionProfileState(null);
       void Promise.all([fetchBrowserProfiles(), fetchSessionBrowserProfileState(sessionId)]).then(([catalog, current]) => {
         if (cancelled) return;
         setProfileChoices(catalog.profiles.filter((profile) => profile.state === "active"));
@@ -318,7 +319,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
         <div className="shrink-0 border-b border-blue-900/50 bg-blue-950/25 px-3 py-3 text-xs text-blue-100">
           <label className="flex flex-col gap-2 sm:flex-row sm:items-center">
             <span className="font-medium">{state?.profile.persistence === "named" ? "Session Browser Profile" : "This session needs a named Browser Profile."}</span>
-            <select className="rounded border border-blue-800 bg-neutral-950 px-2 py-1.5 text-neutral-100" defaultValue={sessionProfileState?.active_profile_id ?? ""} onChange={(event) => {
+            <select className="rounded border border-blue-800 bg-neutral-950 px-2 py-1.5 text-neutral-100" value={sessionProfileState?.active_profile_id ?? ""} disabled={busy} onChange={(event) => {
               const profileId = event.target.value;
               if (!profileId) return;
               void runAction(async () => {
@@ -379,10 +380,10 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
       {state?.profile.persistence === "named" && state.tabs && (
         <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-neutral-900 bg-neutral-950 px-2 py-1.5" role="tablist" aria-label="Session-owned browser tabs">
           {state.tabs.map((tab) => <div key={tab.tab} className={`inline-flex max-w-56 shrink-0 items-center rounded border ${state.activeTab === tab.tab ? "border-blue-600 bg-blue-950/50" : "border-neutral-800 bg-neutral-900"}`}>
-            <button type="button" role="tab" aria-selected={state.activeTab === tab.tab} onClick={() => void runAction(async () => applyState(await selectBrowserTab(sessionId, sessionCwd, tab.tab)))} className="truncate px-2 py-1 text-xs text-neutral-200" title={tab.title || tab.url || "Untitled tab"}>{tab.title || tab.url || "Untitled tab"}</button>
-            <button type="button" aria-label={`Close ${tab.title || "tab"}`} onClick={() => void runAction(async () => applyState(await closeBrowserTab(sessionId, sessionCwd, tab.tab)))} className="px-1.5 py-1 text-xs text-neutral-500 hover:text-neutral-100">×</button>
+            <button type="button" role="tab" aria-selected={state.activeTab === tab.tab} disabled={cooperative} onClick={() => void runAction(async () => applyState(await selectBrowserTab(sessionId, sessionCwd, tab.tab)))} className="truncate px-2 py-1 text-xs text-neutral-200" title={tab.title || tab.url || "Untitled tab"}>{tab.title || tab.url || "Untitled tab"}</button>
+            <button type="button" aria-label={`Close ${tab.title || "tab"}`} disabled={cooperative} onClick={() => void runAction(async () => applyState(await closeBrowserTab(sessionId, sessionCwd, tab.tab)))} className="px-1.5 py-1 text-xs text-neutral-500 hover:text-neutral-100">×</button>
           </div>)}
-          <button type="button" onClick={() => void runAction(async () => applyState(await openBrowserTab(sessionId, sessionCwd)))} className="shrink-0 rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800" aria-label="Open browser tab">＋</button>
+          <button type="button" disabled={cooperative} onClick={() => void runAction(async () => applyState(await openBrowserTab(sessionId, sessionCwd)))} className="shrink-0 rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800" aria-label="Open browser tab">＋</button>
         </div>
       )}
 

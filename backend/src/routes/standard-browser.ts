@@ -235,10 +235,10 @@ export function createStandardBrowserRouter(integration?: StandardBrowserIntegra
     await runtime.workspace.host.ownerOpenTab(selection.sourceSessionId, selection.workspaceGeneration, String(req.body?.url ?? "about:blank"), authorize);
     res.status(201).json(publicState(selection, runtime));
   }));
-  router.post("/browser/tabs/select", asyncHandler((req, res) => {
+  router.post("/browser/tabs/select", asyncHandler(async (req, res) => {
     const selection = selections.get(req)!;
     const runtime = exactRuntime(req, integration!);
-    runtime.workspace.host.ownerSelectTab(selection.sourceSessionId, selection.workspaceGeneration, String(req.body?.tab ?? ""));
+    await runtime.workspace.host.ownerSelectTab(selection.sourceSessionId, selection.workspaceGeneration, String(req.body?.tab ?? ""));
     res.json(publicState(selection, runtime));
   }));
   router.delete("/browser/tabs/:tab", asyncHandler(async (req, res) => {

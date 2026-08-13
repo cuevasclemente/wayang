@@ -16,6 +16,7 @@ import {
 import { getSessionById } from "../sessions.js";
 import { getProject } from "../projects.js";
 import { WorkspaceStoreError } from "../workspace-types.js";
+import { stopPiSession } from "../pi-bridge.js";
 import type { StandardBrowserProfileHostService } from "../browser/standard-service.js";
 import type { BrowserProfileCleanupCoordinator } from "../browser/profile-cleanup.js";
 
@@ -119,7 +120,7 @@ export function createBrowserProfilesRouter(
     if (!getSessionById(req.params.sessionId)) throw new WorkspaceStoreError("Session not found", 404);
     res.json({ state: getSessionBrowserState(req.params.sessionId) });
   }));
-  router.put("/browser-profiles/sessions/:sessionId/state", asyncHandler((req, res) => {
+  router.put("/browser-profiles/sessions/:sessionId/state", asyncHandler(async (req, res) => {
     if (!getSessionById(req.params.sessionId)) throw new WorkspaceStoreError("Session not found", 404);
     const body = exactObject(req.body, ["profileId", "expectedRevision"]);
     const profileId = body.profileId === null ? null : typeof body.profileId === "string" ? body.profileId : undefined;
@@ -128,7 +129,10 @@ export function createBrowserProfilesRouter(
     const expectedRevision = body.expectedRevision === null ? null : revision(body.expectedRevision);
     if ((existing?.revision ?? null) !== expectedRevision) throw new WorkspaceStoreError("Session Browser state changed; refresh and retry", 409);
     const current = existing ?? materializeSessionBrowserState(req.params.sessionId);
-    res.json({ state: setSessionBrowserProfile({ sessionId: req.params.sessionId, profileId, expectedRevision: current.revision }) });
+    const next = setSessionBrowserProfile({ sessionId: req.params.sessionId, profileId, expectedRevision: current.revision });
+    await stopPiSession(req.params.sessionId, { kind: "detach", reason: "runtime_replaced" });
+    await service?.closeSessionWorkspaces(req.params.sessionId, "owner_close_all");
+    res.json({ state: next });
   }));
   return router;
 }

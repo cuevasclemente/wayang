@@ -404,32 +404,41 @@ export class StandardBrowserProfileHost {
   async ownerOpenTab(sourceSessionId: string, workspaceGeneration: string, url: string, authorize: () => void | Promise<void>): Promise<StandardBrowserWorkspacePublicState> {
     if (url !== "about:blank" && !isProtectedBrowserAllowedTopLevelUrl(url)) throw new Error("Standard browser tab requires an absolute HTTPS URL");
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
-    await this.ensureStartedAuthorized(authorize);
-    const target = await this.backend.createTarget(url);
-    await authorize();
-    const record = this.adoptTarget(workspace, target);
-    workspace.activeTargetId = record.rawId;
-    return this.ownerPublicState(sourceSessionId, workspaceGeneration);
+    return this.queueWorkspace(workspace, async () => {
+      if (workspace.controlMode === "agent") throw new Error("Standard browser tab changes require human control");
+      await this.ensureStartedAuthorized(authorize);
+      const target = await this.backend.createTarget(url);
+      await authorize();
+      const record = this.adoptTarget(workspace, target);
+      workspace.activeTargetId = record.rawId;
+      return this.ownerPublicState(sourceSessionId, workspaceGeneration);
+    });
   }
 
-  ownerSelectTab(sourceSessionId: string, workspaceGeneration: string, handle: string): StandardBrowserWorkspacePublicState {
+  async ownerSelectTab(sourceSessionId: string, workspaceGeneration: string, handle: string): Promise<StandardBrowserWorkspacePublicState> {
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
-    const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
-    if (!target) throw new Error("Standard browser tab choice is stale");
-    workspace.activeTargetId = target.rawId;
-    workspace.lastActivityAt = Date.now();
-    return this.ownerPublicState(sourceSessionId, workspaceGeneration);
+    return this.queueWorkspace(workspace, async () => {
+      if (workspace.controlMode === "agent") throw new Error("Standard browser tab changes require human control");
+      const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
+      if (!target) throw new Error("Standard browser tab choice is stale");
+      workspace.activeTargetId = target.rawId;
+      workspace.lastActivityAt = Date.now();
+      return this.ownerPublicState(sourceSessionId, workspaceGeneration);
+    });
   }
 
   async ownerCloseTab(sourceSessionId: string, workspaceGeneration: string, handle: string): Promise<StandardBrowserWorkspacePublicState> {
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
-    const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
-    if (!target) throw new Error("Standard browser tab choice is stale");
-    this.targetOwners.delete(target.rawId);
-    workspace.targets.delete(target.rawId);
-    await this.backend.closeTarget(target.rawId);
-    if (workspace.activeTargetId === target.rawId) workspace.activeTargetId = workspace.targets.keys().next().value ?? null;
-    return this.ownerPublicState(sourceSessionId, workspaceGeneration);
+    return this.queueWorkspace(workspace, async () => {
+      if (workspace.controlMode === "agent") throw new Error("Standard browser tab changes require human control");
+      const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
+      if (!target) throw new Error("Standard browser tab choice is stale");
+      this.targetOwners.delete(target.rawId);
+      workspace.targets.delete(target.rawId);
+      await this.backend.closeTarget(target.rawId);
+      if (workspace.activeTargetId === target.rawId) workspace.activeTargetId = workspace.targets.keys().next().value ?? null;
+      return this.ownerPublicState(sourceSessionId, workspaceGeneration);
+    });
   }
 
   async ownerAttachActiveViewer(
@@ -606,9 +615,16 @@ export class StandardBrowserProfileHost {
     operation: ProtectedBrowserOperation,
   ): Promise<unknown> {
     const workspace = this.exactWorkspace(binding, workspaceGeneration);
+    const capturedControlGeneration = workspace.controlGeneration;
     return this.queueWorkspace(workspace, async () => {
       this.assertAuthority(binding);
-      if (workspace.controlMode !== "agent" && operation.kind !== "status") throw new Error("Standard browser workspace is under human control");
+      const assertAgentControl = () => {
+        const current = this.exactWorkspace(binding, workspaceGeneration);
+        if (current.controlMode !== "agent" || current.controlGeneration !== capturedControlGeneration) {
+          throw new Error("Standard browser workspace control changed");
+        }
+      };
+      if (operation.kind !== "status") assertAgentControl();
       if (operation.kind === "status") return this.publicState(binding, workspaceGeneration);
       if (operation.kind === "start") {
         await this.ensureActiveTarget(binding, workspace);
@@ -620,9 +636,9 @@ export class StandardBrowserProfileHost {
       }
       const target = await this.ensureActiveTarget(binding, workspace);
       const value = await this.backend.execute(target.rawId, operation, async () => {
-        this.exactWorkspace(binding, workspaceGeneration);
+        assertAgentControl();
       });
-      this.exactWorkspace(binding, workspaceGeneration);
+      assertAgentControl();
       workspace.lastActivityAt = Date.now();
       return value;
     });
