@@ -146,7 +146,7 @@ export function createStandardBrowserSessionRuntime(options: {
         const currentCatalog = options.service.listProfiles(options.binding);
         if (!choice || choice.catalogGeneration !== currentCatalog.generation
           || !currentCatalog.profiles.some((profile) => profile.id === choice.profileId)) throw new Error("Browser Profile choice is stale");
-        const switched = options.service.switchProfile(options.binding, workspace, choice.profileId, state.revision);
+        const switched = await options.service.switchProfile(options.binding, workspace, choice.profileId, state.revision);
         state = switched.state;
         workspace = switched.workspace;
         profileChoices.clear();

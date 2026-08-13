@@ -88,6 +88,11 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     return profile;
   }
 
+  private activeProfile(profileId: string): BrowserProfileRow | null {
+    const profile = this.options.catalog.catalog().profiles.find((candidate) => candidate.id === profileId);
+    return profile?.state === "active" ? profile : null;
+  }
+
   private host(profile: BrowserProfileRow): StandardBrowserProfileHost {
     const current = this.hosts.get(profile.id);
     if (current && !current.isClosed) return current;
@@ -127,7 +132,8 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
 
   attachWorkspace(binding: Readonly<ProtectedBrowserBinding>, state: Readonly<SessionBrowserStateRow>): StandardBrowserRuntimeWorkspace | null {
     if (state.active_profile_id === null) return null;
-    const profile = this.profile(state.active_profile_id);
+    const profile = this.activeProfile(state.active_profile_id);
+    if (!profile) return null;
     if (!this.options.catalog.authorize(binding, profile)) throw new Error("Standard Browser Profile authority is unavailable");
     const host = this.host(profile);
     const workspace = host.bindWorkspace(binding);
@@ -206,21 +212,21 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     };
   }
 
-  switchProfile(
+  async switchProfile(
     binding: Readonly<ProtectedBrowserBinding>,
     current: StandardBrowserRuntimeWorkspace | null,
     profileId: string,
     expectedSessionRevision: number,
-  ): { state: SessionBrowserStateRow; workspace: StandardBrowserRuntimeWorkspace } {
+  ): Promise<{ state: SessionBrowserStateRow; workspace: StandardBrowserRuntimeWorkspace }> {
     for (const host of this.hosts.values()) {
       if (host.hasBlockingControl(binding.sourceSessionId)) throw new Error("Cannot switch Browser Profile during human or credential control");
     }
     const profile = this.profile(profileId);
     if (!this.options.catalog.authorize(binding, profile)) throw new Error("Browser Profile choice is unavailable");
+    if (current) await current.host.detachAgentLease(binding.sourceSessionId, binding.runtimeGeneration);
     const state = this.options.catalog.switchSessionProfile({ binding, profileId, expectedRevision: expectedSessionRevision });
     const workspace = this.attachWorkspace(binding, state);
     if (!workspace) throw new Error("Browser Profile assignment failed");
-    void current;
     return { state, workspace };
   }
 
