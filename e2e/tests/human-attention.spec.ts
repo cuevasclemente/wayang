@@ -356,7 +356,7 @@ test("notification dedupe evicts from both bounded order and membership", async 
     window.localStorage.getItem("wayang:human-attention:seen-source-ids") ?? "[]",
   ) as string[]);
   expect(stored).toHaveLength(4096);
-  expect(stored.at(-1)).toBe(oldest);
+  expect(stored.at(-1)).toBe(JSON.stringify([sessionId, oldest]));
 });
 
 test("Notifications Settings remains usable when project and profile loads fail", async ({ page }) => {

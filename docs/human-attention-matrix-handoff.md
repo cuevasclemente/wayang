@@ -1,7 +1,7 @@
 # Human-attention handoff for connector-neutral messaging
 
-**Date:** 2026-08-10  
-**Owner:** existing connector-neutral messaging/Matrix implementation session  
+**Date:** 2026-08-10
+**Owner:** existing connector-neutral messaging/Matrix implementation session
 **Status:** contract handoff only; Matrix remains disabled and undeployed
 
 ## Goal

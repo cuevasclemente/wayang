@@ -56,6 +56,10 @@ function loadSeenSourceIds(): { ids: Set<string>; order: string[] } {
   return { ids: seenSourceIds, order: seenSourceIdOrder };
 }
 
+function attentionStorageKey(sessionId: string, sourceId: string): string {
+  return JSON.stringify([sessionId, sourceId]);
+}
+
 function rememberSourceIds(sourceIds: string[]): void {
   const { ids, order } = loadSeenSourceIds();
   let changed = false;
@@ -117,13 +121,16 @@ export function observeHumanAttention(sessions: AttentionSessionSummary[]): void
 
   for (const session of sessions) {
     for (const attention of session.humanAttention) {
-      if (!ids.has(attention.sourceId) && !batchSourceIds.has(attention.sourceId)) {
-        batchSourceIds.add(attention.sourceId);
+      const storageKey = attentionStorageKey(session.id, attention.sourceId);
+      // Legacy releases stored sourceId alone. Treat those entries as seen so
+      // upgrading never re-notifies old gates; new entries bind exact session.
+      if (!ids.has(storageKey) && !ids.has(attention.sourceId) && !batchSourceIds.has(storageKey)) {
+        batchSourceIds.add(storageKey);
         newlyObserved.push({ sessionId: session.id, sourceId: attention.sourceId });
       }
     }
   }
-  rememberSourceIds(newlyObserved.map(({ sourceId }) => sourceId));
+  rememberSourceIds(newlyObserved.map(({ sessionId, sourceId }) => attentionStorageKey(sessionId, sourceId)));
 
   if (getBrowserNotificationState().kind !== "granted") return;
   for (const { sessionId } of newlyObserved) {
@@ -141,4 +148,3 @@ export function observeHumanAttention(sessions: AttentionSessionSummary[]): void
     }
   }
 }
-

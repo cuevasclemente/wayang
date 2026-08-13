@@ -5,10 +5,11 @@ import { validateCommandGuardIdentityPin } from "../command-guard-pin.js";
 import { removeSession as removeSearchSession } from "../search/indexer.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
 import { listHumanAttentionForSession, type HumanAttentionSummary } from "../human-attention.js";
+import type { Session as ProtocolSession } from "@wayang/protocol";
 
 export const router = Router();
 
-type SessionResponse = SessionRow & ReturnType<typeof getPiSessionRuntimeState> & {
+type SessionResponse = ProtocolSession & SessionRow & ReturnType<typeof getPiSessionRuntimeState> & {
   bash_mode: ReturnType<typeof getPiSessionBashMode>;
   browser_mode: ReturnType<typeof getPiSessionBrowserMode>;
   browser_agent: ReturnType<typeof getPiSessionBrowserAgentDiagnostic>;
