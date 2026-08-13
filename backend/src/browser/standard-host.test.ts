@@ -165,6 +165,24 @@ test("human handoff hides agent tab metadata and denies every agent tab mutation
   await f.host.close();
 });
 
+test("human resume retains exact tabs and workspace activity is not host-wide", async () => {
+  const f = hostFixture();
+  const exact = binding("session-a");
+  const workspace = f.host.bindWorkspace(exact);
+  await f.host.execute(exact, workspace.generation, { kind: "navigate", url: "https://resume.example/path" });
+  const before = f.host.publicState(exact, workspace.generation);
+  await f.host.ownerSetControlMode(exact.sourceSessionId, workspace.generation, "paused");
+  await f.host.ownerResumeAgent(exact.sourceSessionId, workspace.generation);
+  const after = f.host.publicState(exact, workspace.generation);
+  assert.deepEqual(after.tabs, before.tabs);
+  assert.equal(after.activeTab, before.activeTab);
+  assert.equal(after.running, true);
+  await f.host.closeWorkspace(exact.sourceSessionId, "owner_close_all");
+  const rebound = f.host.bindWorkspace({ ...exact, runtimeGeneration: "runtime-rebound" });
+  assert.equal(f.host.publicState({ ...exact, runtimeGeneration: "runtime-rebound" }, rebound.generation).running, false);
+  await f.host.close();
+});
+
 test("downloads freeze exact target/workspace ownership and detach cancels before publication", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-standard-download-owner-"));
   const projectDir = path.join(root, "project");

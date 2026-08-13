@@ -339,7 +339,7 @@ export class StandardBrowserProfileHost {
       controlMode: workspace.controlMode,
       activeTab: workspace.activeTargetId ? workspace.targets.get(workspace.activeTargetId)?.handle ?? null : null,
       tabs,
-      running: this.backend.running,
+      running: workspace.targets.size > 0,
       updatedAt: workspace.lastActivityAt,
       ...(workspace.latestDownload ? { download: { ...workspace.latestDownload } } : {}),
     };
@@ -366,13 +366,6 @@ export class StandardBrowserProfileHost {
     await this.closeWorkspaceViewers(sourceSessionId);
     await workspace.queueTail.catch(() => undefined);
     await this.cancelWorkspaceDownloads(sourceSessionId, workspaceGeneration);
-    const targets = [...workspace.targets.keys()];
-    workspace.targets.clear();
-    workspace.activeTargetId = null;
-    for (const targetId of targets) {
-      this.targetOwners.delete(targetId);
-      await this.backend.closeTarget(targetId).catch(() => undefined);
-    }
     workspace.controlMode = "agent";
     workspace.controlGeneration += 1;
     workspace.lastActivityAt = Date.now();
@@ -620,7 +613,7 @@ export class StandardBrowserProfileHost {
       controlMode: workspace.controlMode,
       activeTab: workspace.controlMode === "agent" && workspace.activeTargetId ? workspace.targets.get(workspace.activeTargetId)?.handle ?? null : null,
       tabs,
-      running: this.backend.running,
+      running: workspace.targets.size > 0,
       updatedAt: workspace.lastActivityAt,
       ...(workspace.latestDownload ? { download: { ...workspace.latestDownload } } : {}),
     };
@@ -750,6 +743,12 @@ export class StandardBrowserProfileHost {
   hasBlockingControl(sourceSessionId: string): boolean {
     const workspace = this.workspaces.get(sourceSessionId);
     return Boolean(workspace && !workspace.closed && (workspace.controlTransition || workspace.controlMode !== "agent"));
+  }
+
+  viewerControlAvailable(sourceSessionId: string, workspaceGeneration: string): boolean {
+    const workspace = this.workspaces.get(sourceSessionId);
+    return Boolean(workspace && !workspace.closed && workspace.generation === workspaceGeneration
+      && !workspace.controlTransition && workspace.controlMode !== "agent");
   }
 
   registerViewer(sourceSessionId: string, workspaceGeneration: string, close: () => Promise<void>): () => void {
