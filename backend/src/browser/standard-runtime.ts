@@ -96,7 +96,7 @@ export function createStandardBrowserSessionRuntime(options: {
         const reason = String((raw as { reason?: unknown }).reason ?? "");
         if (!reason || Buffer.byteLength(reason, "utf8") > 2048) throw new Error("Browser handoff reason is invalid");
         const exact = ensureWorkspace();
-        exact.host.setControlMode(options.binding.sourceSessionId, "paused");
+        await exact.host.ownerSetControlMode(options.binding.sourceSessionId, exact.workspaceGeneration, "paused");
         return textResult({ needsUser: true, reason, controlMode: "paused" });
       },
     }),

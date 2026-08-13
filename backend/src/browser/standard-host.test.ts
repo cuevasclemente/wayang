@@ -154,7 +154,7 @@ test("human handoff hides agent tab metadata and denies every agent tab mutation
   const exact = binding("session-a");
   const workspace = f.host.bindWorkspace(exact);
   await f.host.execute(exact, workspace.generation, { kind: "navigate", url: "https://sensitive.example/path?token=SECRET" });
-  f.host.setControlMode(exact.sourceSessionId, "paused");
+  await f.host.ownerSetControlMode(exact.sourceSessionId, workspace.generation, "paused");
   const status = f.host.publicState(exact, workspace.generation);
   assert.deepEqual(status.tabs, []);
   assert.equal(status.activeTab, null);

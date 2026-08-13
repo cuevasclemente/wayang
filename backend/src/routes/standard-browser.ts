@@ -212,7 +212,7 @@ export function createStandardBrowserRouter(integration?: StandardBrowserIntegra
     const mode = req.body?.mode;
     if (mode !== "agent" && mode !== "user" && mode !== "paused") throw error("Invalid Standard browser control mode", 400);
     if (mode === "agent") await runtime.workspace.host.ownerResumeAgent(selection.sourceSessionId, selection.workspaceGeneration);
-    else runtime.workspace.host.ownerSetControlMode(selection.sourceSessionId, selection.workspaceGeneration, mode);
+    else await runtime.workspace.host.ownerSetControlMode(selection.sourceSessionId, selection.workspaceGeneration, mode);
     res.json(publicState(selection, runtime));
   }));
   router.post("/browser/paste", (_req, res) => {

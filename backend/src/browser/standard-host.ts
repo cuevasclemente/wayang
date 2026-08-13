@@ -119,6 +119,7 @@ interface WorkspaceRecord {
   lastActivityAt: number;
   queueDepth: number;
   queueTail: Promise<void>;
+  controlTransition: boolean;
   binding: ProtectedBrowserBinding;
   latestDownload?: InteractiveBrowserDownloadState;
   closed: boolean;
@@ -234,6 +235,7 @@ export class StandardBrowserProfileHost {
       lastActivityAt: Date.now(),
       queueDepth: 0,
       queueTail: Promise.resolve(),
+      controlTransition: false,
       binding: { ...binding },
       closed: false,
     };
@@ -342,13 +344,25 @@ export class StandardBrowserProfileHost {
     };
   }
 
-  ownerSetControlMode(sourceSessionId: string, workspaceGeneration: string, mode: "user" | "paused"): void {
-    this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
-    this.setControlMode(sourceSessionId, mode);
+  async ownerSetControlMode(sourceSessionId: string, workspaceGeneration: string, mode: "user" | "paused"): Promise<void> {
+    const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    if (workspace.controlTransition) throw new Error("Standard browser control transition is busy");
+    workspace.controlTransition = true;
+    workspace.controlGeneration += 1;
+    try {
+      await workspace.queueTail.catch(() => undefined);
+      this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+      workspace.controlMode = mode;
+      workspace.lastActivityAt = Date.now();
+    } finally { workspace.controlTransition = false; }
   }
 
   async ownerResumeAgent(sourceSessionId: string, workspaceGeneration: string): Promise<void> {
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    if (workspace.controlTransition) throw new Error("Standard browser control transition is busy");
+    workspace.controlTransition = true;
+    workspace.controlGeneration += 1;
+    await workspace.queueTail.catch(() => undefined);
     await this.cancelWorkspaceDownloads(sourceSessionId, workspaceGeneration);
     const targets = [...workspace.targets.keys()];
     workspace.targets.clear();
@@ -360,6 +374,7 @@ export class StandardBrowserProfileHost {
     workspace.controlMode = "agent";
     workspace.controlGeneration += 1;
     workspace.lastActivityAt = Date.now();
+    workspace.controlTransition = false;
   }
 
   async ownerStart(sourceSessionId: string, workspaceGeneration: string, authorize: () => void | Promise<void>): Promise<void> {
@@ -460,7 +475,7 @@ export class StandardBrowserProfileHost {
     if (target.openerId) {
       const sourceSessionId = this.targetOwners.get(target.openerId);
       const workspace = sourceSessionId ? this.workspaces.get(sourceSessionId) : undefined;
-      if (workspace && !workspace.closed) {
+      if (workspace && !workspace.closed && !workspace.controlTransition) {
         try { this.adoptTarget(workspace, target); return; }
         catch { void this.backend.closeTarget(target.id).catch(() => undefined); return; }
       }
