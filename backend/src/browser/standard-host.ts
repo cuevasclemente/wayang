@@ -30,11 +30,26 @@ function agentVisibleUrl(value: string | undefined): string | undefined {
   } catch { return ""; }
 }
 
+function redactUrlSecrets(value: string, rawUrl: string | undefined): string {
+  if (!rawUrl) return value;
+  let output = value.split(rawUrl).join(agentVisibleUrl(rawUrl) ?? "");
+  try {
+    const parsed = new URL(rawUrl);
+    const secrets = [parsed.username, parsed.password, parsed.hash.slice(1), ...parsed.searchParams.values()]
+      .filter((secret) => secret.length >= 3)
+      .sort((left, right) => right.length - left.length);
+    for (const secret of secrets) {
+      output = output.split(secret).join("[REDACTED]");
+      try { output = output.split(decodeURIComponent(secret)).join("[REDACTED]"); } catch { /* malformed encoding */ }
+    }
+  } catch { /* malformed URL already projects as empty */ }
+  return output;
+}
+
 function agentVisibleTitle(value: string | undefined, rawUrl: string | undefined): string | undefined {
   if (!value) return undefined;
-  const visibleUrl = agentVisibleUrl(rawUrl);
-  if (rawUrl && value.includes(rawUrl)) return visibleUrl;
-  return value.length > 512 ? `${value.slice(0, 512)}…` : value;
+  const redacted = redactUrlSecrets(value, rawUrl);
+  return redacted.length > 512 ? `${redacted.slice(0, 512)}…` : redacted;
 }
 
 export interface StandardBrowserBackendTarget {
@@ -128,6 +143,7 @@ export class StandardBrowserProfileHost {
   private readonly targetOwners = new Map<string, string>();
   private readonly unassignedTargets = new Map<string, StandardBrowserBackendTarget>();
   private readonly downloads = new Map<string, StandardDownloadOwner>();
+  private observedDownloadCount = 0;
   private backend: StandardBrowserHostBackend;
   private openerLease: BrowserStorageOpenerLease;
   private startPromise: Promise<void> | null = null;
@@ -486,10 +502,12 @@ export class StandardBrowserProfileHost {
     if (!sourceSessionId || !targetId || !workspace || workspace.closed || !target || !this.backend.downloadStagingDir
       || workspace.runtimeGeneration !== workspace.binding.runtimeGeneration
       || workspaceDownloadCount >= MAX_STANDARD_BROWSER_DOWNLOADS_PER_WORKSPACE
-      || this.downloads.size >= MAX_STANDARD_BROWSER_DOWNLOADS_PER_HOST) {
+      || this.downloads.size >= MAX_STANDARD_BROWSER_DOWNLOADS_PER_HOST
+      || this.observedDownloadCount >= 32) {
       this.cancelDownload(event.guid);
       return;
     }
+    this.observedDownloadCount += 1;
     let publisher: InteractiveBrowserDownloadPublisher;
     try {
       publisher = new InteractiveBrowserDownloadPublisher(this.backend.downloadStagingDir, workspace.binding.projectCwd, { cleanStaging: false });

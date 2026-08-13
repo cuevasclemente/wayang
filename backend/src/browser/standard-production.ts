@@ -54,6 +54,21 @@ async function targetIdForFrame(managed: StandardManagedChromiumPort, frameId: s
   return matched;
 }
 
+function redactNavigationTitle(title: string, rawUrl: string): string {
+  let output = title;
+  try {
+    const parsed = new URL(rawUrl);
+    const visible = new URL(rawUrl);
+    visible.username = ""; visible.password = ""; visible.search = ""; visible.hash = "";
+    output = output.split(rawUrl).join(visible.toString());
+    for (const secret of [parsed.username, parsed.password, parsed.hash.slice(1), ...parsed.searchParams.values()]
+      .filter((value) => value.length >= 3).sort((a, b) => b.length - a.length)) {
+      output = output.split(secret).join("[REDACTED]");
+    }
+  } catch { return ""; }
+  return output.slice(0, 512);
+}
+
 function publicTarget(target: ChromeTarget): StandardBrowserBackendTarget {
   return {
     id: target.id,
@@ -94,6 +109,7 @@ async function executeExactTargetOperation(
       }
       case "snapshot": {
         const page = await evaluateGuardedPage<{ url: string; title: string; text: string }>(cdp, authorize, compileGuardedDomOperation({ kind: "snapshot" }));
+        page.title = redactNavigationTitle(page.title, page.url);
         if (operation.mode === "screenshot") {
           const shot = await guardedSend<any>(cdp, authorize, "Page.captureScreenshot", { format: "jpeg", quality: 80, fromSurface: true });
           value = { url: page.url, title: page.title, screenshot: shot?.data ? `data:image/jpeg;base64,${shot.data}` : undefined };
@@ -147,7 +163,7 @@ async function executeExactTargetOperation(
     if (operation.kind === "navigate" && value && typeof value === "object") {
       const visible = new URL(after.topLevelUrl);
       visible.username = ""; visible.password = ""; visible.search = ""; visible.hash = "";
-      value = { ...value, url: visible.toString(), title: after.title.includes(after.topLevelUrl) ? visible.toString() : after.title.slice(0, 512) };
+      value = { ...value, url: visible.toString(), title: redactNavigationTitle(after.title, after.topLevelUrl) };
     }
     return protection.redact(value);
   } finally { attachment.close(); }

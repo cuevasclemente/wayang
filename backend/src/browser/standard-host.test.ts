@@ -139,10 +139,12 @@ test("agent tab projections strip URL credentials, query, fragments, and URL-bea
   const workspace = f.host.bindWorkspace(exact);
   await f.host.execute(exact, workspace.generation, { kind: "navigate", url: "https://example.test/path?code=SECRET#fragment" });
   const rawTarget = f.backend().executions.at(-1)!.targetId;
-  f.backend().targets.get(rawTarget)!.title = "Login https://example.test/path?code=SECRET#fragment";
+  const updated = f.backend().targets.get(rawTarget)!;
+  updated.title = "Login code SECRET";
+  (f.backend() as any).callbacks.targetChanged({ ...updated });
   const state = f.host.publicState(exact, workspace.generation);
   assert.equal(state.tabs[0]?.url, "https://example.test/path");
-  assert.equal(state.tabs[0]?.title, "https://example.test/path");
+  assert.equal(state.tabs[0]?.title, "Login code [REDACTED]");
   assert.doesNotMatch(JSON.stringify(state), /SECRET|fragment/);
   await f.host.close();
 });
