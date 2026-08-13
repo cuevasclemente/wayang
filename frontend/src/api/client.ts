@@ -1088,7 +1088,15 @@ export type BrowserViewerTransport = "vnc" | "cdp-screencast";
 
 /** Public profile metadata deliberately excludes private runtime and filesystem paths. */
 export interface BrowserProfileMetadata {
-  persistence: "shared" | "project" | "session" | "protected";
+  persistence: "shared" | "project" | "session" | "protected" | "named";
+  id?: string;
+  name?: string;
+}
+
+export interface BrowserWorkspaceTab {
+  tab: string;
+  title?: string;
+  url?: string;
 }
 
 /** Exact public state returned by browser HTTP routes and status messages. */
@@ -1125,6 +1133,8 @@ export interface BrowserSessionState {
   credentialInspection?: "blocked" | "text-allowed";
   credentialBroker?: { supported: boolean; guarded: true };
   download?: ProtectedDownloadStatus;
+  tabs?: BrowserWorkspaceTab[];
+  activeTab?: string | null;
 }
 
 export interface BrowserSnapshot {
@@ -1450,6 +1460,85 @@ export async function lockProtectedAutomationCredentials(
   const raw = asRecord(await apiPost<unknown>(protectedAutomationCredentialPath(selection, "lock")));
   if (raw.locked !== true) throw new Error("Automation credential vault did not confirm it was locked");
   return { locked: true };
+}
+
+export type BrowserProfileState = "active" | "disabled" | "trash_pending" | "trashed" | "purge_pending";
+
+export interface NamedBrowserProfile {
+  id: string;
+  name: string;
+  state: BrowserProfileState;
+  storage_source: "managed" | "legacy_shared_v1" | "standard_pair_v1" | "legacy_candidate_v1";
+  revision: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProjectBrowserDefault {
+  project_id: string;
+  profile_id: string | null;
+  revision: number;
+  updated_at: number;
+  updated_by: "owner" | "agent";
+}
+
+export interface SessionBrowserProfileState {
+  session_id: string;
+  active_profile_id: string | null;
+  revision: number;
+  updated_at: number;
+}
+
+export async function fetchBrowserProfiles(): Promise<{ profiles: NamedBrowserProfile[]; consequence: string }> {
+  return apiGet("/api/browser-profiles");
+}
+
+export async function createBrowserProfile(name: string): Promise<{ profile: NamedBrowserProfile }> {
+  return apiPost("/api/browser-profiles", { name, confirmSharedState: true });
+}
+
+export async function updateBrowserProfile(profileId: string, input: { expectedRevision: number; name?: string; enabled?: boolean }): Promise<{ profile: NamedBrowserProfile }> {
+  return request("PATCH", `/api/browser-profiles/${encodeURIComponent(profileId)}`, input);
+}
+
+export async function trashBrowserProfile(profileId: string, expectedRevision: number): Promise<unknown> {
+  return apiPost(`/api/browser-profiles/${encodeURIComponent(profileId)}/trash`, { expectedRevision });
+}
+
+export async function restoreBrowserProfile(profileId: string, expectedRevision: number): Promise<{ profile: NamedBrowserProfile }> {
+  return apiPost(`/api/browser-profiles/${encodeURIComponent(profileId)}/restore`, { expectedRevision });
+}
+
+export async function fetchProjectBrowserDefault(projectId: string): Promise<{ default: ProjectBrowserDefault | null }> {
+  return apiGet(`/api/browser-profiles/projects/${encodeURIComponent(projectId)}/default`);
+}
+
+export async function updateProjectBrowserDefault(projectId: string, profileId: string | null, expectedRevision: number | null): Promise<{ default: ProjectBrowserDefault }> {
+  return apiPut(`/api/browser-profiles/projects/${encodeURIComponent(projectId)}/default`, { profileId, expectedRevision });
+}
+
+export async function fetchSessionBrowserProfileState(sessionId: string): Promise<{ state: SessionBrowserProfileState | null }> {
+  return apiGet(`/api/browser-profiles/sessions/${encodeURIComponent(sessionId)}/state`);
+}
+
+export async function updateSessionBrowserProfileState(sessionId: string, profileId: string | null, expectedRevision: number): Promise<{ state: SessionBrowserProfileState }> {
+  return apiPut(`/api/browser-profiles/sessions/${encodeURIComponent(sessionId)}/state`, { profileId, expectedRevision });
+}
+
+export function fetchBrowserTabs(sessionId: string | null, projectCwd: string | null): Promise<BrowserSessionState> {
+  return apiGet(`/api/browser/tabs?${browserQuery(sessionId, projectCwd)}`);
+}
+
+export function openBrowserTab(sessionId: string | null, projectCwd: string | null, url = "about:blank"): Promise<BrowserSessionState> {
+  return apiPost(`/api/browser/tabs?${browserQuery(sessionId, projectCwd)}`, browserBody(sessionId, projectCwd, { url }));
+}
+
+export function selectBrowserTab(sessionId: string | null, projectCwd: string | null, tab: string): Promise<BrowserSessionState> {
+  return apiPost(`/api/browser/tabs/select?${browserQuery(sessionId, projectCwd)}`, browserBody(sessionId, projectCwd, { tab }));
+}
+
+export function closeBrowserTab(sessionId: string | null, projectCwd: string | null, tab: string): Promise<BrowserSessionState> {
+  return request("DELETE", `/api/browser/tabs/${encodeURIComponent(tab)}?${browserQuery(sessionId, projectCwd)}`);
 }
 
 export function browserWsUrl(sessionId: string | null, projectCwd: string | null): string {

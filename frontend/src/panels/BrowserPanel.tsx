@@ -6,8 +6,11 @@ import {
   type BrowserSessionState,
   type BrowserSurfaceMode,
   type BrowserViewerTransport,
+  closeBrowserTab,
   fetchBrowserStatus,
   navigateBrowser,
+  openBrowserTab,
+  selectBrowserTab,
   pasteTextBrowser,
   resetBrowserProfile,
   restartBrowser,
@@ -255,7 +258,9 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
   // support is positive metadata from the exact runtime and is never inferred
   // from a project/profile label or from Protected styling alone.
   const credentialsSupported = browserMode === "standard" || state?.credentialBroker?.supported === true;
-  const profileLabel = state?.profile.persistence === "shared"
+  const profileLabel = state?.profile.persistence === "named"
+    ? state.profile.name || "Named Browser Profile"
+    : state?.profile.persistence === "shared"
     ? "Wayang shared"
     : state?.profile.persistence === "session"
       ? "Session isolated"
@@ -324,9 +329,19 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
         onPasteClipboard={() => void handlePasteClipboard()}
       />
 
-      {state?.profile.persistence === "protected" && (
+      {state?.profile.persistence === "named" && state.tabs && (
+        <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-neutral-900 bg-neutral-950 px-2 py-1.5" role="tablist" aria-label="Session-owned browser tabs">
+          {state.tabs.map((tab) => <div key={tab.tab} className={`inline-flex max-w-56 shrink-0 items-center rounded border ${state.activeTab === tab.tab ? "border-blue-600 bg-blue-950/50" : "border-neutral-800 bg-neutral-900"}`}>
+            <button type="button" role="tab" aria-selected={state.activeTab === tab.tab} onClick={() => void runAction(async () => applyState(await selectBrowserTab(sessionId, sessionCwd, tab.tab)))} className="truncate px-2 py-1 text-xs text-neutral-200" title={tab.title || tab.url || "Untitled tab"}>{tab.title || tab.url || "Untitled tab"}</button>
+            <button type="button" aria-label={`Close ${tab.title || "tab"}`} onClick={() => void runAction(async () => applyState(await closeBrowserTab(sessionId, sessionCwd, tab.tab)))} className="px-1.5 py-1 text-xs text-neutral-500 hover:text-neutral-100">×</button>
+          </div>)}
+          <button type="button" onClick={() => void runAction(async () => applyState(await openBrowserTab(sessionId, sessionCwd)))} className="shrink-0 rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800" aria-label="Open browser tab">＋</button>
+        </div>
+      )}
+
+      {(state?.profile.persistence === "protected" || state?.profile.persistence === "named") && (
         <div data-testid="protected-downloads" className="shrink-0 border-b border-neutral-900 bg-neutral-950 px-3 py-1.5 text-xs text-neutral-500">
-          Completed bounded downloads publish to <code className="text-neutral-300">.wayang/browser-downloads/</code>.
+          Completed bounded downloads from exactly owned tabs publish to <code className="text-neutral-300">.wayang/browser-downloads/</code>.
           {state?.download && (
             <span className="ml-2" data-testid="protected-download-status">
               Latest: <span className="text-neutral-300">{state.download.status}</span>
