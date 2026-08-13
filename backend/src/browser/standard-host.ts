@@ -659,19 +659,33 @@ export class StandardBrowserProfileHost {
 
   async listTabs(binding: Readonly<ProtectedBrowserBinding>, workspaceGeneration: string): Promise<StandardBrowserWorkspacePublicState> {
     const workspace = this.exactWorkspace(binding, workspaceGeneration);
-    if (workspace.controlMode !== "agent") throw new Error("Standard browser workspace is under human control");
+    const controlGeneration = workspace.controlGeneration;
+    const assertControl = () => {
+      const current = this.exactWorkspace(binding, workspaceGeneration);
+      if (current.controlMode !== "agent" || current.controlGeneration !== controlGeneration) throw new Error("Standard browser workspace control changed");
+    };
+    assertControl();
     await this.ensureActiveTarget(binding, workspace);
+    assertControl();
     return this.publicState(binding, workspaceGeneration);
   }
 
   async openTab(binding: Readonly<ProtectedBrowserBinding>, workspaceGeneration: string, url = "about:blank"): Promise<StandardBrowserWorkspacePublicState> {
     if (url !== "about:blank" && !isProtectedBrowserAllowedTopLevelUrl(url)) throw new Error("Standard browser tab requires an absolute HTTPS URL");
     const workspace = this.exactWorkspace(binding, workspaceGeneration);
-    if (workspace.controlMode !== "agent") throw new Error("Standard browser workspace is under human control");
+    const controlGeneration = workspace.controlGeneration;
+    const assertControl = () => {
+      const current = this.exactWorkspace(binding, workspaceGeneration);
+      if (current.controlMode !== "agent" || current.controlGeneration !== controlGeneration) throw new Error("Standard browser workspace control changed");
+    };
+    assertControl();
     return this.queueWorkspace(workspace, async () => {
-      if (workspace.controlMode !== "agent") throw new Error("Standard browser workspace is under human control");
+      assertControl();
       await this.ensureStarted(binding);
+      assertControl();
       const target = await this.backend.createTarget(url);
+      try { assertControl(); }
+      catch (error) { await this.backend.closeTarget(target.id).catch(() => undefined); throw error; }
       const record = this.adoptTarget(workspace, target);
       workspace.activeTargetId = record.rawId;
       return this.publicState(binding, workspaceGeneration);
@@ -690,10 +704,16 @@ export class StandardBrowserProfileHost {
 
   async closeTab(binding: Readonly<ProtectedBrowserBinding>, workspaceGeneration: string, handle: string): Promise<StandardBrowserWorkspacePublicState | null> {
     const workspace = this.exactWorkspace(binding, workspaceGeneration);
-    if (workspace.controlMode !== "agent") throw new Error("Standard browser workspace is under human control");
+    const controlGeneration = workspace.controlGeneration;
+    const assertControl = () => {
+      const current = this.exactWorkspace(binding, workspaceGeneration);
+      if (current.controlMode !== "agent" || current.controlGeneration !== controlGeneration) throw new Error("Standard browser workspace control changed");
+    };
+    assertControl();
     const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
     if (!target) throw new Error("Standard browser tab choice is stale");
     await this.backend.closeTarget(target.rawId);
+    assertControl();
     this.onTargetDestroyed(target.rawId);
     if (workspace.targets.size === 0) {
       await this.closeWorkspace(binding.sourceSessionId, "final_tab");

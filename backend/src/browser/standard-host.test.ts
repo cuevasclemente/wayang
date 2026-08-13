@@ -158,10 +158,10 @@ test("human handoff hides agent tab metadata and denies every agent tab mutation
   const status = f.host.publicState(exact, workspace.generation);
   assert.deepEqual(status.tabs, []);
   assert.equal(status.activeTab, null);
-  await assert.rejects(() => f.host.listTabs(exact, workspace.generation), /human control/);
-  await assert.rejects(() => f.host.openTab(exact, workspace.generation), /human control/);
+  await assert.rejects(() => f.host.listTabs(exact, workspace.generation), /human control|control changed/);
+  await assert.rejects(() => f.host.openTab(exact, workspace.generation), /human control|control changed/);
   assert.throws(() => f.host.selectTab(exact, workspace.generation, "stale"), /human control/);
-  await assert.rejects(() => f.host.closeTab(exact, workspace.generation, "stale"), /human control/);
+  await assert.rejects(() => f.host.closeTab(exact, workspace.generation, "stale"), /human control|control changed/);
   await f.host.close();
 });
 
