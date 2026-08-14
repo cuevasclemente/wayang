@@ -1,8 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { close as closeStore } from "../db.js";
 import type { SessionRow } from "../sessions.js";
 import { serializeSession } from "./sessions.js";
 import { serializeSessionRuntimeState } from "./ws.js";
+
+const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-session-runtime-state-"));
+const previousDataDir = process.env.WAYANG_DATA_DIR;
+process.env.WAYANG_DATA_DIR = path.join(fixtureRoot, "data");
+
+test.after(() => {
+  closeStore();
+  if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+  else process.env.WAYANG_DATA_DIR = previousDataDir;
+  fs.rmSync(fixtureRoot, { recursive: true, force: true });
+});
 
 function stoppedSessionRow(id: string): SessionRow {
   return {
