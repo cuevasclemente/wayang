@@ -7,8 +7,8 @@ import {
   listBrowserProfiles,
   materializeSessionBrowserState,
   renameBrowserProfile,
+  requestBrowserProfilePurge,
   requestBrowserProfileTrash,
-  restoreTrashedBrowserProfile,
   setBrowserProfileEnabled,
   setProjectBrowserDefault,
   setSessionBrowserProfile,
@@ -19,6 +19,7 @@ import { WorkspaceStoreError } from "../workspace-types.js";
 import { stopPiSession } from "../pi-bridge.js";
 import type { StandardBrowserProfileHostService } from "../browser/standard-service.js";
 import type { BrowserProfileCleanupCoordinator } from "../browser/profile-cleanup.js";
+import { validateCommandGuardIdentityPin } from "../command-guard-pin.js";
 
 function exactObject(value: unknown, keys: readonly string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new WorkspaceStoreError("Invalid Browser Profile request", 400);
@@ -83,21 +84,36 @@ export function createBrowserProfilesRouter(
     res.json({ profile });
   }));
   router.post("/browser-profiles/:profileId/trash", asyncHandler(async (req, res) => {
+    if (!cleanupCoordinator) throw new WorkspaceStoreError("Browser Profile cleanup is unavailable", 503);
     const body = exactObject(req.body, ["expectedRevision"]);
     const result = requestBrowserProfileTrash(req.params.profileId, revision(body.expectedRevision));
     await service?.invalidateProfile(req.params.profileId);
-    if (cleanupCoordinator) await cleanupCoordinator.executeTrash(req.params.profileId, result.cleanup.id);
-    res.status(202).json(result);
+    try {
+      await cleanupCoordinator.executeTrash(req.params.profileId, result.cleanup.id);
+      res.status(202).json({ ...result, cleanup_pending: false });
+    } catch {
+      res.status(202).json({ ...result, cleanup_pending: true });
+    }
   }));
   router.post("/browser-profiles/:profileId/restore", asyncHandler(async (req, res) => {
+    if (!cleanupCoordinator) throw new WorkspaceStoreError("Browser Profile cleanup is unavailable", 503);
     const body = exactObject(req.body, ["expectedRevision"]);
     const expectedRevision = revision(body.expectedRevision);
-    if (cleanupCoordinator) {
-      await cleanupCoordinator.restore(req.params.profileId, expectedRevision);
-      res.json({ profile: getBrowserProfile(req.params.profileId) });
-      return;
+    await cleanupCoordinator.restore(req.params.profileId, expectedRevision);
+    res.json({ profile: getBrowserProfile(req.params.profileId) });
+  }));
+  router.post("/browser-profiles/:profileId/purge", asyncHandler(async (req, res) => {
+    if (!cleanupCoordinator) throw new WorkspaceStoreError("Browser Profile cleanup is unavailable", 503);
+    const body = exactObject(req.body, ["expectedRevision", "pin"]);
+    const validation = validateCommandGuardIdentityPin(body.pin);
+    if (!validation.ok) throw new WorkspaceStoreError(validation.error || "Command guard identity PIN is required", 403);
+    const result = requestBrowserProfilePurge(req.params.profileId, revision(body.expectedRevision));
+    try {
+      await cleanupCoordinator.purge(req.params.profileId, result.cleanup.id);
+      res.json({ purged: true, profile_id: req.params.profileId });
+    } catch {
+      res.status(202).json({ purged: false, cleanup_pending: true, profile: result.profile });
     }
-    res.json({ profile: restoreTrashedBrowserProfile(req.params.profileId, expectedRevision) });
   }));
   router.get("/browser-profiles/projects/:projectId/default", asyncHandler((req, res) => {
     if (!getProject(req.params.projectId)) throw new WorkspaceStoreError("Project not found", 404);

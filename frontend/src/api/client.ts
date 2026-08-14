@@ -1509,6 +1509,10 @@ export async function restoreBrowserProfile(profileId: string, expectedRevision:
   return apiPost(`/api/browser-profiles/${encodeURIComponent(profileId)}/restore`, { expectedRevision });
 }
 
+export async function purgeBrowserProfile(profileId: string, expectedRevision: number, pin: string): Promise<{ purged: boolean; cleanup_pending?: boolean }> {
+  return apiPost(`/api/browser-profiles/${encodeURIComponent(profileId)}/purge`, { expectedRevision, pin });
+}
+
 export async function fetchProjectBrowserDefault(projectId: string): Promise<{ default: ProjectBrowserDefault | null }> {
   return apiGet(`/api/browser-profiles/projects/${encodeURIComponent(projectId)}/default`);
 }

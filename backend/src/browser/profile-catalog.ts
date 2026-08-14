@@ -221,7 +221,6 @@ export function requestBrowserProfileTrash(profileId: string, expectedRevision: 
     const row = exactProfile(draft, profileId);
     assertExpectedRevision(row.revision, expectedRevision);
     if (hasProfileReferences(draft, profileId)) throw new WorkspaceStoreError("Browser Profile is still referenced", 409);
-    if (row.storage_source.kind !== "managed") throw new WorkspaceStoreError("Migrated Browser Profiles cannot be moved to recovery yet", 409);
     if (!["active", "disabled"].includes(row.state)) throw new WorkspaceStoreError("Browser Profile is already in cleanup", 409);
     const trashCount = draft.browserProfiles.filter((candidate) => ["trash_pending", "trashed", "purge_pending"].includes(candidate.state)).length;
     if (trashCount >= MAX_BROWSER_PROFILE_TRASH_ROWS) throw new WorkspaceStoreError("Browser Profile trash limit reached", 409);
@@ -268,7 +267,7 @@ export function markBrowserProfileCleanupFailed(profileId: string, cleanupId: st
   return commitStoreMutation((draft) => {
     const profile = exactProfile(draft, profileId);
     const cleanup = draft.browserCleanups.find((candidate) => candidate.id === cleanupId && candidate.profile_id === profileId);
-    if (profile.state !== "trash_pending" || !cleanup || cleanup.state !== "pending") {
+    if (!["trash_pending", "purge_pending"].includes(profile.state) || !cleanup || cleanup.state !== "pending") {
       throw new WorkspaceStoreError("Browser Profile cleanup failure is stale", 409);
     }
     cleanup.state = "cleanup_failed";
@@ -308,6 +307,59 @@ export function markBrowserProfileRestored(profileId: string, cleanupId: string,
     row.revision += 1;
     row.updated_at = now;
     return publicProfile(row);
+  });
+}
+
+export function requestBrowserProfilePurge(profileId: string, expectedRevision: number, now = Date.now()): {
+  profile: PublicBrowserProfile;
+  cleanup: BrowserCleanupRow;
+} {
+  return commitStoreMutation((draft) => {
+    const row = exactProfile(draft, profileId);
+    assertExpectedRevision(row.revision, expectedRevision);
+    if (hasProfileReferences(draft, profileId)) throw new WorkspaceStoreError("Browser Profile is still referenced", 409);
+    const cleanup = [...draft.browserCleanups].reverse().find((candidate) => candidate.profile_id === profileId
+      && candidate.subject_kind === "profile" && candidate.state === "verified" && candidate.recovery_entry_id !== null);
+    if (row.state !== "trashed" || !cleanup) throw new WorkspaceStoreError("Browser Profile is not ready for permanent purge", 409);
+    row.state = "purge_pending";
+    row.revision += 1;
+    row.updated_at = now;
+    cleanup.state = "pending";
+    cleanup.attempts = 0;
+    cleanup.last_attempt_at = null;
+    cleanup.updated_at = now;
+    return { profile: publicProfile(row), cleanup: structuredClone(cleanup) };
+  });
+}
+
+export function claimBrowserProfilePurgeAttempt(profileId: string, cleanupId: string, now = Date.now()): BrowserCleanupRow {
+  return commitStoreMutation((draft) => {
+    const profile = exactProfile(draft, profileId);
+    const cleanup = draft.browserCleanups.find((candidate) => candidate.id === cleanupId && candidate.profile_id === profileId);
+    if (profile.state !== "purge_pending" || !cleanup || !["pending", "cleanup_failed"].includes(cleanup.state)
+      || cleanup.attempts >= 10 || cleanup.recovery_entry_id === null) {
+      throw new WorkspaceStoreError("Browser Profile purge attempt is stale", 409);
+    }
+    cleanup.state = "pending";
+    cleanup.attempts += 1;
+    cleanup.last_attempt_at = now;
+    cleanup.updated_at = now;
+    return structuredClone(cleanup);
+  });
+}
+
+export function markBrowserProfilePurged(profileId: string, cleanupId: string): void {
+  commitStoreMutation((draft) => {
+    const profile = exactProfile(draft, profileId);
+    const cleanup = draft.browserCleanups.find((candidate) => candidate.id === cleanupId && candidate.profile_id === profileId);
+    if (profile.state !== "purge_pending" || !cleanup || cleanup.state !== "pending") {
+      throw new WorkspaceStoreError("Browser Profile purge transition is stale", 409);
+    }
+    if (hasProfileReferences(draft, profileId)) throw new WorkspaceStoreError("Browser Profile is still referenced", 409);
+    draft.projectBrowserDefaults = draft.projectBrowserDefaults.filter((row) => row.profile_id !== profileId);
+    draft.sessionBrowserStates = draft.sessionBrowserStates.filter((row) => row.active_profile_id !== profileId);
+    draft.browserCleanups = draft.browserCleanups.filter((row) => row.profile_id !== profileId);
+    draft.browserProfiles = draft.browserProfiles.filter((row) => row.id !== profileId);
   });
 }
 

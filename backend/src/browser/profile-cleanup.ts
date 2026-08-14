@@ -4,7 +4,9 @@ import { getStore } from "../db.js";
 import { WorkspaceStoreError } from "../workspace-types.js";
 import {
   claimBrowserProfileCleanupAttempt,
+  claimBrowserProfilePurgeAttempt,
   markBrowserProfileCleanupFailed,
+  markBrowserProfilePurged,
   markBrowserProfileRestored,
   markBrowserProfileTrashed,
 } from "./profile-catalog.js";
@@ -51,7 +53,8 @@ function reconcileRename(source: string, destination: string, allowBothAbsent = 
   if (sourceStat && destinationStat) throw new Error("Browser Profile cleanup found both live and recovery payloads");
   if (!sourceStat) {
     if (!destinationStat && !allowBothAbsent) throw new Error("Browser Profile recovery payload is missing");
-    return; // already moved or never materialized when allowed
+    if (!destinationStat && allowBothAbsent) safeDirectory(destination);
+    return; // already moved or a never-materialized profile now has an empty recovery payload
   }
   safeDirectory(path.dirname(destination));
   try { fs.renameSync(source, destination); }
@@ -69,13 +72,31 @@ function reconcileRename(source: string, destination: string, allowBothAbsent = 
 
 export class BrowserProfileCleanupCoordinator {
   private readonly tails = new Map<string, Promise<void>>();
+  private retryTimer: NodeJS.Timeout | null = null;
+  private closed = false;
 
   constructor(
     private readonly dataDir: string,
     private readonly service?: StandardBrowserProfileHostService,
   ) {}
 
+  start(): void {
+    if (this.closed || this.retryTimer) return;
+    void this.resumePending();
+    this.retryTimer = setInterval(() => { void this.resumePending(); }, 60_000);
+    this.retryTimer.unref();
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.retryTimer) clearInterval(this.retryTimer);
+    this.retryTimer = null;
+    await Promise.allSettled([...this.tails.values()]);
+  }
+
   private serialize<T>(profileId: string, operation: () => Promise<T>): Promise<T> {
+    if (this.closed) return Promise.reject(new Error("Browser Profile cleanup coordinator is closed"));
     const prior = this.tails.get(profileId) ?? Promise.resolve();
     let release!: () => void;
     const tail = new Promise<void>((resolve) => { release = resolve; });
@@ -104,9 +125,6 @@ export class BrowserProfileCleanupCoordinator {
         if (!profile || profile.state !== "trash_pending" || attempt.recovery_entry_id === null) {
           throw new WorkspaceStoreError("Browser Profile cleanup subject changed", 409);
         }
-        if (profile.storage_source.kind !== "managed") {
-          throw new Error("Migrated Browser Profile cleanup requires source-specific recovery support");
-        }
         const descriptor = resolveBrowserProfileStorageDescriptor(this.dataDir, profile);
         if (descriptor.identityDigest !== attempt.storage_identity_digest) throw new Error("Browser Profile cleanup identity changed");
         reconcileRename(descriptor.root, this.recoveryPath(attempt.recovery_entry_id));
@@ -126,20 +144,47 @@ export class BrowserProfileCleanupCoordinator {
       const cleanup = [...store.browserCleanups].reverse().find((candidate) => candidate.profile_id === profileId
         && candidate.subject_kind === "profile" && candidate.state === "verified" && candidate.recovery_entry_id !== null);
       if (!profile || !cleanup || profile.state !== "trashed") throw new WorkspaceStoreError("Browser Profile is not restorable", 409);
-      if (profile.storage_source.kind !== "managed") {
-        throw new Error("Migrated Browser Profile restore requires source-specific recovery support");
-      }
       const descriptor = resolveBrowserProfileStorageDescriptor(this.dataDir, profile);
       reconcileRename(this.recoveryPath(cleanup.recovery_entry_id!), descriptor.root, false);
       markBrowserProfileRestored(profileId, cleanup.id, expectedRevision);
     });
   }
 
+  async purge(profileId: string, cleanupId: string): Promise<void> {
+    await this.serialize(profileId, async () => {
+      await this.service?.invalidateProfile(profileId);
+      claimBrowserProfilePurgeAttempt(profileId, cleanupId);
+      try {
+        const profile = getStore().browserProfiles.find((candidate) => candidate.id === profileId);
+        const cleanup = getStore().browserCleanups.find((candidate) => candidate.id === cleanupId && candidate.profile_id === profileId);
+        if (!profile || profile.state !== "purge_pending" || !cleanup?.recovery_entry_id) {
+          throw new WorkspaceStoreError("Browser Profile purge subject changed", 409);
+        }
+        const recoveryPath = this.recoveryPath(cleanup.recovery_entry_id);
+        const recoveryRoot = path.dirname(recoveryPath);
+        const payload = existingDirectory(recoveryPath);
+        if (payload) fs.rmSync(recoveryPath, { recursive: true, force: false });
+        if (existingDirectory(recoveryPath)) throw new Error("Browser Profile purge could not verify removal");
+        try { fs.rmdirSync(recoveryRoot); } catch (error) {
+          if (!["ENOENT", "ENOTEMPTY"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        }
+        fsyncDirectory(path.dirname(recoveryRoot));
+        markBrowserProfilePurged(profileId, cleanupId);
+      } catch (error) {
+        try { markBrowserProfileCleanupFailed(profileId, cleanupId); } catch { /* retain original failure */ }
+        throw error;
+      }
+    });
+  }
+
   async resumePending(): Promise<void> {
+    if (this.closed) return;
     const pending = getStore().browserCleanups.filter((cleanup) => cleanup.subject_kind === "profile"
       && ["pending", "cleanup_failed"].includes(cleanup.state) && cleanup.attempts < 10);
     for (const cleanup of pending) {
-      await this.executeTrash(cleanup.profile_id, cleanup.id).catch(() => undefined);
+      const profile = getStore().browserProfiles.find((candidate) => candidate.id === cleanup.profile_id);
+      if (profile?.state === "purge_pending") await this.purge(cleanup.profile_id, cleanup.id).catch(() => undefined);
+      else await this.executeTrash(cleanup.profile_id, cleanup.id).catch(() => undefined);
     }
   }
 }

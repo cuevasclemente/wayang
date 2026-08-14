@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArchiveRestore, Loader2, Plus, Power, Trash2 } from "lucide-react";
 import {
   ApiError,
   createBrowserProfile,
   fetchBrowserProfiles,
+  purgeBrowserProfile,
   restoreBrowserProfile,
   trashBrowserProfile,
   updateBrowserProfile,
@@ -22,6 +23,8 @@ export function BrowserProfilesSettings({ onChanged }: { onChanged?: () => void 
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [purgeTarget, setPurgeTarget] = useState<NamedBrowserProfile | null>(null);
+  const purgePinRef = useRef<HTMLInputElement | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -71,14 +74,25 @@ export function BrowserProfilesSettings({ onChanged }: { onChanged?: () => void 
             <div className="min-w-0 flex-1"><div className="truncate text-sm font-medium text-neutral-100">{profile.name}</div><div className="mt-1 text-[11px] text-neutral-500">{profile.state.replaceAll("_", " ")} · {profile.storage_source.replaceAll("_", " ")} · revision {profile.revision}</div></div>
             <div className="flex flex-wrap gap-2">
               {(profile.state === "active" || profile.state === "disabled") && <button type="button" disabled={pending} onClick={() => void run(profile.id, () => updateBrowserProfile(profile.id, { expectedRevision: profile.revision, enabled: profile.state !== "active" }))} className="inline-flex items-center gap-1 rounded border border-neutral-700 px-2 py-1.5 text-xs text-neutral-200 disabled:opacity-40"><Power size={13} />{profile.state === "active" ? "Disable" : "Enable"}</button>}
-              {(profile.state === "active" || profile.state === "disabled") && profile.storage_source === "managed" && <button type="button" disabled={pending} onClick={() => void run(profile.id, () => trashBrowserProfile(profile.id, profile.revision))} className="inline-flex items-center gap-1 rounded border border-red-900/70 px-2 py-1.5 text-xs text-red-300 disabled:opacity-40"><Trash2 size={13} />Move to recovery</button>}
+              {(profile.state === "active" || profile.state === "disabled") && <button type="button" disabled={pending} onClick={() => void run(profile.id, () => trashBrowserProfile(profile.id, profile.revision))} className="inline-flex items-center gap-1 rounded border border-red-900/70 px-2 py-1.5 text-xs text-red-300 disabled:opacity-40"><Trash2 size={13} />Move to recovery</button>}
               {profile.state === "trashed" && <button type="button" disabled={pending} onClick={() => void run(profile.id, () => restoreBrowserProfile(profile.id, profile.revision))} className="inline-flex items-center gap-1 rounded border border-neutral-700 px-2 py-1.5 text-xs text-neutral-200 disabled:opacity-40"><ArchiveRestore size={13} />Restore disabled</button>}
+              {profile.state === "trashed" && <button type="button" disabled={pending} onClick={() => setPurgeTarget(profile)} className="inline-flex items-center gap-1 rounded border border-red-800 bg-red-950/30 px-2 py-1.5 text-xs text-red-200 disabled:opacity-40"><Trash2 size={13} />Permanently purge</button>}
               {pending && <Loader2 size={14} className="animate-spin text-neutral-500" />}
             </div>
           </article>;
         })}
         {profiles.length === 0 && <p className="rounded border border-dashed border-neutral-800 p-5 text-sm text-neutral-500">No named Browser Profiles. Existing migrated roots appear here only when metadata-only inventory found an expected root.</p>}
       </div>
+      {purgeTarget && <div role="dialog" aria-modal="true" aria-labelledby="browser-profile-purge-title" className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 p-4"><form className="w-full max-w-md rounded-xl border border-red-900 bg-neutral-950 shadow-2xl" onSubmit={(event) => {
+        event.preventDefault();
+        const input = purgePinRef.current;
+        const pin = input?.value ?? "";
+        if (input) input.value = "";
+        if (!/^[0-9]{8}$/.test(pin)) { setError("Enter the complete 8-digit identity PIN."); return; }
+        const target = purgeTarget;
+        setPurgeTarget(null);
+        void run(target.id, () => purgeBrowserProfile(target.id, target.revision, pin));
+      }}><header className="border-b border-red-900/60 p-4"><h3 id="browser-profile-purge-title" className="text-sm font-semibold text-red-100">Permanently purge {purgeTarget.name}?</h3><p className="mt-2 text-xs leading-5 text-amber-100">This permanently removes the recovered Browser Profile directory and its catalog identity. It cannot be undone. No profile contents are inspected.</p></header><div className="p-4"><label className="block text-xs text-neutral-300">8-digit identity PIN<input ref={purgePinRef} type="password" inputMode="numeric" pattern="[0-9]{8}" maxLength={8} autoComplete="off" autoFocus onInput={(event) => { event.currentTarget.value = event.currentTarget.value.replace(/\D/g, "").slice(0, 8); }} className="mt-2 w-full rounded border border-neutral-700 bg-neutral-900 px-3 py-2 tracking-widest text-neutral-100" /></label></div><footer className="flex justify-end gap-2 border-t border-neutral-800 p-3"><button type="button" onClick={() => setPurgeTarget(null)} className="rounded border border-neutral-700 px-3 py-2 text-xs text-neutral-300">Cancel</button><button type="submit" className="rounded bg-red-700 px-3 py-2 text-xs font-semibold text-white">Permanently purge</button></footer></form></div>}
     </section>
   );
 }

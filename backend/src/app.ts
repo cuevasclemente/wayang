@@ -433,13 +433,14 @@ export function start() {
     server,
     workspaceCapabilities,
     standardBrowser,
+    ...(browserProfileCleanup ? [browserProfileCleanup] : []),
     protectedBrowser,
     protectedAutomation,
     fileAudioExperiment,
     matrixMessaging,
   );
   protectedAutomation.start();
-  void browserProfileCleanup?.resumePending();
+  browserProfileCleanup?.start();
   // Valid configuration plus homeserver/provisioning outage must not take down
   // the Wayang browser workbench. The Matrix route remains 503/not-ready and
   // the bootstrap retains bounded retry/attention state.
