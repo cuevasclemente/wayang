@@ -19,6 +19,7 @@ import type {
 } from "./types.js";
 import { stripInternalCapabilityEnv } from "../child-env.js";
 import { resolveBrowserSessionLookup } from "./lookup.js";
+import { ManagedChromiumFrameTargetIndex } from "./frame-target-index.js";
 
 // Generic protected-browser coordination is re-exported here for runtime
 // composition while its workspace authority and Chromium backend stay injected.
@@ -1770,7 +1771,7 @@ export interface ManagedChromiumRuntimeOptions {
   /** `allow` keeps browser-selected filenames; `allowAndName` stores GUID names. */
   downloadBehavior?: "allow" | "allowAndName";
   workingDirectory: string;
-  onDownloadWillBegin?: (event: ManagedChromiumDownloadWillBegin) => void;
+  onDownloadWillBegin?: (event: ManagedChromiumDownloadWillBegin, pageTargetId?: string | null) => void;
   onDownloadProgress?: (event: ManagedChromiumDownloadProgress) => void;
   /** Browser-lifetime observation of every top-level page target URL. */
   onTopLevelNavigation?: (url: string) => void;
@@ -1778,6 +1779,8 @@ export interface ManagedChromiumRuntimeOptions {
   onTargetChanged?: (target: ChromeTarget) => void;
   onTargetDestroyed?: (targetId: string) => void;
   onUnexpectedExit?: () => void;
+  /** Standard-only synchronous frame attribution. Default leaves existing callers unchanged. */
+  downloadAttribution?: "none" | "exact-frame-page-target";
 }
 
 export interface ManagedChromiumDocumentIdentity {
@@ -1807,6 +1810,8 @@ export class ManagedChromiumRuntime {
   private cdpPort: number | null = null;
   private stoppingChild: ChildProcess | null = null;
   private lifecycleTail: Promise<void> = Promise.resolve();
+  private readonly frameTargetIndex = new ManagedChromiumFrameTargetIndex();
+  private readonly pendingFrameInitializations = new Set<Promise<void>>();
 
   constructor(private readonly options: ManagedChromiumRuntimeOptions) {}
 
@@ -1819,6 +1824,21 @@ export class ManagedChromiumRuntime {
     let release!: () => void;
     this.lifecycleTail = new Promise<void>((resolve) => { release = resolve; });
     return prior.catch(() => undefined).then(operation).finally(release);
+  }
+
+  private trackFrameInitialization(operation: Promise<void>): void {
+    this.pendingFrameInitializations.add(operation);
+    void operation.finally(() => this.pendingFrameInitializations.delete(operation)).catch(() => undefined);
+  }
+
+  private async drainFrameInitializations(timeoutMs = 2_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.pendingFrameInitializations.size > 0 && Date.now() < deadline) {
+      await Promise.race([
+        Promise.allSettled([...this.pendingFrameInitializations]),
+        sleep(Math.max(1, Math.min(50, deadline - Date.now()))),
+      ]);
+    }
   }
 
   async start(assertAuthorizedBeforeBrowserCdp?: () => Promise<void>): Promise<void> {
@@ -1838,6 +1858,9 @@ export class ManagedChromiumRuntime {
       };
       for (const executable of executableCandidates) {
         await assertAuthorized();
+        const frameEpoch = this.frameTargetIndex.reset();
+        this.pendingFrameInitializations.clear();
+        const exactDownloadAttribution = this.options.downloadAttribution === "exact-frame-page-target";
         const port = await allocatePort();
       const child = spawn(executable, [
         "--remote-debugging-address=127.0.0.1",
@@ -1865,22 +1888,77 @@ export class ManagedChromiumRuntime {
         if (child.exitCode !== null) throw new Error("Managed Chromium exited during startup");
         const browserCdp = await connectBrowserCdp(port);
         this.browserCdp = browserCdp;
-        if (this.options.onTopLevelNavigation || this.options.onTargetCreated
-          || this.options.onTargetChanged || this.options.onTargetDestroyed) {
-          const targetInfo = (event: any): ChromeTarget | undefined => {
-            const target = event?.targetInfo;
-            if (!target || typeof target.targetId !== "string" || typeof target.type !== "string") return undefined;
-            return {
-              id: target.targetId,
-              type: target.type,
-              ...(typeof target.title === "string" ? { title: target.title } : {}),
-              ...(typeof target.url === "string" ? { url: target.url } : {}),
-              ...(typeof target.openerId === "string" ? { openerId: target.openerId } : {}),
-            };
+        const targetInfo = (event: any): ChromeTarget | undefined => {
+          const target = event?.targetInfo;
+          if (!target || typeof target.targetId !== "string" || typeof target.type !== "string") return undefined;
+          return {
+            id: target.targetId,
+            type: target.type,
+            ...(typeof target.title === "string" ? { title: target.title } : {}),
+            ...(typeof target.url === "string" ? { url: target.url } : {}),
+            ...(typeof target.openerId === "string" ? { openerId: target.openerId } : {}),
           };
+        };
+        const addFrameTree = (sessionId: string, tree: any) => {
+          const frameId = tree?.frame?.id;
+          if (typeof frameId === "string") this.frameTargetIndex.addFrame(sessionId, frameId, frameEpoch);
+          for (const childTree of Array.isArray(tree?.childFrames) ? tree.childFrames : []) addFrameTree(sessionId, childTree);
+        };
+        if (exactDownloadAttribution) {
+          await browserCdp.send("Browser.setDownloadBehavior", { behavior: "deny", eventsEnabled: true });
+          browserCdp.on("Target.attachedToTarget", (event: any, parentSessionId?: string) => {
+            const sessionId = typeof event?.sessionId === "string" ? event.sessionId : "";
+            const target = targetInfo(event);
+            if (!sessionId || !target) return;
+            let rootTargetId: string | null = null;
+            if (target.type === "page") {
+              rootTargetId = target.id;
+              this.frameTargetIndex.addPageTarget(rootTargetId, frameEpoch);
+            } else if (target.type === "iframe") {
+              rootTargetId = this.frameTargetIndex.rootTargetForSession(parentSessionId);
+            }
+            if (!rootTargetId || !this.frameTargetIndex.attachSession(sessionId, rootTargetId, frameEpoch)) return;
+            const initialize = (async () => {
+              try {
+                await browserCdp.sendToSession(sessionId, "Page.enable");
+                await browserCdp.sendToSession(sessionId, "Target.setAutoAttach", {
+                  autoAttach: true,
+                  waitForDebuggerOnStart: false,
+                  flatten: true,
+                }).catch(() => undefined);
+                const seeded = await browserCdp.sendToSession<any>(sessionId, "Page.getFrameTree");
+                if (this.browserCdp !== browserCdp || this.frameTargetIndex.currentEpoch() !== frameEpoch) return;
+                addFrameTree(sessionId, seeded?.frameTree);
+                if (target.type === "page") this.frameTargetIndex.markReady(rootTargetId!, frameEpoch);
+              } catch {
+                this.frameTargetIndex.degrade(rootTargetId!, frameEpoch);
+              } finally {
+                if (event?.waitingForDebugger === true) {
+                  await browserCdp.sendToSession(sessionId, "Runtime.runIfWaitingForDebugger").catch(() => undefined);
+                }
+              }
+            })();
+            this.trackFrameInitialization(initialize);
+          });
+          browserCdp.on("Target.detachedFromTarget", (event: any) => {
+            if (typeof event?.sessionId === "string") this.frameTargetIndex.removeSession(event.sessionId);
+          });
+          browserCdp.on("Page.frameAttached", (event: any, sessionId?: string) => {
+            if (sessionId && typeof event?.frameId === "string") this.frameTargetIndex.addFrame(sessionId, event.frameId, frameEpoch);
+          });
+          browserCdp.on("Page.frameNavigated", (event: any, sessionId?: string) => {
+            if (sessionId && typeof event?.frame?.id === "string") this.frameTargetIndex.addFrame(sessionId, event.frame.id, frameEpoch);
+          });
+          browserCdp.on("Page.frameDetached", (event: any, sessionId?: string) => {
+            if (sessionId && typeof event?.frameId === "string") this.frameTargetIndex.removeFrame(sessionId, event.frameId);
+          });
+        }
+        if (this.options.onTopLevelNavigation || this.options.onTargetCreated
+          || this.options.onTargetChanged || this.options.onTargetDestroyed || exactDownloadAttribution) {
           browserCdp.on("Target.targetCreated", (event: any) => {
             const target = targetInfo(event);
             if (!target) return;
+            if (target.type === "page") this.frameTargetIndex.addPageTarget(target.id, frameEpoch);
             if (target.type === "page" && typeof target.url === "string") this.options.onTopLevelNavigation?.(target.url);
             this.options.onTargetCreated?.(target);
           });
@@ -1891,14 +1969,26 @@ export class ManagedChromiumRuntime {
             this.options.onTargetChanged?.(target);
           });
           browserCdp.on("Target.targetDestroyed", (event: any) => {
-            if (typeof event?.targetId === "string") this.options.onTargetDestroyed?.(event.targetId);
+            if (typeof event?.targetId !== "string") return;
+            this.frameTargetIndex.removePageTarget(event.targetId);
+            this.options.onTargetDestroyed?.(event.targetId);
           });
           await assertAuthorized();
+          if (exactDownloadAttribution) {
+            await browserCdp.send("Target.setAutoAttach", {
+              autoAttach: true,
+              waitForDebuggerOnStart: false,
+              flatten: true,
+            });
+          }
           await browserCdp.send("Target.setDiscoverTargets", { discover: true });
         }
         if (this.options.onDownloadWillBegin) {
           browserCdp.on("Browser.downloadWillBegin", (event: ManagedChromiumDownloadWillBegin) => {
-            this.options.onDownloadWillBegin?.({ ...event });
+            const targetId = exactDownloadAttribution && typeof event?.frameId === "string"
+              ? this.frameTargetIndex.resolve(event.frameId)
+              : null;
+            this.options.onDownloadWillBegin?.({ ...event }, targetId);
           });
         }
         if (this.options.onDownloadProgress) {
@@ -1907,17 +1997,20 @@ export class ManagedChromiumRuntime {
           });
         }
         await assertAuthorized();
+        await this.pageTarget();
+        if (exactDownloadAttribution) await this.drainFrameInitializations();
         await browserCdp.send("Browser.setDownloadBehavior", {
           behavior: this.options.downloadBehavior ?? "allowAndName",
           downloadPath: this.options.downloadsDir,
           eventsEnabled: true,
         });
-        await this.pageTarget();
         child.once("exit", () => {
           if (this.child !== child) return;
           const expectedStop = this.stoppingChild === child;
           this.browserCdp?.close();
           this.browserCdp = null;
+          this.frameTargetIndex.reset();
+          this.pendingFrameInitializations.clear();
           this.child = null;
           this.cdpPort = null;
           if (expectedStop) this.stoppingChild = null;
@@ -1927,6 +2020,8 @@ export class ManagedChromiumRuntime {
       } catch (error) {
         this.browserCdp?.close();
         this.browserCdp = null;
+        this.frameTargetIndex.reset();
+        this.pendingFrameInitializations.clear();
         terminateChild(child);
         const exitedAfterTerm = await Promise.race([
           exited,
@@ -1970,6 +2065,8 @@ export class ManagedChromiumRuntime {
       const child = this.child;
       this.browserCdp?.close();
       this.browserCdp = null;
+      this.frameTargetIndex.reset();
+      this.pendingFrameInitializations.clear();
       this.cdpPort = null;
       if (!child) return;
       if (child.exitCode !== null) {

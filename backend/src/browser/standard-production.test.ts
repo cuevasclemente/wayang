@@ -43,6 +43,7 @@ test("Standard production binds one exact profile root and explicit target lifec
       managedFactory: (options) => { managed = new FakeManaged(options); return managed; },
     });
     const events: string[] = [];
+    const downloads: Array<{ guid: string; targetId: string | null }> = [];
     const backend = factory({
       profile,
       storage: { profileId: profile.id, root: path.join(root, "profile"), identityDigest: profile.storage_identity_digest },
@@ -51,7 +52,7 @@ test("Standard production binds one exact profile root and explicit target lifec
         targetChanged: (target) => events.push(`changed:${target.id}`),
         targetDestroyed: (targetId) => events.push(`destroyed:${targetId}`),
         unexpectedExit: () => events.push("exit"),
-        downloadWillBegin: () => undefined,
+        downloadWillBegin: (event, targetId) => downloads.push({ guid: event.guid, targetId }),
         downloadProgress: () => undefined,
       },
     });
@@ -68,6 +69,9 @@ test("Standard production binds one exact profile root and explicit target lifec
     managed.options.onTargetChanged?.({ id: "popup", type: "page", url: "https://changed.example" });
     managed.options.onTargetDestroyed?.("popup");
     assert.deepEqual(events, ["created:popup", "changed:popup", "destroyed:popup"], "non-page targets entered tab ownership callbacks");
+    managed.options.onDownloadWillBegin?.({ frameId: "frame", guid: "known", url: "https://download.example/a", suggestedFilename: "a" }, "restored");
+    managed.options.onDownloadWillBegin?.({ frameId: "unknown", guid: "unknown", url: "https://download.example/b", suggestedFilename: "b" }, null);
+    assert.deepEqual(downloads, [{ guid: "known", targetId: "restored" }, { guid: "unknown", targetId: null }]);
     await assert.rejects(
       () => backend.execute("restored", { kind: "navigate", url: "http://not-https.example" }, async () => undefined),
       /absolute HTTPS/,

@@ -129,6 +129,9 @@ interface WorkspaceRecord {
 interface StandardDownloadOwner {
   sourceSessionId: string;
   workspaceGeneration: string;
+  workspaceControlGeneration: number;
+  controlMode: WorkspaceRecord["controlMode"];
+  runtimeGeneration: string;
   targetId: string;
   targetGeneration: string;
   binding: ProtectedBrowserBinding;
@@ -146,6 +149,7 @@ export class StandardBrowserProfileHost {
   private readonly unassignedTargets = new Map<string, StandardBrowserBackendTarget>();
   private readonly downloads = new Map<string, StandardDownloadOwner>();
   private readonly viewerClosers = new Map<string, Set<() => Promise<void>>>();
+  private readonly observedDownloadGuids = new Set<string>();
   private observedDownloadCount = 0;
   private backend: StandardBrowserHostBackend;
   private openerLease: BrowserStorageOpenerLease;
@@ -422,10 +426,21 @@ export class StandardBrowserProfileHost {
     return this.queueWorkspace(workspace, async () => {
       if (workspace.controlMode === "agent") throw new Error("Standard browser tab changes require human control");
       await this.ensureStartedAuthorized(authorize);
-      const target = await this.backend.createTarget(url);
+      const target = await this.backend.createTarget("about:blank");
       await authorize();
       const record = this.adoptTarget(workspace, target);
       workspace.activeTargetId = record.rawId;
+      if (url !== "about:blank") {
+        try { await this.backend.execute(record.rawId, { kind: "navigate", url }, async () => { await authorize(); }); }
+        catch (error) {
+          this.cancelTargetDownloads(record.rawId);
+          this.targetOwners.delete(record.rawId);
+          workspace.targets.delete(record.rawId);
+          workspace.activeTargetId = workspace.targets.keys().next().value ?? null;
+          await this.backend.closeTarget(record.rawId).catch(() => undefined);
+          throw error;
+        }
+      }
       return this.ownerPublicState(sourceSessionId, workspaceGeneration);
     });
   }
@@ -448,6 +463,7 @@ export class StandardBrowserProfileHost {
       if (workspace.controlMode === "agent") throw new Error("Standard browser tab changes require human control");
       const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
       if (!target) throw new Error("Standard browser tab choice is stale");
+      this.cancelTargetDownloads(target.rawId);
       this.targetOwners.delete(target.rawId);
       workspace.targets.delete(target.rawId);
       await this.backend.closeTarget(target.rawId);
@@ -501,6 +517,7 @@ export class StandardBrowserProfileHost {
   }
 
   private onTargetDestroyed(targetId: string): void {
+    this.cancelTargetDownloads(targetId);
     const owner = this.targetOwners.get(targetId);
     this.targetOwners.delete(targetId);
     this.unassignedTargets.delete(targetId);
@@ -516,7 +533,22 @@ export class StandardBrowserProfileHost {
     void this.backend.cancelDownload?.(guid).catch(() => undefined);
   }
 
+  private cancelTargetDownloads(targetId: string): void {
+    for (const [guid, owner] of [...this.downloads]) {
+      if (owner.targetId !== targetId) continue;
+      owner.publisher.revoke();
+      this.downloads.delete(guid);
+      this.cancelDownload(guid);
+    }
+  }
+
   private onDownloadWillBegin(event: ManagedChromiumDownloadWillBegin, targetId: string | null): void {
+    if (this.observedDownloadGuids.has(event.guid) || this.observedDownloadCount >= 32) {
+      this.cancelDownload(event.guid);
+      return;
+    }
+    this.observedDownloadGuids.add(event.guid);
+    this.observedDownloadCount += 1;
     const sourceSessionId = targetId ? this.targetOwners.get(targetId) : undefined;
     const workspace = sourceSessionId ? this.workspaces.get(sourceSessionId) : undefined;
     const workspaceDownloadCount = sourceSessionId
@@ -524,14 +556,12 @@ export class StandardBrowserProfileHost {
       : 0;
     const target = targetId && workspace ? workspace.targets.get(targetId) : undefined;
     if (!sourceSessionId || !targetId || !workspace || workspace.closed || !target || !this.backend.downloadStagingDir
-      || workspace.runtimeGeneration !== workspace.binding.runtimeGeneration
+      || workspace.runtimeGeneration !== workspace.binding.runtimeGeneration || workspace.controlTransition
       || workspaceDownloadCount >= MAX_STANDARD_BROWSER_DOWNLOADS_PER_WORKSPACE
-      || this.downloads.size >= MAX_STANDARD_BROWSER_DOWNLOADS_PER_HOST
-      || this.observedDownloadCount >= 32) {
+      || this.downloads.size >= MAX_STANDARD_BROWSER_DOWNLOADS_PER_HOST) {
       this.cancelDownload(event.guid);
       return;
     }
-    this.observedDownloadCount += 1;
     let publisher: InteractiveBrowserDownloadPublisher;
     try {
       publisher = new InteractiveBrowserDownloadPublisher(this.backend.downloadStagingDir, workspace.binding.projectCwd, { cleanStaging: false });
@@ -549,6 +579,9 @@ export class StandardBrowserProfileHost {
     this.downloads.set(event.guid, {
       sourceSessionId,
       workspaceGeneration: workspace.generation,
+      workspaceControlGeneration: workspace.controlGeneration,
+      controlMode: workspace.controlMode,
+      runtimeGeneration: workspace.runtimeGeneration,
       targetId,
       targetGeneration: target.generation,
       binding: { ...workspace.binding },
@@ -572,7 +605,9 @@ export class StandardBrowserProfileHost {
     const authorize = async () => {
       const workspace = this.exactWorkspace(owner.binding, owner.workspaceGeneration);
       const target = workspace.targets.get(owner.targetId);
-      if (!target || target.generation !== owner.targetGeneration || this.targetOwners.get(owner.targetId) !== owner.sourceSessionId) {
+      if (workspace.controlGeneration !== owner.workspaceControlGeneration || workspace.controlMode !== owner.controlMode
+        || workspace.runtimeGeneration !== owner.runtimeGeneration || workspace.controlTransition
+        || !target || target.generation !== owner.targetGeneration || this.targetOwners.get(owner.targetId) !== owner.sourceSessionId) {
         throw new Error("Standard browser download owner changed");
       }
     };
@@ -701,11 +736,22 @@ export class StandardBrowserProfileHost {
       assertControl();
       await this.ensureStarted(binding);
       assertControl();
-      const target = await this.backend.createTarget(url);
+      const target = await this.backend.createTarget("about:blank");
       try { assertControl(); }
       catch (error) { await this.backend.closeTarget(target.id).catch(() => undefined); throw error; }
       const record = this.adoptTarget(workspace, target);
       workspace.activeTargetId = record.rawId;
+      if (url !== "about:blank") {
+        try { await this.backend.execute(record.rawId, { kind: "navigate", url }, async () => { assertControl(); }); }
+        catch (error) {
+          this.cancelTargetDownloads(record.rawId);
+          this.targetOwners.delete(record.rawId);
+          workspace.targets.delete(record.rawId);
+          workspace.activeTargetId = workspace.targets.keys().next().value ?? null;
+          await this.backend.closeTarget(record.rawId).catch(() => undefined);
+          throw error;
+        }
+      }
       return this.publicState(binding, workspaceGeneration);
     });
   }
@@ -734,6 +780,7 @@ export class StandardBrowserProfileHost {
       if (!target) throw new Error("Standard browser tab choice is stale");
       // Remove agent ownership before the irreversible close. A concurrent
       // handoff can no longer expose this target as human-owned after close.
+      this.cancelTargetDownloads(target.rawId);
       this.targetOwners.delete(target.rawId);
       workspace.targets.delete(target.rawId);
       if (workspace.activeTargetId === target.rawId) workspace.activeTargetId = workspace.targets.keys().next().value ?? null;

@@ -2,6 +2,7 @@ import { WebSocket } from "ws";
 
 interface PendingCommand {
   method: string;
+  sessionId?: string;
   timeout: NodeJS.Timeout;
   resolve: (value: any) => void;
   reject: (err: Error) => void;
@@ -12,7 +13,7 @@ const DEFAULT_CDP_TIMEOUT_MS = 10_000;
 export class CdpConnection {
   private nextId = 1;
   private pending = new Map<number, PendingCommand>();
-  private listeners = new Map<string, Set<(params: any) => void>>();
+  private listeners = new Map<string, Set<(params: any, sessionId?: string) => void>>();
 
   private constructor(private readonly ws: WebSocket) {}
 
@@ -52,7 +53,9 @@ export class CdpConnection {
         if (!pending) return;
         this.pending.delete(msg.id);
         clearTimeout(pending.timeout);
-        if (msg.error) {
+        if (pending.sessionId !== undefined && msg.sessionId !== pending.sessionId) {
+          pending.reject(new Error(`CDP ${pending.method} session response mismatch`));
+        } else if (msg.error) {
           pending.reject(new Error(`CDP ${pending.method} failed`));
         } else {
           pending.resolve(msg.result ?? null);
@@ -63,7 +66,7 @@ export class CdpConnection {
       if (typeof msg.method === "string") {
         const listeners = this.listeners.get(msg.method);
         if (!listeners) return;
-        for (const listener of listeners) listener(msg.params ?? {});
+        for (const listener of listeners) listener(msg.params ?? {}, typeof msg.sessionId === "string" ? msg.sessionId : undefined);
       }
     });
 
@@ -78,17 +81,26 @@ export class CdpConnection {
   }
 
   send<T = any>(method: string, params?: Record<string, unknown>, timeoutMs = DEFAULT_CDP_TIMEOUT_MS): Promise<T> {
+    return this.sendCommand<T>(method, params, timeoutMs);
+  }
+
+  sendToSession<T = any>(sessionId: string, method: string, params?: Record<string, unknown>, timeoutMs = DEFAULT_CDP_TIMEOUT_MS): Promise<T> {
+    if (!sessionId) return Promise.reject(new Error("CDP session identifier is required"));
+    return this.sendCommand<T>(method, params, timeoutMs, sessionId);
+  }
+
+  private sendCommand<T>(method: string, params: Record<string, unknown> | undefined, timeoutMs: number, sessionId?: string): Promise<T> {
     if (this.ws.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error("CDP connection is not open"));
     }
     const id = this.nextId++;
-    const payload = JSON.stringify({ id, method, params: params ?? {} });
+    const payload = JSON.stringify({ id, method, params: params ?? {}, ...(sessionId ? { sessionId } : {}) });
     return new Promise<T>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`CDP ${method} timed out`));
       }, Math.max(1, timeoutMs));
-      this.pending.set(id, { method, timeout, resolve, reject });
+      this.pending.set(id, { method, ...(sessionId ? { sessionId } : {}), timeout, resolve, reject });
       this.ws.send(payload, (err) => {
         if (!err) return;
         const pending = this.pending.get(id);
@@ -99,8 +111,8 @@ export class CdpConnection {
     });
   }
 
-  on(method: string, listener: (params: any) => void): () => void {
-    const listeners = this.listeners.get(method) ?? new Set<(params: any) => void>();
+  on(method: string, listener: (params: any, sessionId?: string) => void): () => void {
+    const listeners = this.listeners.get(method) ?? new Set<(params: any, sessionId?: string) => void>();
     listeners.add(listener);
     this.listeners.set(method, listeners);
     return () => listeners.delete(listener);

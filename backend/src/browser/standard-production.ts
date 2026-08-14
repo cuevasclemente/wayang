@@ -217,17 +217,14 @@ export function createStandardBrowserHostBackendFactory(options: {
       profileDir: storage.root,
       downloadsDir: downloadStagingDir,
       downloadBehavior: "allowAndName",
+      downloadAttribution: "exact-frame-page-target",
       workingDirectory: options.dataDir,
       onTargetCreated: (target) => { if (target.type === "page") callbacks.targetCreated(publicTarget(target)); },
       onTargetChanged: (target) => { if (target.type === "page") callbacks.targetChanged(publicTarget(target)); },
       onTargetDestroyed: (targetId) => { protections.delete(targetId); callbacks.targetDestroyed(targetId); },
-      onDownloadWillBegin(event) {
-        // Browser.downloadWillBegin does not carry a page target ID, and an
-        // asynchronous frame lookup can race detach/rebind. Until Managed
-        // Chromium provides a synchronously maintained frame→target index,
-        // Standard host downloads fail closed rather than reattribute later.
-        callbacks.downloadWillBegin(event, null);
-        void managed.cancelDownload(event.guid).catch(() => undefined);
+      onDownloadWillBegin(event, targetId) {
+        callbacks.downloadWillBegin(event, targetId ?? null);
+        if (!targetId) void managed.cancelDownload(event.guid).catch(() => undefined);
       },
       onDownloadProgress: callbacks.downloadProgress,
       onUnexpectedExit: callbacks.unexpectedExit,
