@@ -212,15 +212,12 @@ function validateState(value) {
   if (value.phase !== "failed" && !candidateRequired && value.candidateOid !== null) throw new SchemaError("state candidate does not match phase");
   if (["initialized", "locked", "refs_snapshot", "policy_passed", "merging", "candidate_ready"].includes(value.phase) && value.reason !== null) throw new SchemaError("nonterminal state has a reason");
   if (value.phase === "completed" && ![null, "pi_up_to_date"].includes(value.reason)) throw new SchemaError("completed state reason is invalid");
-  if (value.phase === "blocked" && !["critical_path_policy", "candidate_tree_policy", "merge_conflict"].includes(value.reason)) throw new SchemaError("blocked state reason is invalid");
+  if (value.phase === "blocked" && !["stale_base", "critical_path_policy", "candidate_tree_policy", "merge_conflict"].includes(value.reason)) throw new SchemaError("blocked state reason is invalid");
   if (value.phase === "blocked") {
-    const expectedPrevious = value.reason === "critical_path_policy" ? "refs_snapshot" : "merging";
+    const expectedPrevious = ["stale_base", "critical_path_policy"].includes(value.reason) ? "refs_snapshot" : "merging";
     if (value.previousPhase !== expectedPrevious) throw new SchemaError("blocked state reason does not match predecessor");
   }
-  if (value.phase === "failed" && !["ref_mismatch", "internal_error"].includes(value.reason)) throw new SchemaError("failed state reason is invalid");
-  if (value.phase === "failed" && value.reason === "ref_mismatch" && (value.previousPhase !== "refs_snapshot" || value.refs === null || value.candidateOid !== null || value.details.length !== 0)) {
-    throw new SchemaError("ref mismatch state payload is invalid");
-  }
+  if (value.phase === "failed" && value.reason !== "internal_error") throw new SchemaError("failed state reason is invalid");
   if (value.phase === "failed" && value.reason === "internal_error" && value.details.length === 0) throw new SchemaError("internal error state requires bounded details");
   if (value.phase === "completed" && value.reason === "pi_up_to_date" && (value.previousPhase !== "refs_snapshot" || value.candidateOid !== value.refs?.downstream)) {
     throw new SchemaError("no-action state payload is invalid");

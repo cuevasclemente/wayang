@@ -74,8 +74,12 @@ export async function prepareCandidate(intentInput, configuration) {
     const refs = { upstream, downstream };
     await journal.transition("locked", "refs_snapshot", { refs });
     if (upstream !== intent.expected.upstream || downstream !== intent.expected.downstream) {
-      const state = await journal.transition("refs_snapshot", "failed", { reason: "ref_mismatch", refs });
-      return Object.freeze({ outcome: "failed", state, statePath });
+      const state = await journal.transition("refs_snapshot", "blocked", {
+        reason: "stale_base",
+        refs,
+        details: ["observed_refs_changed"],
+      });
+      return Object.freeze({ outcome: "stale_base", state, statePath });
     }
     if (await git.isAncestor([`--git-dir=${config.mirrorPath}`], upstream, downstream)) {
       const state = await journal.transition("refs_snapshot", "completed", { refs, candidateOid: downstream, reason: "pi_up_to_date" });

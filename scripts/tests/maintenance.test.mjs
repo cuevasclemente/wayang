@@ -384,6 +384,19 @@ test("trusted engine resources must remain inside one locked state root", async 
   await assert.rejects(prepareCandidate(intent("root-equality", OID_A, OID_B), config), /syntheticTmp must be a strict descendant/);
 });
 
+test("changed Pi heads return a durable stale_base result without creating a worktree", async (t) => {
+  const fixture = await createGitFixture(t);
+  const config = await engineConfig(fixture);
+  const result = await prepareCandidate(intent("stale-base", OID_A, fixture.downstream), config);
+  assert.equal(result.outcome, "stale_base");
+  assert.equal(result.state.phase, "blocked");
+  assert.equal(result.state.reason, "stale_base");
+  assert.deepEqual(result.state.details, ["observed_refs_changed"]);
+  assert.deepEqual(result.state.refs, { upstream: fixture.upstream, downstream: fixture.downstream });
+  assert.equal(existsSync(join(config.worktreeRoot, "stale-base")), false);
+  assert.deepEqual(await readState(result.statePath), result.state);
+});
+
 test("clean upstream advancement creates an exact two-parent candidate and durable terminal state", async (t) => {
   const fixture = await createGitFixture(t);
   const config = await engineConfig(fixture);
