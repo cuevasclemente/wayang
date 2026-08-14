@@ -1,8 +1,8 @@
 # Terra canonical session titles implementation
 
 **Date:** 2026-08-13  
-**Status:** implementation, synthetic validation, and independent terminal privacy/concurrency gates complete (GO)  
-**Authorization boundary:** no extension installation, flags, live Terra transcript calls, service restart, production schema migration, deployment, push, or merge
+**Status:** final local integration, synthetic validation, and independent terminal privacy/concurrency gates complete (GO)
+**Authorization boundary:** no extension installation, flags, live Terra transcript calls, service restart, production schema migration, deployment, or remote push
 
 ## Implemented commits
 
@@ -66,4 +66,28 @@ Fresh independent scoped reviews returned:
 
 The gate uncovered and drove fixes for mutable compatibility dispatch, mutable catalog endpoint aliases, models-configured OAuth substitution, stale migration rewrites, non-atomic transcript replacement, Wayang/Pi session-ID mismatch, and publication of unmaterialized session paths. A later generic stale-extension finding was independently adjudicated as outside the Terra title path and not applicable to its exact manager/CAS behavior.
 
-Do not install, enable, migrate, restart, deploy, push, or merge until Clemente separately authorizes the next phase.
+## Final integration follow-up
+
+A rollout review of the first gated artifact found that atomic migration through a symlink could replace the alias and split one session ID into divergent files. The final Pi integration therefore added stable physical descriptor/path revisions, short revision-validated append and replacement transactions, crash-safe materialization reconciliation, strict tail handling, hardlink denial, transactional manager state, and stable legacy fork snapshots.
+
+Final exact heads before this journal update:
+
+- Pi `5bc35555`
+- Wayang `bdbbcc4`
+- mypi `9ad15b4`
+
+Final vendored artifact:
+
+- version `0.84.1-wayang.5bc35555`
+- SHA-256 `b25bad929297ebb76c0c95cae3d52304a5f40c2a3157fdf3e364b35423409b7a`
+
+Final validation:
+
+- Pi full check and focused session/input/fork suites: 70/70.
+- Wayang title/provenance/bridge/session/provider slice: 76/76; backend and frontend production builds pass.
+- Wayang unrestricted aggregate exceeded the parallel 30-minute harness cap in two protected-automation feasibility tests; both tests pass individually and are unrelated to title behavior.
+- mypi extension: 7/7 and TypeScript pass.
+- Independent terminal privacy/security gate: GO.
+- Independent terminal concurrency/correctness gate: GO.
+
+Clemente explicitly authorized both Standard and Protected interactive title disclosure. No flags were changed and no live provider request, production migration, restart, deployment, or remote push occurred during this gate. The separate identity-neutral downstream Pi proposal is `docs/plans/downstream-pi-session-transactions.md`.
