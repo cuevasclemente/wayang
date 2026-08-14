@@ -260,6 +260,19 @@ function exactBody(req: Request, keys: readonly string[]): Record<string, unknow
   return body as Record<string, unknown>;
 }
 
+function exactCredentialBody(
+  req: Request,
+  selection: StandardBrowserRouteSelection,
+  keys: readonly string[] = [],
+): Record<string, unknown> {
+  const body = exactBody(req, ["sessionId", "projectCwd", ...keys]);
+  if ((body.sessionId !== undefined && body.sessionId !== selection.sourceSessionId)
+    || (body.projectCwd !== undefined && body.projectCwd !== selection.projectCwd)) {
+    throw error("Standard browser credential target changed", 409);
+  }
+  return body;
+}
+
 function operation(req: Request): ProtectedBrowserOperation {
   const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body as Record<string, unknown> : {};
   switch (req.params.operation) {
@@ -300,27 +313,27 @@ export function createStandardBrowserRouter(integration?: StandardBrowserIntegra
     res.json(publicState(selection, runtime));
   }));
   router.post("/browser/credentials/status", asyncHandler(async (req, res) => {
-    exactBody(req, []);
     const selection = selections.get(req)!;
+    exactCredentialBody(req, selection);
     res.json(await integration!.credentialStatus(selection));
   }));
   router.post("/browser/credentials/matches", asyncHandler(async (req, res) => {
-    exactBody(req, []);
     const selection = selections.get(req)!;
+    exactCredentialBody(req, selection);
     res.json(await integration!.credentialMatches(selection));
   }));
   const fillCredential = (kind: "login" | "totp") => asyncHandler(async (req, res) => {
-    const body = exactBody(req, ["choiceToken"]);
+    const selection = selections.get(req)!;
+    const body = exactCredentialBody(req, selection, ["choiceToken"]);
     const choiceToken = typeof body.choiceToken === "string" ? body.choiceToken : "";
     if (!choiceToken) throw error("choiceToken is required", 400);
-    const selection = selections.get(req)!;
     res.json(await integration!.credentialFill(selection, choiceToken, kind));
   });
   router.post("/browser/credentials/fill", fillCredential("login"));
   router.post("/browser/credentials/fill-totp", fillCredential("totp"));
   router.post("/browser/credentials/allow-agent-inspection", asyncHandler(async (req, res) => {
-    exactBody(req, []);
     const selection = selections.get(req)!;
+    exactCredentialBody(req, selection);
     await integration!.allowCredentialInspection(selection);
     const runtime = exactRuntime(req, integration!);
     res.json({
@@ -331,8 +344,8 @@ export function createStandardBrowserRouter(integration?: StandardBrowserIntegra
     });
   }));
   router.post("/browser/credentials/lock", asyncHandler(async (req, res) => {
-    exactBody(req, []);
     const selection = selections.get(req)!;
+    exactCredentialBody(req, selection);
     await integration!.lockCredentials(selection);
     res.json({ locked: true });
   }));

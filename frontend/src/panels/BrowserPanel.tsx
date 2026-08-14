@@ -287,7 +287,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
   // support is positive metadata from the exact runtime and is never inferred
   // from a project/profile label or from Protected styling alone.
   const namedRuntime = state?.profile.persistence === "named";
-  const credentialsSupported = state?.credentialBroker?.supported === true;
+  const credentialsSupported = !protectedRuntime || state?.credentialBroker?.supported === true;
   const tabControlsDisabled = cooperative || credentialsOpen || credentialInspection !== undefined;
   const pasteSupported = !namedRuntime;
   const resetSupported = !namedRuntime;
