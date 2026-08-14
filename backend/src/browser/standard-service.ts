@@ -76,6 +76,8 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
   private readonly workspaceLeases = new Map<string, Map<string, StandardBrowserRuntimeWorkspace>>();
   private readonly storageRegistry: BrowserStorageOwnershipRegistry;
   private closed = false;
+  private closePromise: Promise<void> | null = null;
+  private shutdownComplete = false;
 
   constructor(private readonly options: StandardBrowserProfileHostServiceOptions) {
     this.storageRegistry = options.storageRegistry ?? new BrowserStorageOwnershipRegistry();
@@ -288,12 +290,12 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
   async invalidateProfile(profileId: string): Promise<void> {
     const host = this.hosts.get(profileId);
     if (!host) return;
+    await host.close();
+    if (this.hosts.get(profileId) === host) this.hosts.delete(profileId);
     for (const [sourceSessionId, leases] of this.workspaceLeases) {
       leases.delete(profileId);
       if (leases.size === 0) this.workspaceLeases.delete(sourceSessionId);
     }
-    await host.close();
-    if (this.hosts.get(profileId) === host) this.hosts.delete(profileId);
   }
 
   async sweepIdle(
@@ -336,13 +338,24 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
+    if (this.shutdownComplete) return;
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
     for (const runtimes of this.runtimes.values()) for (const runtime of runtimes) runtime.latchRevoked();
-    this.runtimes.clear();
-    this.workspaceLeases.clear();
-    await Promise.allSettled([...this.hosts.values()].map((host) => host.close()));
-    this.hosts.clear();
-    this.storageRegistry.close();
+    let closing!: Promise<void>;
+    closing = (async () => {
+      const results = await Promise.allSettled([...this.hosts.values()].map((host) => host.close()));
+      const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason);
+      if (failures.length > 0) throw new AggregateError(failures, "Standard Browser Profile service shutdown is incomplete");
+      this.runtimes.clear();
+      this.workspaceLeases.clear();
+      this.hosts.clear();
+      this.storageRegistry.close();
+      this.shutdownComplete = true;
+    })().finally(() => {
+      if (this.closePromise === closing) this.closePromise = null;
+    });
+    this.closePromise = closing;
+    return closing;
   }
 }

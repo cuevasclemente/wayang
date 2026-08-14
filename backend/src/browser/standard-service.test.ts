@@ -13,10 +13,14 @@ class FakeBackend implements StandardBrowserHostBackend {
   targets = new Map<string, { id: string; url?: string; title?: string; openerId?: string }>();
   executions: Array<{ targetId: string; operation: ProtectedBrowserOperation }> = [];
   closeFailures = new Set<string>();
+  stopFailures = 0;
   serial = 0;
   constructor(private callbacks: StandardBrowserHostBackendCallbacks) {}
   async start(authorize: () => Promise<void>) { await authorize(); this.running = true; }
-  async stop() { this.running = false; this.targets.clear(); }
+  async stop() {
+    if (this.stopFailures > 0) { this.stopFailures -= 1; throw new Error("synthetic host stop failed"); }
+    this.running = false; this.targets.clear();
+  }
   async listTargets() { return [...this.targets.values()]; }
   async createTarget(url: string) { const target = { id: `target-${++this.serial}`, url }; this.targets.set(target.id, target); this.callbacks.targetCreated(target); return target; }
   async closeTarget(id: string) {
@@ -129,6 +133,30 @@ test("session cleanup propagates target-close failure and retries with retained 
     backend.closeFailures.delete(targetId);
     await f.service.sweepIdle();
     assert.equal(backend.targets.has(targetId), false, "bounded cleanup retry did not retire the retained target");
+  } finally { await f.cleanup(); }
+});
+
+test("profile invalidation retains a failed host shutdown for exact retry", async () => {
+  const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+  try {
+    const runtime = f.service.createRuntime(binding("session-a"));
+    await execute(runtime, "browser_open");
+    f.backends[0]!.stopFailures = 1;
+    await assert.rejects(() => f.service.invalidateProfile(f.profiles[0]!.id), /shutdown is incomplete/);
+    await f.service.invalidateProfile(f.profiles[0]!.id);
+    assert.equal(f.backends[0]!.running, false);
+  } finally { await f.cleanup(); }
+});
+
+test("service shutdown propagates failure and remains retryable", async () => {
+  const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+  try {
+    const runtime = f.service.createRuntime(binding("session-a"));
+    await execute(runtime, "browser_open");
+    f.backends[0]!.stopFailures = 1;
+    await assert.rejects(() => f.service.close(), /service shutdown is incomplete/);
+    await f.service.close();
+    assert.equal(f.backends[0]!.running, false);
   } finally { await f.cleanup(); }
 });
 

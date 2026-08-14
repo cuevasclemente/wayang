@@ -151,8 +151,10 @@ export class StandardBrowserProfileHost {
   private openerLease: BrowserStorageOpenerLease;
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
+  private closePromise: Promise<void> | null = null;
   private startupReconciled = false;
   private closed = false;
+  private shutdownComplete = false;
   private emptySince: number | null = Date.now();
 
   constructor(
@@ -855,20 +857,29 @@ export class StandardBrowserProfileHost {
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
+    if (this.shutdownComplete) return;
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
-    const cleanupResults = await Promise.allSettled(
-      [...this.workspaces.keys()].map((sourceSessionId) => this.closeWorkspace(sourceSessionId, "host_close")),
-    );
-    if (!this.stopPromise) this.stopPromise = this.backend.stop().finally(() => { this.stopPromise = null; });
-    try { await this.stopPromise; }
-    catch (error) {
-      const failures = cleanupResults.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason);
-      throw new AggregateError([...failures, error], "Standard Browser Profile host shutdown is incomplete");
-    }
-    this.workspaces.clear();
-    this.targetOwners.clear();
-    this.unassignedTargets.clear();
-    this.openerLease.release();
+    let closing!: Promise<void>;
+    closing = (async () => {
+      const cleanupResults = await Promise.allSettled(
+        [...this.workspaces.keys()].map((sourceSessionId) => this.closeWorkspace(sourceSessionId, "host_close")),
+      );
+      if (!this.stopPromise) this.stopPromise = this.backend.stop().finally(() => { this.stopPromise = null; });
+      try { await this.stopPromise; }
+      catch (error) {
+        const failures = cleanupResults.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason);
+        throw new AggregateError([...failures, error], "Standard Browser Profile host shutdown is incomplete");
+      }
+      this.workspaces.clear();
+      this.targetOwners.clear();
+      this.unassignedTargets.clear();
+      this.openerLease.release();
+      this.shutdownComplete = true;
+    })().finally(() => {
+      if (this.closePromise === closing) this.closePromise = null;
+    });
+    this.closePromise = closing;
+    return closing;
   }
 }

@@ -1805,6 +1805,7 @@ export class ManagedChromiumRuntime {
   private child: ChildProcess | null = null;
   private browserCdp: CdpConnection | null = null;
   private cdpPort: number | null = null;
+  private stoppingChild: ChildProcess | null = null;
   private lifecycleTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: ManagedChromiumRuntimeOptions) {}
@@ -1823,6 +1824,9 @@ export class ManagedChromiumRuntime {
   async start(assertAuthorizedBeforeBrowserCdp?: () => Promise<void>): Promise<void> {
     return this.serializeLifecycle(async () => {
       if (this.running) return;
+      if (this.child && this.child.exitCode === null) {
+        throw new Error("Managed Chromium cleanup is pending");
+      }
       fs.mkdirSync(this.options.profileDir, { recursive: true, mode: 0o700 });
       fs.mkdirSync(this.options.downloadsDir, { recursive: true, mode: 0o700 });
       const executableCandidates = findChromiumExecutableCandidates();
@@ -1911,11 +1915,13 @@ export class ManagedChromiumRuntime {
         await this.pageTarget();
         child.once("exit", () => {
           if (this.child !== child) return;
+          const expectedStop = this.stoppingChild === child;
           this.browserCdp?.close();
           this.browserCdp = null;
           this.child = null;
           this.cdpPort = null;
-          this.options.onUnexpectedExit?.();
+          if (expectedStop) this.stoppingChild = null;
+          else this.options.onUnexpectedExit?.();
         });
         return;
       } catch (error) {
@@ -1933,12 +1939,13 @@ export class ManagedChromiumRuntime {
             sleep(2_000).then(() => false),
           ]);
           if (!exitedAfterKill) {
-            this.child = null;
+            this.stoppingChild = child;
             this.cdpPort = null;
             throw new Error("Managed Chromium could not be terminated after a failed startup attempt");
           }
         }
-        this.child = null;
+        if (this.child === child) this.child = null;
+        if (this.stoppingChild === child) this.stoppingChild = null;
         this.cdpPort = null;
         if (authorizationError !== undefined) throw authorizationError;
         lastStartupError = error;
@@ -1963,19 +1970,24 @@ export class ManagedChromiumRuntime {
       const child = this.child;
       this.browserCdp?.close();
       this.browserCdp = null;
-      this.child = null;
       this.cdpPort = null;
       if (!child) return;
-      const exited = new Promise<void>((resolve) => {
-        if (child.exitCode !== null) resolve();
-        else child.once("exit", () => resolve());
-      });
+      if (child.exitCode !== null) {
+        if (this.child === child) this.child = null;
+        if (this.stoppingChild === child) this.stoppingChild = null;
+        return;
+      }
+      this.stoppingChild = child;
+      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
       terminateChild(child);
       const graceful = await Promise.race([exited.then(() => true), sleep(3_000).then(() => false)]);
-      if (graceful) return;
-      killChild(child);
-      const killed = await Promise.race([exited.then(() => true), sleep(3_000).then(() => false)]);
-      if (!killed) throw new Error("Managed Chromium did not exit after forced termination");
+      if (!graceful) {
+        killChild(child);
+        const killed = await Promise.race([exited.then(() => true), sleep(3_000).then(() => false)]);
+        if (!killed) throw new Error("Managed Chromium did not exit after forced termination");
+      }
+      if (this.child === child) this.child = null;
+      if (this.stoppingChild === child) this.stoppingChild = null;
     });
   }
 

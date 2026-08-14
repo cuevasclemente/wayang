@@ -140,6 +140,9 @@ export function bootstrapStandardBrowserProduction(
       })
     : null;
   let closed = false;
+  let shutdownComplete = false;
+  let closePromise: Promise<void> | null = null;
+  let integrationsUninstalled = false;
   const factory: InteractiveBrowserFactory = (binding) => {
     if (closed) throw new Error("Interactive browser production bootstrap is closed");
     if (binding.capabilityId === STANDARD_BROWSER_CAPABILITY_ID) {
@@ -162,12 +165,24 @@ export function bootstrapStandardBrowserProduction(
     service,
     factory,
     async close() {
-      if (closed) return;
+      if (shutdownComplete) return;
+      if (closePromise) return closePromise;
       closed = true;
-      if (idleTimer) clearInterval(idleTimer);
-      uninstallFactory();
-      uninstallLifecycle();
-      await service?.close();
+      if (!integrationsUninstalled) {
+        integrationsUninstalled = true;
+        if (idleTimer) clearInterval(idleTimer);
+        uninstallFactory();
+        uninstallLifecycle();
+      }
+      let closing!: Promise<void>;
+      closing = (async () => {
+        await service?.close();
+        shutdownComplete = true;
+      })().finally(() => {
+        if (closePromise === closing) closePromise = null;
+      });
+      closePromise = closing;
+      return closing;
     },
   };
 }

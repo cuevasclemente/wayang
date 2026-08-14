@@ -15,13 +15,17 @@ class FakeBackend implements StandardBrowserHostBackend {
   readonly executions: Array<{ targetId: string; operation: ProtectedBrowserOperation }> = [];
   readonly canceledDownloads: string[] = [];
   readonly closeFailures = new Set<string>();
+  stopFailures = 0;
   downloadStagingDir?: string;
   private serial = 0;
   constructor(private readonly callbacks: StandardBrowserHostBackendCallbacks) {
     this.targets.set("restored", { id: "restored", url: "https://restore.invalid" });
   }
   async start(authorize: () => Promise<void>) { await authorize(); this.running = true; }
-  async stop() { this.running = false; this.targets.clear(); }
+  async stop() {
+    if (this.stopFailures > 0) { this.stopFailures -= 1; throw new Error("synthetic host stop failed"); }
+    this.running = false; this.targets.clear();
+  }
   async listTargets() { return [...this.targets.values()].map((target) => ({ ...target })); }
   async createTarget(url: string) {
     const target = { id: `target-${++this.serial}`, url, title: url };
@@ -150,6 +154,18 @@ test("failed target closure retains exact cleanup identity and blocks workspace 
   assert.equal(f.backend().targets.has(targetId), false);
   assert.doesNotThrow(() => f.host.bindWorkspace(binding("session-a", "replacement-runtime")));
   await f.host.close();
+});
+
+test("failed host shutdown retains its opener identity and retries termination", async () => {
+  const f = hostFixture();
+  const exact = binding("session-a");
+  const workspace = f.host.bindWorkspace(exact);
+  await f.host.execute(exact, workspace.generation, { kind: "start" });
+  f.backend().stopFailures = 1;
+  await assert.rejects(() => f.host.close(), /shutdown is incomplete/);
+  await f.host.close();
+  assert.equal(f.backend().running, false);
+  f.registry.close();
 });
 
 test("agent tab projections strip URL credentials, query, fragments, and URL-bearing titles", async () => {

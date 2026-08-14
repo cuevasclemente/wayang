@@ -99,7 +99,11 @@ function bindProductionBootstraps(
   ...bootstraps: readonly { close(): Promise<void> }[]
 ): void {
   serverProductionBootstraps.set(server, bootstraps);
-  server.once("close", () => { void closeProductionBootstraps(server); });
+  server.once("close", () => {
+    void closeProductionBootstraps(server).catch(() => {
+      console.warn("[app] production bootstrap cleanup remains pending");
+    });
+  });
 }
 
 function closeProductionBootstraps(server: http.Server): Promise<void> {
@@ -109,9 +113,18 @@ function closeProductionBootstraps(server: http.Server): Promise<void> {
   if (!bootstraps) return Promise.resolve();
   // Start every closer independently: a synchronous throw or rejection from
   // either bootstrap must not skip the other, and all callers share one run.
-  const cleanup = Promise.allSettled(bootstraps.map((bootstrap) =>
+  // Failed shutdown remains retryable and is never reported as complete.
+  let cleanup!: Promise<void>;
+  cleanup = Promise.allSettled(bootstraps.map((bootstrap) =>
     Promise.resolve().then(() => bootstrap.close())))
-    .then(() => undefined);
+    .then((results) => {
+      const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason);
+      if (failures.length > 0) throw new AggregateError(failures, "Production bootstrap cleanup is incomplete");
+      serverProductionBootstraps.delete(server);
+    })
+    .finally(() => {
+      if (serverProductionCleanup.get(server) === cleanup) serverProductionCleanup.delete(server);
+    });
   serverProductionCleanup.set(server, cleanup);
   return cleanup;
 }
@@ -315,7 +328,7 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
     : Promise.resolve();
   // Begin teardown after close has stopped new accepts, but do not make one
   // failing subsystem (or an upgraded viewer awaiting teardown) block others.
-  const [serverCloseResult] = await Promise.allSettled([
+  const results = await Promise.allSettled([
     serverClose,
     closeProductionBootstraps(server),
     Promise.resolve().then(() => serverCredentialBrokers.get(server)?.shutdown()),
@@ -325,7 +338,8 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
   ]);
   clearBrowserAgentToken();
   clearAppsAgentToken();
-  if (serverCloseResult.status === "rejected") throw serverCloseResult.reason;
+  const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason);
+  if (failures.length > 0) throw new AggregateError(failures, "Wayang server shutdown is incomplete");
 }
 
 export function start() {
