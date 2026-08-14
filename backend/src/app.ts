@@ -344,19 +344,10 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
 
 export function start() {
   const config = getConfig();
-  // The source tree remains deliberately non-activatable until the remaining
-  // reviewed milestones and independent gate are complete. In particular,
-  // merely deploying this binary with the default gate must not migrate schema.
-  assertStandardBrowserProfileHostsStartupReady(config);
-
-  // Initialize the durable store before composing production authority. These
-  // bootstraps are inert: they install policy/runtime bridges but do not create
-  // an interactive runtime, browser process, CDP connection, or profile.
-  init({ browserProfilesEnabled: config.standardBrowserProfileHosts });
-  console.log(`[db] Store at ${config.dbPath}`);
+  // Compose the complete inert Standard/Protected browser process graph before
+  // allowing schema 6 to migrate. Constructors install closures only: they do
+  // not open profile storage or start Chromium until exact runtime use.
   const authService = new AuthService(config.auth);
-  const workspaceCapabilities = createProductionWorkspaceCapabilityBootstrap(authService, config);
-  installActionApprovalPinAttempts(workspaceCapabilities.pinAttempts);
   const owner = createProductionProtectedBrowserOwner(authService);
   const credentialBroker = new CredentialBroker(config.browser.credentials);
   const protectedBrowser = bootstrapProtectedBrowserProduction({
@@ -376,6 +367,17 @@ export function start() {
   const browserProfileCleanup = standardBrowser.service
     ? new BrowserProfileCleanupCoordinator(config.dataDir, standardBrowser.service)
     : undefined;
+  assertStandardBrowserProfileHostsStartupReady(
+    config,
+    !config.standardBrowserProfileHosts || Boolean(standardBrowser.service && browserProfileCleanup),
+  );
+
+  // Only a fully composed gate-on process may publish schema 6. Migration is
+  // durable-backup-first and aborts before replacement if that backup fails.
+  init({ browserProfilesEnabled: config.standardBrowserProfileHosts });
+  console.log(`[db] Store at ${config.dbPath}`);
+  const workspaceCapabilities = createProductionWorkspaceCapabilityBootstrap(authService, config);
+  installActionApprovalPinAttempts(workspaceCapabilities.pinAttempts);
   const protectedAutomation = bootstrapProtectedAutomationProduction({
     dataDir: config.dataDir,
     credentialBroker,
