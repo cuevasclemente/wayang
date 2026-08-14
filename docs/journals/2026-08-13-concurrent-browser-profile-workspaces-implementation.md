@@ -1,5 +1,29 @@
 # Concurrent Browser Profile workspaces — implementation handoff (2026-08-13)
 
+## Final four-surface completion and integration gate (2026-08-14)
+
+Clemente authorized completing the four previously deferred product surfaces before final integration. The branch now includes:
+
+- exact synchronous Standard download frame→root-page attribution with browser-epoch, target, workspace, control, and runtime generation fencing;
+- exact named-profile credential brokering and UI, including guarded HTTPS document fill, redacted inspection, exact target/body cross-checks, and safe resume;
+- metadata-only atomic recovery/restore for compiled managed and migrated storage roots, bounded retry, and PIN-gated permanent purge from verified recovery only;
+- profile-wide cooperative Full browser VNC with one explicit controller, one-use takeover, per-batch exact input/output authorization, bounded TCP/WebSocket buffering, server-first RFB greeting preservation, lifecycle/idle fencing, and persistent disclosure that pixels are profile-wide rather than workspace-isolated.
+
+Final functional commits are `1013519`, `c29290a`, `890cb2a`, `3a04afb`, and `adcd26d`. Independent blocker/high review of the completed range returned **GO** after closing output-authorization, buffer-bound, transport-policy, stale-workspace, takeover, credential-body, switch-rollback, and old-WebSocket findings.
+
+The final rebase check reports the branch already up to date with canonical `main` `de97396`. Validation in the isolated worktree:
+
+- backend: **836 passed, 0 failed, 5 skipped**;
+- all Playwright E2E: **76 passed, 0 failed**;
+- frontend production build: passed;
+- frontend lint: 0 errors and the one pre-existing Fast Refresh warning in `SessionResultSnippet.tsx`;
+- script suite: unchanged fake-Bitwarden baseline **44/45**, with only `Bitwarden unlock failed`;
+- `make doctor`: 0 failures and 3 expected isolated-worktree configuration warnings.
+
+A synthetic managed-Chromium smoke test verified clean startup/fallback/shutdown. This host's Xvfb currently aborts in the NVIDIA EGL/GBM stack, so `auto` correctly falls back to CDP; explicit `vnc` remains fail-closed. This is a host dependency/runtime issue, not activation, and no live Browser Profile was opened.
+
+Source completion does **not** authorize migration, profile access, feature activation, restart, deployment, or publication. Those remain separate gates. No browser-profile contents, cookies, credentials, transcripts, or live production data were inspected.
+
 ## Terminal pre-rebase gate
 
 Browser-only blockers independent of Terra were closed through clean branch head `cbdf13f` (`72e8058` latest functional change). Repeated independent blocker/high reviews now return **GO**. Final remediations cover authenticated named-workspace routing, exact human/agent control barriers, retained per-profile workspaces, recoverable managed-profile cleanup, redacted bounded projections, profile-switch operation fencing, disabled-profile catalog-only recovery, fail-closed production download attribution, and immediate closure of forbidden top-level documents.
