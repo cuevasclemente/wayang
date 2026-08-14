@@ -23,6 +23,7 @@ import {
   type StandardBrowserProfileHostServiceOptions,
 } from "./standard-service.js";
 import { STANDARD_BROWSER_CAPABILITY_ID, type ProtectedBrowserBinding } from "./types.js";
+import type { CredentialBroker } from "./credentials.js";
 
 function profileCatalogGeneration(profiles: readonly BrowserProfileRow[]): number {
   const bytes = createHash("sha256")
@@ -110,6 +111,7 @@ export interface StandardBrowserProductionBootstrapOptions {
   dataDir: string;
   protectedFactory: InteractiveBrowserFactory;
   backendFactory?: StandardBrowserProfileHostServiceOptions["backendFactory"];
+  credentialBroker?: CredentialBroker;
   installFactory?: (factory: InteractiveBrowserFactory) => () => void;
   installLifecycle?: (port: InteractiveBrowserSessionLifecyclePort) => () => void;
 }
@@ -137,6 +139,7 @@ export function bootstrapStandardBrowserProduction(
         dataDir: options.dataDir,
         catalog: createProductionStandardBrowserCatalog(),
         backendFactory: options.backendFactory ?? createStandardBrowserHostBackendFactory({ dataDir: options.dataDir }),
+        credentialBroker: options.credentialBroker,
       })
     : null;
   let closed = false;

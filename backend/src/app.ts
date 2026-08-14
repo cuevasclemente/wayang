@@ -371,6 +371,7 @@ export function start() {
     enabled: config.standardBrowserProfileHosts,
     dataDir: config.dataDir,
     protectedFactory: protectedBrowser.factory,
+    credentialBroker,
   });
   const browserProfileCleanup = standardBrowser.service
     ? new BrowserProfileCleanupCoordinator(config.dataDir, standardBrowser.service)

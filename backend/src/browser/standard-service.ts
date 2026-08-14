@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ProtectedBrowserBinding } from "./types.js";
+import type { CredentialBroker } from "./credentials.js";
 import type {
   BrowserAuthorityRevokeReason,
   InteractiveBrowserAuthorityScope,
@@ -68,6 +69,7 @@ export interface StandardBrowserProfileHostServiceOptions {
   catalog: StandardBrowserCatalogPort;
   backendFactory: StandardBrowserHostBackendFactory;
   storageRegistry?: BrowserStorageOwnershipRegistry;
+  credentialBroker?: CredentialBroker;
 }
 
 export class StandardBrowserProfileHostService implements InteractiveBrowserSessionLifecyclePort {
@@ -82,6 +84,8 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
   constructor(private readonly options: StandardBrowserProfileHostServiceOptions) {
     this.storageRegistry = options.storageRegistry ?? new BrowserStorageOwnershipRegistry();
   }
+
+  get credentialBrokerSupported(): boolean { return Boolean(this.options.credentialBroker); }
 
   private profile(profileId: string): BrowserProfileRow {
     const profile = this.options.catalog.catalog().profiles.find((candidate) => candidate.id === profileId);
@@ -195,6 +199,74 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     const authority = this.options.catalog.ownerAuthority(sourceSessionId, workspace.profile);
     if (!authority || (expectedProjectCwd !== undefined && authority.projectCwd !== expectedProjectCwd)) return null;
     return { authority, workspace };
+  }
+
+  private ownerCredentialSelection(sourceSessionId: string, expectedProjectCwd?: string) {
+    const resolved = this.resolveOwnerWorkspace(sourceSessionId, expectedProjectCwd);
+    if (!resolved) throw new Error("Standard browser credential workspace is unavailable");
+    const authorize = async () => {
+      const current = this.resolveOwnerWorkspace(sourceSessionId, expectedProjectCwd);
+      if (!current || current.workspace.host !== resolved.workspace.host
+        || current.workspace.profile.id !== resolved.workspace.profile.id
+        || current.workspace.workspaceGeneration !== resolved.workspace.workspaceGeneration
+        || current.workspace.sessionStateRevision !== resolved.workspace.sessionStateRevision
+        || current.authority.associationRevision !== resolved.authority.associationRevision) {
+        throw new Error("Standard browser credential authority changed");
+      }
+    };
+    return { ...resolved, authorize };
+  }
+
+  async credentialStatus(sourceSessionId: string, expectedProjectCwd?: string): Promise<unknown> {
+    const broker = this.options.credentialBroker;
+    if (!broker) throw new Error("Standard browser credential broker is unavailable");
+    const selected = this.ownerCredentialSelection(sourceSessionId, expectedProjectCwd);
+    const status = broker.status();
+    let origin: string | null = null;
+    try {
+      origin = (await selected.workspace.host.ownerCredentialContext(
+        sourceSessionId, selected.workspace.workspaceGeneration, selected.authorize,
+      )).origin;
+    } catch { origin = null; }
+    return { ...status, origin };
+  }
+
+  async credentialMatches(sourceSessionId: string, expectedProjectCwd?: string): Promise<unknown> {
+    const broker = this.options.credentialBroker;
+    if (!broker) throw new Error("Standard browser credential broker is unavailable");
+    const selected = this.ownerCredentialSelection(sourceSessionId, expectedProjectCwd);
+    const context = await selected.workspace.host.ownerCredentialContext(
+      sourceSessionId, selected.workspace.workspaceGeneration, selected.authorize,
+    );
+    return broker.matches(context);
+  }
+
+  async credentialFill(sourceSessionId: string, expectedProjectCwd: string | undefined, choiceToken: string, operation: "login" | "totp"): Promise<unknown> {
+    const broker = this.options.credentialBroker;
+    if (!broker) throw new Error("Standard browser credential broker is unavailable");
+    const selected = this.ownerCredentialSelection(sourceSessionId, expectedProjectCwd);
+    const context = await selected.workspace.host.ownerCredentialContext(
+      sourceSessionId, selected.workspace.workspaceGeneration, selected.authorize,
+    );
+    return broker.fill(choiceToken, operation, context, (values) => selected.workspace.host.ownerFillCredential(
+      sourceSessionId, selected.workspace.workspaceGeneration, context, values, selected.authorize,
+    ));
+  }
+
+  async allowCredentialInspection(sourceSessionId: string, expectedProjectCwd?: string): Promise<StandardBrowserWorkspacePublicState> {
+    const selected = this.ownerCredentialSelection(sourceSessionId, expectedProjectCwd);
+    await selected.workspace.host.ownerAllowCredentialInspection(
+      sourceSessionId, selected.workspace.workspaceGeneration, selected.authorize,
+    );
+    return selected.workspace.host.ownerPublicState(sourceSessionId, selected.workspace.workspaceGeneration);
+  }
+
+  async lockCredentials(sourceSessionId: string, expectedProjectCwd?: string): Promise<void> {
+    const broker = this.options.credentialBroker;
+    if (!broker) throw new Error("Standard browser credential broker is unavailable");
+    const selected = this.ownerCredentialSelection(sourceSessionId, expectedProjectCwd);
+    await selected.authorize();
+    await broker.lock();
   }
 
   resolveLiveWorkspace(binding: Readonly<ProtectedBrowserBinding>): StandardBrowserRuntimeWorkspace | null {

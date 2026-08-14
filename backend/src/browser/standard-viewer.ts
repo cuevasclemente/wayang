@@ -15,6 +15,7 @@ export async function openStandardCdpViewer(options: {
   attachment: { cdp: Pick<CdpConnection, "send" | "on" | "close">; target: ChromeTarget; close(): void };
   authorize(): Promise<void>;
   revoke(): Promise<void>;
+  redact?(value: unknown): unknown;
 }): Promise<ProtectedBrowserViewerTransport> {
   const { cdp, target } = options.attachment;
   const listeners = new Set<(message: Buffer, isBinary: boolean) => void>();
@@ -48,7 +49,9 @@ export async function openStandardCdpViewer(options: {
       void options.revoke().catch(() => undefined);
       throw new Error("Standard browser viewer reached a forbidden top-level document");
     }
-    emit({ type: "page", url: document.topLevelUrl, title: document.title });
+    const redacted = options.redact?.({ type: "page", url: document.topLevelUrl, title: document.title })
+      ?? { type: "page", url: document.topLevelUrl, title: document.title };
+    emit(redacted);
   };
   return {
     async dispatch(raw, isBinary) {

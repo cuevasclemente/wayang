@@ -20,6 +20,7 @@ export interface StandardBrowserRouteSelection {
 
 export interface StandardBrowserHttpRuntime {
   workspace: StandardBrowserRuntimeWorkspace;
+  credentialsSupported: boolean;
 }
 
 export interface StandardBrowserIntegration {
@@ -33,6 +34,11 @@ export interface StandardBrowserIntegration {
   }): StandardBrowserRouteSelection | null;
   resolve(selection: Readonly<StandardBrowserRouteSelection>): StandardBrowserHttpRuntime | null;
   openViewer(selection: Readonly<StandardBrowserRouteSelection>, kind: "vnc" | "cdp"): Promise<ProtectedBrowserViewerTransport | null>;
+  credentialStatus(selection: Readonly<StandardBrowserRouteSelection>): Promise<unknown>;
+  credentialMatches(selection: Readonly<StandardBrowserRouteSelection>): Promise<unknown>;
+  credentialFill(selection: Readonly<StandardBrowserRouteSelection>, choiceToken: string, operation: "login" | "totp"): Promise<unknown>;
+  allowCredentialInspection(selection: Readonly<StandardBrowserRouteSelection>): Promise<unknown>;
+  lockCredentials(selection: Readonly<StandardBrowserRouteSelection>): Promise<void>;
 }
 
 export function createStandardBrowserIntegration(service: StandardBrowserProfileHostService): StandardBrowserIntegration {
@@ -59,7 +65,7 @@ export function createStandardBrowserIntegration(service: StandardBrowserProfile
     },
     resolve(selection) {
       const resolved = exactOwner(selection);
-      return resolved ? { workspace: resolved.workspace } : null;
+      return resolved ? { workspace: resolved.workspace, credentialsSupported: service.credentialBrokerSupported } : null;
     },
     async openViewer(selection, kind) {
       if (kind !== "cdp") return null;
@@ -77,6 +83,7 @@ export function createStandardBrowserIntegration(service: StandardBrowserProfile
         attachment,
         authorize,
         revoke: () => workspace.host.closeWorkspace(selection.sourceSessionId, "viewer_policy"),
+        redact: (value) => workspace.host.redactCredentialMetadata(value),
       });
       const unregister = workspace.host.registerViewer(selection.sourceSessionId, selection.workspaceGeneration, async () => {
         unregister();
@@ -87,6 +94,26 @@ export function createStandardBrowserIntegration(service: StandardBrowserProfile
         close: async () => { unregister(); await viewer.close(); },
         onMessage: (listener) => viewer.onMessage(listener),
       };
+    },
+    async credentialStatus(selection) {
+      if (!exactOwner(selection)) throw new Error("Standard browser credential authority is unavailable");
+      return service.credentialStatus(selection.sourceSessionId, selection.projectCwd);
+    },
+    async credentialMatches(selection) {
+      if (!exactOwner(selection)) throw new Error("Standard browser credential authority is unavailable");
+      return service.credentialMatches(selection.sourceSessionId, selection.projectCwd);
+    },
+    async credentialFill(selection, choiceToken, operation) {
+      if (!exactOwner(selection)) throw new Error("Standard browser credential authority is unavailable");
+      return service.credentialFill(selection.sourceSessionId, selection.projectCwd, choiceToken, operation);
+    },
+    async allowCredentialInspection(selection) {
+      if (!exactOwner(selection)) throw new Error("Standard browser credential authority is unavailable");
+      return service.allowCredentialInspection(selection.sourceSessionId, selection.projectCwd);
+    },
+    async lockCredentials(selection) {
+      if (!exactOwner(selection)) throw new Error("Standard browser credential authority is unavailable");
+      await service.lockCredentials(selection.sourceSessionId, selection.projectCwd);
     },
   };
 }
@@ -188,8 +215,16 @@ function publicState(selection: StandardBrowserRouteSelection, runtime: Standard
     tabs: state.tabs,
     activeTab: state.activeTab,
     updatedAt: state.updatedAt,
-    credentialBroker: { supported: false, guarded: true },
+    ...(state.credentialInspection ? { credentialInspection: state.credentialInspection } : {}),
+    credentialBroker: { supported: runtime.credentialsSupported, guarded: true },
   };
+}
+
+function exactBody(req: Request, keys: readonly string[]): Record<string, unknown> {
+  const body = req.body === undefined ? {} : req.body;
+  if (!body || typeof body !== "object" || Array.isArray(body)
+    || Object.keys(body).some((key) => !keys.includes(key))) throw error("Invalid Standard browser request", 400);
+  return body as Record<string, unknown>;
 }
 
 function operation(req: Request): ProtectedBrowserOperation {
@@ -225,9 +260,48 @@ export function createStandardBrowserRouter(integration?: StandardBrowserIntegra
     const runtime = exactRuntime(req, integration!);
     const mode = req.body?.mode;
     if (mode !== "agent" && mode !== "user" && mode !== "paused") throw error("Invalid Standard browser control mode", 400);
-    if (mode === "agent") await runtime.workspace.host.ownerResumeAgent(selection.sourceSessionId, selection.workspaceGeneration);
+    if (mode === "agent") await runtime.workspace.host.ownerResumeAgent(selection.sourceSessionId, selection.workspaceGeneration, async () => {
+      if (!integration!.resolve(selection)) throw error("Standard browser owner authority changed");
+    });
     else await runtime.workspace.host.ownerSetControlMode(selection.sourceSessionId, selection.workspaceGeneration, mode);
     res.json(publicState(selection, runtime));
+  }));
+  router.post("/browser/credentials/status", asyncHandler(async (req, res) => {
+    exactBody(req, []);
+    const selection = selections.get(req)!;
+    res.json(await integration!.credentialStatus(selection));
+  }));
+  router.post("/browser/credentials/matches", asyncHandler(async (req, res) => {
+    exactBody(req, []);
+    const selection = selections.get(req)!;
+    res.json(await integration!.credentialMatches(selection));
+  }));
+  const fillCredential = (kind: "login" | "totp") => asyncHandler(async (req, res) => {
+    const body = exactBody(req, ["choiceToken"]);
+    const choiceToken = typeof body.choiceToken === "string" ? body.choiceToken : "";
+    if (!choiceToken) throw error("choiceToken is required", 400);
+    const selection = selections.get(req)!;
+    res.json(await integration!.credentialFill(selection, choiceToken, kind));
+  });
+  router.post("/browser/credentials/fill", fillCredential("login"));
+  router.post("/browser/credentials/fill-totp", fillCredential("totp"));
+  router.post("/browser/credentials/allow-agent-inspection", asyncHandler(async (req, res) => {
+    exactBody(req, []);
+    const selection = selections.get(req)!;
+    await integration!.allowCredentialInspection(selection);
+    const runtime = exactRuntime(req, integration!);
+    res.json({
+      allowedInspection: "text-only",
+      screenshotsAllowed: false,
+      mutationsAllowed: false,
+      state: publicState(selection, runtime),
+    });
+  }));
+  router.post("/browser/credentials/lock", asyncHandler(async (req, res) => {
+    exactBody(req, []);
+    const selection = selections.get(req)!;
+    await integration!.lockCredentials(selection);
+    res.json({ locked: true });
   }));
   router.post("/browser/paste", (_req, res) => {
     res.status(409).json({ error: "Use the authenticated Browser viewer for Standard profile input" });

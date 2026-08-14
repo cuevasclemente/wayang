@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { ChromeTarget } from "./cdp.js";
 import {
   ManagedChromiumRuntime,
+  type BrowserCredentialContext,
   type ManagedChromiumPageAttachment,
   type ManagedChromiumRuntimeOptions,
 } from "./manager.js";
@@ -86,6 +87,7 @@ async function executeExactTargetOperation(
   operation: ProtectedBrowserOperation,
   authorize: () => Promise<void>,
   protection: ProtectedCredentialProtection,
+  hostRedactor: ProtectedCredentialProtection,
 ): Promise<unknown> {
   if (operation.kind === "status" || operation.kind === "start" || operation.kind === "stop") {
     throw new Error("Standard host lifecycle operation reached page backend");
@@ -177,9 +179,84 @@ async function executeExactTargetOperation(
       visible.username = ""; visible.password = ""; visible.search = ""; visible.hash = "";
       value = { ...value, url: visible.toString(), title: redactNavigationTitle(after.title, after.topLevelUrl) };
     }
-    const redacted = protection.redact(value);
+    const redacted = hostRedactor.redact(protection.redact(value));
     assertBoundedObservation(redacted);
     return redacted;
+  } finally { attachment.close(); }
+}
+
+async function standardCredentialContext(
+  managed: StandardManagedChromiumPort,
+  targetId: string,
+  runtimeKey: string,
+  authorize: () => Promise<void>,
+): Promise<BrowserCredentialContext> {
+  await authorize();
+  const attachment = await managed.attachTargetCdpViewer(targetId);
+  try {
+    await guardedSend(attachment.cdp, authorize, "Page.enable");
+    await guardedSend(attachment.cdp, authorize, "Runtime.enable");
+    const document = await settledTopLevelDocument(attachment.cdp, attachment.target, authorize, SETTLE_TIMEOUT_MS, SETTLE_INTERVAL_MS);
+    if (!isProtectedBrowserAllowedTopLevelUrl(document.topLevelUrl)) throw new Error("Current page does not have a credential-safe HTTPS origin");
+    const origin = new URL(document.topLevelUrl).origin;
+    if (origin === "null") throw new Error("Current page does not have a credential-safe HTTPS origin");
+    return { runtimeKey, targetId, documentIdentity: document.documentIdentity, url: document.topLevelUrl, origin };
+  } finally { attachment.close(); }
+}
+
+function sameCredentialContext(left: BrowserCredentialContext, right: BrowserCredentialContext): boolean {
+  return left.runtimeKey === right.runtimeKey && left.targetId === right.targetId
+    && left.documentIdentity === right.documentIdentity && left.origin === right.origin;
+}
+
+async function fillStandardCredentialDocument(
+  managed: StandardManagedChromiumPort,
+  targetId: string,
+  expected: BrowserCredentialContext,
+  values: { username?: string; password?: string; totp?: string },
+  protection: ProtectedCredentialProtection,
+  hostRedactor: ProtectedCredentialProtection,
+  authorize: () => Promise<void>,
+): Promise<Array<"username" | "password" | "totp">> {
+  const current = await standardCredentialContext(managed, targetId, expected.runtimeKey, authorize);
+  if (!sameCredentialContext(expected, current)) throw new Error("Credential choice is no longer valid for this page");
+  const attachment = await managed.attachTargetCdpViewer(targetId);
+  try {
+    protection.recordFill(expected.documentIdentity, values);
+    hostRedactor.recordFill(expected.documentIdentity, values);
+    const documentResult = await guardedSend<any>(attachment.cdp, authorize, "Runtime.evaluate", { expression: "document", returnByValue: false });
+    const objectId = documentResult?.result?.objectId;
+    if (!objectId) throw new Error("Credential fill could not access the page");
+    const result = await guardedSend<any>(attachment.cdp, authorize, "Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: `function(values) {
+        const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return !el.disabled && !el.readOnly && el.type !== "hidden" && r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden" && Number(s.opacity) !== 0; };
+        const identity = (el) => [el.id, el.name, el.placeholder, el.getAttribute("aria-label"), el.autocomplete].filter(Boolean).join(" ");
+        const setValue = (el, value) => { el.focus({ preventScroll: true }); const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set; if (setter) setter.call(el, value); else el.value = value; el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true })); };
+        const inputs = Array.from(document.querySelectorAll("input,textarea")).filter(visible);
+        const passwords = inputs.filter((el) => el instanceof HTMLInputElement && el.type === "password");
+        const totps = inputs.filter((el) => /one-time-code/i.test(el.autocomplete || "") || /(?:otp|totp|verification|auth(?:entication)?[ _-]?code)/i.test(identity(el)));
+        if (typeof values.password === "string" && passwords.length !== 1) return { error: "required-password-field", filled: [] };
+        if (typeof values.totp === "string" && totps.length !== 1) return { error: "required-totp-field", filled: [] };
+        const excluded = new Set([passwords[0], totps[0]].filter(Boolean));
+        const usernames = inputs.filter((el) => !excluded.has(el) && (!(el instanceof HTMLInputElement) || ["text", "email", "tel", ""].includes(el.type)) && (/(?:user|email|login)/i.test(identity(el)) || /username|email/i.test(el.autocomplete || "")));
+        const filled = [];
+        if (typeof values.username === "string" && usernames.length === 1) { setValue(usernames[0], values.username); filled.push("username"); }
+        if (typeof values.password === "string") { setValue(passwords[0], values.password); filled.push("password"); }
+        if (typeof values.totp === "string") { setValue(totps[0], values.totp); filled.push("totp"); }
+        return { filled };
+      }`,
+      arguments: [{ value: values }],
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    if (result?.exceptionDetails) throw new Error("Credential fill failed in the page");
+    const value = result?.result?.value ?? {};
+    if (value.error === "required-password-field") throw new Error("Credential fill requires exactly one eligible password field");
+    if (value.error === "required-totp-field") throw new Error("Credential fill requires exactly one eligible verification-code field");
+    const after = await standardCredentialContext(managed, targetId, expected.runtimeKey, authorize);
+    if (!sameCredentialContext(expected, after)) throw new Error("Credential document changed during fill");
+    return (Array.isArray(value.filled) ? value.filled : []).filter((field: unknown): field is "username" | "password" | "totp" => field === "username" || field === "password" || field === "totp");
   } finally { attachment.close(); }
 }
 
@@ -190,6 +267,12 @@ export function createStandardBrowserHostBackendFactory(options: {
   const managedFactory = options.managedFactory ?? ((runtimeOptions) => new ManagedChromiumRuntime(runtimeOptions));
   return ({ profile, storage, callbacks }): StandardBrowserHostBackend => {
     const protections = new Map<string, ProtectedCredentialProtection>();
+    const hostRedactor = new ProtectedCredentialProtection();
+    const protectionFor = (targetId: string) => {
+      let protection = protections.get(targetId);
+      if (!protection) { protection = new ProtectedCredentialProtection(); protections.set(targetId, protection); }
+      return protection;
+    };
     let managed!: StandardManagedChromiumPort;
     const downloadStagingDir = path.join(options.dataDir, "browser-profiles", "v1", "download-staging", profile.id);
     let stagingCleaned = false;
@@ -239,11 +322,27 @@ export function createStandardBrowserHostBackendFactory(options: {
       closeTarget: (targetId) => managed.closePageTarget(targetId),
       cancelDownload: (guid) => managed.cancelDownload(guid),
       attachViewer: (targetId) => managed.attachTargetCdpViewer(targetId),
-      execute: (targetId, operation, authorize) => {
-        let protection = protections.get(targetId);
-        if (!protection) { protection = new ProtectedCredentialProtection(); protections.set(targetId, protection); }
-        return executeExactTargetOperation(managed, targetId, operation, authorize, protection);
+      execute: (targetId, operation, authorize) => executeExactTargetOperation(
+        managed, targetId, operation, authorize, protectionFor(targetId), hostRedactor,
+      ),
+      credentialContext: (targetId, runtimeKey, authorize) => standardCredentialContext(managed, targetId, runtimeKey, authorize),
+      fillCredential: (targetId, expected, values, authorize) => fillStandardCredentialDocument(
+        managed, targetId, expected, values, protectionFor(targetId), hostRedactor, authorize,
+      ),
+      async allowCredentialInspection(targetId, expected, authorize) {
+        const current = await standardCredentialContext(managed, targetId, expected.runtimeKey, authorize);
+        if (!sameCredentialContext(expected, current)) throw new Error("Credential choice is no longer valid for this page");
+        protectionFor(targetId).allowInspection(current.documentIdentity);
       },
+      async assertSafeCredentialResume(targetId, authorize) {
+        const protection = protectionFor(targetId);
+        if (protection.mode === "none") return;
+        const current = await standardCredentialContext(managed, targetId, "resume", authorize);
+        protection.reconcile(current.documentIdentity);
+        if ((protection.mode as string) !== "none") throw new Error("Standard browser credential inspection requires a fresh top-level document");
+      },
+      credentialInspection: (targetId) => protections.get(targetId)?.mode ?? "none",
+      redactCredentialMetadata: (value) => hostRedactor.redact(value),
     };
   };
 }

@@ -1,7 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { CdpConnection, ChromeTarget } from "./cdp.js";
 import { InteractiveBrowserDownloadPublisher, type InteractiveBrowserDownloadState } from "./interactive-downloads.js";
-import type { ManagedChromiumDownloadProgress, ManagedChromiumDownloadWillBegin } from "./manager.js";
+import type { BrowserCredentialContext, ManagedChromiumDownloadProgress, ManagedChromiumDownloadWillBegin } from "./manager.js";
+import type { ProtectedCredentialInspectionMode } from "./guarded-page.js";
 import { isProtectedBrowserAllowedTopLevelUrl } from "./protected-browser.js";
 import type { ProtectedBrowserBinding, ProtectedBrowserOperation } from "./types.js";
 import type { BrowserProfileRow } from "./profile-catalog-store.js";
@@ -78,6 +79,12 @@ export interface StandardBrowserHostBackend {
   closeTarget(targetId: string): Promise<void>;
   cancelDownload?(guid: string): Promise<void>;
   execute(targetId: string, operation: ProtectedBrowserOperation, authorize: () => Promise<void>): Promise<unknown>;
+  credentialContext?(targetId: string, runtimeKey: string, authorize: () => Promise<void>): Promise<BrowserCredentialContext>;
+  fillCredential?(targetId: string, expected: BrowserCredentialContext, values: { username?: string; password?: string; totp?: string }, authorize: () => Promise<void>): Promise<Array<"username" | "password" | "totp">>;
+  allowCredentialInspection?(targetId: string, expected: BrowserCredentialContext, authorize: () => Promise<void>): Promise<void>;
+  assertSafeCredentialResume?(targetId: string, authorize: () => Promise<void>): Promise<void>;
+  credentialInspection?(targetId: string): ProtectedCredentialInspectionMode;
+  redactCredentialMetadata?(value: unknown): unknown;
   attachViewer?(targetId: string): Promise<{ cdp: Pick<CdpConnection, "send" | "on" | "close">; target: ChromeTarget; close(): void }>;
 }
 
@@ -97,6 +104,7 @@ export interface StandardBrowserWorkspacePublicState {
   tabs: Array<{ tab: string; title?: string; url?: string }>;
   running: boolean;
   updatedAt: number;
+  credentialInspection?: Exclude<ProtectedCredentialInspectionMode, "none">;
   download?: InteractiveBrowserDownloadState;
 }
 
@@ -332,6 +340,13 @@ export class StandardBrowserProfileHost {
     return workspace;
   }
 
+  private workspaceCredentialInspection(workspace: WorkspaceRecord): Exclude<ProtectedCredentialInspectionMode, "none"> | undefined {
+    const targetId = workspace.activeTargetId;
+    if (!targetId) return undefined;
+    const mode = this.backend.credentialInspection?.(targetId) ?? "none";
+    return mode === "none" ? undefined : mode;
+  }
+
   ownerPublicState(sourceSessionId: string, workspaceGeneration: string): StandardBrowserWorkspacePublicState {
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
     const tabs = [...workspace.targets.values()].map((target) => ({
@@ -349,6 +364,7 @@ export class StandardBrowserProfileHost {
       tabs,
       running: workspace.targets.size > 0,
       updatedAt: workspace.lastActivityAt,
+      ...(this.workspaceCredentialInspection(workspace) ? { credentialInspection: this.workspaceCredentialInspection(workspace) } : {}),
       ...(workspace.latestDownload ? { download: { ...workspace.latestDownload } } : {}),
     };
   }
@@ -367,24 +383,123 @@ export class StandardBrowserProfileHost {
     } finally { workspace.controlTransition = false; }
   }
 
-  async ownerResumeAgent(sourceSessionId: string, workspaceGeneration: string): Promise<void> {
+  async ownerResumeAgent(sourceSessionId: string, workspaceGeneration: string, authorize?: () => void | Promise<void>): Promise<void> {
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
     if (workspace.controlTransition) throw new Error("Standard browser control transition is busy");
     workspace.controlTransition = true;
     workspace.controlGeneration += 1;
-    await this.closeWorkspaceViewers(sourceSessionId);
-    await workspace.queueTail.catch(() => undefined);
-    await this.cancelWorkspaceDownloads(sourceSessionId, workspaceGeneration);
-    workspace.controlMode = "agent";
-    workspace.controlGeneration += 1;
-    workspace.lastActivityAt = Date.now();
-    workspace.controlTransition = false;
+    try {
+      await this.closeWorkspaceViewers(sourceSessionId);
+      await workspace.queueTail.catch(() => undefined);
+      const targetId = workspace.activeTargetId;
+      if (targetId && this.backend.assertSafeCredentialResume) {
+        await this.backend.assertSafeCredentialResume(targetId, async () => {
+          await authorize?.();
+          this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+        });
+      }
+      await this.cancelWorkspaceDownloads(sourceSessionId, workspaceGeneration);
+      workspace.controlMode = "agent";
+      workspace.controlGeneration += 1;
+      workspace.lastActivityAt = Date.now();
+    } finally { workspace.controlTransition = false; }
   }
 
   async ownerStart(sourceSessionId: string, workspaceGeneration: string, authorize: () => void | Promise<void>): Promise<void> {
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
     await this.ensureActiveTargetAuthorized(workspace, authorize);
     this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration).lastActivityAt = Date.now();
+  }
+
+  private workspaceHasCredentialProtection(workspace: WorkspaceRecord): boolean {
+    return [...workspace.targets.keys()].some((targetId) => (this.backend.credentialInspection?.(targetId) ?? "none") !== "none");
+  }
+
+  private credentialRuntimeKey(workspace: WorkspaceRecord, target: TargetRecord): string {
+    if (!workspace.runtimeGeneration) throw new Error("Standard browser credentials require a live exact runtime");
+    return `standard:${createHash("sha256").update(JSON.stringify({
+      profileId: this.profile.id,
+      storageIdentity: this.profile.storage_identity_digest,
+      profileRevision: this.profile.revision,
+      sourceSessionId: workspace.sourceSessionId,
+      projectId: workspace.binding.projectId,
+      projectCwd: workspace.binding.projectCwd,
+      agentProfileId: workspace.binding.agentProfileId,
+      associationRevision: workspace.binding.associationRevision,
+      runtimeGeneration: workspace.runtimeGeneration,
+      processBootNonce: workspace.binding.processBootNonce,
+      workspaceGeneration: workspace.generation,
+      controlGeneration: workspace.controlGeneration,
+      targetId: target.rawId,
+      targetGeneration: target.generation,
+    })).digest("hex")}`;
+  }
+
+  async ownerCredentialContext(
+    sourceSessionId: string,
+    workspaceGeneration: string,
+    authorize: () => void | Promise<void>,
+  ): Promise<BrowserCredentialContext> {
+    const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    if (workspace.controlMode === "agent" || workspace.controlTransition) throw new Error("Standard browser credentials require human control");
+    const target = await this.ensureActiveTargetAuthorized(workspace, authorize);
+    if (!this.backend.credentialContext) throw new Error("Standard browser credential broker is unavailable");
+    const controlGeneration = workspace.controlGeneration;
+    const targetGeneration = target.generation;
+    const runtimeGeneration = workspace.runtimeGeneration;
+    if (!runtimeGeneration) throw new Error("Standard browser credentials require a live exact runtime");
+    const checkpoint = async () => {
+      await authorize();
+      const current = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+      const currentTarget = current.targets.get(target.rawId);
+      if (current.controlMode === "agent" || current.controlTransition || current.controlGeneration !== controlGeneration
+        || current.runtimeGeneration !== runtimeGeneration || !currentTarget || currentTarget.generation !== targetGeneration
+        || current.activeTargetId !== target.rawId || this.targetOwners.get(target.rawId) !== sourceSessionId) {
+        throw new Error("Standard browser credential context changed");
+      }
+    };
+    const context = await this.backend.credentialContext(target.rawId, this.credentialRuntimeKey(workspace, target), checkpoint);
+    await checkpoint();
+    return context;
+  }
+
+  async ownerFillCredential(
+    sourceSessionId: string,
+    workspaceGeneration: string,
+    expected: BrowserCredentialContext,
+    values: { username?: string; password?: string; totp?: string },
+    authorize: () => void | Promise<void>,
+  ): Promise<Array<"username" | "password" | "totp">> {
+    const current = await this.ownerCredentialContext(sourceSessionId, workspaceGeneration, authorize);
+    if (current.runtimeKey !== expected.runtimeKey || current.targetId !== expected.targetId
+      || current.documentIdentity !== expected.documentIdentity || current.origin !== expected.origin) {
+      throw new Error("Credential choice is no longer valid for this page");
+    }
+    if (!this.backend.fillCredential) throw new Error("Standard browser credential broker is unavailable");
+    const result = await this.backend.fillCredential(current.targetId, expected, values, async () => {
+      const next = await this.ownerCredentialContext(sourceSessionId, workspaceGeneration, authorize);
+      if (next.runtimeKey !== expected.runtimeKey || next.targetId !== expected.targetId
+        || next.documentIdentity !== expected.documentIdentity || next.origin !== expected.origin) {
+        throw new Error("Credential choice is no longer valid for this page");
+      }
+    });
+    this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration).lastActivityAt = Date.now();
+    return result;
+  }
+
+  async ownerAllowCredentialInspection(
+    sourceSessionId: string,
+    workspaceGeneration: string,
+    authorize: () => void | Promise<void>,
+  ): Promise<void> {
+    const context = await this.ownerCredentialContext(sourceSessionId, workspaceGeneration, authorize);
+    if (!this.backend.allowCredentialInspection) throw new Error("Standard browser credential broker is unavailable");
+    await this.backend.allowCredentialInspection(context.targetId, context, async () => { await authorize(); });
+    const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    await this.closeWorkspaceViewers(sourceSessionId);
+    workspace.controlGeneration += 1;
+    workspace.controlMode = "agent";
+    workspace.lastActivityAt = Date.now();
   }
 
   async ownerExecute(
@@ -425,6 +540,7 @@ export class StandardBrowserProfileHost {
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
     return this.queueWorkspace(workspace, async () => {
       if (workspace.controlMode === "agent") throw new Error("Standard browser tab changes require human control");
+      if (this.workspaceHasCredentialProtection(workspace)) throw new Error("Standard browser credential protection blocks tab changes");
       await this.ensureStartedAuthorized(authorize);
       const target = await this.backend.createTarget("about:blank");
       await authorize();
@@ -449,6 +565,7 @@ export class StandardBrowserProfileHost {
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
     return this.queueWorkspace(workspace, async () => {
       if (workspace.controlMode === "agent") throw new Error("Standard browser tab changes require human control");
+      if (this.workspaceHasCredentialProtection(workspace)) throw new Error("Standard browser credential protection blocks tab changes");
       const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
       if (!target) throw new Error("Standard browser tab choice is stale");
       workspace.activeTargetId = target.rawId;
@@ -655,6 +772,7 @@ export class StandardBrowserProfileHost {
       tabs,
       running: workspace.targets.size > 0,
       updatedAt: workspace.lastActivityAt,
+      ...(this.workspaceCredentialInspection(workspace) ? { credentialInspection: this.workspaceCredentialInspection(workspace) } : {}),
       ...(workspace.latestDownload ? { download: { ...workspace.latestDownload } } : {}),
     };
   }
@@ -726,6 +844,7 @@ export class StandardBrowserProfileHost {
   async openTab(binding: Readonly<ProtectedBrowserBinding>, workspaceGeneration: string, url = "about:blank"): Promise<StandardBrowserWorkspacePublicState> {
     if (url !== "about:blank" && !isProtectedBrowserAllowedTopLevelUrl(url)) throw new Error("Standard browser tab requires an absolute HTTPS URL");
     const workspace = this.exactWorkspace(binding, workspaceGeneration);
+    if (this.workspaceHasCredentialProtection(workspace)) throw new Error("Standard browser credential protection blocks tab changes");
     const controlGeneration = workspace.controlGeneration;
     const assertControl = () => {
       const current = this.exactWorkspace(binding, workspaceGeneration);
@@ -759,6 +878,7 @@ export class StandardBrowserProfileHost {
   selectTab(binding: Readonly<ProtectedBrowserBinding>, workspaceGeneration: string, handle: string): StandardBrowserWorkspacePublicState {
     const workspace = this.exactWorkspace(binding, workspaceGeneration);
     if (workspace.controlMode !== "agent") throw new Error("Standard browser workspace is under human control");
+    if (this.workspaceHasCredentialProtection(workspace)) throw new Error("Standard browser credential protection blocks tab changes");
     const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
     if (!target) throw new Error("Standard browser tab choice is stale");
     workspace.activeTargetId = target.rawId;
@@ -768,6 +888,7 @@ export class StandardBrowserProfileHost {
 
   async closeTab(binding: Readonly<ProtectedBrowserBinding>, workspaceGeneration: string, handle: string): Promise<StandardBrowserWorkspacePublicState | null> {
     const workspace = this.exactWorkspace(binding, workspaceGeneration);
+    if (this.workspaceHasCredentialProtection(workspace)) throw new Error("Standard browser credential protection blocks tab changes");
     const controlGeneration = workspace.controlGeneration;
     const assertControl = () => {
       const current = this.exactWorkspace(binding, workspaceGeneration);
@@ -811,6 +932,10 @@ export class StandardBrowserProfileHost {
     const workspace = this.workspaces.get(sourceSessionId);
     return Boolean(workspace && !workspace.closed && workspace.generation === workspaceGeneration
       && !workspace.controlTransition && workspace.controlMode !== "agent");
+  }
+
+  redactCredentialMetadata(value: unknown): unknown {
+    return this.backend.redactCredentialMetadata?.(value) ?? value;
   }
 
   registerViewer(sourceSessionId: string, workspaceGeneration: string, close: () => Promise<void>): () => void {

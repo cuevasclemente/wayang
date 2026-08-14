@@ -14,6 +14,7 @@ class FakeBackend implements StandardBrowserHostBackend {
   executions: Array<{ targetId: string; operation: ProtectedBrowserOperation }> = [];
   closeFailures = new Set<string>();
   stopFailures = 0;
+  credentialMode: "none" | "blocked" | "text-allowed" = "none";
   serial = 0;
   constructor(private callbacks: StandardBrowserHostBackendCallbacks) {}
   async start(authorize: () => Promise<void>) { await authorize(); this.running = true; }
@@ -28,6 +29,21 @@ class FakeBackend implements StandardBrowserHostBackend {
     this.targets.delete(id); this.callbacks.targetDestroyed(id);
   }
   async execute(targetId: string, operation: ProtectedBrowserOperation, authorize: () => Promise<void>) { await authorize(); this.executions.push({ targetId, operation }); await authorize(); return { targetId, kind: operation.kind }; }
+  async credentialContext(targetId: string, runtimeKey: string, authorize: () => Promise<void>) {
+    await authorize();
+    return { runtimeKey, targetId, documentIdentity: `${targetId}:document`, url: "https://login.example/", origin: "https://login.example" };
+  }
+  async fillCredential(targetId: string, expected: any, values: any, authorize: () => Promise<void>) {
+    await authorize();
+    assert.equal(expected.targetId, targetId);
+    assert.equal(values.password, "synthetic-secret");
+    this.credentialMode = "blocked";
+    return ["username", "password"] as Array<"username" | "password">;
+  }
+  async allowCredentialInspection(_targetId: string, _expected: any, authorize: () => Promise<void>) { await authorize(); this.credentialMode = "text-allowed"; }
+  async assertSafeCredentialResume() { if (this.credentialMode !== "none") throw new Error("fresh top-level document required"); }
+  credentialInspection() { return this.credentialMode; }
+  redactCredentialMetadata(value: unknown) { return value; }
 }
 
 function binding(session: string, projectId = "project"): ProtectedBrowserBinding {
@@ -44,7 +60,7 @@ function binding(session: string, projectId = "project"): ProtectedBrowserBindin
   };
 }
 
-function fixture(configured: Record<string, string | null>) {
+function fixture(configured: Record<string, string | null>, credentialBroker?: any) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-standard-service-"));
   const dataDir = path.join(root, "data");
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
@@ -90,6 +106,7 @@ function fixture(configured: Record<string, string | null>) {
     dataDir,
     catalog,
     backendFactory: ({ callbacks }) => { const backend = new FakeBackend(callbacks); backends.push(backend); return backend; },
+    credentialBroker,
   });
   return { root, service, profiles, states, backends, cleanup: async () => { await service.close(); fs.rmSync(root, { recursive: true, force: true }); } };
 }
@@ -157,6 +174,44 @@ test("service shutdown propagates failure and remains retryable", async () => {
     await assert.rejects(() => f.service.close(), /service shutdown is incomplete/);
     await f.service.close();
     assert.equal(f.backends[0]!.running, false);
+  } finally { await f.cleanup(); }
+});
+
+test("Standard credentials bind the exact live workspace target and require explicit redacted inspection", async () => {
+  let choiceContext: any;
+  const broker = {
+    status: () => ({ availability: "unlocked", unlockExpiresAt: Date.now() + 60_000 }),
+    async matches(context: any) {
+      choiceContext = context;
+      return { availability: "unlocked", exactOrigin: context.origin, choices: [{ choiceToken: "opaque-choice", label: "Synthetic", maskedIdentifier: "s…@example", hasTotp: false }] };
+    },
+    async fill(token: string, operation: string, context: any, filler: (values: any) => Promise<any>) {
+      assert.equal(token, "opaque-choice");
+      assert.equal(operation, "login");
+      assert.equal(context.runtimeKey, choiceContext.runtimeKey);
+      return { filled: await filler({ username: "synthetic-user", password: "synthetic-secret" }) };
+    },
+    async lock() {},
+  };
+  const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }, broker);
+  try {
+    const runtime = f.service.createRuntime(binding("session-a"));
+    await execute(runtime, "browser_open");
+    await execute(runtime, "browser_wait_for_user", { reason: "credential test" });
+    const status = await f.service.credentialStatus("session-a", "/synthetic/project") as any;
+    assert.equal(status.origin, "https://login.example");
+    await f.service.credentialMatches("session-a", "/synthetic/project");
+    const fill = await f.service.credentialFill("session-a", "/synthetic/project", "opaque-choice", "login") as any;
+    assert.deepEqual(fill.filled, ["username", "password"]);
+    const owner = f.service.resolveOwnerWorkspace("session-a", "/synthetic/project")!;
+    assert.equal(owner.workspace.host.ownerPublicState("session-a", owner.workspace.workspaceGeneration).credentialInspection, "blocked");
+    await assert.rejects(
+      () => owner.workspace.host.ownerResumeAgent("session-a", owner.workspace.workspaceGeneration),
+      /fresh top-level document/,
+    );
+    const allowed = await f.service.allowCredentialInspection("session-a", "/synthetic/project");
+    assert.equal(allowed.controlMode, "agent");
+    assert.equal(allowed.credentialInspection, "text-allowed");
   } finally { await f.cleanup(); }
 });
 
