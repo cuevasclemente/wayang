@@ -3096,7 +3096,7 @@ export function resolveProtectedBrowserAuthority(
 ): ProtectedBrowserAuthoritySnapshot | null {
   const row = getSessionById(binding.sourceSessionId);
   const handle = sessions.get(binding.sourceSessionId);
-  if (!row || !handle || handle.capabilityAuthorityDenied || !isSessionCapabilityEligible(row)
+  if (!row || row.archived || !handle || handle.capabilityAuthorityDenied || !isSessionCapabilityEligible(row)
     || row.pending_agent_switch !== null || row.cwd !== binding.projectCwd
     || row.agent_profile_id !== binding.agentProfileId
     || handle.runtimeGeneration !== binding.runtimeGeneration

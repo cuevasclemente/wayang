@@ -123,6 +123,7 @@ interface WorkspaceRecord {
   binding: ProtectedBrowserBinding;
   latestDownload?: InteractiveBrowserDownloadState;
   closed: boolean;
+  cleanupPromise?: Promise<void>;
 }
 
 interface StandardDownloadOwner {
@@ -222,6 +223,7 @@ export class StandardBrowserProfileHost {
       workspace.lastActivityAt = Date.now();
       return { generation: workspace.generation, reused: true };
     }
+    if (workspace?.closed) throw new Error("Standard browser workspace cleanup is pending");
     if (this.workspaces.size >= MAX_STANDARD_BROWSER_WORKSPACES_PER_HOST) {
       throw new Error("Standard Browser Profile workspace limit reached");
     }
@@ -795,6 +797,12 @@ export class StandardBrowserProfileHost {
       .map((workspace) => workspace.sourceSessionId);
   }
 
+  cleanupPendingSessionIds(): string[] {
+    return [...this.workspaces.values()]
+      .filter((workspace) => workspace.closed)
+      .map((workspace) => workspace.sourceSessionId);
+  }
+
   emptySinceTimestamp(): number | null {
     return this.workspaces.size === 0 ? this.emptySince : null;
   }
@@ -811,29 +819,56 @@ export class StandardBrowserProfileHost {
 
   async closeWorkspace(sourceSessionId: string, _reason: string, closedAt = Date.now()): Promise<void> {
     const workspace = this.workspaces.get(sourceSessionId);
-    if (!workspace || workspace.closed) return;
-    workspace.closed = true;
-    workspace.runtimeGeneration = null;
-    await this.closeWorkspaceViewers(sourceSessionId);
-    workspace.controlGeneration += 1;
-    await this.cancelWorkspaceDownloads(sourceSessionId, workspace.generation);
-    const targets = [...workspace.targets.keys()];
-    workspace.targets.clear();
-    workspace.activeTargetId = null;
-    this.workspaces.delete(sourceSessionId);
-    if (this.workspaces.size === 0) this.emptySince = closedAt;
-    for (const targetId of targets) {
-      this.targetOwners.delete(targetId);
-      await this.backend.closeTarget(targetId).catch(() => undefined);
-    }
+    if (!workspace) return;
+    if (workspace.cleanupPromise) return workspace.cleanupPromise;
+    let cleanup!: Promise<void>;
+    cleanup = (async () => {
+      if (!workspace.closed) {
+        workspace.closed = true;
+        workspace.runtimeGeneration = null;
+        await this.closeWorkspaceViewers(sourceSessionId);
+        workspace.controlGeneration += 1;
+        await this.cancelWorkspaceDownloads(sourceSessionId, workspace.generation);
+      }
+      const failures: unknown[] = [];
+      for (const targetId of [...workspace.targets.keys()]) {
+        try {
+          await this.backend.closeTarget(targetId);
+          if (this.targetOwners.get(targetId) === sourceSessionId) this.targetOwners.delete(targetId);
+          workspace.targets.delete(targetId);
+        } catch (error) {
+          // A destruction event may have won the race with a rejected close.
+          if (workspace.targets.has(targetId)) failures.push(error);
+        }
+      }
+      if (workspace.targets.size === 0) {
+        workspace.activeTargetId = null;
+        this.workspaces.delete(sourceSessionId);
+        if (this.workspaces.size === 0) this.emptySince = closedAt;
+      }
+      if (failures.length > 0) throw new AggregateError(failures, "Standard browser workspace cleanup is pending");
+    })().finally(() => {
+      if (workspace.cleanupPromise === cleanup) workspace.cleanupPromise = undefined;
+    });
+    workspace.cleanupPromise = cleanup;
+    return cleanup;
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    for (const sourceSessionId of [...this.workspaces.keys()]) await this.closeWorkspace(sourceSessionId, "host_close");
+    const cleanupResults = await Promise.allSettled(
+      [...this.workspaces.keys()].map((sourceSessionId) => this.closeWorkspace(sourceSessionId, "host_close")),
+    );
     if (!this.stopPromise) this.stopPromise = this.backend.stop().finally(() => { this.stopPromise = null; });
-    await this.stopPromise;
+    try { await this.stopPromise; }
+    catch (error) {
+      const failures = cleanupResults.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason);
+      throw new AggregateError([...failures, error], "Standard Browser Profile host shutdown is incomplete");
+    }
+    this.workspaces.clear();
+    this.targetOwners.clear();
+    this.unassignedTargets.clear();
     this.openerLease.release();
   }
 }

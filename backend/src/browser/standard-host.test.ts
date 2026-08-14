@@ -14,6 +14,7 @@ class FakeBackend implements StandardBrowserHostBackend {
   readonly closed: string[] = [];
   readonly executions: Array<{ targetId: string; operation: ProtectedBrowserOperation }> = [];
   readonly canceledDownloads: string[] = [];
+  readonly closeFailures = new Set<string>();
   downloadStagingDir?: string;
   private serial = 0;
   constructor(private readonly callbacks: StandardBrowserHostBackendCallbacks) {
@@ -30,6 +31,7 @@ class FakeBackend implements StandardBrowserHostBackend {
   }
   async closeTarget(targetId: string) {
     this.closed.push(targetId);
+    if (this.closeFailures.has(targetId)) throw new Error("synthetic target close failed");
     this.targets.delete(targetId);
     this.callbacks.targetDestroyed(targetId);
   }
@@ -130,6 +132,23 @@ test("same-profile sessions own exact independent targets and opener popups", as
   f.backend().unassigned("https://human.example");
   assert.equal(f.host.publicState(a, wa.generation).tabs.length, 2, "unattributed target leaked into A");
   assert.equal(f.host.publicState(b, wb.generation).tabs.length, 1, "unattributed target leaked into B");
+  await f.host.close();
+});
+
+test("failed target closure retains exact cleanup identity and blocks workspace replacement until retry", async () => {
+  const f = hostFixture();
+  const exact = binding("session-a");
+  const workspace = f.host.bindWorkspace(exact);
+  await f.host.execute(exact, workspace.generation, { kind: "navigate", url: "https://cleanup.example" });
+  const targetId = f.backend().executions.at(-1)!.targetId;
+  f.backend().closeFailures.add(targetId);
+  await assert.rejects(() => f.host.closeWorkspace(exact.sourceSessionId, "archive"), /cleanup is pending/);
+  assert.ok(f.backend().targets.has(targetId));
+  assert.throws(() => f.host.bindWorkspace(binding("session-a", "replacement-runtime")), /cleanup is pending/);
+  f.backend().closeFailures.delete(targetId);
+  await f.host.closeWorkspace(exact.sourceSessionId, "cleanup_retry");
+  assert.equal(f.backend().targets.has(targetId), false);
+  assert.doesNotThrow(() => f.host.bindWorkspace(binding("session-a", "replacement-runtime")));
   await f.host.close();
 });
 

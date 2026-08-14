@@ -49,7 +49,7 @@ export function createProductionStandardBrowserCatalog(): StandardBrowserCatalog
       const current = getStore().browserProfiles.find((candidate) => candidate.id === profile.id);
       if (!current || current.state !== "active" || current.storage_identity_digest !== profile.storage_identity_digest) return null;
       const session = getStore().sessions.find((candidate) => candidate.id === sourceSessionId);
-      if (!session || !session.project_id || !session.agent_profile_id || session.pending_agent_switch !== null
+      if (!session || session.archived || !session.project_id || !session.agent_profile_id || session.pending_agent_switch !== null
         || session.legacy_capability_ineligible || session.legacy_private_session_quarantine) return null;
       const resolution = resolveWorkspaceCapability({
         capability_id: STANDARD_BROWSER_CAPABILITY_ID,
@@ -72,7 +72,7 @@ export function createProductionStandardBrowserCatalog(): StandardBrowserCatalog
     materializeSessionState(binding) {
       if (!exactStandardAuthority(binding)) throw new Error("Standard Browser Profile authority is unavailable");
       const session = getStore().sessions.find((candidate) => candidate.id === binding.sourceSessionId);
-      if (!session || session.project_id !== binding.projectId || session.agent_profile_id !== binding.agentProfileId) {
+      if (!session || session.archived || session.project_id !== binding.projectId || session.agent_profile_id !== binding.agentProfileId) {
         throw new Error("Standard Browser Profile session binding is unavailable");
       }
       return materializeSessionBrowserState(binding.sourceSessionId);

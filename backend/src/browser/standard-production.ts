@@ -218,8 +218,8 @@ export function createStandardBrowserHostBackendFactory(options: {
       downloadsDir: downloadStagingDir,
       downloadBehavior: "allowAndName",
       workingDirectory: options.dataDir,
-      onTargetCreated: (target) => callbacks.targetCreated(publicTarget(target)),
-      onTargetChanged: (target) => callbacks.targetChanged(publicTarget(target)),
+      onTargetCreated: (target) => { if (target.type === "page") callbacks.targetCreated(publicTarget(target)); },
+      onTargetChanged: (target) => { if (target.type === "page") callbacks.targetChanged(publicTarget(target)); },
       onTargetDestroyed: (targetId) => { protections.delete(targetId); callbacks.targetDestroyed(targetId); },
       onDownloadWillBegin(event) {
         // Browser.downloadWillBegin does not carry a page target ID, and an

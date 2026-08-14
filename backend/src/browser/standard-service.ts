@@ -263,13 +263,25 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
   async closeSessionWorkspaces(sourceSessionId: string, reason: SessionWorkspaceCloseReason): Promise<void> {
     const runtimes = this.runtimes.get(sourceSessionId);
     if (runtimes) for (const runtime of [...runtimes]) runtime.latchRevoked();
-    await Promise.allSettled([...this.hosts.values()].map((host) => host.closeWorkspace(sourceSessionId, reason)));
-    this.workspaceLeases.delete(sourceSessionId);
+    const leases = this.workspaceLeases.get(sourceSessionId);
+    const failures: unknown[] = [];
+    for (const [profileId, host] of this.hosts) {
+      try {
+        await host.closeWorkspace(sourceSessionId, reason);
+        leases?.delete(profileId);
+      } catch (error) { failures.push(error); }
+    }
+    if (leases?.size === 0) this.workspaceLeases.delete(sourceSessionId);
+    if (failures.length > 0) throw new AggregateError(failures, "Standard browser session cleanup is pending");
   }
 
   async revokeAuthority(scope: Readonly<InteractiveBrowserAuthorityScope>, reason: BrowserAuthorityRevokeReason): Promise<void> {
     const sessions = this.options.catalog.sourceSessionsForAuthority(scope);
-    await Promise.allSettled(sessions.map((sourceSessionId) => this.closeSessionWorkspaces(sourceSessionId, "owner_close_all")));
+    const results = await Promise.allSettled(
+      sessions.map((sourceSessionId) => this.closeSessionWorkspaces(sourceSessionId, "owner_close_all")),
+    );
+    const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason);
+    if (failures.length > 0) throw new AggregateError(failures, "Standard browser authority cleanup is pending");
     void reason;
   }
 
@@ -292,6 +304,14 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     let workspacesClosed = 0;
     let hostsStopped = 0;
     for (const [profileId, host] of [...this.hosts]) {
+      for (const sourceSessionId of host.cleanupPendingSessionIds()) {
+        try {
+          await host.closeWorkspace(sourceSessionId, "cleanup_retry", now);
+          const leases = this.workspaceLeases.get(sourceSessionId);
+          leases?.delete(profileId);
+          if (leases?.size === 0) this.workspaceLeases.delete(sourceSessionId);
+        } catch { /* keep exact cleanup identity for the next bounded retry */ }
+      }
       for (const sourceSessionId of host.idleWorkspaceSessionIds(now, workspaceIdleMs)) {
         await host.closeWorkspace(sourceSessionId, "workspace_idle", now);
         const leases = this.workspaceLeases.get(sourceSessionId);

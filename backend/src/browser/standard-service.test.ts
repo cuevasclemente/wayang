@@ -12,13 +12,17 @@ class FakeBackend implements StandardBrowserHostBackend {
   running = false;
   targets = new Map<string, { id: string; url?: string; title?: string; openerId?: string }>();
   executions: Array<{ targetId: string; operation: ProtectedBrowserOperation }> = [];
+  closeFailures = new Set<string>();
   serial = 0;
   constructor(private callbacks: StandardBrowserHostBackendCallbacks) {}
   async start(authorize: () => Promise<void>) { await authorize(); this.running = true; }
   async stop() { this.running = false; this.targets.clear(); }
   async listTargets() { return [...this.targets.values()]; }
   async createTarget(url: string) { const target = { id: `target-${++this.serial}`, url }; this.targets.set(target.id, target); this.callbacks.targetCreated(target); return target; }
-  async closeTarget(id: string) { this.targets.delete(id); this.callbacks.targetDestroyed(id); }
+  async closeTarget(id: string) {
+    if (this.closeFailures.has(id)) throw new Error("synthetic target close failed");
+    this.targets.delete(id); this.callbacks.targetDestroyed(id);
+  }
   async execute(targetId: string, operation: ProtectedBrowserOperation, authorize: () => Promise<void>) { await authorize(); this.executions.push({ targetId, operation }); await authorize(); return { targetId, kind: operation.kind }; }
 }
 
@@ -108,6 +112,23 @@ test("two Standard runtimes share one profile host but own distinct tool objects
     await a.detachAgentLease("pi_idle");
     assert.equal(a.preflight().allowed, false);
     assert.equal(b.preflight().allowed, true);
+  } finally { await f.cleanup(); }
+});
+
+test("session cleanup propagates target-close failure and retries with retained host identity", async () => {
+  const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+  try {
+    const runtime = f.service.createRuntime(binding("session-a"));
+    await execute(runtime, "browser_open");
+    const backend = f.backends[0]!;
+    const targetId = backend.executions.at(-1)?.targetId ?? [...backend.targets.keys()][0]!;
+    backend.closeFailures.add(targetId);
+    await assert.rejects(() => f.service.closeSessionWorkspaces("session-a", "archive"), /cleanup is pending/);
+    assert.equal(runtime.preflight().allowed, false);
+    assert.ok(backend.targets.has(targetId));
+    backend.closeFailures.delete(targetId);
+    await f.service.sweepIdle();
+    assert.equal(backend.targets.has(targetId), false, "bounded cleanup retry did not retire the retained target");
   } finally { await f.cleanup(); }
 });
 

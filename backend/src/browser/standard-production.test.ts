@@ -62,10 +62,12 @@ test("Standard production binds one exact profile root and explicit target lifec
     assert.equal((await backend.listTargets())[0]?.id, "restored");
     assert.equal((await backend.createTarget("about:blank")).id, "created");
     await backend.closeTarget("created");
+    managed.options.onTargetCreated?.({ id: "worker", type: "service_worker", openerId: "restored", url: "https://worker.example" });
+    managed.options.onTargetChanged?.({ id: "worker", type: "service_worker", url: "https://worker.example/changed" });
     managed.options.onTargetCreated?.({ id: "popup", type: "page", openerId: "restored", url: "https://popup.example" });
     managed.options.onTargetChanged?.({ id: "popup", type: "page", url: "https://changed.example" });
     managed.options.onTargetDestroyed?.("popup");
-    assert.deepEqual(events, ["created:popup", "changed:popup", "destroyed:popup"]);
+    assert.deepEqual(events, ["created:popup", "changed:popup", "destroyed:popup"], "non-page targets entered tab ownership callbacks");
     await assert.rejects(
       () => backend.execute("restored", { kind: "navigate", url: "http://not-https.example" }, async () => undefined),
       /absolute HTTPS/,
