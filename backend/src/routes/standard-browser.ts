@@ -4,6 +4,7 @@ import express from "express";
 import type { WebSocket } from "ws";
 import { openStandardCdpViewer } from "../browser/standard-viewer.js";
 import { classifyGenericBrowserTarget } from "../browser/request-auth.js";
+import { openLoopbackVncTransport } from "../browser/vnc-transport.js";
 import type { StandardBrowserRuntimeWorkspace, StandardBrowserProfileHostService } from "../browser/standard-service.js";
 import type { ProtectedBrowserOperation } from "../browser/types.js";
 import type { ProtectedBrowserViewerTransport } from "./protected-browser.js";
@@ -16,6 +17,7 @@ export interface StandardBrowserRouteSelection {
   associationRevision: number;
   profileId: string;
   workspaceGeneration: string;
+  fullBrowserTakeover?: boolean;
 }
 
 export interface StandardBrowserHttpRuntime {
@@ -31,6 +33,7 @@ export interface StandardBrowserIntegration {
     requestedPersistence?: string;
     requestedScope?: string;
     transport: "http" | "vnc" | "cdp";
+    fullBrowserTakeover?: boolean;
   }): StandardBrowserRouteSelection | null;
   resolve(selection: Readonly<StandardBrowserRouteSelection>): StandardBrowserHttpRuntime | null;
   openViewer(selection: Readonly<StandardBrowserRouteSelection>, kind: "vnc" | "cdp"): Promise<ProtectedBrowserViewerTransport | null>;
@@ -61,6 +64,7 @@ export function createStandardBrowserIntegration(service: StandardBrowserProfile
         ...resolved.authority,
         profileId: resolved.workspace.profile.id,
         workspaceGeneration: resolved.workspace.workspaceGeneration,
+        ...(input.fullBrowserTakeover === true ? { fullBrowserTakeover: true } : {}),
       };
     },
     resolve(selection) {
@@ -68,7 +72,6 @@ export function createStandardBrowserIntegration(service: StandardBrowserProfile
       return resolved ? { workspace: resolved.workspace, credentialsSupported: service.credentialBrokerSupported } : null;
     },
     async openViewer(selection, kind) {
-      if (kind !== "cdp") return null;
       const resolved = exactOwner(selection);
       if (!resolved) return null;
       const { workspace } = resolved;
@@ -78,6 +81,35 @@ export function createStandardBrowserIntegration(service: StandardBrowserProfile
           throw new Error("Standard browser viewer control is unavailable");
         }
       };
+      if (kind === "vnc") {
+        let controllerGeneration = 0;
+        const transport = await openLoopbackVncTransport(workspace.host.vncPort(), async () => {
+          if (!exactOwner(selection) || !workspace.host.hasWorkspace(selection.sourceSessionId, selection.workspaceGeneration)) {
+            throw new Error("Standard Full browser authority is unavailable");
+          }
+          if (controllerGeneration && !workspace.host.vncControllerCurrent(controllerGeneration)) {
+            throw new Error("Standard Full browser controller is stale");
+          }
+        });
+        try {
+          const lease = await workspace.host.acquireVncController(
+            selection.sourceSessionId,
+            selection.workspaceGeneration,
+            selection.fullBrowserTakeover === true,
+            async () => { await transport.close(); },
+          );
+          controllerGeneration = lease.generation;
+          return {
+            dispatch: (message, binary) => transport.dispatch(message, binary),
+            close: async () => { lease.release(); await transport.close(); },
+            onMessage: (listener) => transport.onMessage(listener),
+            onClose: (listener) => transport.onClose?.(listener) ?? (() => undefined),
+          };
+        } catch (error) {
+          await transport.close();
+          throw error;
+        }
+      }
       const attachment = await workspace.host.ownerAttachActiveViewer(selection.sourceSessionId, selection.workspaceGeneration, authorize);
       const viewer = await openStandardCdpViewer({
         attachment,
@@ -130,6 +162,7 @@ function selectionInput(request: IncomingMessage, transport: "http" | "vnc" | "c
     requestedPersistence: url.searchParams.has("persistence") ? url.searchParams.get("persistence") ?? "" : undefined,
     requestedScope: url.searchParams.has("scope") ? url.searchParams.get("scope") ?? "" : undefined,
     transport,
+    fullBrowserTakeover: url.searchParams.get("takeover") === "1",
   };
 }
 
@@ -182,7 +215,6 @@ export function selectStandardBrowserWebSocket(
     return null;
   }
   if (input.sourceSessionId) throw error("Standard browser agent access requires exact capability-bound tools");
-  if (transport === "vnc") throw error("Standard browser VNC transport is not available in this build", 404);
   return selection;
 }
 
@@ -207,10 +239,11 @@ function publicState(selection: StandardBrowserRouteSelection, runtime: Standard
     needsUser: state.controlMode !== "agent",
     ...(state.controlMode === "agent" ? {} : { needsUserReason: "Human control is active for this session workspace" }),
     cdpReady: state.running,
-    viewerTransport: "cdp-screencast",
+    viewerTransport: state.fullBrowser.available ? "vnc" : "cdp-screencast",
     cdpScreencastWsPath: `/ws/browser?${params.toString()}`,
     viewerWsPath: `/ws/browser?${params.toString()}`,
-    vncReady: false,
+    vncReady: state.fullBrowser.available,
+    fullBrowser: state.fullBrowser,
     profile: { persistence: "named", id: state.profileId, name: runtime.workspace.profile.name },
     tabs: state.tabs,
     activeTab: state.activeTab,
@@ -364,9 +397,19 @@ export function attachSelectedStandardViewer(
     ws.on("close", () => { void viewer.close(); });
     ws.on("error", () => { void viewer.close(); });
     const unsubscribe = viewer.onMessage((message, isBinary) => {
-      if (ws.readyState === ws.OPEN) ws.send(message, { binary: isBinary });
+      if (ws.readyState !== ws.OPEN) return;
+      if (ws.bufferedAmount + message.length > 2 * 1024 * 1024) {
+        void viewer.close();
+        ws.close(1009, "Standard browser viewer is not draining");
+        return;
+      }
+      ws.send(message, { binary: isBinary });
+    });
+    const unsubscribeClose = viewer.onClose?.(() => {
+      if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) ws.close(1000, "Standard browser controller closed");
     });
     ws.once("close", unsubscribe);
+    if (unsubscribeClose) ws.once("close", unsubscribeClose);
   }).catch(() => ws.close(1008, "Standard browser transport denied"));
 }
 

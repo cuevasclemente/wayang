@@ -10,6 +10,8 @@ import { BrowserStorageOwnershipRegistry } from "./profile-storage-registry.js";
 
 class FakeBackend implements StandardBrowserHostBackend {
   running = false;
+  vncReady = true;
+  vncPort = 5900;
   readonly targets = new Map<string, { id: string; openerId?: string; url?: string; title?: string }>();
   readonly closed: string[] = [];
   readonly executions: Array<{ targetId: string; operation: ProtectedBrowserOperation }> = [];
@@ -242,6 +244,31 @@ test("downloads freeze exact target/workspace ownership and detach cancels befor
   assert.equal(fs.existsSync(path.join(projectDir, ".wayang", "browser-downloads", "owned.bin")), false);
   await f.host.close();
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("profile-wide Full browser has one explicit cooperative controller with fenced takeover", async () => {
+  const f = hostFixture();
+  const exact = binding("session-a");
+  const workspace = f.host.bindWorkspace(exact);
+  let firstClosed = 0;
+  let secondClosed = 0;
+  const first = await f.host.acquireVncController(exact.sourceSessionId, workspace.generation, false, async () => { firstClosed += 1; });
+  assert.equal(f.host.vncControllerCurrent(first.generation), true);
+  await assert.rejects(
+    () => f.host.acquireVncController(exact.sourceSessionId, workspace.generation, false, async () => undefined),
+    /already has a controller/,
+  );
+  const second = await f.host.acquireVncController(exact.sourceSessionId, workspace.generation, true, async () => { secondClosed += 1; });
+  assert.equal(firstClosed, 1);
+  assert.equal(f.host.vncControllerCurrent(first.generation), false);
+  assert.equal(f.host.vncControllerCurrent(second.generation), true);
+  first.release();
+  assert.equal(f.host.vncControllerCurrent(second.generation), true);
+  await f.host.closeWorkspace(exact.sourceSessionId, "owner-stop");
+  assert.equal(secondClosed, 1);
+  assert.equal(f.host.vncControllerCurrent(second.generation), false);
+  second.release();
+  await f.host.close();
 });
 
 test("agent detach preserves UI workspace while runtime rebind fences the old generation", async () => {

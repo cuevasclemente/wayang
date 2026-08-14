@@ -15,6 +15,9 @@ interface BrowserViewerProps {
   onStatus?: () => void;
   onPageChange?: (page: { url?: string; title?: string }) => void;
   onPasteText?: (text: string) => void;
+  vncTakeoverRequest?: number;
+  vncTakeoverConsumed?: number;
+  onVncTakeoverConsumed?: (request: number) => void;
 }
 
 interface ScreencastMetadata {
@@ -73,7 +76,7 @@ function directPaste(event: React.ClipboardEvent, onPasteText?: (text: string) =
   onPasteText(text);
 }
 
-function VncBrowserViewer({ sessionId, projectCwd, running, onPasteText }: BrowserViewerProps) {
+function VncBrowserViewer({ sessionId, projectCwd, running, onPasteText, vncTakeoverRequest = 0, vncTakeoverConsumed = 0, onVncTakeoverConsumed }: BrowserViewerProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const rfbRef = useRef<RFB | null>(null);
   const [connected, setConnected] = useState(false);
@@ -88,7 +91,9 @@ function VncBrowserViewer({ sessionId, projectCwd, running, onPasteText }: Brows
 
     let rfb: RFB;
     try {
-      rfb = new RFB(host, browserVncWsUrl(sessionId, projectCwd));
+      const takeover = vncTakeoverRequest > vncTakeoverConsumed;
+      if (takeover) onVncTakeoverConsumed?.(vncTakeoverRequest);
+      rfb = new RFB(host, browserVncWsUrl(sessionId, projectCwd, takeover));
     } catch {
       setError("Full browser viewer could not connect.");
       return;
@@ -121,7 +126,10 @@ function VncBrowserViewer({ sessionId, projectCwd, running, onPasteText }: Brows
       rfb.disconnect();
       if (rfbRef.current === rfb) rfbRef.current = null;
     };
-  }, [sessionId, projectCwd, running]);
+  // vncTakeoverConsumed is intentionally read only when this connection
+  // attempt starts; acknowledging it must not itself reconnect the viewer.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, projectCwd, running, vncTakeoverRequest]);
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-black" onPaste={(event) => directPaste(event, onPasteText)}>

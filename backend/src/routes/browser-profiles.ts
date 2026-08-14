@@ -146,8 +146,11 @@ export function createBrowserProfilesRouter(
     if ((existing?.revision ?? null) !== expectedRevision) throw new WorkspaceStoreError("Session Browser state changed; refresh and retry", 409);
     const current = existing ?? materializeSessionBrowserState(req.params.sessionId);
     service?.assertOwnerSwitchAllowed(req.params.sessionId);
-    const next = setSessionBrowserProfile({ sessionId: req.params.sessionId, profileId, expectedRevision: current.revision });
+    // Fence and drain the old Pi/browser lease before the durable profile CAS.
+    // A failed detach leaves the assignment unchanged and safely retryable.
     await stopPiSession(req.params.sessionId, { kind: "detach", reason: "runtime_replaced" });
+    service?.assertOwnerSwitchAllowed(req.params.sessionId);
+    const next = setSessionBrowserProfile({ sessionId: req.params.sessionId, profileId, expectedRevision: current.revision });
     res.json({ state: next });
   }));
   return router;

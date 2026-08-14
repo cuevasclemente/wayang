@@ -136,6 +136,21 @@ test("two Standard runtimes share one profile host but own distinct tool objects
   } finally { await f.cleanup(); }
 });
 
+test("owner workspace stop invalidates its lease and the same runtime safely reacquires", async () => {
+  const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+  try {
+    const runtime = f.service.createRuntime(binding("session-a"));
+    await execute(runtime, "browser_open");
+    const first = f.service.resolveOwnerWorkspace("session-a", "/synthetic/project")!.workspace;
+    await first.host.closeWorkspace("session-a", "owner_stop");
+    const rebound = f.service.resolveOwnerWorkspace("session-a", "/synthetic/project")!.workspace;
+    assert.notEqual(rebound.workspaceGeneration, first.workspaceGeneration);
+    await execute(runtime, "browser_status");
+    await execute(runtime, "browser_open");
+    assert.equal(rebound.host.hasWorkspace("session-a", rebound.workspaceGeneration), true);
+  } finally { await f.cleanup(); }
+});
+
 test("session cleanup propagates target-close failure and retries with retained host identity", async () => {
   const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
   try {
@@ -244,6 +259,23 @@ test("workspace and empty-host idle thresholds are independent", async () => {
     assert.deepEqual(await f.service.sweepIdle(future), { workspacesClosed: 1, hostsStopped: 0 });
     assert.deepEqual(await f.service.sweepIdle(future + 14 * 60 * 1000), { workspacesClosed: 0, hostsStopped: 0 });
     assert.deepEqual(await f.service.sweepIdle(future + 15 * 60 * 1000), { workspacesClosed: 0, hostsStopped: 1 });
+  } finally { await f.cleanup(); }
+});
+
+test("failed profile CAS restores the old runtime lease", async () => {
+  const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+  try {
+    const exactBinding = binding("session-a");
+    const runtime = f.service.createRuntime(exactBinding);
+    await execute(runtime, "browser_open");
+    const current = f.service.resolveLiveWorkspace(exactBinding);
+    assert.ok(current);
+    await assert.rejects(
+      () => f.service.switchProfile(exactBinding, current, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 99),
+      /stale session state/,
+    );
+    await execute(runtime, "browser_status");
+    await execute(runtime, "browser_open");
   } finally { await f.cleanup(); }
 });
 

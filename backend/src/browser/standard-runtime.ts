@@ -44,7 +44,8 @@ export function createStandardBrowserSessionRuntime(options: {
     assertLive();
     if (!workspace) workspace = options.service.attachWorkspace(options.binding, state);
     if (!workspace) throw new Error("This session has no active Browser Profile; list and switch profiles first");
-    return options.service.resolveWorkspace(options.binding, workspace);
+    workspace = options.service.resolveWorkspace(options.binding, workspace);
+    return workspace;
   };
   const execute = async (operation: ProtectedBrowserOperation): Promise<unknown> => {
     assertLive();

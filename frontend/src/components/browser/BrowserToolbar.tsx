@@ -45,6 +45,7 @@ export function BrowserToolbar({
   // Runtime kind is a backend projection. Never infer browser authority from a
   // project/profile display name.
   const protectedRuntime = state?.profile.persistence === "protected";
+  const namedRuntime = state?.profile.persistence === "named";
 
   const handleNavigate = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -116,9 +117,11 @@ export function BrowserToolbar({
                 checked={viewerTransport === "vnc"}
                 disabled={busy || !running}
                 onClick={() => onViewerTransport("vnc")}
-                title="Full browser includes browser chrome and extensions."
+                title={namedRuntime
+                  ? "Profile-wide Full browser can display and control every visible tab in this shared named profile."
+                  : "Full browser includes browser chrome and extensions."}
               >
-                Full browser
+                {namedRuntime ? "Profile-wide Full browser" : "Full browser"}
               </ViewerButton>
             )}
             <ViewerButton

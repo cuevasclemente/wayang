@@ -100,6 +100,7 @@ export interface ProtectedBrowserViewerTransport {
   dispatch(message: Buffer, isBinary: boolean): void | Promise<void>;
   close(): void | Promise<void>;
   onMessage(listener: (message: Buffer, isBinary: boolean) => void): () => void;
+  onClose?(listener: () => void): () => void;
 }
 
 export interface ProtectedBrowserIntegration {

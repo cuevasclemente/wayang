@@ -805,13 +805,18 @@ async function allocateDisplay(): Promise<string> {
   for (let i = 0; i < 50; i++) {
     const displayNumber = 90 + Math.floor(Math.random() * 200);
     const socketPath = `/tmp/.X11-unix/X${displayNumber}`;
-    if (!fs.existsSync(socketPath)) return `:${displayNumber}`;
+    const lockPath = `/tmp/.X${displayNumber}-lock`;
+    if (!fs.existsSync(socketPath) && !fs.existsSync(lockPath)) return `:${displayNumber}`;
   }
   throw new Error("Failed to allocate X display number");
 }
 
+function childHasExited(child: ChildProcess | null): boolean {
+  return !child || child.exitCode !== null || child.signalCode !== null;
+}
+
 function terminateChild(child: ChildProcess | null): void {
-  if (!child || child.exitCode !== null || child.killed) return;
+  if (!child || childHasExited(child)) return;
   try {
     if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGTERM");
     else child.kill("SIGTERM");
@@ -821,13 +826,22 @@ function terminateChild(child: ChildProcess | null): void {
 }
 
 function killChild(child: ChildProcess | null): void {
-  if (!child || child.exitCode !== null || child.killed) return;
+  if (!child || childHasExited(child)) return;
   try {
     if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
     else child.kill("SIGKILL");
   } catch {
     try { child.kill("SIGKILL"); } catch {}
   }
+}
+
+async function stopChildBounded(child: ChildProcess | null): Promise<boolean> {
+  if (!child || childHasExited(child)) return true;
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  terminateChild(child);
+  if (await Promise.race([exited.then(() => true), sleep(3_000).then(() => false)])) return true;
+  killChild(child);
+  return Promise.race([exited.then(() => true), sleep(3_000).then(() => false)]);
 }
 
 export function getBrowserVncPort(lookup: BrowserSessionLookup): number {
@@ -1781,6 +1795,8 @@ export interface ManagedChromiumRuntimeOptions {
   onUnexpectedExit?: () => void;
   /** Standard-only synchronous frame attribution. Default leaves existing callers unchanged. */
   downloadAttribution?: "none" | "exact-frame-page-target";
+  /** Standard-only headed Chromium with loopback Xvfb/x11vnc when available. */
+  enableVnc?: boolean;
 }
 
 export interface ManagedChromiumDocumentIdentity {
@@ -1806,8 +1822,12 @@ export interface ManagedChromiumPageAttachment {
  */
 export class ManagedChromiumRuntime {
   private child: ChildProcess | null = null;
+  private xvfbChild: ChildProcess | null = null;
+  private vncChild: ChildProcess | null = null;
   private browserCdp: CdpConnection | null = null;
   private cdpPort: number | null = null;
+  private managedVncPort: number | null = null;
+  private managedDisplay: string | null = null;
   private stoppingChild: ChildProcess | null = null;
   private lifecycleTail: Promise<void> = Promise.resolve();
   private readonly frameTargetIndex = new ManagedChromiumFrameTargetIndex();
@@ -1816,8 +1836,15 @@ export class ManagedChromiumRuntime {
   constructor(private readonly options: ManagedChromiumRuntimeOptions) {}
 
   get running(): boolean {
-    return Boolean(this.child && this.child.exitCode === null && this.browserCdp && this.cdpPort);
+    return Boolean(this.child && !childHasExited(this.child) && this.browserCdp && this.cdpPort);
   }
+
+  get vncReady(): boolean {
+    return Boolean(this.running && this.vncChild && !childHasExited(this.vncChild) && this.xvfbChild
+      && !childHasExited(this.xvfbChild) && this.managedVncPort);
+  }
+
+  get vncPort(): number | null { return this.vncReady ? this.managedVncPort : null; }
 
   private serializeLifecycle<T>(operation: () => Promise<T>): Promise<T> {
     const prior = this.lifecycleTail;
@@ -1844,7 +1871,7 @@ export class ManagedChromiumRuntime {
   async start(assertAuthorizedBeforeBrowserCdp?: () => Promise<void>): Promise<void> {
     return this.serializeLifecycle(async () => {
       if (this.running) return;
-      if (this.child && this.child.exitCode === null) {
+      if ([this.child, this.xvfbChild, this.vncChild].some((child) => !childHasExited(child))) {
         throw new Error("Managed Chromium cleanup is pending");
       }
       fs.mkdirSync(this.options.profileDir, { recursive: true, mode: 0o700 });
@@ -1861,7 +1888,56 @@ export class ManagedChromiumRuntime {
         const frameEpoch = this.frameTargetIndex.reset();
         this.pendingFrameInitializations.clear();
         const exactDownloadAttribution = this.options.downloadAttribution === "exact-frame-page-target";
+        const configuredTransport = process.env.WAYANG_BROWSER_TRANSPORT || "auto";
+        if (configuredTransport === "vnc" && !canUseVncTransport()) {
+          throw new Error("VNC transport requested but Xvfb/x11vnc are unavailable");
+        }
+        let useVnc = this.options.enableVnc === true && configuredTransport !== "cdp" && canUseVncTransport();
+        const display = useVnc ? await allocateDisplay() : null;
+        const vncPort = useVnc ? await allocatePort() : null;
         const port = await allocatePort();
+        if (useVnc && display && vncPort) {
+          try {
+            const xvfbExecutable = executableOnPath("Xvfb");
+            const vncExecutable = executableOnPath("x11vnc");
+            if (!xvfbExecutable || !vncExecutable) throw new Error("Standard VNC dependencies are unavailable");
+            await assertAuthorized();
+            this.xvfbChild = spawn(xvfbExecutable, [display, "-screen", "0", "1280x720x24", "-nolisten", "tcp", "-ac"], {
+              cwd: this.options.workingDirectory,
+              detached: process.platform !== "win32",
+              env: browserChildEnvironment(),
+              stdio: ["ignore", "ignore", "ignore"],
+              shell: false,
+            });
+            await sleep(500);
+            if (childHasExited(this.xvfbChild)) throw new Error("Standard Xvfb exited during startup");
+            await assertAuthorized();
+            this.vncChild = spawn(vncExecutable, [
+              "-display", display, "-localhost", "-nopw", "-forever", "-shared",
+              "-rfbport", String(vncPort), "-noxdamage", "-repeat", "-quiet",
+            ], {
+              cwd: this.options.workingDirectory,
+              detached: process.platform !== "win32",
+              env: browserChildEnvironment(),
+              stdio: ["ignore", "ignore", "ignore"],
+              shell: false,
+            });
+            await waitForTcpPort(vncPort, 10_000);
+            this.managedDisplay = display;
+            this.managedVncPort = vncPort;
+          } catch (error) {
+            const [vncStopped, xvfbStopped] = await Promise.all([
+              stopChildBounded(this.vncChild), stopChildBounded(this.xvfbChild),
+            ]);
+            if (vncStopped) this.vncChild = null;
+            if (xvfbStopped) this.xvfbChild = null;
+            this.managedDisplay = null;
+            this.managedVncPort = null;
+            if (!vncStopped || !xvfbStopped) throw new Error("Standard VNC startup cleanup is pending");
+            if (configuredTransport === "vnc") throw error;
+            useVnc = false;
+          }
+        }
       const child = spawn(executable, [
         "--remote-debugging-address=127.0.0.1",
         `--remote-debugging-port=${port}`,
@@ -1871,12 +1947,12 @@ export class ManagedChromiumRuntime {
         "--disable-gpu",
         "--no-first-run",
         "--no-default-browser-check",
-        "--headless=new",
+        ...(useVnc ? [] : ["--headless=new"]),
         "about:blank",
       ], {
         cwd: this.options.workingDirectory,
         detached: process.platform !== "win32",
-        env: browserChildEnvironment(),
+        env: browserChildEnvironment(useVnc && display ? { DISPLAY: display } : {}),
         stdio: ["ignore", "ignore", "ignore"],
         shell: false,
       });
@@ -1885,7 +1961,7 @@ export class ManagedChromiumRuntime {
       const exited = new Promise<boolean>((resolve) => child.once("exit", () => resolve(true)));
       try {
         await waitForCdp(port);
-        if (child.exitCode !== null) throw new Error("Managed Chromium exited during startup");
+        if (childHasExited(child)) throw new Error("Managed Chromium exited during startup");
         const browserCdp = await connectBrowserCdp(port);
         this.browserCdp = browserCdp;
         const targetInfo = (event: any): ChromeTarget | undefined => {
@@ -2014,7 +2090,14 @@ export class ManagedChromiumRuntime {
           this.child = null;
           this.cdpPort = null;
           if (expectedStop) this.stoppingChild = null;
-          else this.options.onUnexpectedExit?.();
+          else {
+            void Promise.all([stopChildBounded(this.vncChild), stopChildBounded(this.xvfbChild)]).then(([vncStopped, xvfbStopped]) => {
+              if (vncStopped) this.vncChild = null;
+              if (xvfbStopped) this.xvfbChild = null;
+              if (vncStopped && xvfbStopped) { this.managedVncPort = null; this.managedDisplay = null; }
+            });
+            this.options.onUnexpectedExit?.();
+          }
         });
         return;
       } catch (error) {
@@ -2042,6 +2125,13 @@ export class ManagedChromiumRuntime {
         if (this.child === child) this.child = null;
         if (this.stoppingChild === child) this.stoppingChild = null;
         this.cdpPort = null;
+        const [vncStopped, xvfbStopped] = await Promise.all([
+          stopChildBounded(this.vncChild), stopChildBounded(this.xvfbChild),
+        ]);
+        if (vncStopped) this.vncChild = null;
+        if (xvfbStopped) this.xvfbChild = null;
+        if (vncStopped && xvfbStopped) { this.managedVncPort = null; this.managedDisplay = null; }
+        if (!vncStopped || !xvfbStopped) throw new Error("Standard VNC startup cleanup is pending");
         if (authorizationError !== undefined) throw authorizationError;
         lastStartupError = error;
       }
@@ -2062,29 +2152,26 @@ export class ManagedChromiumRuntime {
 
   async stop(): Promise<void> {
     return this.serializeLifecycle(async () => {
-      const child = this.child;
+      const browserChild = this.child;
+      const vncChild = this.vncChild;
+      const xvfbChild = this.xvfbChild;
       this.browserCdp?.close();
       this.browserCdp = null;
       this.frameTargetIndex.reset();
       this.pendingFrameInitializations.clear();
       this.cdpPort = null;
-      if (!child) return;
-      if (child.exitCode !== null) {
-        if (this.child === child) this.child = null;
-        if (this.stoppingChild === child) this.stoppingChild = null;
-        return;
+      if (!childHasExited(browserChild)) this.stoppingChild = browserChild;
+      const [browserStopped, vncStopped, xvfbStopped] = await Promise.all([
+        stopChildBounded(browserChild), stopChildBounded(vncChild), stopChildBounded(xvfbChild),
+      ]);
+      if (browserStopped && this.child === browserChild) this.child = null;
+      if (vncStopped && this.vncChild === vncChild) this.vncChild = null;
+      if (xvfbStopped && this.xvfbChild === xvfbChild) this.xvfbChild = null;
+      if (browserStopped && this.stoppingChild === browserChild) this.stoppingChild = null;
+      if (vncStopped && xvfbStopped) { this.managedVncPort = null; this.managedDisplay = null; }
+      if (!browserStopped || !vncStopped || !xvfbStopped) {
+        throw new Error("Managed Chromium process set did not exit after forced termination");
       }
-      this.stoppingChild = child;
-      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
-      terminateChild(child);
-      const graceful = await Promise.race([exited.then(() => true), sleep(3_000).then(() => false)]);
-      if (!graceful) {
-        killChild(child);
-        const killed = await Promise.race([exited.then(() => true), sleep(3_000).then(() => false)]);
-        if (!killed) throw new Error("Managed Chromium did not exit after forced termination");
-      }
-      if (this.child === child) this.child = null;
-      if (this.stoppingChild === child) this.stoppingChild = null;
     });
   }
 

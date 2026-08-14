@@ -164,6 +164,11 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
       || !this.options.catalog.authorize(binding, expected.profile)) {
       throw new Error("Standard Browser Profile assignment changed");
     }
+    if (!expected.host.hasWorkspace(binding.sourceSessionId, expected.workspaceGeneration)) {
+      const rebound = this.attachWorkspace(binding, state);
+      if (!rebound) throw new Error("Standard browser workspace is unavailable");
+      return rebound;
+    }
     return expected;
   }
 
@@ -174,7 +179,8 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     const state = this.options.catalog.sessionState(sourceSessionId);
     if (!state?.active_profile_id) return null;
     let workspace = this.workspaceLeases.get(sourceSessionId)?.get(state.active_profile_id);
-    if (!workspace || workspace.sessionStateRevision !== state.revision || workspace.host.isClosed) {
+    if (!workspace || workspace.sessionStateRevision !== state.revision || workspace.host.isClosed
+      || !workspace.host.hasWorkspace(sourceSessionId, workspace.workspaceGeneration)) {
       const profile = this.profile(state.active_profile_id);
       const authority = this.options.catalog.ownerAuthority(sourceSessionId, profile);
       if (!authority || (expectedProjectCwd !== undefined && authority.projectCwd !== expectedProjectCwd)) return null;
@@ -297,11 +303,37 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     }
     const profile = this.profile(profileId);
     if (!this.options.catalog.authorize(binding, profile)) throw new Error("Browser Profile choice is unavailable");
+    const targetHost = this.host(profile);
+    if (!targetHost.canBindWorkspace(binding.sourceSessionId)) {
+      throw new Error("Standard Browser Profile workspace limit reached");
+    }
     if (current) await current.host.detachAgentLease(binding.sourceSessionId, binding.runtimeGeneration);
-    const state = this.options.catalog.switchSessionProfile({ binding, profileId, expectedRevision: expectedSessionRevision });
-    const workspace = this.attachWorkspace(binding, state);
-    if (!workspace) throw new Error("Browser Profile assignment failed");
-    return { state, workspace };
+    let state: SessionBrowserStateRow;
+    try {
+      state = this.options.catalog.switchSessionProfile({ binding, profileId, expectedRevision: expectedSessionRevision });
+    } catch (error) {
+      if (current) current.host.bindWorkspace(binding);
+      throw error;
+    }
+    try {
+      const workspace = this.attachWorkspace(binding, state);
+      if (!workspace) throw new Error("Browser Profile assignment failed");
+      return { state, workspace };
+    } catch (error) {
+      if (current) {
+        try {
+          this.options.catalog.switchSessionProfile({
+            binding,
+            profileId: current.profile.id,
+            expectedRevision: state.revision,
+          });
+          current.host.bindWorkspace(binding);
+        } catch (rollbackError) {
+          throw new AggregateError([error, rollbackError], "Browser Profile switch rollback failed");
+        }
+      }
+      throw error;
+    }
   }
 
   assertOwnerSwitchAllowed(sourceSessionId: string): void {

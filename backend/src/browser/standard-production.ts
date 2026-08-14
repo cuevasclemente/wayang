@@ -48,6 +48,8 @@ function assertBoundedObservation(value: unknown): void {
 
 export interface StandardManagedChromiumPort {
   readonly running: boolean;
+  readonly vncReady?: boolean;
+  readonly vncPort?: number | null;
   start(authorize?: () => Promise<void>): Promise<void>;
   stop(): Promise<void>;
   listPageTargets(): Promise<ChromeTarget[]>;
@@ -301,6 +303,7 @@ export function createStandardBrowserHostBackendFactory(options: {
       downloadsDir: downloadStagingDir,
       downloadBehavior: "allowAndName",
       downloadAttribution: "exact-frame-page-target",
+      enableVnc: true,
       workingDirectory: options.dataDir,
       onTargetCreated: (target) => { if (target.type === "page") callbacks.targetCreated(publicTarget(target)); },
       onTargetChanged: (target) => { if (target.type === "page") callbacks.targetChanged(publicTarget(target)); },
@@ -314,6 +317,8 @@ export function createStandardBrowserHostBackendFactory(options: {
     });
     return {
       get running() { return managed.running; },
+      get vncReady() { return managed.vncReady === true; },
+      get vncPort() { return managed.vncPort ?? null; },
       downloadStagingDir,
       start: async (authorize) => { cleanStaging(); await managed.start(authorize); },
       stop: () => managed.stop(),

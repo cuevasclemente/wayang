@@ -42,6 +42,8 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
   const [notice, setNotice] = useState<string | null>(null);
   const [clipboardCaptureOpen, setClipboardCaptureOpen] = useState(false);
   const [credentialsOpen, setCredentialsOpen] = useState(false);
+  const [vncTakeoverGeneration, setVncTakeoverGeneration] = useState(0);
+  const [vncTakeoverConsumed, setVncTakeoverConsumed] = useState(0);
   const [profileChoices, setProfileChoices] = useState<NamedBrowserProfile[]>([]);
   const [sessionProfileState, setSessionProfileState] = useState<SessionBrowserProfileState | null>(null);
   const clipboardCaptureRef = useRef<HTMLTextAreaElement | null>(null);
@@ -53,10 +55,10 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
       void fetchSessionBrowserProfileState(sessionId).then((current) => setSessionProfileState(current.state)).catch(() => undefined);
     }
     setViewerTransport((current) => {
-      // CDP is the default for this release. A user may still select a
-      // backend-advertised generic VNC viewer, but Protected always remains CDP.
-      if (!viewerChosenRef.current) return "cdp-screencast";
+      // Follow the backend's configured auto/cdp/vnc policy until the user
+      // explicitly chooses a currently available viewer. Protected remains CDP.
       if (next.profile.persistence === "protected") return "cdp-screencast";
+      if (!viewerChosenRef.current) return next.viewerTransport;
       if (current === "vnc" && next.vncReady === false && next.cdpReady) return "cdp-screencast";
       if (current === "cdp-screencast" && next.cdpReady === false && next.vncReady) return "vnc";
       return current;
@@ -96,6 +98,8 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
     setState(null);
     setCredentialsOpen(false);
     setClipboardCaptureOpen(false);
+    setVncTakeoverGeneration(0);
+    setVncTakeoverConsumed(0);
     void refresh();
     const interval = window.setInterval(refresh, 4_000);
     return () => window.clearInterval(interval);
@@ -164,6 +168,8 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
 
   const handleViewerTransport = (transport: BrowserViewerTransport) => {
     viewerChosenRef.current = true;
+    setVncTakeoverGeneration(0);
+    setVncTakeoverConsumed(0);
     setViewerTransport(transport);
     setNotice(transport === "vnc"
       ? "Full browser selected: browser chrome and extensions are visible."
@@ -381,6 +387,15 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
         onPasteClipboard={() => void handlePasteClipboard()}
       />
 
+      {namedRuntime && viewerTransport === "vnc" && (
+        <div role="note" className="shrink-0 border-b border-amber-800/60 bg-amber-950/30 px-3 py-2 text-xs leading-5 text-amber-100">
+          <strong>Profile-wide Full browser:</strong> this view can display and control every visible tab in the shared named profile, including tabs owned by other session workspaces. Pixels, clipboard data, cookies, and login state are not session-isolated. Agent tools remain bound to their exact owned targets.
+          {state?.fullBrowser?.controllerActive && <button type="button" className="ml-2 rounded border border-amber-600 px-2 py-1 text-[11px] font-semibold" onClick={() => {
+            if (window.confirm("Take over profile-wide Full browser control? The previous controller will be disconnected.")) setVncTakeoverGeneration((value) => value + 1);
+          }}>Take over controller</button>}
+        </div>
+      )}
+
       {state?.profile.persistence === "named" && state.tabs && (
         <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-neutral-900 bg-neutral-950 px-2 py-1.5" role="tablist" aria-label="Session-owned browser tabs">
           {state.tabs.map((tab) => <div key={tab.tab} className={`inline-flex max-w-56 shrink-0 items-center rounded border ${state.activeTab === tab.tab ? "border-blue-600 bg-blue-950/50" : "border-neutral-800 bg-neutral-900"}`}>
@@ -529,7 +544,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
 
       <div className="min-h-0 flex-1">
         {running ? (
-          namedRuntime && cooperative ? (
+          namedRuntime && cooperative && viewerTransport !== "vnc" ? (
             <div className="flex h-full items-center justify-center p-6 text-center text-sm text-neutral-500">
               <div><div className="mb-2 text-base text-neutral-300">Viewer paused during agent control</div><div>Choose Pause agent to take explicit human control and attach the exact session tab viewer.</div></div>
             </div>
@@ -537,8 +552,13 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
             sessionId={sessionId}
             projectCwd={sessionCwd}
             running
-            key={`${viewerTransport}:${state?.controlMode ?? "unknown"}:${state?.activeTab ?? "none"}`}
+            key={viewerTransport === "vnc"
+              ? "vnc"
+              : `${viewerTransport}:${state?.controlMode ?? "unknown"}:${state?.activeTab ?? "none"}`}
             transport={viewerTransport}
+            vncTakeoverRequest={vncTakeoverGeneration}
+            vncTakeoverConsumed={vncTakeoverConsumed}
+            onVncTakeoverConsumed={setVncTakeoverConsumed}
             onStatus={refresh}
             onPageChange={handlePageChange}
             onPasteText={pasteSupported ? (text) => void handleViewerPasteText(text) : undefined}

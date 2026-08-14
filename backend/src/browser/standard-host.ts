@@ -71,6 +71,8 @@ export interface StandardBrowserHostBackendCallbacks {
 
 export interface StandardBrowserHostBackend {
   readonly running: boolean;
+  readonly vncReady?: boolean;
+  readonly vncPort?: number | null;
   readonly downloadStagingDir?: string;
   start(authorize: () => Promise<void>): Promise<void>;
   stop(): Promise<void>;
@@ -105,6 +107,7 @@ export interface StandardBrowserWorkspacePublicState {
   running: boolean;
   updatedAt: number;
   credentialInspection?: Exclude<ProtectedCredentialInspectionMode, "none">;
+  fullBrowser: { available: boolean; controllerActive: boolean; controllerGeneration: number };
   download?: InteractiveBrowserDownloadState;
 }
 
@@ -159,6 +162,9 @@ export class StandardBrowserProfileHost {
   private readonly viewerClosers = new Map<string, Set<() => Promise<void>>>();
   private readonly observedDownloadGuids = new Set<string>();
   private observedDownloadCount = 0;
+  private vncController: { generation: number; sourceSessionId: string; workspaceGeneration: string; close(): Promise<void> } | null = null;
+  private vncControllerGeneration = 0;
+  private vncControllerTail: Promise<void> = Promise.resolve();
   private backend: StandardBrowserHostBackend;
   private openerLease: BrowserStorageOpenerLease;
   private startPromise: Promise<void> | null = null;
@@ -225,6 +231,11 @@ export class StandardBrowserProfileHost {
 
   private ensureStarted(binding: Readonly<ProtectedBrowserBinding>): Promise<void> {
     return this.ensureStartedAuthorized(() => this.assertAuthority(binding));
+  }
+
+  canBindWorkspace(sourceSessionId: string): boolean {
+    const workspace = this.workspaces.get(sourceSessionId);
+    return Boolean(workspace && !workspace.closed) || (!workspace && this.workspaces.size < MAX_STANDARD_BROWSER_WORKSPACES_PER_HOST);
   }
 
   bindWorkspace(binding: Readonly<ProtectedBrowserBinding>): { generation: string; reused: boolean } {
@@ -364,6 +375,7 @@ export class StandardBrowserProfileHost {
       tabs,
       running: workspace.targets.size > 0,
       updatedAt: workspace.lastActivityAt,
+      fullBrowser: { available: this.backend.vncReady === true, controllerActive: this.vncController !== null, controllerGeneration: this.vncControllerGeneration },
       ...(this.workspaceCredentialInspection(workspace) ? { credentialInspection: this.workspaceCredentialInspection(workspace) } : {}),
       ...(workspace.latestDownload ? { download: { ...workspace.latestDownload } } : {}),
     };
@@ -772,6 +784,7 @@ export class StandardBrowserProfileHost {
       tabs,
       running: workspace.targets.size > 0,
       updatedAt: workspace.lastActivityAt,
+      fullBrowser: { available: this.backend.vncReady === true, controllerActive: this.vncController !== null, controllerGeneration: this.vncControllerGeneration },
       ...(this.workspaceCredentialInspection(workspace) ? { credentialInspection: this.workspaceCredentialInspection(workspace) } : {}),
       ...(workspace.latestDownload ? { download: { ...workspace.latestDownload } } : {}),
     };
@@ -925,7 +938,8 @@ export class StandardBrowserProfileHost {
 
   hasBlockingControl(sourceSessionId: string): boolean {
     const workspace = this.workspaces.get(sourceSessionId);
-    return Boolean(workspace && !workspace.closed && (workspace.controlTransition || workspace.controlMode !== "agent"));
+    return Boolean((workspace && !workspace.closed && (workspace.controlTransition || workspace.controlMode !== "agent"))
+      || this.vncController?.sourceSessionId === sourceSessionId);
   }
 
   viewerControlAvailable(sourceSessionId: string, workspaceGeneration: string): boolean {
@@ -938,6 +952,64 @@ export class StandardBrowserProfileHost {
     return this.backend.redactCredentialMetadata?.(value) ?? value;
   }
 
+  vncPort(): number {
+    const port = this.backend.vncPort;
+    if (!this.backend.vncReady || !Number.isInteger(port) || !port) throw new Error("Profile-wide Full browser is unavailable");
+    return port;
+  }
+
+  vncControllerCurrent(generation: number): boolean {
+    return this.vncController?.generation === generation;
+  }
+
+  hasWorkspace(sourceSessionId: string, workspaceGeneration: string): boolean {
+    const workspace = this.workspaces.get(sourceSessionId);
+    return Boolean(workspace && !workspace.closed && workspace.generation === workspaceGeneration);
+  }
+
+  async acquireVncController(
+    sourceSessionId: string,
+    workspaceGeneration: string,
+    takeover: boolean,
+    close: () => Promise<void>,
+  ): Promise<{ generation: number; release(): void }> {
+    if (!this.hasWorkspace(sourceSessionId, workspaceGeneration)) throw new Error("Standard browser workspace is unavailable");
+    const prior = this.vncControllerTail;
+    let releaseTail!: () => void;
+    this.vncControllerTail = new Promise<void>((resolve) => { releaseTail = resolve; });
+    await prior.catch(() => undefined);
+    try {
+      const previous = this.vncController;
+      if (previous && !takeover) throw new Error("Profile-wide Full browser already has a controller");
+      if (previous) {
+        this.vncController = null;
+        this.vncControllerGeneration += 1;
+        const closed = await Promise.race([
+          previous.close().then(() => true).catch(() => false),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5_000)),
+        ]);
+        if (!closed) throw new Error("Previous Full browser controller did not close");
+      }
+      const generation = ++this.vncControllerGeneration;
+      if (!this.hasWorkspace(sourceSessionId, workspaceGeneration)) throw new Error("Standard browser workspace is unavailable");
+      this.vncController = { generation, sourceSessionId, workspaceGeneration, close };
+      this.emptySince = null;
+      let released = false;
+      return {
+        generation,
+        release: () => {
+          if (released) return;
+          released = true;
+          if (this.vncController?.generation === generation) {
+            this.vncController = null;
+            this.vncControllerGeneration += 1;
+            if (this.workspaces.size === 0) this.emptySince = Date.now();
+          }
+        },
+      };
+    } finally { releaseTail(); }
+  }
+
   registerViewer(sourceSessionId: string, workspaceGeneration: string, close: () => Promise<void>): () => void {
     this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
     let closers = this.viewerClosers.get(sourceSessionId);
@@ -947,6 +1019,14 @@ export class StandardBrowserProfileHost {
       closers!.delete(close);
       if (closers!.size === 0) this.viewerClosers.delete(sourceSessionId);
     };
+  }
+
+  private async closeWorkspaceVncController(sourceSessionId: string, workspaceGeneration: string): Promise<void> {
+    const controller = this.vncController;
+    if (!controller || controller.sourceSessionId !== sourceSessionId || controller.workspaceGeneration !== workspaceGeneration) return;
+    this.vncController = null;
+    this.vncControllerGeneration += 1;
+    await controller.close();
   }
 
   private async closeWorkspaceViewers(sourceSessionId: string): Promise<void> {
@@ -965,6 +1045,7 @@ export class StandardBrowserProfileHost {
   }
 
   idleWorkspaceSessionIds(now: number, idleMs: number): string[] {
+    if (this.vncController) return [];
     return [...this.workspaces.values()]
       .filter((workspace) => !workspace.closed && workspace.controlMode === "agent"
         && workspace.queueDepth === 0 && now - workspace.lastActivityAt >= idleMs)
@@ -978,7 +1059,7 @@ export class StandardBrowserProfileHost {
   }
 
   emptySinceTimestamp(): number | null {
-    return this.workspaces.size === 0 ? this.emptySince : null;
+    return this.workspaces.size === 0 && !this.vncController ? this.emptySince : null;
   }
 
   private async cancelWorkspaceDownloads(sourceSessionId: string, workspaceGeneration: string): Promise<void> {
@@ -1000,7 +1081,10 @@ export class StandardBrowserProfileHost {
       if (!workspace.closed) {
         workspace.closed = true;
         workspace.runtimeGeneration = null;
-        await this.closeWorkspaceViewers(sourceSessionId);
+        await Promise.all([
+          this.closeWorkspaceViewers(sourceSessionId),
+          this.closeWorkspaceVncController(sourceSessionId, workspace.generation),
+        ]);
         workspace.controlGeneration += 1;
         await this.cancelWorkspaceDownloads(sourceSessionId, workspace.generation);
       }
@@ -1034,6 +1118,10 @@ export class StandardBrowserProfileHost {
     this.closed = true;
     let closing!: Promise<void>;
     closing = (async () => {
+      const controller = this.vncController;
+      this.vncController = null;
+      this.vncControllerGeneration += 1;
+      await controller?.close().catch(() => undefined);
       const cleanupResults = await Promise.allSettled(
         [...this.workspaces.keys()].map((sourceSessionId) => this.closeWorkspace(sourceSessionId, "host_close")),
       );

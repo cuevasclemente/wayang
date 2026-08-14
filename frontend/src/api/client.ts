@@ -1132,6 +1132,7 @@ export interface BrowserSessionState {
   lastError?: string;
   credentialInspection?: "blocked" | "text-allowed";
   credentialBroker?: { supported: boolean; guarded: true };
+  fullBrowser?: { available: boolean; controllerActive: boolean; controllerGeneration: number };
   download?: ProtectedDownloadStatus;
   tabs?: BrowserWorkspaceTab[];
   activeTab?: string | null;
@@ -1261,7 +1262,7 @@ export async function fetchBrowserCredentialStatus(
 ): Promise<BrowserCredentialStatus> {
   const raw = asRecord(await apiPost<unknown>(
     browserApiPath("credentials/status", sessionId, projectCwd),
-    browserBody(sessionId, projectCwd),
+    {},
   ));
   if (typeof raw.available !== "boolean" || typeof raw.unlocked !== "boolean") {
     throw new Error("Credential broker returned an invalid status");
@@ -1281,7 +1282,7 @@ export async function fetchBrowserCredentialMatches(
   try {
     raw = asRecord(await apiPost<unknown>(
       browserApiPath("credentials/matches", sessionId, projectCwd),
-      browserBody(sessionId, projectCwd),
+      {},
     ));
   } catch (error) {
     // The finalized UI route pauses the agent before checking the broker. Its
@@ -1340,7 +1341,7 @@ export async function fillBrowserCredentialLogin(
 ): Promise<BrowserCredentialFillResult> {
   const raw = await apiPost<unknown>(
     browserApiPath("credentials/fill", sessionId, projectCwd),
-    browserBody(sessionId, projectCwd, { choiceToken }),
+    { choiceToken },
   );
   return normalizeCredentialFill(raw);
 }
@@ -1352,7 +1353,7 @@ export async function fillBrowserCredentialTotp(
 ): Promise<BrowserCredentialFillResult> {
   const raw = await apiPost<unknown>(
     browserApiPath("credentials/fill-totp", sessionId, projectCwd),
-    browserBody(sessionId, projectCwd, { choiceToken }),
+    { choiceToken },
   );
   return normalizeCredentialFill(raw);
 }
@@ -1363,7 +1364,7 @@ export async function allowAgentBrowserCredentialInspection(
 ): Promise<BrowserCredentialInspectionResult> {
   return apiPost<BrowserCredentialInspectionResult>(
     browserApiPath("credentials/allow-agent-inspection", sessionId, projectCwd),
-    browserBody(sessionId, projectCwd),
+    {},
   );
 }
 
@@ -1373,7 +1374,7 @@ export async function lockBrowserCredentials(
 ): Promise<{ locked: true }> {
   const raw = asRecord(await apiPost<unknown>(
     browserApiPath("credentials/lock", sessionId, projectCwd),
-    browserBody(sessionId, projectCwd),
+    {},
   ));
   if (raw.locked !== true) throw new Error("Credential vault did not confirm it was locked");
   return { locked: true };
@@ -1552,10 +1553,11 @@ export function browserWsUrl(sessionId: string | null, projectCwd: string | null
   return `${proto}//${window.location.host}/ws/browser?${params.toString()}`;
 }
 
-export function browserVncWsUrl(sessionId: string | null, projectCwd: string | null): string {
+export function browserVncWsUrl(sessionId: string | null, projectCwd: string | null, takeover = false): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const params = browserQuery(sessionId, projectCwd);
-  return `${proto}//${window.location.host}/ws/browser-vnc?${params}`;
+  const params = new URLSearchParams(browserQuery(sessionId, projectCwd));
+  if (takeover) params.set("takeover", "1");
+  return `${proto}//${window.location.host}/ws/browser-vnc?${params.toString()}`;
 }
 
 // ---------------------------------------------------------------------------
