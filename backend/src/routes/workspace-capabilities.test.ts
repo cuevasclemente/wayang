@@ -4,14 +4,15 @@ import test, { type TestContext } from "node:test";
 import express from "express";
 import { capabilityPreviewStateDigest } from "../workspace-capability-approval/renderer.js";
 import { WorkspaceCapabilityApprovalService } from "../workspace-capability-approval/service.js";
-import type { SettingsPinAttemptPort, WorkspaceCapabilityMutationPort } from "../workspace-capability-approval/types.js";
+import type { ReservePinAttemptResult, SettingsPinAttemptPort, WorkspaceCapabilityMutationPort } from "../workspace-capability-approval/types.js";
 import { createWorkspaceCapabilitiesRouter } from "./workspace-capabilities.js";
 
 const OWNER = { sessionId: "synthetic-web-session", origin: "https://wayang.test" };
 
 class Pins implements SettingsPinAttemptPort {
   cancellations: string[] = [];
-  async reserve() { return { status: "reserved" as const }; }
+  constructor(private readonly reservation: ReservePinAttemptResult = { status: "reserved" }) {}
+  async reserve() { return this.reservation; }
   async verifyAndConsume() { return { status: "verified" as const }; }
   async cancelAndConsume(input: Parameters<SettingsPinAttemptPort["cancelAndConsume"]>[0]) { this.cancellations.push(input.reason); }
 }
@@ -73,8 +74,7 @@ function workspace(): WorkspaceCapabilityMutationPort {
   };
 }
 
-async function start(t: TestContext) {
-  const pins = new Pins();
+async function start(t: TestContext, pins = new Pins()) {
   const service = new WorkspaceCapabilityApprovalService({ workspace: workspace(), pinAttempts: pins, randomId: () => "request" });
   const app = express();
   app.use("/api", createWorkspaceCapabilitiesRouter({
@@ -119,6 +119,21 @@ test("request API accepts compiled IDs and rejects provider/model extras", async
   assert.equal("provider" in challenge, false);
   assert.equal("model" in challenge, false);
   assert.match(created.headers.get("cache-control") ?? "", /no-store/);
+});
+
+test("cooldown returns the typed 429 contract and Retry-After without creating a challenge", async (t) => {
+  const retryAt = Date.now() + 5_000;
+  const { base } = await start(t, new Pins({ status: "cooldown", retryAt }));
+  const response = await fetch(`${base}/workspace-capabilities/requests`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(INTENT),
+  });
+  assert.equal(response.status, 429);
+  assert.ok(Number(response.headers.get("retry-after")) >= 1);
+  const body = await response.json() as { code?: string; error?: string; requestId?: string };
+  assert.equal(body.code, "cooldown");
+  assert.equal("requestId" in body, false);
 });
 
 test("authentication loss consumes pending PIN request and malformed commit cannot replay", async (t) => {

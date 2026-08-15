@@ -777,12 +777,13 @@ export function fetchWorkspaceCapabilities(): Promise<WorkspaceCapabilityCatalog
 
 export function requestWorkspaceCapabilityActivation(
   intent: WorkspaceCapabilityAssociationIntent,
+  signal?: AbortSignal,
 ): Promise<WorkspaceCapabilityChallenge> {
   return request<WorkspaceCapabilityChallenge>(
     "POST",
     "/api/workspace-capabilities/requests",
     intent,
-    undefined,
+    signal,
     false,
     "no-store",
   );

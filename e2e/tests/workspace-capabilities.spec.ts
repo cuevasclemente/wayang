@@ -70,10 +70,18 @@ interface SyntheticCapabilityApi {
   activationRequests: Record<string, unknown>[];
   commitBodies: Record<string, unknown>[];
   revokeBodies: Record<string, unknown>[];
+  cancellations: string[];
   statusReads: number;
 }
 
-async function installSyntheticApi(page: Page, options: { modelDiscoveryFails?: boolean } = {}): Promise<SyntheticCapabilityApi> {
+async function installSyntheticApi(page: Page, options: {
+  modelDiscoveryFails?: boolean;
+  activationFailure?: { status: number; code: string; error: string };
+  activationDelayMs?: number;
+  catalogFailure?: { status: number; code: string; error: string };
+  commitFailure?: { status: number; code: string; error: string };
+  revokeFailure?: { status: number; code: string; error: string };
+} = {}): Promise<SyntheticCapabilityApi> {
   const projects = [
     project(standardProjectId, "Quartz Orchard", "standard"),
     project(protectedProjectId, "Night Archive", "protected"),
@@ -83,6 +91,7 @@ async function installSyntheticApi(page: Page, options: { modelDiscoveryFails?: 
     activationRequests: [],
     commitBodies: [],
     revokeBodies: [],
+    cancellations: [],
     statusReads: 0,
   };
   let association: Record<string, unknown> | null = null;
@@ -119,6 +128,7 @@ async function installSyntheticApi(page: Page, options: { modelDiscoveryFails?: 
 
     if (path === "/api/workspace-capabilities" && method === "GET") {
       api.statusReads += 1;
+      if (options.catalogFailure) return route.fulfill({ status: options.catalogFailure.status, json: options.catalogFailure });
       return route.fulfill({ json: {
         capabilities: catalog,
         associations: association ? [association] : [],
@@ -129,7 +139,12 @@ async function installSyntheticApi(page: Page, options: { modelDiscoveryFails?: 
 
     if (path === "/api/workspace-capabilities/requests" && method === "POST") {
       api.activationRequests.push(structuredClone(body));
-      return route.fulfill({ json: {
+      if (options.activationDelayMs) await new Promise((resolve) => setTimeout(resolve, options.activationDelayMs));
+      if (options.activationFailure) return route.fulfill({ status: options.activationFailure.status, json: {
+        code: options.activationFailure.code,
+        error: options.activationFailure.error,
+      } });
+      return route.fulfill({ status: 201, json: {
         requestId,
         operationDigest: "digest-operation-abc123",
         previewStateDigest: "digest-preview-def456",
@@ -155,6 +170,7 @@ async function installSyntheticApi(page: Page, options: { modelDiscoveryFails?: 
 
     if (path === `/api/workspace-capabilities/requests/${requestId}/commit` && method === "POST") {
       api.commitBodies.push(structuredClone(body));
+      if (options.commitFailure) return route.fulfill({ status: options.commitFailure.status, json: options.commitFailure });
       const now = Date.now();
       association = {
         capabilityId: "wayang.protected-browser.v1",
@@ -181,6 +197,7 @@ async function installSyntheticApi(page: Page, options: { modelDiscoveryFails?: 
 
     if (path === "/api/workspace-capability-associations/revoke" && method === "POST") {
       api.revokeBodies.push(structuredClone(body));
+      if (options.revokeFailure) return route.fulfill({ status: options.revokeFailure.status, json: options.revokeFailure });
       const now = Date.now();
       association = { ...association!, revision: 2, active: false, revokedAt: now, updatedAt: now };
       approvalEvent = { ...approvalEvent!, revokedAt: now };
@@ -188,6 +205,7 @@ async function installSyntheticApi(page: Page, options: { modelDiscoveryFails?: 
     }
 
     if (path.startsWith("/api/workspace-capabilities/requests/") && method === "DELETE") {
+      api.cancellations.push(decodeURIComponent(path.slice("/api/workspace-capabilities/requests/".length)));
       return route.fulfill({ status: 204 });
     }
 
@@ -248,10 +266,18 @@ test("capability Settings uses model-independent Project-Agent associations, exa
   await expect(challenge).not.toContainText(provider);
   await expect(challenge).not.toContainText(model);
   await expect(challenge).toContainText("runtime-synthetic-1 (idle)");
+  await expect(settings).toHaveAttribute("inert", "");
 
   const pin = challenge.getByLabel("8-digit identity PIN");
   await expect(pin).toHaveAttribute("type", "password");
   await expect(pin).toHaveAttribute("autocomplete", "off");
+  await expect(pin).toBeFocused();
+  await settings.locator('button[aria-label="Close settings"]').evaluate((element) => (element as HTMLElement).focus());
+  await expect(pin).toBeFocused();
+  await pin.press("Shift+Tab");
+  await expect(challenge.getByRole("button", { name: "Cancel" })).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(pin).toBeFocused();
   await pin.fill("2468abcd");
   await expect(pin).toHaveValue("2468");
   await pin.fill(syntheticPin);
@@ -259,6 +285,8 @@ test("capability Settings uses model-independent Project-Agent associations, exa
   await challenge.getByRole("button", { name: "Associate capability" }).click();
 
   await expect(challenge).toBeHidden();
+  await expect(settings).not.toHaveAttribute("inert", "");
+  await expect(settings.getByRole("button", { name: "Review association" })).toBeFocused();
   await expect.poll(() => api.commitBodies).toEqual([{ pin: syntheticPin }]);
   await expect.poll(() => api.statusReads).toBeGreaterThanOrEqual(2);
 
@@ -286,6 +314,143 @@ test("capability Settings uses model-independent Project-Agent associations, exa
   await expect(history).toContainText("revoked");
   await expect(settings).toContainText("Prior filesystem, process, credential, network, download, or remote-account effects remain");
   await expect(current.getByRole("button", { name: "Revoke" })).toHaveCount(0);
+});
+
+for (const scenario of [
+  { label: "unauthenticated owner", failure: { status: 401, code: "unauthenticated", error: "Authentication required" }, expected: "authenticated owner identity" },
+  { label: "invalid remote origin", failure: { status: 403, code: "invalid_origin", error: "Origin not allowed" }, expected: "rejected this browser Origin" },
+  { label: "PIN cooldown", failure: { status: 429, code: "cooldown", error: "Try later" }, expected: "temporarily cooling down" },
+  { label: "PIN metadata unavailable", failure: { status: 503, code: "pin_unavailable", error: "Settings PIN approval is unavailable" }, expected: "PIN approval is unavailable" },
+  { label: "backend failure", failure: { status: 500, code: "internal", error: "Capability approval failed" }, expected: "could not create the capability review" },
+]) {
+  test(`Review association shows and focuses an action-local error for ${scenario.label}`, async ({ page }) => {
+    await installSyntheticApi(page, { activationFailure: scenario.failure });
+    await page.setViewportSize({ width: 900, height: 560 });
+    await page.goto("/");
+    await page.getByRole("button", { name: "Open workspace and capability settings" }).click();
+    const settings = page.getByRole("dialog", { name: "Workspace settings" });
+    await settings.getByRole("tab", { name: "Capabilities" }).click();
+    await settings.getByRole("button", { name: /Host execution/ }).click();
+    await settings.getByRole("button", { name: "Review association" }).click();
+
+    const alert = settings.getByRole("alert");
+    await expect(alert).toContainText(scenario.expected);
+    await expect(settings).not.toContainText(scenario.failure.error);
+    await expect(alert).toBeFocused();
+    const box = await alert.boundingBox();
+    const viewport = page.viewportSize();
+    expect(box).not.toBeNull();
+    expect(viewport).not.toBeNull();
+    expect(box!.y).toBeGreaterThanOrEqual(0);
+    expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height);
+    await expect(settings.getByRole("button", { name: "Review association" })).toBeEnabled();
+  });
+}
+
+test("Review association times out visibly instead of remaining inert", async ({ page }) => {
+  const api = await installSyntheticApi(page, { activationDelayMs: 30_000 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open workspace and capability settings" }).click();
+  const settings = page.getByRole("dialog", { name: "Workspace settings" });
+  await settings.getByRole("tab", { name: "Capabilities" }).click();
+  await settings.getByRole("button", { name: /Host execution/ }).click();
+  await settings.getByRole("button", { name: "Review association" }).click();
+  await expect(settings.getByRole("button", { name: "Review association" })).toBeDisabled();
+  const alert = settings.getByRole("alert");
+  await expect(alert).toContainText("timed out before the backend responded", { timeout: 15_000 });
+  await expect(alert).toBeFocused();
+  expect(api.activationRequests).toHaveLength(1);
+  expect(api.commitBodies).toHaveLength(0);
+  await expect(settings.getByRole("button", { name: "Review association" })).toBeEnabled();
+});
+
+test("rapid duplicate preview submissions remain exact single-flight", async ({ page }) => {
+  const api = await installSyntheticApi(page, { activationDelayMs: 250 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open workspace and capability settings" }).click();
+  const settings = page.getByRole("dialog", { name: "Workspace settings" });
+  await settings.getByRole("tab", { name: "Capabilities" }).click();
+  await settings.getByRole("button", { name: /Host execution/ }).click();
+  const review = settings.getByRole("button", { name: "Review association" });
+  await review.evaluate((button) => {
+    const form = button.closest("form")!;
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+  });
+  await expect(page.getByRole("dialog", { name: /Associate protected browser/ })).toBeVisible();
+  expect(api.activationRequests).toHaveLength(1);
+  expect(api.commitBodies).toHaveLength(0);
+});
+
+test("an issued challenge traps focus, cancels on Settings unmount, and does not strand the approval realm", async ({ page }) => {
+  const api = await installSyntheticApi(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open workspace and capability settings" }).click();
+  const settings = page.getByRole("dialog", { name: "Workspace settings" });
+  await settings.getByRole("tab", { name: "Capabilities" }).click();
+  await settings.getByRole("button", { name: /Protected browser/ }).click();
+  await settings.getByLabel("Project").selectOption(protectedProjectId);
+  await settings.getByRole("button", { name: "Review association" }).click();
+  const challenge = page.getByRole("dialog", { name: "Associate protected browser with the synthetic Project-Agent pair" });
+  await expect(challenge).toBeVisible();
+  await expect(settings).toHaveAttribute("inert", "");
+
+  // Simulate the parent Settings surface being removed by navigation/session
+  // replacement; ordinary pointer/keyboard interaction cannot cross `inert`.
+  await settings.locator('button[aria-label="Close settings"]').evaluate((element) => (element as HTMLElement).click());
+  await expect(settings).toBeHidden();
+  await expect.poll(() => api.cancellations).toEqual([requestId]);
+});
+
+test("catalog failures never expose raw backend text", async ({ page }) => {
+  const raw = "SYNTHETIC_CATALOG_RAW_CANARY";
+  await installSyntheticApi(page, { catalogFailure: { status: 500, code: "internal", error: raw } });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open workspace and capability settings" }).click();
+  const settings = page.getByRole("dialog", { name: "Workspace settings" });
+  await settings.getByRole("tab", { name: "Capabilities" }).click();
+  await expect(settings).toContainText("Capability Settings is unavailable");
+  await expect(settings).not.toContainText(raw);
+});
+
+test("PIN commit failures are sanitized and action-local", async ({ page }) => {
+  const raw = "SYNTHETIC_COMMIT_RAW_CANARY";
+  await installSyntheticApi(page, { commitFailure: { status: 500, code: "internal", error: raw } });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open workspace and capability settings" }).click();
+  const settings = page.getByRole("dialog", { name: "Workspace settings" });
+  await settings.getByRole("tab", { name: "Capabilities" }).click();
+  await settings.getByRole("button", { name: /Protected browser/ }).click();
+  await settings.getByLabel("Project").selectOption(protectedProjectId);
+  await settings.getByRole("button", { name: "Review association" }).click();
+  const challenge = page.getByRole("dialog", { name: /Associate protected browser/ });
+  await challenge.getByLabel("8-digit identity PIN").fill(syntheticPin);
+  await challenge.getByRole("button", { name: "Associate capability" }).click();
+  const alert = settings.getByRole("alert");
+  await expect(alert).toContainText("could not commit the capability review");
+  await expect(alert).toBeFocused();
+  await expect(settings).not.toContainText(raw);
+});
+
+test("revocation failures never expose raw backend text", async ({ page }) => {
+  const raw = "SYNTHETIC_REVOKE_RAW_CANARY";
+  await installSyntheticApi(page, { revokeFailure: { status: 500, code: "internal", error: raw } });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open workspace and capability settings" }).click();
+  const settings = page.getByRole("dialog", { name: "Workspace settings" });
+  await settings.getByRole("tab", { name: "Capabilities" }).click();
+  await settings.getByRole("button", { name: /Protected browser/ }).click();
+  await settings.getByLabel("Project").selectOption(protectedProjectId);
+  await settings.getByRole("button", { name: "Review association" }).click();
+  const challenge = page.getByRole("dialog", { name: /Associate protected browser/ });
+  await challenge.getByLabel("8-digit identity PIN").fill(syntheticPin);
+  await challenge.getByRole("button", { name: "Associate capability" }).click();
+  const current = settings.getByRole("region", { name: "Current associations" });
+  await expect(current.getByText("ACTIVE", { exact: true })).toBeVisible();
+  page.once("dialog", (dialog) => dialog.accept());
+  await current.getByRole("button", { name: "Revoke" }).click();
+  await expect(settings).toContainText("Capability Settings is unavailable");
+  await expect(settings).not.toContainText(raw);
 });
 
 test("capability Settings does not depend on provider/model discovery", async ({ page }) => {

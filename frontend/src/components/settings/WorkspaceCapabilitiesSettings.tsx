@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { AlertTriangle, Check, Loader2, RefreshCw, ShieldCheck, ShieldOff } from "lucide-react";
 import {
   ApiError,
@@ -38,11 +39,71 @@ const CAPABILITY_RISK_DETAILS: Record<WorkspaceCapabilityId, string> = {
 };
 
 function errorMessage(error: unknown): string {
-  if (error instanceof ApiError && error.status === 401) {
+  if (!(error instanceof ApiError)) return "Capability Settings could not reach the backend. Check Wayang health and retry.";
+  if (error.status === 401) {
     return "Capability Settings requires an authenticated Wayang session. Remote passwordless access cannot approve capabilities; enable the shared password or use a loopback browser origin.";
   }
-  return error instanceof ApiError ? error.message || `HTTP ${error.status}` : String(error);
+  if (error.status === 403) return "Capability Settings denied this owner, Origin, or exact Project-Agent operation.";
+  if (error.status === 409) return "Capability state changed. Refresh Settings before retrying.";
+  if (error.status === 429) return "Capability approval is temporarily cooling down. Wait before retrying.";
+  if (error.status >= 500) return "Capability Settings is unavailable. Check Wayang health and local service diagnostics.";
+  return `Capability Settings rejected the request (HTTP ${error.status}).`;
 }
+
+function capabilityErrorCode(error: ApiError): string | null {
+  if (!error.body || typeof error.body !== "object" || Array.isArray(error.body)) return null;
+  const code = (error.body as { code?: unknown }).code;
+  return typeof code === "string" ? code : null;
+}
+
+function activationRequestErrorMessage(error: unknown, timedOut: boolean): string {
+  if (timedOut || (error instanceof DOMException && error.name === "AbortError")) {
+    return "Capability review timed out before the backend responded. Check Wayang health, then retry; no PIN was requested or submitted.";
+  }
+  if (!(error instanceof ApiError)) {
+    return "Capability review could not reach the backend. Check the connection and Wayang health, then retry; no PIN was requested or submitted.";
+  }
+  const code = capabilityErrorCode(error);
+  if (error.status === 401) {
+    return "Capability review needs an authenticated owner identity. Sign in again; for remote access, verify the authenticated proxy identity bridge or use the loopback administration origin.";
+  }
+  if (error.status === 403 && code === "invalid_origin") {
+    return "Capability review rejected this browser Origin. Use the configured exact Wayang origin or the loopback administration origin.";
+  }
+  if (error.status === 403) {
+    return "Capability review was denied for this exact Project, Agent Profile, or privacy policy. Refresh Settings and verify that the profile is enabled and allowed by the Project.";
+  }
+  if (error.status === 429 && code === "cooldown") {
+    return "Capability review is temporarily cooling down after prior PIN attempts. Wait for the retry period, then create a fresh review.";
+  }
+  if (error.status === 409) {
+    return code === "realm_busy"
+      ? "Another capability review is already pending. Finish or cancel it, or wait for it to expire before retrying."
+      : "Capability state changed while creating the review. Refresh Settings and retry the exact association.";
+  }
+  if (error.status === 503 && code === "pin_unavailable") {
+    return "Capability PIN approval is unavailable on this Wayang deployment. Run make doctor locally and repair only the reported PIN/cooldown metadata before retrying.";
+  }
+  if (error.status >= 500) {
+    return "Wayang could not create the capability review. Check service diagnostics and retry; no PIN was requested or submitted.";
+  }
+  return "Capability review was rejected. Refresh Settings and verify the exact Project, Agent Profile, and capability before retrying.";
+}
+
+function capabilityCommitErrorMessage(error: unknown): string {
+  if (!(error instanceof ApiError)) return "Capability submission could not reach the backend. Create a fresh review before trying again.";
+  const code = capabilityErrorCode(error);
+  if (error.status === 401) return "The authenticated owner session expired before submission. Sign in and create a fresh review.";
+  if (error.status === 403 && code === "wrong_pin") return "The identity PIN was not accepted. The attempt was consumed; create a fresh review before retrying.";
+  if (error.status === 403) return "Capability submission was denied for this owner or exact association. Create a fresh review.";
+  if (error.status === 409) return "Capability state changed or the review was already consumed. Create a fresh review.";
+  if (error.status === 410) return "The capability review expired. Create a fresh review.";
+  if (error.status === 429) return "Capability approval is cooling down. Wait for the retry period, then create a fresh review.";
+  if (error.status === 503) return "Capability PIN approval is unavailable on this Wayang deployment. Run make doctor locally before retrying.";
+  return "Wayang could not commit the capability review. Its one-use attempt is no longer reusable; create a fresh review.";
+}
+
+const ACTIVATION_PREVIEW_TIMEOUT_MS = 12_000;
 
 function associationKey(association: WorkspaceCapabilityAssociation): string {
   return `${association.projectId}\u0000${association.agentProfileId}\u0000${association.capabilityId}\u0000${association.revision}`;
@@ -64,7 +125,15 @@ export function WorkspaceCapabilitiesSettings({
   const [revokingKey, setRevokingKey] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [activationError, setActivationError] = useState("");
   const pinRef = useRef<HTMLInputElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const activationErrorRef = useRef<HTMLDivElement>(null);
+  const reviewButtonRef = useRef<HTMLButtonElement>(null);
+  const activationRequestRef = useRef<AbortController | null>(null);
+  const activationRequestInFlightRef = useRef(false);
+  const challengeRef = useRef<WorkspaceCapabilityChallenge | null>(null);
+  const challengeWasOpenRef = useRef(false);
   const commitInFlightRef = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -82,6 +151,36 @@ export function WorkspaceCapabilitiesSettings({
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => { challengeRef.current = challenge; }, [challenge]);
+  useEffect(() => {
+    if (!challenge) return;
+    const settingsDialog = contentRef.current?.closest<HTMLElement>("[role='dialog'][aria-labelledby='workspace-settings-title']");
+    if (!settingsDialog) return;
+    const alreadyInert = settingsDialog.hasAttribute("inert");
+    settingsDialog.setAttribute("inert", "");
+    return () => { if (!alreadyInert) settingsDialog.removeAttribute("inert"); };
+  }, [challenge]);
+  useEffect(() => () => {
+    activationRequestRef.current?.abort();
+    activationRequestInFlightRef.current = false;
+    const pending = challengeRef.current;
+    if (pending) void cancelWorkspaceCapabilityActivation(pending.requestId).catch(() => undefined);
+  }, []);
+  useEffect(() => {
+    if (challenge) { challengeWasOpenRef.current = true; return; }
+    if (!challengeWasOpenRef.current) return;
+    challengeWasOpenRef.current = false;
+    const frame = window.requestAnimationFrame(() => reviewButtonRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [challenge]);
+  useEffect(() => {
+    if (!activationError) return;
+    const frame = window.requestAnimationFrame(() => {
+      activationErrorRef.current?.focus();
+      activationErrorRef.current?.scrollIntoView({ block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activationError]);
 
   const selectedCapability = status?.capabilities.find((item) => item.id === capabilityId) ?? null;
   const compatibleProjects = useMemo(
@@ -111,26 +210,47 @@ export function WorkspaceCapabilitiesSettings({
 
   const requestActivation = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!capabilityId || !projectId || !profileId || requesting) return;
+    if (activationRequestInFlightRef.current) {
+      setActivationError("A capability review request is already in progress. Wait for it to finish or time out before retrying.");
+      return;
+    }
+    if (!capabilityId || !projectId || !profileId) {
+      setActivationError("Choose a capability, compatible Project, and allowed Agent Profile before requesting review.");
+      return;
+    }
+    const controller = new AbortController();
+    activationRequestInFlightRef.current = true;
+    activationRequestRef.current = controller;
+    let timedOut = false;
+    const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, ACTIVATION_PREVIEW_TIMEOUT_MS);
     setRequesting(true);
+    setActivationError("");
     setError("");
     setNotice("");
     try {
-      setChallenge(await requestWorkspaceCapabilityActivation({
+      const next = await requestWorkspaceCapabilityActivation({
         capabilityId,
         projectId,
         agentProfileId: profileId,
-      }));
+      }, controller.signal);
+      challengeRef.current = next;
+      setChallenge(next);
     } catch (caught) {
-      setError(errorMessage(caught));
+      setActivationError(activationRequestErrorMessage(caught, timedOut));
     } finally {
-      setRequesting(false);
+      window.clearTimeout(timeout);
+      if (activationRequestRef.current === controller) {
+        activationRequestRef.current = null;
+        activationRequestInFlightRef.current = false;
+        setRequesting(false);
+      }
     }
   };
 
   const cancelChallenge = useCallback(async () => {
     const current = challenge;
     if (pinRef.current) pinRef.current.value = "";
+    challengeRef.current = null;
     setChallenge(null);
     commitInFlightRef.current = false;
     if (!current) return;
@@ -157,6 +277,7 @@ export function WorkspaceCapabilitiesSettings({
     setCommitting(true);
     setError("");
     setNotice("");
+    challengeRef.current = null;
     setChallenge(null);
     try {
       await commitWorkspaceCapabilityActivation(current.requestId, pin);
@@ -164,7 +285,7 @@ export function WorkspaceCapabilitiesSettings({
       await refresh();
       onChanged?.();
     } catch (caught) {
-      setError(`${errorMessage(caught)} Create a fresh activation preview before trying again.`);
+      setActivationError(capabilityCommitErrorMessage(caught));
     } finally {
       commitInFlightRef.current = false;
       setCommitting(false);
@@ -196,7 +317,8 @@ export function WorkspaceCapabilitiesSettings({
   const associations = status?.associations ?? [];
   const approvalEvents = status?.approvalEvents ?? [];
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto pb-6">
+    <>
+    <div ref={contentRef} className="min-h-0 flex-1 overflow-y-auto pb-6">
       <div className="mx-auto max-w-4xl space-y-6">
         <section className="space-y-3">
           <div className="flex items-start justify-between gap-3">
@@ -208,23 +330,24 @@ export function WorkspaceCapabilitiesSettings({
           </div>
           <div className="grid gap-3 md:grid-cols-3">
             {(status?.capabilities ?? []).map((capability) => (
-              <CapabilityCard key={capability.id} capability={capability} selected={capability.id === capabilityId} onSelect={() => setCapabilityId(capability.id)} />
+              <CapabilityCard key={capability.id} capability={capability} selected={capability.id === capabilityId} disabled={requesting} onSelect={() => { setActivationError(""); setCapabilityId(capability.id); }} />
             ))}
           </div>
         </section>
 
-        <form onSubmit={requestActivation} className="space-y-4 rounded-lg border border-neutral-800 bg-neutral-900/35 p-4">
+        <form onSubmit={requestActivation} aria-busy={requesting} className="space-y-4 rounded-lg border border-neutral-800 bg-neutral-900/35 p-4">
           <div><h3 className="text-sm font-semibold text-neutral-100">Associate capability</h3><p className="mt-1 text-xs leading-relaxed text-neutral-500">The backend will render a fresh review of this exact Project, Agent Profile, and capability before accepting a one-use PIN submission.</p></div>
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Project"><select value={projectId} onChange={(event) => setProjectId(event.target.value)} className={inputClass}><option value="">Select compatible project</option>{compatibleProjects.map((project) => <option key={project.id} value={project.id}>{project.name} — {project.id}</option>)}</select></Field>
-            <Field label="Agent profile"><select value={profileId} onChange={(event) => setProfileId(event.target.value)} className={inputClass}><option value="">Select allowed profile</option>{compatibleProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name} — {profile.id}</option>)}</select></Field>
+            <Field label="Project"><select value={projectId} onChange={(event) => { setActivationError(""); setProjectId(event.target.value); }} disabled={requesting} className={inputClass}><option value="">Select compatible project</option>{compatibleProjects.map((project) => <option key={project.id} value={project.id}>{project.name} — {project.id}</option>)}</select></Field>
+            <Field label="Agent profile"><select value={profileId} onChange={(event) => { setActivationError(""); setProfileId(event.target.value); }} disabled={requesting} className={inputClass}><option value="">Select allowed profile</option>{compatibleProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name} — {profile.id}</option>)}</select></Field>
           </div>
           <div className="rounded border border-blue-900/60 bg-blue-950/20 px-3 py-2 text-xs leading-relaxed text-blue-100">
             This grants broad authority to any model currently used by this Agent Profile in this Project. Model switches invalidate old runtime actions and rebuild lazily, but do not require another PIN. The association also survives profile instruction, tool, resource, memory, and default edits, plus disable/re-enable of the same stable profile ID; a disabled profile cannot run.
           </div>
           <p className="text-xs leading-relaxed text-neutral-500">Only explicit revocation, excluding this exact profile from the project allowlist, an incompatible privacy change, or deleting the Project or Agent Profile ends the association. Restoring an excluded/deleted relationship requires a new activation.</p>
           {selectedCapability && <div className="rounded border border-amber-900/60 bg-amber-950/20 px-3 py-2 text-xs leading-relaxed text-amber-100"><AlertTriangle size={14} className="mr-2 inline text-amber-400" />{CAPABILITY_RISK_DETAILS[selectedCapability.id]}</div>}
-          <div className="flex justify-end"><button type="submit" disabled={requesting || !capabilityId || !projectId || !profileId} className={primaryButtonClass}>{requesting ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />} Review association</button></div>
+          {activationError && <div ref={activationErrorRef} id="capability-review-error" role="alert" tabIndex={-1} className="flex items-start gap-2 rounded border border-red-900/70 bg-red-950/30 px-3 py-2 text-xs leading-relaxed text-red-200 outline-none focus:ring-2 focus:ring-red-500"><AlertTriangle size={14} className="mt-0.5 shrink-0" />{activationError}</div>}
+          <div className="flex justify-end"><button ref={reviewButtonRef} type="submit" aria-describedby={activationError ? "capability-review-error" : undefined} disabled={requesting || !capabilityId || !projectId || !profileId} className={primaryButtonClass}>{requesting ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />} Review association</button></div>
         </form>
 
         <section className="space-y-3" aria-labelledby="current-capability-associations">
@@ -245,14 +368,14 @@ export function WorkspaceCapabilitiesSettings({
         {notice && <div role="status" className="flex items-start gap-2 rounded border border-emerald-900/60 bg-emerald-950/25 px-3 py-2 text-xs text-emerald-200"><Check size={14} className="mt-0.5 shrink-0" />{notice}</div>}
         {error && <ErrorBox>{error}</ErrorBox>}
       </div>
-
-      {challenge && <ActivationChallenge challenge={challenge} committing={committing} pinRef={pinRef} onSubmit={commitChallenge} onCancel={() => void cancelChallenge()} />}
     </div>
+    {challenge && createPortal(<ActivationChallenge challenge={challenge} committing={committing} pinRef={pinRef} onSubmit={commitChallenge} onCancel={() => void cancelChallenge()} />, document.body)}
+    </>
   );
 }
 
-function CapabilityCard({ capability, selected, onSelect }: { capability: WorkspaceCapabilityCatalogItem; selected: boolean; onSelect: () => void }) {
-  return <button type="button" onClick={onSelect} className={`rounded-lg border p-3 text-left ${selected ? "border-blue-600 bg-blue-950/35" : "border-neutral-800 bg-neutral-950/60 hover:border-neutral-700"}`}><div className="text-sm font-semibold text-neutral-100">{capability.title}</div><div className="mt-1 break-all font-mono text-[10px] text-blue-300">{capability.id}</div><div className="mt-2 text-xs leading-relaxed text-neutral-400">{capability.riskSummary}</div><div className="mt-2 text-[10px] uppercase text-neutral-600">{capability.compatiblePrivacyMode} projects</div></button>;
+function CapabilityCard({ capability, selected, disabled, onSelect }: { capability: WorkspaceCapabilityCatalogItem; selected: boolean; disabled: boolean; onSelect: () => void }) {
+  return <button type="button" onClick={onSelect} disabled={disabled} className={`rounded-lg border p-3 text-left disabled:opacity-60 ${selected ? "border-blue-600 bg-blue-950/35" : "border-neutral-800 bg-neutral-950/60 hover:border-neutral-700"}`}><div className="text-sm font-semibold text-neutral-100">{capability.title}</div><div className="mt-1 break-all font-mono text-[10px] text-blue-300">{capability.id}</div><div className="mt-2 text-xs leading-relaxed text-neutral-400">{capability.riskSummary}</div><div className="mt-2 text-[10px] uppercase text-neutral-600">{capability.compatiblePrivacyMode} projects</div></button>;
 }
 
 function subjectLabel(label: string | undefined, kind: "project" | "profile", id: string): React.ReactNode {
@@ -272,5 +395,43 @@ function ApprovalEventRow({ event, projects, profiles }: { event: WorkspaceCapab
 }
 
 function ActivationChallenge({ challenge, committing, pinRef, onSubmit, onCancel }: { challenge: WorkspaceCapabilityChallenge; committing: boolean; pinRef: React.RefObject<HTMLInputElement | null>; onSubmit: (event: React.FormEvent) => void; onCancel: () => void }) {
-  return <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/80 p-3" role="dialog" aria-modal="true" aria-labelledby="capability-challenge-title" onKeyDown={(event) => { if (event.key === "Escape" && !committing) { event.preventDefault(); event.stopPropagation(); onCancel(); } }}><div className="flex max-h-[92dvh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-red-800 bg-neutral-950 shadow-2xl"><header className="border-b border-red-900/60 bg-red-950/25 px-4 py-3"><div className="text-[10px] font-bold uppercase tracking-widest text-red-300">Project-Agent capability association · PIN required</div><h2 id="capability-challenge-title" className="mt-1 text-base font-semibold text-neutral-100">{challenge.summary}</h2></header><div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4"><dl className="grid gap-x-4 gap-y-2 rounded border border-neutral-800 bg-neutral-900/50 p-3 text-xs sm:grid-cols-[10rem_minmax(0,1fr)]"><dt className="text-neutral-500">Capability ID</dt><dd className="break-all font-mono text-neutral-100">{challenge.capabilityId}</dd><dt className="text-neutral-500">Project</dt><dd className="break-all text-neutral-100">{challenge.projectLabel} · <code>{challenge.projectId}</code>{challenge.projectCwd ? <> · <code>{challenge.projectCwd}</code></> : null}</dd><dt className="text-neutral-500">Agent profile</dt><dd className="break-all text-neutral-100">{challenge.agentProfileLabel} · <code>{challenge.agentProfileId}</code></dd>{challenge.privacyMode && <><dt className="text-neutral-500">Project policy</dt><dd className="text-neutral-100">{challenge.privacyMode} · exact profile {challenge.profileAllowed === false ? "not allowed" : "allowed"}</dd></>}{challenge.profileEnabled !== undefined && <><dt className="text-neutral-500">Profile state</dt><dd className="text-neutral-100">{challenge.profileEnabled ? "enabled" : "disabled"}</dd></>}<dt className="text-neutral-500">Association revision</dt><dd className="font-mono text-neutral-100">{challenge.association.before?.revision ?? "new"} → {challenge.association.after.revision}</dd>{challenge.previewStateDigest && <><dt className="text-neutral-500">Preview state digest</dt><dd className="break-all font-mono text-neutral-300">{challenge.previewStateDigest}</dd></>}<dt className="text-neutral-500">Operation digest</dt><dd className="break-all font-mono text-neutral-300">{challenge.operationDigest}</dd><dt className="text-neutral-500">Expires</dt><dd className="text-neutral-100">{new Date(challenge.expiresAt).toLocaleString()}</dd></dl><div className="rounded border border-blue-900/60 bg-blue-950/20 p-3 text-xs leading-relaxed text-blue-100">This authority follows the stable Project-Agent IDs across every provider/model change and across profile instruction, tool, resource, memory, and default edits. Disabling blocks the profile but preserves the association; re-enabling the same ID restores it through a fresh runtime without another PIN. Only explicit revocation, exact-profile allowlist exclusion, incompatible privacy, or subject deletion ends it, and revocation cannot undo completed effects.</div><div className="rounded border border-amber-900/60 bg-amber-950/20 p-3"><div className="text-xs font-semibold uppercase text-amber-300">Consequences</div><ul className="mt-2 list-disc space-y-2 pl-5 text-xs leading-relaxed text-amber-100">{challenge.consequences.map((line) => <li key={line}>{line}</li>)}</ul></div>{challenge.affectedRuntimes.length > 0 && <div className="text-xs text-neutral-400">Affected idle runtimes: {challenge.affectedRuntimes.map((runtime) => `${runtime.runtimeId} (${runtime.status})`).join(", ")}</div>}</div><form autoComplete="off" onSubmit={onSubmit} className="border-t border-neutral-800 p-4"><label htmlFor="workspace-capability-pin" className="text-xs font-semibold text-neutral-300">8-digit identity PIN</label><p className="mt-1 text-xs text-neutral-500">Read once from this field, cleared immediately, and sent in one non-retrying no-store request.</p><div className="mt-3 flex flex-col gap-2 sm:flex-row"><input ref={pinRef} id="workspace-capability-pin" type="password" inputMode="numeric" pattern="[0-9]{8}" maxLength={8} defaultValue="" onInput={(event) => { event.currentTarget.value = event.currentTarget.value.replace(/\D/g, "").slice(0, 8); }} autoComplete="off" autoCapitalize="off" spellCheck={false} autoFocus className="min-w-0 flex-1 rounded border border-neutral-700 bg-neutral-900 px-3 py-2 tracking-widest text-neutral-100 outline-none focus:border-red-500" /><button type="submit" disabled={committing} className="rounded bg-red-700 px-3 py-2 text-xs font-bold text-white hover:bg-red-600 disabled:opacity-40">{committing ? "Submitting…" : "Associate capability"}</button><button type="button" onClick={onCancel} disabled={committing} className="rounded border border-neutral-700 px-3 py-2 text-xs font-semibold text-neutral-300 hover:bg-neutral-800 disabled:opacity-40">Cancel</button></div></form></div></div>;
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => pinRef.current?.focus());
+    const containFocus = (event: FocusEvent) => {
+      if (dialogRef.current?.contains(event.target as Node)) return;
+      pinRef.current?.focus();
+    };
+    document.addEventListener("focusin", containFocus);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("focusin", containFocus);
+    };
+  }, [pinRef]);
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape" && !committing) {
+      event.preventDefault();
+      event.stopPropagation();
+      onCancel();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = [...(dialogRef.current?.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])") ?? [])]
+      .filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true");
+    if (focusable.length === 0) { event.preventDefault(); return; }
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
+    const active = document.activeElement;
+    if (!dialogRef.current?.contains(active)) {
+      event.preventDefault();
+      first.focus();
+    } else if (event.shiftKey && active === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && active === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  return <div ref={dialogRef} className="fixed inset-0 z-[70] flex items-center justify-center bg-black/80 p-3" role="dialog" aria-modal="true" aria-labelledby="capability-challenge-title" onKeyDown={handleKeyDown}><div className="flex max-h-[92dvh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-red-800 bg-neutral-950 shadow-2xl"><header className="border-b border-red-900/60 bg-red-950/25 px-4 py-3"><div className="text-[10px] font-bold uppercase tracking-widest text-red-300">Project-Agent capability association · PIN required</div><h2 id="capability-challenge-title" className="mt-1 text-base font-semibold text-neutral-100">{challenge.summary}</h2></header><div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4"><dl className="grid gap-x-4 gap-y-2 rounded border border-neutral-800 bg-neutral-900/50 p-3 text-xs sm:grid-cols-[10rem_minmax(0,1fr)]"><dt className="text-neutral-500">Capability ID</dt><dd className="break-all font-mono text-neutral-100">{challenge.capabilityId}</dd><dt className="text-neutral-500">Project</dt><dd className="break-all text-neutral-100">{challenge.projectLabel} · <code>{challenge.projectId}</code>{challenge.projectCwd ? <> · <code>{challenge.projectCwd}</code></> : null}</dd><dt className="text-neutral-500">Agent profile</dt><dd className="break-all text-neutral-100">{challenge.agentProfileLabel} · <code>{challenge.agentProfileId}</code></dd>{challenge.privacyMode && <><dt className="text-neutral-500">Project policy</dt><dd className="text-neutral-100">{challenge.privacyMode} · exact profile {challenge.profileAllowed === false ? "not allowed" : "allowed"}</dd></>}{challenge.profileEnabled !== undefined && <><dt className="text-neutral-500">Profile state</dt><dd className="text-neutral-100">{challenge.profileEnabled ? "enabled" : "disabled"}</dd></>}<dt className="text-neutral-500">Association revision</dt><dd className="font-mono text-neutral-100">{challenge.association.before?.revision ?? "new"} → {challenge.association.after.revision}</dd>{challenge.previewStateDigest && <><dt className="text-neutral-500">Preview state digest</dt><dd className="break-all font-mono text-neutral-300">{challenge.previewStateDigest}</dd></>}<dt className="text-neutral-500">Operation digest</dt><dd className="break-all font-mono text-neutral-300">{challenge.operationDigest}</dd><dt className="text-neutral-500">Expires</dt><dd className="text-neutral-100">{new Date(challenge.expiresAt).toLocaleString()}</dd></dl><div className="rounded border border-blue-900/60 bg-blue-950/20 p-3 text-xs leading-relaxed text-blue-100">This authority follows the stable Project-Agent IDs across every provider/model change and across profile instruction, tool, resource, memory, and default edits. Disabling blocks the profile but preserves the association; re-enabling the same ID restores it through a fresh runtime without another PIN. Only explicit revocation, exact-profile allowlist exclusion, incompatible privacy, or subject deletion ends it, and revocation cannot undo completed effects.</div><div className="rounded border border-amber-900/60 bg-amber-950/20 p-3"><div className="text-xs font-semibold uppercase text-amber-300">Consequences</div><ul className="mt-2 list-disc space-y-2 pl-5 text-xs leading-relaxed text-amber-100">{challenge.consequences.map((line) => <li key={line}>{line}</li>)}</ul></div>{challenge.affectedRuntimes.length > 0 && <div className="text-xs text-neutral-400">Affected idle runtimes: {challenge.affectedRuntimes.map((runtime) => `${runtime.runtimeId} (${runtime.status})`).join(", ")}</div>}</div><form autoComplete="off" onSubmit={onSubmit} className="border-t border-neutral-800 p-4"><label htmlFor="workspace-capability-pin" className="text-xs font-semibold text-neutral-300">8-digit identity PIN</label><p className="mt-1 text-xs text-neutral-500">Read once from this field, cleared immediately, and sent in one non-retrying no-store request.</p><div className="mt-3 flex flex-col gap-2 sm:flex-row"><input ref={pinRef} id="workspace-capability-pin" type="password" inputMode="numeric" pattern="[0-9]{8}" maxLength={8} defaultValue="" onInput={(event) => { event.currentTarget.value = event.currentTarget.value.replace(/\D/g, "").slice(0, 8); }} autoComplete="off" autoCapitalize="off" spellCheck={false} autoFocus className="min-w-0 flex-1 rounded border border-neutral-700 bg-neutral-900 px-3 py-2 tracking-widest text-neutral-100 outline-none focus:border-red-500" /><button type="submit" disabled={committing} className="rounded bg-red-700 px-3 py-2 text-xs font-bold text-white hover:bg-red-600 disabled:opacity-40">{committing ? "Submitting…" : "Associate capability"}</button><button type="button" onClick={onCancel} disabled={committing} className="rounded border border-neutral-700 px-3 py-2 text-xs font-semibold text-neutral-300 hover:bg-neutral-800 disabled:opacity-40">Cancel</button></div></form></div></div>;
 }
