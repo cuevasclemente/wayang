@@ -2249,14 +2249,13 @@ export async function createPiSession(
             try { assertCreationCurrent(); return true; } catch { return false; }
           },
         });
-        try {
-          pendingProtectedBrowserRuntime = await selectedProtectedBrowserFactory(protectedBinding);
-        } finally {
-          const pendingAuthority = pendingInteractiveBrowserAuthority.get(id);
-          if (pendingAuthority && exactProtectedBrowserBindingEqual(pendingAuthority.binding, protectedBinding)) {
-            pendingInteractiveBrowserAuthority.delete(id);
-          }
-        }
+        // The exact pending witness must remain live through every factory,
+        // tool-catalog, extension, and final pre-publication check. Standard
+        // runtimes reauthorize through this resolver, and no live handle exists
+        // until sessions.set() below. Removing the witness when the factory
+        // merely returns makes the mandatory next preflight revoke every fresh
+        // Standard browser runtime before it can publish.
+        pendingProtectedBrowserRuntime = await selectedProtectedBrowserFactory(protectedBinding);
         assertCreationCurrent();
         if (pendingProtectedBrowserRuntime) {
           assertInteractiveBrowserToolCatalog(pendingProtectedBrowserRuntime);
@@ -2267,6 +2266,10 @@ export async function createPiSession(
         if (!pendingProtectedBrowserRuntime || !returnedBinding
           || pendingProtectedBrowserRuntime.kind !== expectedRuntimeKind
           || !exactProtectedBrowserBindingEqual(returnedBinding, protectedBinding)) {
+          const pendingAuthority = pendingInteractiveBrowserAuthority.get(id);
+          if (pendingAuthority && exactProtectedBrowserBindingEqual(pendingAuthority.binding, protectedBinding)) {
+            pendingInteractiveBrowserAuthority.delete(id);
+          }
           await pendingProtectedBrowserRuntime?.revokeAuthority("project_or_profile_denied").catch(() => undefined);
           pendingProtectedBrowserRuntime = undefined;
           throw new WorkspaceStoreError("Protected browser factory returned a non-exact runtime lease", 409);
@@ -2736,6 +2739,9 @@ export async function createPiSession(
     runtimeOptions.testHooks?.onPrivilegedEffect?.("handle_publication");
     assertCreationCurrent();
     sessions.set(id, handle);
+    // Publication transfers browser authorization from the exact pending
+    // witness to this live handle. No await is permitted across the transfer.
+    pendingInteractiveBrowserAuthority.delete(id);
     // Publish exact object ownership before advertising the runtime. The sudo
     // broker fails closed on an unmapped manager whenever this map exists, so
     // colliding legacy ID/file keys cannot redirect an approval to another
@@ -2753,17 +2759,26 @@ export async function createPiSession(
     pendingProtectedBrowserRuntime = undefined;
     pendingProtectedAutomationRuntime = undefined;
     pendingFileAudioExperimentRuntime = undefined;
-    runtimeEvents.emit("event", {
-      type: "runtime_state_changed",
-      sessionId: id,
-      bashMode: handle.bashMode,
-    } satisfies PiSessionRuntimeEvent);
-    ensureIdleCleanupTimer();
+    // The live handle is now the committed authority owner. Observer/timer
+    // failures must not reject creation while leaving that published handle
+    // live behind a reported startup failure.
+    try {
+      runtimeEvents.emit("event", {
+        type: "runtime_state_changed",
+        sessionId: id,
+        bashMode: handle.bashMode,
+      } satisfies PiSessionRuntimeEvent);
+    } catch {
+      console.warn("[pi-bridge] Runtime state listener failed after session publication");
+    }
+    try { ensureIdleCleanupTimer(); }
+    catch { console.warn("[pi-bridge] Idle cleanup timer failed after session publication"); }
     return handle;
   })().catch(async (error) => {
     // A stale creation owns all of its partial objects until this cleanup has
     // finished. Denial cleanup waits on this promise and therefore cannot race
     // a second destroy/publication path.
+    pendingInteractiveBrowserAuthority.delete(id);
     await closeUnpublishedAgentSession(pendingAgentSession);
     pendingAgentSession = undefined;
     await pendingRestrictedMcpRuntime?.close().catch(() => undefined);

@@ -4,7 +4,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { Type } from "@earendil-works/pi-ai";
+import { SessionManager, defineTool } from "@earendil-works/pi-coding-agent";
 import {
   abortInteractiveTurn,
   appendStreamingMessageToHistory,
@@ -35,6 +36,7 @@ import {
   previewSessionAgentSwitch,
   protectedBrowserIdleRetentionIsRequired,
   reconcilePendingAgentSwitch,
+  resolveInteractiveBrowserAuthority,
   resolveInteractiveTurn,
   sendBrowserMessageTurn,
   settleInteractiveTurns,
@@ -56,6 +58,7 @@ import { createHostBashOperations } from "./host-execution.js";
 import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability, revokeWorkspaceCapabilityAssociation } from "./workspace-capabilities.js";
 import type { PendingAgentSwitch } from "./workspace-types.js";
 import type { ProtectedBrowserToolRuntime } from "./browser/protected-tools.js";
+import type { ProtectedBrowserBinding } from "./browser/types.js";
 import { getActionApprovalBridge } from "./action-approval-bridge.js";
 import { setAutoTitleProviderForTests } from "./session-title-service.js";
 import { extractCompletedTitleExchanges } from "./session-title-policy.js";
@@ -602,6 +605,129 @@ test("starting runtime revocation fences privileged loading and publication, whi
     close();
     if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
     else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pending interactive-browser authority survives through exact Standard runtime publication", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-standard-browser-publication-"));
+  const cwd = path.join(dir, "project");
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
+  fs.mkdirSync(cwd, { recursive: true });
+  process.env.WAYANG_DATA_DIR = path.join(dir, "data");
+  process.env.ANTHROPIC_API_KEY = "synthetic-test-key";
+  init();
+  const profile = createAgentProfile({ name: "Standard browser publication", resource_mode: "project_only" });
+  const project = createProject({
+    cwd,
+    name: "Standard browser publication",
+    default_agent_profile_id: profile.id,
+    access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [profile.id] },
+  });
+  commitWorkspaceCapabilityActivation({
+    capability_id: "wayang.standard-browser.v1",
+    project_id: project.id,
+    agent_profile_id: profile.id,
+    operation_digest: "c".repeat(64),
+  });
+  const row = createSession(cwd, {
+    provider: "anthropic",
+    model: "claude-sonnet-4-5",
+    agentProfileId: profile.id,
+  });
+  let factorySawPendingAuthority = false;
+  let publishedBinding: Readonly<ProtectedBrowserBinding> | null = null;
+  let runtimeRevoked = false;
+  const tool = defineTool({
+    name: "browser_publication_probe",
+    label: "Browser publication probe",
+    description: "Synthetic browser publication lifecycle probe.",
+    parameters: Type.Object({}, { additionalProperties: false }),
+    async execute() { return { content: [{ type: "text" as const, text: "ok" }], details: {} }; },
+  });
+  let publicationEventAttempted = false;
+  const removeThrowingListener = onPiSessionRuntimeEvent((event) => {
+    if (event.type === "runtime_state_changed" && event.sessionId === row.id) {
+      publicationEventAttempted = true;
+      throw new Error("synthetic post-publication observer failure");
+    }
+  });
+
+  try {
+    const handle = await createPiSession(row.id, cwd, row.provider, row.model, null, {
+      protectedBrowserFactory(binding) {
+        publishedBinding = binding;
+        factorySawPendingAuthority = resolveInteractiveBrowserAuthority(binding) !== null;
+        const runtime = {
+          kind: "standard" as const,
+          binding,
+          tools: Object.freeze([tool]),
+          toolForName: (name: string) => name === tool.name ? tool : undefined,
+          preflight: () => !runtimeRevoked && resolveInteractiveBrowserAuthority(binding)
+            ? { allowed: true as const }
+            : { allowed: false as const, reason: "synthetic authority unavailable" },
+          async detachAgentLease() { runtimeRevoked = true; },
+          async closeSessionWorkspaces() { runtimeRevoked = true; },
+          async revokeAuthority() { runtimeRevoked = true; },
+        };
+        return runtime;
+      },
+    });
+    removeThrowingListener();
+    assert.equal(publicationEventAttempted, true);
+    assert.equal(factorySawPendingAuthority, true, "the exact pending witness authorizes factory construction");
+    assert.equal(handle.protectedBrowserRuntime?.preflight().allowed, true,
+      "the published handle takes over authority without a revoked gap");
+    assert.equal((handle.session as any)._toolRegistry?.has?.(tool.name), true,
+      "the validated Standard browser tool publishes with the fresh runtime");
+    await destroyPiSession(row.id);
+    assert.ok(publishedBinding);
+    assert.equal(resolveInteractiveBrowserAuthority(publishedBinding), null,
+      "destroyed live authority cannot fall back to a stale pending witness");
+
+    const invalidRow = createSession(cwd, {
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      agentProfileId: profile.id,
+    });
+    const invalidCleanupEntered = deferred();
+    const invalidCleanupRelease = deferred();
+    let invalidBinding: Readonly<ProtectedBrowserBinding> | null = null;
+    const invalidCreation = createPiSession(invalidRow.id, cwd, invalidRow.provider, invalidRow.model, null, {
+      protectedBrowserFactory(binding) {
+        invalidBinding = binding;
+        return {
+          kind: "protected" as const,
+          binding,
+          tools: Object.freeze([tool]),
+          toolForName: (name: string) => name === tool.name ? tool : undefined,
+          preflight: () => resolveInteractiveBrowserAuthority(binding)
+            ? { allowed: true as const }
+            : { allowed: false as const, reason: "synthetic authority unavailable" },
+          async detachAgentLease() {},
+          async closeSessionWorkspaces() {},
+          async revokeAuthority() {
+            invalidCleanupEntered.resolve();
+            await invalidCleanupRelease.promise;
+          },
+        };
+      },
+    });
+    await invalidCleanupEntered.promise;
+    assert.ok(invalidBinding);
+    assert.equal(resolveInteractiveBrowserAuthority(invalidBinding), null,
+      "invalid runtime cleanup removes pending authority before awaiting teardown");
+    invalidCleanupRelease.resolve();
+    await assert.rejects(invalidCreation, /factory returned a non-exact runtime lease/);
+  } finally {
+    removeThrowingListener();
+    await destroyPiSession(row.id).catch(() => undefined);
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
