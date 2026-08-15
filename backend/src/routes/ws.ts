@@ -113,6 +113,7 @@ import type {
 import { authorizeProjectAction } from "../policy.js";
 import type { AuthService } from "../auth/service.js";
 import { prepareAttachments } from "../attachments.js";
+import { logSessionRuntimeStartFailure } from "../session-runtime-logging.js";
 
 export const router = Router();
 
@@ -978,13 +979,19 @@ async function getOrCreatePiSession(id: string): Promise<void> {
   const existing = getPiSession(id);
   if (existing) return;
 
-  const handle = await createPiSession(
-    id,
-    session.cwd,
-    session.provider || null,
-    session.model || null,
-    session.pi_session_file,
-  );
+  let handle: PiSessionHandle;
+  try {
+    handle = await createPiSession(
+      id,
+      session.cwd,
+      session.provider || null,
+      session.model || null,
+      session.pi_session_file,
+    );
+  } catch (error) {
+    logSessionRuntimeStartFailure({ source: "websocket", sessionId: id, error });
+    throw error;
+  }
   ensureInteractiveCommandGuardEnabled(id, "websocket-created pi session");
   if (handle.sessionFile && !session.pi_session_file) updatePiSessionFile(id, handle.sessionFile);
 }

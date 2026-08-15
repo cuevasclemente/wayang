@@ -14,6 +14,7 @@ import {
   classifyScheduledPromptResult,
   cleanupPiSessionCapabilityDenial,
   closePiSessionAuthorities,
+  composeRuntimeActiveTools,
   createPiSession,
   destroyPiSession,
   fileAudioExperimentRuntimeIsEligible,
@@ -74,6 +75,14 @@ function syntheticProtectedRuntime(
       : { allowed: true as const },
   } as Pick<ProtectedBrowserToolRuntime, "browser" | "preflight">;
 }
+
+test("runtime companion tools preserve unrestricted policy and only widen explicit lists", () => {
+  assert.equal(composeRuntimeActiveTools(undefined, ["browser_status"]), undefined);
+  assert.deepEqual(
+    composeRuntimeActiveTools(["read", "bash"], ["browser_status", "bash"]),
+    ["read", "bash", "browser_status"],
+  );
+});
 
 test("file-audio experiment eligibility is disabled-by-default and exact Wren Standard interactive only", () => {
   const eligible = {
@@ -631,6 +640,18 @@ test("pending interactive-browser authority survives through exact Standard runt
     agent_profile_id: profile.id,
     operation_digest: "c".repeat(64),
   });
+  commitWorkspaceCapabilityActivation({
+    capability_id: "wayang.standard-resources.v1",
+    project_id: project.id,
+    agent_profile_id: profile.id,
+    operation_digest: "d".repeat(64),
+  });
+  commitWorkspaceCapabilityActivation({
+    capability_id: "wayang.host-execution.v1",
+    project_id: project.id,
+    agent_profile_id: profile.id,
+    operation_digest: "e".repeat(64),
+  });
   const row = createSession(cwd, {
     provider: "anthropic",
     model: "claude-sonnet-4-5",
@@ -681,6 +702,14 @@ test("pending interactive-browser authority survives through exact Standard runt
       "the published handle takes over authority without a revoked gap");
     assert.equal((handle.session as any)._toolRegistry?.has?.(tool.name), true,
       "the validated Standard browser tool publishes with the fresh runtime");
+    assert.equal(handle.bashMode, "host");
+    assert.ok(handle.trustedHostBashTool, "browser companion activation must preserve exact trusted host bash");
+    assert.equal((handle.session as any)._toolDefinitions?.get?.("bash")?.definition,
+      handle.trustedHostBashTool?.definition);
+    const unrestrictedActiveTools = new Set(handle.session.getActiveToolNames());
+    for (const name of ["read", "edit", "write", "bash", tool.name]) {
+      assert.equal(unrestrictedActiveTools.has(name), true, `unrestricted active tool ${name}`);
+    }
     await destroyPiSession(row.id);
     assert.ok(publishedBinding);
     assert.equal(resolveInteractiveBrowserAuthority(publishedBinding), null,

@@ -2019,6 +2019,16 @@ export function piSessionHandleRequiresFreshRuntime(
   catch { return true; }
 }
 
+/** Preserve the SDK's intentional unrestricted `undefined` policy. */
+export function composeRuntimeActiveTools(
+  configured: readonly string[] | undefined,
+  companions: readonly string[],
+): string[] | undefined {
+  return configured === undefined
+    ? undefined
+    : [...new Set([...configured, ...companions])];
+}
+
 export async function createPiSession(
   id: string,
   cwd: string,
@@ -2524,6 +2534,20 @@ export async function createPiSession(
       ? createHostBashToolDefinition(cwd, { authorizeExecution: reauthorizeHostExecution })
       : undefined;
 
+    const configuredActiveTools = includeRestrictedMcpActiveTool(runtimeResources.tools, pendingRestrictedMcpRuntime);
+    const companionActiveTools = [
+      ...pendingProtectedBrowserTools.map((tool) => tool.name),
+      ...(pendingProtectedAutomationRuntime ? [PROTECTED_AUTOMATION_TOOL_NAME] : []),
+      ...(pendingFileAudioExperimentRuntime ? [FILE_AUDIO_EXPERIMENT_TOOL_NAME] : []),
+    ];
+    // `undefined` is an intentional SDK policy: preserve Pi's normal built-ins,
+    // configured defaults, and reviewed extension tools. Converting it to an
+    // explicit companion-only allowlist filters out the exact trusted host
+    // bash definition (and every other normal tool) during runtime creation.
+    // Restricted profiles already carry an explicit reviewed list, so only
+    // that case is widened by the exact backend-owned companion names.
+    const activeTools = composeRuntimeActiveTools(configuredActiveTools, companionActiveTools);
+
     assertCreationCurrent();
     assertPendingBrowserCatalogCurrent();
     runtimeOptions.testHooks?.onPrivilegedEffect?.("agent_session");
@@ -2536,14 +2560,7 @@ export async function createPiSession(
       sessionManager,
       settingsManager,
       resourceLoader: runtimeResources.resourceLoader,
-      tools: pendingProtectedBrowserRuntime || pendingProtectedAutomationRuntime || pendingFileAudioExperimentRuntime
-        ? [
-            ...(includeRestrictedMcpActiveTool(runtimeResources.tools, pendingRestrictedMcpRuntime) ?? []),
-            ...pendingProtectedBrowserTools.map((tool) => tool.name),
-            ...(pendingProtectedAutomationRuntime ? [PROTECTED_AUTOMATION_TOOL_NAME] : []),
-            ...(pendingFileAudioExperimentRuntime ? [FILE_AUDIO_EXPERIMENT_TOOL_NAME] : []),
-          ]
-        : includeRestrictedMcpActiveTool(runtimeResources.tools, pendingRestrictedMcpRuntime),
+      tools: activeTools,
       excludeTools: excludeTools.length > 0 ? [...new Set(excludeTools)] : undefined,
       customTools: createWayangSessionCustomTools({
         webSessionId: id,
