@@ -76,6 +76,20 @@ function directPaste(event: React.ClipboardEvent, onPasteText?: (text: string) =
   onPasteText(text);
 }
 
+function cdpViewerCloseMessage(event: CloseEvent, connectionLabel: string): string {
+  const messages: Record<string, string> = {
+    "viewer input invalid": "Viewer disconnected because an input message was rejected.",
+    "viewer input overloaded": "Viewer disconnected because the input queue was overloaded.",
+    "input authorization failed": "Input authorization failed. The viewer was disconnected.",
+    "input dispatch failed": "Browser input dispatch failed. The viewer was disconnected.",
+    "input attestation failed": "Browser input safety verification failed. The viewer was disconnected.",
+    "viewer authorization failed": "Viewer authorization failed. The viewer was disconnected.",
+    "input transport failed": "Input transport failed. The viewer was disconnected.",
+    "viewer closed": "Viewer disconnected.",
+  };
+  return messages[event.reason] || `${connectionLabel} viewer disconnected.`;
+}
+
 function VncBrowserViewer({ sessionId, projectCwd, running, onPasteText, vncTakeoverRequest = 0, vncTakeoverConsumed = 0, onVncTakeoverConsumed }: BrowserViewerProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const rfbRef = useRef<RFB | null>(null);
@@ -180,6 +194,8 @@ export function CdpScreencastViewer({
   const [error, setError] = useState<string | null>(null);
   const [pasteCaptureOpen, setPasteCaptureOpen] = useState(false);
   const [pasteNotice, setPasteNotice] = useState<string | null>(null);
+  const [retryGeneration, setRetryGeneration] = useState(0);
+  const [retrying, setRetrying] = useState(false);
 
   useEffect(() => { onStatusRef.current = onStatus; }, [onStatus]);
   useEffect(() => { onPageChangeRef.current = onPageChange; }, [onPageChange]);
@@ -197,10 +213,17 @@ export function CdpScreencastViewer({
     return true;
   }, []);
 
+  const sendInput = useCallback((payload: Record<string, unknown>): boolean => {
+    if (send(payload)) return true;
+    setConnected(false);
+    setError("Input transport unavailable. Retry the viewer.");
+    return false;
+  }, [send]);
+
   const handlePasteText = useCallback((text: string) => {
     if (onPasteText) { onPasteText(text); return; }
-    if (pasteThroughViewer) send({ type: "paste", text });
-  }, [onPasteText, pasteThroughViewer, send]);
+    if (pasteThroughViewer) sendInput({ type: "paste", text });
+  }, [onPasteText, pasteThroughViewer, sendInput]);
 
   const submitCapturedPaste = useCallback((text: string) => {
     if (!text) return;
@@ -209,10 +232,10 @@ export function CdpScreencastViewer({
       setPasteNotice("Clipboard text exceeds the protected preparation paste limit.");
       return;
     }
-    setPasteNotice(send({ type: "paste", text })
+    setPasteNotice(sendInput({ type: "paste", text })
       ? "Clipboard text was sent to the focused browser field."
       : "The preparation viewer is not connected.");
-  }, [send]);
+  }, [sendInput]);
 
   const readSystemClipboard = useCallback(async () => {
     if (!navigator.clipboard?.readText) {
@@ -286,15 +309,19 @@ export function CdpScreencastViewer({
 
     ws.onopen = () => {
       if (wsRef.current !== ws) return;
+      setError(null);
+      setRetrying(false);
       if (!requireReadyHandshake) {
         readyRef.current = true;
         setConnected(true);
       }
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (wsRef.current !== ws) return;
       readyRef.current = false;
       setConnected(false);
+      setRetrying(false);
+      setError(cdpViewerCloseMessage(event, connectionLabel));
       void canRetryAuthenticatedTransport();
     };
     ws.onerror = () => {
@@ -370,7 +397,7 @@ export function CdpScreencastViewer({
       }
       presentingRef.current = false;
     };
-  }, [websocketUrl, running, presentFrame, connectionLabel, requireReadyHandshake]);
+  }, [websocketUrl, running, presentFrame, connectionLabel, requireReadyHandshake, retryGeneration]);
 
   useEffect(() => () => {
     if (moveAnimationRef.current !== null) window.cancelAnimationFrame(moveAnimationRef.current);
@@ -384,7 +411,7 @@ export function CdpScreencastViewer({
     }
     const payload = moveRef.current;
     moveRef.current = null;
-    if (payload) send(payload);
+    if (payload) sendInput(payload);
   };
 
   const toBrowserCoordinates = (clientX: number, clientY: number): { x: number; y: number } | null => {
@@ -419,7 +446,7 @@ export function CdpScreencastViewer({
     containerRef.current?.focus();
     event.currentTarget.setPointerCapture(event.pointerId);
     flushMove();
-    send(payload);
+    sendInput(payload);
   };
 
   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -431,7 +458,7 @@ export function CdpScreencastViewer({
       moveAnimationRef.current = null;
       const latest = moveRef.current;
       moveRef.current = null;
-      if (latest) send(latest);
+      if (latest) sendInput(latest);
     });
   };
 
@@ -439,7 +466,7 @@ export function CdpScreencastViewer({
     const payload = pointerPayload(event, "up");
     if (!payload) return;
     flushMove();
-    send(payload);
+    sendInput(payload);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   };
 
@@ -461,14 +488,14 @@ export function CdpScreencastViewer({
       wheelAnimationRef.current = null;
       const payload = wheelRef.current;
       wheelRef.current = null;
-      if (payload) send(payload);
+      if (payload) sendInput(payload);
     });
   };
 
   const handleKeyDown = (event: React.KeyboardEvent) => {
     if (event.key === "F5") return;
     event.preventDefault();
-    send({
+    sendInput({
       type: "key",
       event: "down",
       key: event.key,
@@ -482,7 +509,7 @@ export function CdpScreencastViewer({
 
   const handleKeyUp = (event: React.KeyboardEvent) => {
     event.preventDefault();
-    send({
+    sendInput({
       type: "key",
       event: "up",
       key: event.key,
@@ -494,10 +521,21 @@ export function CdpScreencastViewer({
     });
   };
 
+  const retryViewer = useCallback(async () => {
+    if (retrying || !running || !websocketUrl) return;
+    setRetrying(true);
+    if (!await canRetryAuthenticatedTransport()) {
+      setRetrying(false);
+      return;
+    }
+    setError(null);
+    setRetryGeneration((generation) => generation + 1);
+  }, [retrying, running, websocketUrl]);
+
   return (
     <div data-testid={testId} className="flex h-full min-h-0 flex-col bg-black">
       <div className="flex shrink-0 items-center justify-between gap-3 border-b border-neutral-800 px-3 py-1.5 text-[11px] text-neutral-400">
-        <span>{connected ? `${connectionLabel} connected` : `${connectionLabel} connecting…`}</span>
+        <span>{connected ? `${connectionLabel} connected` : error ? `${connectionLabel} disconnected` : `${connectionLabel} connecting…`}</span>
         <div className="flex min-w-0 items-center gap-2">
           <span className="hidden truncate sm:block">Interactive CDP page view. Click inside to focus.</span>
           {pasteThroughViewer && (
@@ -540,10 +578,11 @@ export function CdpScreencastViewer({
         </div>
       )}
       {pasteNotice && <div className="shrink-0 border-b border-sky-900/50 bg-sky-950/30 px-3 py-2 text-xs text-sky-100">{pasteNotice}</div>}
-      {error && <div className="shrink-0 border-b border-red-900/50 bg-red-950/40 px-3 py-2 text-xs text-red-200">{error}</div>}
+      {error && <div role="alert" className="flex shrink-0 items-center justify-between gap-3 border-b border-red-900/50 bg-red-950/40 px-3 py-2 text-xs text-red-200"><span>{error}</span><button type="button" onClick={() => void retryViewer()} disabled={retrying || !running || !websocketUrl} className="shrink-0 rounded border border-red-700 px-2 py-1 font-medium text-red-100 hover:bg-red-900/50 disabled:opacity-40">{retrying ? "Retrying…" : "Retry viewer"}</button></div>}
       <div
         ref={containerRef}
-        tabIndex={0}
+        tabIndex={connected ? 0 : -1}
+        aria-disabled={!connected}
         className="relative min-h-0 flex-1 touch-none overflow-hidden outline-none focus:ring-2 focus:ring-inset focus:ring-sky-500/60"
         onPointerDown={handlePointerDown}
         onPointerUp={handlePointerUp}
@@ -563,6 +602,11 @@ export function CdpScreencastViewer({
         {!hasFrame && (
           <div className="absolute inset-0 flex items-center justify-center text-sm text-neutral-500">
             Waiting for browser frames…
+          </div>
+        )}
+        {!connected && hasFrame && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/65 px-6 text-center text-sm text-neutral-100" role="status">
+            Viewer disconnected. The retained frame is not interactive; retry the viewer to continue.
           </div>
         )}
       </div>

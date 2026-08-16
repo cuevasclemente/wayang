@@ -550,17 +550,30 @@ export class StandardBrowserProfileHost {
   async ownerOpenTab(sourceSessionId: string, workspaceGeneration: string, url: string, authorize: () => void | Promise<void>): Promise<StandardBrowserWorkspacePublicState> {
     if (url !== "about:blank" && !isProtectedBrowserAllowedTopLevelUrl(url)) throw new Error("Standard browser tab requires an absolute HTTPS URL");
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    const controlGeneration = workspace.controlGeneration;
+    const controlMode = workspace.controlMode;
+    const assertHumanEpoch = () => {
+      this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+      if (workspace.controlTransition || workspace.controlMode !== controlMode || workspace.controlMode === "agent"
+        || workspace.controlGeneration !== controlGeneration) throw new Error("Standard browser tab control changed");
+    };
     return this.queueWorkspace(workspace, async () => {
-      if (workspace.controlMode === "agent") throw new Error("Standard browser tab changes require human control");
+      assertHumanEpoch();
       if (this.workspaceHasCredentialProtection(workspace)) throw new Error("Standard browser credential protection blocks tab changes");
+      await this.closeWorkspaceViewers(sourceSessionId);
+      assertHumanEpoch();
       await this.ensureStartedAuthorized(authorize);
+      assertHumanEpoch();
       const target = await this.backend.createTarget("about:blank");
       await authorize();
+      assertHumanEpoch();
       const record = this.adoptTarget(workspace, target);
       workspace.activeTargetId = record.rawId;
       if (url !== "about:blank") {
-        try { await this.backend.execute(record.rawId, { kind: "navigate", url }, async () => { await authorize(); }); }
-        catch (error) {
+        try {
+          await this.backend.execute(record.rawId, { kind: "navigate", url }, async () => { await authorize(); assertHumanEpoch(); });
+          assertHumanEpoch();
+        } catch (error) {
           this.cancelTargetDownloads(record.rawId);
           this.targetOwners.delete(record.rawId);
           workspace.targets.delete(record.rawId);
@@ -575,11 +588,20 @@ export class StandardBrowserProfileHost {
 
   async ownerSelectTab(sourceSessionId: string, workspaceGeneration: string, handle: string): Promise<StandardBrowserWorkspacePublicState> {
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    const controlGeneration = workspace.controlGeneration;
+    const controlMode = workspace.controlMode;
+    const assertHumanEpoch = () => {
+      this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+      if (workspace.controlTransition || workspace.controlMode !== controlMode || workspace.controlMode === "agent"
+        || workspace.controlGeneration !== controlGeneration) throw new Error("Standard browser tab control changed");
+    };
     return this.queueWorkspace(workspace, async () => {
-      if (workspace.controlMode === "agent") throw new Error("Standard browser tab changes require human control");
+      assertHumanEpoch();
       if (this.workspaceHasCredentialProtection(workspace)) throw new Error("Standard browser credential protection blocks tab changes");
       const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
       if (!target) throw new Error("Standard browser tab choice is stale");
+      await this.closeWorkspaceViewers(sourceSessionId);
+      assertHumanEpoch();
       workspace.activeTargetId = target.rawId;
       workspace.lastActivityAt = Date.now();
       return this.ownerPublicState(sourceSessionId, workspaceGeneration);
@@ -588,10 +610,19 @@ export class StandardBrowserProfileHost {
 
   async ownerCloseTab(sourceSessionId: string, workspaceGeneration: string, handle: string): Promise<StandardBrowserWorkspacePublicState> {
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    const controlGeneration = workspace.controlGeneration;
+    const controlMode = workspace.controlMode;
+    const assertHumanEpoch = () => {
+      this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+      if (workspace.controlTransition || workspace.controlMode !== controlMode || workspace.controlMode === "agent"
+        || workspace.controlGeneration !== controlGeneration) throw new Error("Standard browser tab control changed");
+    };
     return this.queueWorkspace(workspace, async () => {
-      if (workspace.controlMode === "agent") throw new Error("Standard browser tab changes require human control");
+      assertHumanEpoch();
       const target = [...workspace.targets.values()].find((candidate) => candidate.handle === handle);
       if (!target) throw new Error("Standard browser tab choice is stale");
+      await this.closeWorkspaceViewers(sourceSessionId);
+      assertHumanEpoch();
       this.cancelTargetDownloads(target.rawId);
       this.targetOwners.delete(target.rawId);
       workspace.targets.delete(target.rawId);
@@ -605,15 +636,37 @@ export class StandardBrowserProfileHost {
     sourceSessionId: string,
     workspaceGeneration: string,
     authorize: () => void | Promise<void>,
-  ): Promise<{ cdp: Pick<CdpConnection, "send" | "on" | "close">; target: ChromeTarget; close(): void }> {
+  ): Promise<{ cdp: Pick<CdpConnection, "send" | "on" | "close">; target: ChromeTarget; close(): void; authorize(): Promise<void> }> {
     const workspace = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
-    if (workspace.controlMode === "agent") throw new Error("Standard browser viewer requires human control");
+    if (!this.viewerControlAvailable(sourceSessionId, workspaceGeneration)) {
+      throw new Error("Standard browser viewer requires stable human control");
+    }
+    const controlGeneration = workspace.controlGeneration;
+    const controlMode = workspace.controlMode;
     const target = await this.ensureActiveTargetAuthorized(workspace, authorize);
+    const assertExactTarget = () => {
+      const current = this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+      const currentTarget = current.targets.get(target.rawId);
+      if (current.controlTransition || current.controlGeneration !== controlGeneration || current.controlMode !== controlMode
+        || current.controlMode === "agent" || current.activeTargetId !== target.rawId
+        || currentTarget?.generation !== target.generation || this.targetOwners.get(target.rawId) !== sourceSessionId) {
+        throw new Error("Standard browser viewer target changed during attachment");
+      }
+    };
+    assertExactTarget();
     if (!this.backend.attachViewer) throw new Error("Standard browser viewer transport is unavailable");
     const attachment = await this.backend.attachViewer(target.rawId);
-    await authorize();
-    this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
-    return attachment;
+    const authorizeAttachment = async () => {
+      await authorize();
+      assertExactTarget();
+    };
+    try {
+      await authorizeAttachment();
+      return { ...attachment, authorize: authorizeAttachment };
+    } catch (error) {
+      attachment.close();
+      throw error;
+    }
   }
 
   private onTargetCreated(target: StandardBrowserBackendTarget): void {
@@ -1012,6 +1065,9 @@ export class StandardBrowserProfileHost {
 
   registerViewer(sourceSessionId: string, workspaceGeneration: string, close: () => Promise<void>): () => void {
     this.exactOwnerWorkspace(sourceSessionId, workspaceGeneration);
+    if (!this.viewerControlAvailable(sourceSessionId, workspaceGeneration)) {
+      throw new Error("Standard browser viewer control is unavailable");
+    }
     let closers = this.viewerClosers.get(sourceSessionId);
     if (!closers) { closers = new Set(); this.viewerClosers.set(sourceSessionId, closers); }
     closers.add(close);

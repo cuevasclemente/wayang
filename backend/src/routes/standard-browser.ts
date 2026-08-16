@@ -2,7 +2,12 @@ import type { IncomingMessage } from "node:http";
 import type { Request, RequestHandler, Response, Router } from "express";
 import express from "express";
 import type { WebSocket } from "ws";
-import { openStandardCdpViewer } from "../browser/standard-viewer.js";
+import {
+  openStandardCdpViewer,
+  StandardViewerInputError,
+  type StandardViewerFailureReason,
+  type StandardViewerObservation,
+} from "../browser/standard-viewer.js";
 import { classifyGenericBrowserTarget } from "../browser/request-auth.js";
 import { openLoopbackVncTransport } from "../browser/vnc-transport.js";
 import type { StandardBrowserRuntimeWorkspace, StandardBrowserProfileHostService } from "../browser/standard-service.js";
@@ -113,18 +118,26 @@ export function createStandardBrowserIntegration(service: StandardBrowserProfile
       const attachment = await workspace.host.ownerAttachActiveViewer(selection.sourceSessionId, selection.workspaceGeneration, authorize);
       const viewer = await openStandardCdpViewer({
         attachment,
-        authorize,
+        authorize: attachment.authorize,
         revoke: () => workspace.host.closeWorkspace(selection.sourceSessionId, "viewer_policy"),
         redact: (value) => workspace.host.redactCredentialMetadata(value),
+        observe: (event) => logStandardViewerObservation(event),
       });
-      const unregister = workspace.host.registerViewer(selection.sourceSessionId, selection.workspaceGeneration, async () => {
-        unregister();
+      let unregister: () => void = () => undefined;
+      try {
+        unregister = workspace.host.registerViewer(selection.sourceSessionId, selection.workspaceGeneration, async () => {
+          unregister();
+          await viewer.close();
+        });
+      } catch (error) {
         await viewer.close();
-      });
+        throw error;
+      }
       return {
         dispatch: (message, binary) => viewer.dispatch(message, binary),
         close: async () => { unregister(); await viewer.close(); },
         onMessage: (listener) => viewer.onMessage(listener),
+        onClose: (listener) => viewer.onClose?.(listener) ?? (() => undefined),
       };
     },
     async credentialStatus(selection) {
@@ -395,32 +408,71 @@ export function createStandardBrowserRouter(integration?: StandardBrowserIntegra
   return router;
 }
 
+function logStandardViewerObservation(event: Readonly<StandardViewerObservation>): void {
+  // Privacy-safe operational telemetry only. Do not add selection/session IDs,
+  // URLs, titles, text/keys, profile paths, screenshots, or raw errors here.
+  console.info("[standard-browser-viewer]", JSON.stringify({ transport: "cdp", ...event }));
+}
+
+function standardViewerClose(reason: unknown): { code: number; message: string } {
+  const value = reason instanceof StandardViewerInputError ? reason.reason : reason;
+  const mapped: Partial<Record<StandardViewerFailureReason, { code: number; message: string }>> = {
+    input_invalid: { code: 1003, message: "viewer input invalid" },
+    input_queue_full: { code: 1013, message: "viewer input overloaded" },
+    input_authorization_failed: { code: 1008, message: "input authorization failed" },
+    input_dispatch_failed: { code: 1011, message: "input dispatch failed" },
+    input_attestation_failed: { code: 1011, message: "input attestation failed" },
+    viewer_authorization_failed: { code: 1008, message: "viewer authorization failed" },
+    viewer_closed: { code: 1000, message: "viewer closed" },
+  };
+  return typeof value === "string" && value in mapped
+    ? mapped[value as StandardViewerFailureReason]!
+    : { code: 1011, message: "input transport failed" };
+}
+
 export function attachSelectedStandardViewer(
   ws: WebSocket,
   selection: StandardBrowserRouteSelection,
   kind: "vnc" | "cdp",
   integration: StandardBrowserIntegration,
 ): void {
-  void integration.openViewer(selection, kind).then((viewer) => {
+  void integration.openViewer(selection, kind).then(async (viewer) => {
     if (!viewer) throw error("Standard browser viewer is unavailable", 409);
+    // The browser may disconnect while Chromium/CDP attachment is still
+    // opening. Do not publish or leak a transport whose owner has gone away.
+    if (ws.readyState !== ws.OPEN) {
+      await viewer.close();
+      return;
+    }
+    const closeSocket = (failure: unknown) => {
+      if (ws.readyState !== ws.OPEN && ws.readyState !== ws.CONNECTING) return;
+      const close = standardViewerClose(failure);
+      ws.close(close.code, close.message);
+    };
+    let viewerClose: Promise<void> | null = null;
+    const closeViewer = () => {
+      viewerClose ??= Promise.resolve(viewer.close()).then(() => undefined);
+      return viewerClose;
+    };
     ws.on("message", (raw, isBinary) => {
       const bytes = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as any);
-      void Promise.resolve(viewer.dispatch(bytes, isBinary)).catch(() => viewer.close());
+      void Promise.resolve(viewer.dispatch(bytes, isBinary)).catch(async (failure) => {
+        closeSocket(failure);
+        await closeViewer();
+      });
     });
-    ws.on("close", () => { void viewer.close(); });
-    ws.on("error", () => { void viewer.close(); });
+    ws.on("close", () => { void closeViewer(); });
+    ws.on("error", () => { void closeViewer(); });
     const unsubscribe = viewer.onMessage((message, isBinary) => {
       if (ws.readyState !== ws.OPEN) return;
       if (ws.bufferedAmount + message.length > 2 * 1024 * 1024) {
-        void viewer.close();
         ws.close(1009, "Standard browser viewer is not draining");
+        void closeViewer();
         return;
       }
       ws.send(message, { binary: isBinary });
     });
-    const unsubscribeClose = viewer.onClose?.(() => {
-      if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) ws.close(1000, "Standard browser controller closed");
-    });
+    const unsubscribeClose = viewer.onClose?.((reason) => closeSocket(reason));
     ws.once("close", unsubscribe);
     if (unsubscribeClose) ws.once("close", unsubscribeClose);
   }).catch(() => ws.close(1008, "Standard browser transport denied"));

@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { expect, test, type Page, type Route, type WebSocketRoute } from "@playwright/test";
 import { createE2eSession, openSessionInUi } from "./helpers/sessions";
 
 type CredentialAvailability = "unavailable" | "locked" | "unlocked";
@@ -131,8 +131,10 @@ async function openMockBrowser(
   const state: BrowserMockState = { controlMode: "agent", credentialAvailability, matchesAvailability };
   const requests: CapturedRequest[] = [];
   const viewerMessages: string[] = [];
+  const viewerSockets: WebSocketRoute[] = [];
   let sendViewerMessage: ((message: Record<string, unknown>) => void) | null = null;
   await page.routeWebSocket(/\/ws\/browser(?:\?|$)/, (socket) => {
+    viewerSockets.push(socket);
     sendViewerMessage = (message) => socket.send(JSON.stringify(message));
     socket.onMessage((message) => {
       if (typeof message === "string") viewerMessages.push(message);
@@ -158,6 +160,8 @@ async function openMockBrowser(
     requests,
     viewerMessages,
     sendViewerMessage: (message: Record<string, unknown>) => sendViewerMessage?.(message),
+    viewerConnectionCount: () => viewerSockets.length,
+    closeViewer: async (code: number, reason: string) => { await viewerSockets.at(-1)?.close({ code, reason }); },
   };
 }
 
@@ -226,6 +230,46 @@ test("Fast page ACKs binary presentation and coalesces pointer and wheel bursts"
   expect(inputs.filter((message) => message.event === "wheel")).toEqual([
     expect.objectContaining({ deltaY: 40 }),
   ]);
+});
+
+test("paused Fast page forwards complete clicks, surfaces input failure, and reconnects cleanly", async ({ page, request }) => {
+  const session = await createE2eSession(request, "e2e fast viewer handoff retry");
+  const mock = await openMockBrowser(page, session.id, session.cwd);
+  await openSessionInUi(page, session);
+  await page.getByRole("button", { name: "Browser", exact: true }).click();
+  await page.getByRole("button", { name: "Pause agent" }).click();
+  await expect(page.getByText(/Agent paused: your viewer input remains active/)).toBeVisible();
+  await expect(page.getByText("Fast page connected")).toBeVisible();
+  const image = page.getByAltText("Chromium fast page");
+  await expect(image).toHaveCSS("opacity", "1");
+
+  const sendClick = async () => {
+    // Use Playwright's real pointer sequence so setPointerCapture behaves as it
+    // does for a human gesture; synthetic DOM dispatch is not an active pointer.
+    const box = await image.boundingBox();
+    if (!box) throw new Error("synthetic viewer frame is not presentable");
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  };
+  await sendClick();
+  await expect.poll(() => mock.viewerMessages.flatMap((raw) => {
+    const message = JSON.parse(raw) as { type?: string; event?: string };
+    return message.type === "mouse" && (message.event === "down" || message.event === "up") ? [message.event] : [];
+  })).toEqual(["down", "up"]);
+
+  const beforeRetry = mock.viewerConnectionCount();
+  await mock.closeViewer(1011, "input dispatch failed");
+  await expect(page.getByRole("alert")).toContainText("Browser input dispatch failed");
+  await expect(page.getByText(/Viewer disconnected\. The retained frame is not interactive/)).toBeVisible();
+  await page.getByRole("button", { name: "Retry viewer" }).click();
+  await expect.poll(() => mock.viewerConnectionCount()).toBe(beforeRetry + 1);
+  await expect(page.getByText("Fast page connected")).toBeVisible();
+
+  mock.viewerMessages.length = 0;
+  await sendClick();
+  await expect.poll(() => mock.viewerMessages.flatMap((raw) => {
+    const message = JSON.parse(raw) as { type?: string; event?: string };
+    return message.type === "mouse" && (message.event === "down" || message.event === "up") ? [message.event] : [];
+  })).toEqual(["down", "up"]);
 });
 
 test("credential fill stays paused until protected redacted inspection is explicitly allowed", async ({ page, request }) => {

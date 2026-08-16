@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { openStandardCdpViewer } from "./standard-viewer.js";
+import { openStandardCdpViewer, StandardViewerInputError, type StandardViewerInputCategory, type StandardViewerObservation } from "./standard-viewer.js";
 
 class SynchronousFrameCdp {
   readonly calls: Array<{ method: string; params?: unknown }> = [];
@@ -21,6 +21,8 @@ class SynchronousFrameCdp {
       this.emitFrame("latest", 8);
       if (this.failStart) throw new Error("synthetic start failure");
     }
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame", loaderId: "loader" } } } as T;
+    if (method === "Runtime.evaluate") return { result: { value: { url: "about:blank", title: "", readyState: "complete" } } } as T;
     return {} as T;
   }
 
@@ -90,6 +92,243 @@ test("Standard viewer retains the latest synchronous initial frame until the Web
   unsubscribe();
   await viewer.close();
   assert.equal(attachmentCloses, 1);
+});
+
+class InteractiveCdp {
+  readonly calls: Array<{ method: string; params?: any }> = [];
+  readonly listeners = new Map<string, Set<(params: any) => void>>();
+  pointerPressed = false;
+  clicks = 0;
+  failInputDispatch = false;
+  failAttestation = false;
+  inputDispatchGate: Promise<void> | null = null;
+  attestationGate: Promise<void> | null = null;
+  runtimeEvaluationGate: Promise<void> | null = null;
+  runtimeEvaluationGateAt = 0;
+  runtimeEvaluationCalls = 0;
+
+  async send<T = any>(method: string, params?: any): Promise<T> {
+    this.calls.push({ method, params });
+    if (method === "Input.dispatchMouseEvent") {
+      if (this.inputDispatchGate) await this.inputDispatchGate;
+      if (this.failInputDispatch) throw new Error("synthetic CDP failure");
+      if (params?.type === "mousePressed") this.pointerPressed = true;
+      if (params?.type === "mouseReleased" && this.pointerPressed) {
+        this.pointerPressed = false;
+        this.clicks += 1;
+      }
+    }
+    if (method === "Page.getFrameTree") {
+      if (this.attestationGate) await this.attestationGate;
+      if (this.failAttestation) return {} as T;
+      return { frameTree: { frame: { id: "frame", loaderId: "loader" } } } as T;
+    }
+    if (method === "Runtime.evaluate") {
+      this.runtimeEvaluationCalls += 1;
+      if (this.runtimeEvaluationGate && this.runtimeEvaluationCalls === this.runtimeEvaluationGateAt) await this.runtimeEvaluationGate;
+      return { result: { value: { url: "https://example.test/", title: "Synthetic", readyState: "complete" } } } as T;
+    }
+    return {} as T;
+  }
+
+  on(method: string, listener: (params: any) => void): () => void {
+    const listeners = this.listeners.get(method) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(method, listeners);
+    return () => listeners.delete(listener);
+  }
+
+  emit(method: string, params: any): void {
+    for (const listener of this.listeners.get(method) ?? []) listener(params);
+  }
+
+  close(): void {}
+}
+
+async function interactiveViewer(cdp: InteractiveCdp, options: {
+  authorize?: () => Promise<void>;
+  observe?: (event: StandardViewerObservation) => void;
+  onAttachmentClose?: () => void;
+  onRevoke?: () => void;
+} = {}) {
+  return openStandardCdpViewer({
+    attachment: {
+      cdp: cdp as any,
+      target: { id: "target", type: "page", url: "https://example.test/", title: "Synthetic" } as any,
+      close() { options.onAttachmentClose?.(); },
+    },
+    authorize: options.authorize ?? (async () => undefined),
+    async revoke() { options.onRevoke?.(); },
+    observe: options.observe,
+  });
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("synthetic viewer condition timed out");
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+test("pointer, keyboard, and wheel dispatch stay responsive while every navigation-capable event attests", async () => {
+  const cdp = new InteractiveCdp();
+  const observations: StandardViewerObservation[] = [];
+  const viewer = await interactiveViewer(cdp, { observe: (event) => observations.push({ ...event }) });
+  assert.ok(observations.some((event) => event.event === "attestation" && event.category === "viewer_open" && event.outcome === "accepted"));
+
+  let releaseAttestation!: () => void;
+  cdp.attestationGate = new Promise<void>((resolve) => { releaseAttestation = resolve; });
+  await viewer.dispatch(Buffer.from(JSON.stringify({ type: "mouse", event: "down", x: 10, y: 20, button: "left" })), false);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(cdp.pointerPressed, true);
+  await viewer.dispatch(Buffer.from(JSON.stringify({ type: "mouse", event: "up", x: 10, y: 20, button: "left" })), false);
+  assert.equal(cdp.pointerPressed, false);
+  assert.equal(cdp.clicks, 1, "mouse release dispatch is not held behind press attestation");
+
+  await viewer.dispatch(Buffer.from(JSON.stringify({ type: "key", event: "down", key: "s", code: "KeyS" })), false);
+  await viewer.dispatch(Buffer.from(JSON.stringify({ type: "key", event: "up", key: "s", code: "KeyS" })), false);
+  await viewer.dispatch(Buffer.from(JSON.stringify({ type: "mouse", event: "move", x: 11, y: 21 })), false);
+  await viewer.dispatch(Buffer.from(JSON.stringify({ type: "mouse", event: "wheel", x: 10, y: 20, deltaY: 4 })), false);
+  cdp.attestationGate = null;
+  releaseAttestation();
+
+  const expectedCategories: StandardViewerInputCategory[] = ["mouse_down", "mouse_up", "key_down", "key_up", "mouse_move", "wheel"];
+  assert.ok(expectedCategories.every((category) => observations.some((event) => (
+    event.event === "input_received" && event.category === category
+  ))), "every event category is observed without payload values");
+  await waitUntil(() => observations.some((event) => (
+    event.event === "attestation" && event.category === "wheel" && event.outcome === "accepted"
+  )));
+  const burstAttestations = observations.filter((event) => event.event === "attestation" && event.category !== "viewer_open");
+  assert.ok(burstAttestations.length <= 2, "the dirty generation lane coalesces a burst without unbounded queue growth");
+  assert.doesNotMatch(JSON.stringify(observations), /Synthetic|example\.test|KeyS|\"s\"/, "telemetry excludes page and key values");
+  await viewer.close();
+});
+
+test("input authorization, CDP dispatch, and attestation failures seal with stable bounded reasons", async () => {
+  for (const scenario of ["authorization", "dispatch", "attestation"] as const) {
+    const cdp = new InteractiveCdp();
+    let deny = false;
+    let attachmentCloses = 0;
+    let revocations = 0;
+    const viewer = await interactiveViewer(cdp, {
+      async authorize() { if (deny) throw new Error("private raw authority detail"); },
+      onAttachmentClose() { attachmentCloses += 1; },
+      onRevoke() { revocations += 1; },
+    });
+    const reasons: Array<string | undefined> = [];
+    viewer.onClose?.((reason) => reasons.push(reason));
+    if (scenario === "authorization") deny = true;
+    if (scenario === "dispatch") cdp.failInputDispatch = true;
+    if (scenario === "attestation") cdp.failAttestation = true;
+    const message = scenario === "attestation"
+      ? { type: "mouse", event: "up", x: 1, y: 1 }
+      : { type: "mouse", event: "down", x: 1, y: 1 };
+    const expected = scenario === "authorization"
+      ? "input_authorization_failed"
+      : scenario === "dispatch" ? "input_dispatch_failed" : "input_attestation_failed";
+    const dispatch = () => Promise.resolve(viewer.dispatch(Buffer.from(JSON.stringify(message)), false));
+    if (scenario === "attestation") {
+      await dispatch();
+      await waitUntil(() => reasons.length === 1);
+      assert.equal(revocations, 1, "unverified documents revoke the retained workspace before retry");
+    } else {
+      await assert.rejects(
+        dispatch,
+        (error: unknown) => error instanceof StandardViewerInputError && error.reason === expected,
+      );
+      assert.equal(revocations, 0);
+    }
+    assert.deepEqual(reasons, [expected]);
+    assert.equal(attachmentCloses, 1);
+    await viewer.close();
+    assert.equal(attachmentCloses, 1, "sealing is idempotent");
+  }
+});
+
+test("authority changing during CDP dispatch seals before stale input can report success", async () => {
+  const cdp = new InteractiveCdp();
+  let deny = false;
+  let releaseDispatch!: () => void;
+  const viewer = await interactiveViewer(cdp, {
+    async authorize() { if (deny) throw new Error("synthetic authority changed"); },
+  });
+  const reasons: Array<string | undefined> = [];
+  viewer.onClose?.((reason) => reasons.push(reason));
+  cdp.inputDispatchGate = new Promise<void>((resolve) => { releaseDispatch = resolve; });
+  const dispatching = Promise.resolve(viewer.dispatch(Buffer.from(JSON.stringify({
+    type: "mouse", event: "down", x: 1, y: 1,
+  })), false));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  deny = true;
+  cdp.inputDispatchGate = null;
+  releaseDispatch();
+  await assert.rejects(
+    dispatching,
+    (error: unknown) => error instanceof StandardViewerInputError && error.reason === "input_authorization_failed",
+  );
+  assert.deepEqual(reasons, ["input_authorization_failed"]);
+});
+
+test("authority changing during final attestation evaluation cannot publish stale metadata", async () => {
+  const cdp = new InteractiveCdp();
+  let deny = false;
+  let revocations = 0;
+  const observations: StandardViewerObservation[] = [];
+  const viewer = await interactiveViewer(cdp, {
+    async authorize() { if (deny) throw new Error("synthetic authority changed"); },
+    onRevoke() { revocations += 1; },
+    observe(event) { observations.push({ ...event }); },
+  });
+  const initialRuntimeCalls = cdp.runtimeEvaluationCalls;
+  let releaseEvaluation!: () => void;
+  cdp.runtimeEvaluationGateAt = initialRuntimeCalls + 2;
+  cdp.runtimeEvaluationGate = new Promise<void>((resolve) => { releaseEvaluation = resolve; });
+  const reasons: Array<string | undefined> = [];
+  viewer.onClose?.((reason) => reasons.push(reason));
+  await viewer.dispatch(Buffer.from(JSON.stringify({ type: "mouse", event: "down", x: 1, y: 1 })), false);
+  await waitUntil(() => cdp.runtimeEvaluationCalls === cdp.runtimeEvaluationGateAt);
+  deny = true;
+  cdp.runtimeEvaluationGate = null;
+  releaseEvaluation();
+  await waitUntil(() => reasons.length === 1);
+  assert.deepEqual(reasons, ["input_authorization_failed"]);
+  assert.equal(revocations, 1);
+  assert.equal(observations.some((event) => event.event === "attestation" && event.category === "mouse_down" && event.outcome === "accepted"), false);
+});
+
+test("committed forbidden top-level navigation revokes immediately even between attestations", async () => {
+  const cdp = new InteractiveCdp();
+  let attachmentCloses = 0;
+  let revocations = 0;
+  const viewer = await interactiveViewer(cdp, {
+    onAttachmentClose() { attachmentCloses += 1; },
+    onRevoke() { revocations += 1; },
+  });
+  const reasons: Array<string | undefined> = [];
+  viewer.onClose?.((reason) => reasons.push(reason));
+  cdp.emit("Page.frameNavigated", { frame: { id: "frame", url: "http://forbidden.example.test/" } });
+  await waitUntil(() => reasons.length === 1);
+  assert.deepEqual(reasons, ["input_attestation_failed"]);
+  assert.equal(revocations, 1);
+  assert.equal(attachmentCloses, 1);
+});
+
+test("viewer opening fails closed before publication when the initial document cannot be attested", async () => {
+  const cdp = new InteractiveCdp();
+  cdp.failAttestation = true;
+  let attachmentCloses = 0;
+  let revocations = 0;
+  await assert.rejects(
+    () => interactiveViewer(cdp, {
+      onAttachmentClose() { attachmentCloses += 1; },
+      onRevoke() { revocations += 1; },
+    }),
+    (error: unknown) => error instanceof StandardViewerInputError && error.reason === "input_attestation_failed",
+  );
+  assert.equal(attachmentCloses, 1);
+  assert.equal(revocations, 1);
 });
 
 test("close releases the attachment while frame authorization is delayed", async () => {

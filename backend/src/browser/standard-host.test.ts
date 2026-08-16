@@ -19,6 +19,9 @@ class FakeBackend implements StandardBrowserHostBackend {
   readonly closeFailures = new Set<string>();
   stopFailures = 0;
   downloadStagingDir?: string;
+  viewerAttachGate: Promise<void> | null = null;
+  viewerAttachmentCloses = 0;
+  executeGate: Promise<void> | null = null;
   private serial = 0;
   constructor(private readonly callbacks: StandardBrowserHostBackendCallbacks) {
     this.targets.set("restored", { id: "restored", url: "https://restore.invalid" });
@@ -44,6 +47,7 @@ class FakeBackend implements StandardBrowserHostBackend {
   async cancelDownload(guid: string) { this.canceledDownloads.push(guid); }
   async execute(targetId: string, operation: ProtectedBrowserOperation, authorize: () => Promise<void>) {
     await authorize();
+    if (this.executeGate) await this.executeGate;
     this.executions.push({ targetId, operation });
     if (operation.kind === "navigate") {
       const target = this.targets.get(targetId)!;
@@ -53,6 +57,15 @@ class FakeBackend implements StandardBrowserHostBackend {
     }
     await authorize();
     return { targetId, kind: operation.kind };
+  }
+  async attachViewer(targetId: string) {
+    await this.viewerAttachGate;
+    const target = this.targets.get(targetId)!;
+    return {
+      cdp: { async send() { return {}; }, on() { return () => undefined; }, close() {} } as any,
+      target: { ...target, type: "page" } as any,
+      close: () => { this.viewerAttachmentCloses += 1; },
+    };
   }
   popup(openerId: string, url: string) {
     const target = { id: `target-${++this.serial}`, openerId, url, title: url };
@@ -199,6 +212,77 @@ test("human handoff hides agent tab metadata and denies every agent tab mutation
   await assert.rejects(() => f.host.openTab(exact, workspace.generation), /human control|control changed/);
   assert.throws(() => f.host.selectTab(exact, workspace.generation, "stale"), /human control/);
   await assert.rejects(() => f.host.closeTab(exact, workspace.generation, "stale"), /human control|control changed/);
+  await f.host.close();
+});
+
+test("viewer registration is exact and remains unavailable outside stable human control", async () => {
+  const f = hostFixture();
+  const exact = binding("session-a");
+  const workspace = f.host.bindWorkspace(exact);
+  await assert.rejects(
+    Promise.resolve().then(() => f.host.registerViewer(exact.sourceSessionId, workspace.generation, async () => undefined)),
+    /viewer control is unavailable/,
+  );
+  await f.host.ownerSetControlMode(exact.sourceSessionId, workspace.generation, "user");
+  let viewerCloses = 0;
+  const unregister = f.host.registerViewer(exact.sourceSessionId, workspace.generation, async () => { viewerCloses += 1; });
+  await f.host.ownerResumeAgent(exact.sourceSessionId, workspace.generation);
+  assert.equal(viewerCloses, 1);
+  unregister();
+  await f.host.close();
+});
+
+test("viewer attachment closes if the exact active tab changes while CDP attachment is pending", async () => {
+  const f = hostFixture();
+  const exact = binding("session-a");
+  const workspace = f.host.bindWorkspace(exact);
+  await f.host.ownerSetControlMode(exact.sourceSessionId, workspace.generation, "user");
+  const first = await f.host.ownerOpenTab(exact.sourceSessionId, workspace.generation, "https://first.example/", async () => undefined);
+  await f.host.ownerOpenTab(exact.sourceSessionId, workspace.generation, "https://second.example/", async () => undefined);
+  let releaseAttach!: () => void;
+  f.backend().viewerAttachGate = new Promise<void>((resolve) => { releaseAttach = resolve; });
+  const opening = f.host.ownerAttachActiveViewer(exact.sourceSessionId, workspace.generation, async () => undefined);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await f.host.ownerSelectTab(exact.sourceSessionId, workspace.generation, first.tabs[0]!.tab);
+  f.backend().viewerAttachGate = null;
+  releaseAttach();
+  await assert.rejects(opening, /target changed during attachment/);
+  assert.equal(f.backend().viewerAttachmentCloses, 1);
+  await f.host.close();
+});
+
+test("attached viewer authority remains bound to the exact active target generation", async () => {
+  const f = hostFixture();
+  const exact = binding("session-a");
+  const workspace = f.host.bindWorkspace(exact);
+  await f.host.ownerSetControlMode(exact.sourceSessionId, workspace.generation, "paused");
+  const first = await f.host.ownerOpenTab(exact.sourceSessionId, workspace.generation, "about:blank", async () => undefined);
+  await f.host.ownerOpenTab(exact.sourceSessionId, workspace.generation, "about:blank", async () => undefined);
+  const attachment = await f.host.ownerAttachActiveViewer(exact.sourceSessionId, workspace.generation, async () => undefined);
+  await f.host.ownerSelectTab(exact.sourceSessionId, workspace.generation, first.tabs[0]!.tab);
+  await assert.rejects(attachment.authorize(), /target changed during attachment/);
+  attachment.close();
+  await f.host.close();
+});
+
+test("queued tab selection is rejected when agent resumption changes the control epoch", async () => {
+  const f = hostFixture();
+  const exact = binding("session-a");
+  const workspace = f.host.bindWorkspace(exact);
+  await f.host.ownerSetControlMode(exact.sourceSessionId, workspace.generation, "user");
+  const state = await f.host.ownerOpenTab(exact.sourceSessionId, workspace.generation, "about:blank", async () => undefined);
+  let releaseExecute!: () => void;
+  f.backend().executeGate = new Promise<void>((resolve) => { releaseExecute = resolve; });
+  const active = f.host.ownerExecute(exact.sourceSessionId, workspace.generation, { kind: "snapshot" }, async () => undefined);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const queuedSelection = f.host.ownerSelectTab(exact.sourceSessionId, workspace.generation, state.tabs[0]!.tab);
+  const resuming = f.host.ownerResumeAgent(exact.sourceSessionId, workspace.generation);
+  f.backend().executeGate = null;
+  releaseExecute();
+  await active;
+  await assert.rejects(queuedSelection, /tab control changed/);
+  await resuming;
+  assert.equal(f.host.publicState(exact, workspace.generation).controlMode, "agent");
   await f.host.close();
 });
 
