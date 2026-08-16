@@ -20,26 +20,74 @@ export async function openStandardCdpViewer(options: {
   const { cdp, target } = options.attachment;
   const listeners = new Set<(message: Buffer, isBinary: boolean) => void>();
   let closed = false;
-  const emit = (message: unknown) => {
-    const bytes = Buffer.from(JSON.stringify(message));
-    for (const listener of listeners) listener(bytes, false);
+  let attachmentClosed = false;
+  let pendingMessage: { bytes: Buffer; isBinary: boolean } | null = null;
+  let pendingFrame: any | null = null;
+  let framePump: Promise<void> | null = null;
+  let offFrame: (() => void) | null = null;
+  const seal = (): boolean => {
+    if (closed) return false;
+    closed = true;
+    offFrame?.();
+    offFrame = null;
+    pendingFrame = null;
+    pendingMessage = null;
+    listeners.clear();
+    if (!attachmentClosed) {
+      attachmentClosed = true;
+      options.attachment.close();
+    }
+    return true;
   };
+  const emit = (message: unknown) => {
+    const candidate = { bytes: Buffer.from(JSON.stringify(message)), isBinary: false };
+    if (listeners.size === 0) {
+      // Chromium may emit the initial frame synchronously from
+      // Page.startScreencast, before openViewer() returns and the WebSocket
+      // consumer can subscribe. Retain only the latest bounded JPEG envelope;
+      // a static page may never repaint to replace a lost first frame.
+      pendingMessage = candidate;
+      return;
+    }
+    for (const listener of listeners) listener(candidate.bytes, candidate.isBinary);
+  };
+  const startFramePump = () => {
+    if (closed || framePump || !pendingFrame) return;
+    framePump = (async () => {
+      while (!closed && pendingFrame) {
+        // Authorization is binding-wide rather than frame-specific. Read the
+        // retained frame only after authorization so arrivals during the await
+        // coalesce into the one latest frame instead of promise-per-frame data.
+        await options.authorize();
+        if (closed) return;
+        const latest = pendingFrame;
+        pendingFrame = null;
+        if (latest) {
+          emit({ type: "frame", dataUrl: `data:image/jpeg;base64,${latest.data}`, metadata: latest.metadata, sessionId: latest.sessionId });
+        }
+      }
+    })().catch(() => {
+      if (seal()) void options.revoke().catch(() => undefined);
+    }).finally(() => {
+      framePump = null;
+      if (!closed && pendingFrame) startFramePump();
+    });
+  };
+  // Subscribe before startScreencast so a synchronous initial emission cannot
+  // fall into the construction gap. Retain only the latest unprocessed frame.
+  offFrame = cdp.on("Page.screencastFrame", (params: any) => {
+    if (closed) return;
+    pendingFrame = params;
+    startFramePump();
+  });
   try {
     await guardedSend(cdp, options.authorize, "Page.enable");
     await guardedSend(cdp, options.authorize, "Runtime.enable");
     await guardedSend(cdp, options.authorize, "Page.startScreencast", { format: "jpeg", quality: 70, everyNthFrame: 1 });
   } catch (error) {
-    options.attachment.close();
+    seal();
     throw error;
   }
-  let frameAuthorization: Promise<void> = Promise.resolve();
-  const offFrame = cdp.on("Page.screencastFrame", (params: any) => {
-    frameAuthorization = frameAuthorization.then(async () => {
-      await options.authorize();
-      if (closed) return;
-      emit({ type: "frame", dataUrl: `data:image/jpeg;base64,${params.data}`, metadata: params.metadata, sessionId: params.sessionId });
-    }).catch(() => { void options.revoke().catch(() => undefined); });
-  });
   let inputTail: Promise<void> = Promise.resolve();
   let inputDepth = 0;
   const MAX_VIEWER_INPUT_QUEUE = 64;
@@ -110,16 +158,17 @@ export async function openStandardCdpViewer(options: {
       }
     },
     async close() {
-      if (closed) return;
-      closed = true;
-      offFrame();
-      try { await guardedSend(cdp, options.authorize, "Page.stopScreencast"); } catch { /* best effort */ }
-      listeners.clear();
-      options.attachment.close();
+      // Seal and release retained frame data synchronously. Closing the exact
+      // attachment terminates its screencast/CDP session without waiting on a
+      // potentially stalled authorization callback.
+      seal();
     },
     onMessage(listener) {
       if (closed) throw new Error("Standard browser viewer is closed");
       listeners.add(listener);
+      const pending = pendingMessage;
+      pendingMessage = null;
+      if (pending) listener(pending.bytes, pending.isBinary);
       return () => listeners.delete(listener);
     },
   };
