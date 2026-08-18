@@ -249,6 +249,9 @@ const MAX_RETAINED_EXTERNAL_ACTION_OUTCOMES = 20;
 const MAX_EXTERNAL_ACTION_LIFECYCLE_KEYS_PER_STORE = 64;
 const INITIAL_TRANSCRIPT_TAIL_ROWS = 200;
 const TRANSCRIPT_HYDRATION_CHUNK_ROWS = 200;
+// Browser WebSocket clients may initiate close only with 1000 or 3000–4999.
+// 4001 is Wayang's application-level request for authoritative transcript reconnect.
+const TRANSCRIPT_MUTATION_RECONNECT_CLOSE_CODE = 4001;
 
 function createSelectionId(): string {
   return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
@@ -5158,7 +5161,7 @@ export function ChatPanel({
     if (!activeSessionIdRef.current || !selectionIdRef.current) return;
     const socket = wsRef.current;
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.close(1012, "authoritative refresh after transcript mutation");
+      socket.close(TRANSCRIPT_MUTATION_RECONNECT_CLOSE_CODE, "authoritative refresh after transcript mutation");
     } else if (!wsRef.current) {
       connectRef.current();
     }

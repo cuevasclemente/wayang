@@ -407,6 +407,8 @@ export function TranscriptMutationProvider({
         data-testid="transcript-mutation-scope"
         data-modal-open={hasOpenModal ? "true" : "false"}
         data-request-in-flight={requestInFlight ? "true" : "false"}
+        data-transport-generation={transportGeneration}
+        data-history-transport-generation={historyTransportGeneration}
         data-selection-key={selectionKey}
         data-mutation-available={availability.available ? "true" : "false"}
         data-unavailable-reason={availability.reason}
