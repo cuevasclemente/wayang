@@ -66,7 +66,7 @@ Deletion removes the selected event's stored payload. It does not discover/remov
 ## Validation to date
 
 - Pi focused transaction suite: 24/24.
-- Wayang backend aggregate before schema-7 final integration: 897 pass, 0 fail, 5 skip.
+- Final Wayang backend aggregate: 916 pass, 0 fail, 5 skip.
 - Final focused schema/recovery/mutation/index/session suite: 85/85.
 - Final focused transaction/lock/catalog/invalidation suite: 40/40 before durable-journal follow-up.
 - Installed vendored Pi SDK CAS integration: pass.
@@ -76,6 +76,7 @@ Deletion removes the selected event's stored payload. It does not discover/remov
   - confirmed edit, repeat edit after shared cooldown, canonical/search proof;
   - committed request with client-side network ambiguity and authoritative reconnect;
   - rejected PIN with byte-for-byte unchanged transcript.
+- Full Playwright suite: 90/91; the unrelated external-action focus timing failure passed immediately in isolated rerun.
 - `make check`: backend/frontend gates pass; unchanged fake-Bitwarden credential-helper script baseline remains 62/63.
 - Final independent reviews: concurrency/correctness GO, privacy/security GO, UX/accessibility GO.
 
