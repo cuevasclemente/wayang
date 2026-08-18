@@ -143,6 +143,7 @@ import {
 import {
   acquireSessionRuntimeMutationLock,
   isSessionRuntimeMutationLocked,
+  onSessionRuntimeMutationLockChanged,
   releaseSessionRuntimeMutationLock,
 } from "./session-runtime-mutation-lock.js";
 
@@ -292,6 +293,13 @@ interface SessionBrowserTeardownIntent {
 const sessionBrowserTeardownIntents = new Map<string, SessionBrowserTeardownIntent>();
 const agentSwitches = new Map<string, Promise<AgentSwitchResult>>();
 const runtimeEvents = new EventEmitter();
+onSessionRuntimeMutationLockChanged((sessionId) => {
+  runtimeEvents.emit("event", {
+    type: "runtime_state_changed",
+    sessionId,
+    bashMode: getPiSessionBashMode(sessionId),
+  } satisfies PiSessionRuntimeEvent);
+});
 const runtimeUnavailableNotifiedHandles = new WeakSet<object>();
 const PROCESS_BOOT_NONCE = randomUUID();
 let idleCleanupTimer: NodeJS.Timeout | null = null;
@@ -921,6 +929,7 @@ export interface PiSessionRuntimeState {
   runtime_status: "active" | "starting" | "stopped";
   runtime_is_streaming: boolean;
   runtime_is_compacting: boolean;
+  runtime_mutation_locked: boolean;
   runtime_subscriber_count: number;
   runtime_last_activity_at: number | null;
 }
@@ -932,6 +941,7 @@ export function getPiSessionRuntimeState(id: string): PiSessionRuntimeState {
       runtime_status: "active",
       runtime_is_streaming: Boolean(handle.session.isStreaming),
       runtime_is_compacting: Boolean(handle.session.isCompacting),
+      runtime_mutation_locked: isSessionRuntimeMutationLocked(id),
       runtime_subscriber_count: handle.subscriberCount,
       runtime_last_activity_at: handle.lastActivityAt,
     };
@@ -941,6 +951,7 @@ export function getPiSessionRuntimeState(id: string): PiSessionRuntimeState {
       runtime_status: "starting",
       runtime_is_streaming: false,
       runtime_is_compacting: false,
+      runtime_mutation_locked: isSessionRuntimeMutationLocked(id),
       runtime_subscriber_count: 0,
       runtime_last_activity_at: null,
     };
@@ -949,6 +960,7 @@ export function getPiSessionRuntimeState(id: string): PiSessionRuntimeState {
     runtime_status: "stopped",
     runtime_is_streaming: false,
     runtime_is_compacting: false,
+    runtime_mutation_locked: isSessionRuntimeMutationLocked(id),
     runtime_subscriber_count: 0,
     runtime_last_activity_at: null,
   };

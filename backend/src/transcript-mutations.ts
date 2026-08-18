@@ -28,9 +28,11 @@ import {
 } from "./pi-bridge.js";
 import {
   getSessionById,
+  getSessionCatalogGeneration,
   markSessionTranscriptMutated,
   syncPiSessionFiles,
 } from "./sessions.js";
+import { publishTranscriptInvalidation } from "./transcript-invalidation.js";
 import {
   DELETED_EVENT_TOMBSTONE,
   INVALIDATED_DERIVED_EVENT_TOMBSTONE,
@@ -111,7 +113,17 @@ interface ExpectedEntryCasSessionManager {
   ): void | boolean | { replaced: boolean };
 }
 
-function adaptSessionManager(manager: SessionManager): CanonicalTranscriptPort {
+function isCommittedPostCommitFailure(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { committed?: unknown; code?: unknown };
+  return candidate.committed === true
+    || candidate.code === "ERR_SESSION_MUTATION_COMMITTED"
+    || candidate.code === "ERR_SESSION_REWRITE_COMMITTED"
+    || candidate.code === "ERR_SESSION_REWRITE_POST_COMMIT";
+}
+
+/** @internal Installed-SDK/fault seam for atomic CAS integration tests. */
+export function adaptSessionManager(manager: SessionManager): CanonicalTranscriptPort {
   const cas = manager as unknown as ExpectedEntryCasSessionManager;
   return {
     getHeader: () => cas.getHeader(),
@@ -133,6 +145,15 @@ function adaptSessionManager(manager: SessionManager): CanonicalTranscriptPort {
           replacement: replacementEntry,
         })));
       } catch (error) {
+        if (isCommittedPostCommitFailure(error)) {
+          const committed = new TranscriptMutationError(
+            "Canonical transcript rewrite committed but post-commit finalization failed.",
+            500,
+            "canonical_commit_error",
+          ) as TranscriptMutationError & { canonicalMayHaveChanged: true };
+          committed.canonicalMayHaveChanged = true;
+          throw committed;
+        }
         const candidate = error as { statusCode?: unknown; code?: unknown };
         if (candidate?.statusCode === 409 || candidate?.code === "CAS_CONFLICT" || candidate?.code === "ERR_SESSION_ENTRY_CONFLICT") {
           throw new TranscriptMutationError("Transcript events changed before mutation", 409, "cas_conflict");
@@ -176,12 +197,14 @@ export interface TranscriptMutationDependencies {
   purgeSearch(id: string): Promise<void>;
   releaseSearchFence(id: string): void;
   invalidateSnapshots(sessionFile: string | null): void;
-  reconcileMetadata(id: string): Promise<void>;
+  reconcileMetadata(id: string): Promise<number>;
   forceReindex(id: string): Promise<void>;
+  publishInvalidation(id: string, catalogGeneration: number): void;
 }
 
 let transcriptMutationPinAttempts: SettingsPinAttemptPort | undefined;
 const TRANSCRIPT_MUTATION_PIN_REALM = "wayang.transcript-mutation.v1";
+const SESSION_DELETION_PIN_REALM = "wayang.session-deletion.v1";
 const TRANSCRIPT_MUTATION_PIN_TTL_MS = 60_000;
 
 /** Install the one process-wide hardened persistent cooldown authority. */
@@ -196,6 +219,7 @@ export async function validateTranscriptMutationPinAttempt(
   attempts: SettingsPinAttemptPort | undefined,
   pin: unknown,
   operation: unknown,
+  realm = TRANSCRIPT_MUTATION_PIN_REALM,
 ): Promise<TranscriptMutationPinValidationResult> {
   if (!attempts) return {
     ok: false,
@@ -217,7 +241,7 @@ export async function validateTranscriptMutationPinAttempt(
   };
   const operationDigest = createHash("sha256").update(encodedOperation, "utf8").digest("hex");
   const reserved = await attempts.reserve({
-    realm: TRANSCRIPT_MUTATION_PIN_REALM,
+    realm,
     reservationId,
     requestId,
     operationDigest,
@@ -248,7 +272,7 @@ export async function validateTranscriptMutationPinAttempt(
   let verified: Awaited<ReturnType<SettingsPinAttemptPort["verifyAndConsume"]>>;
   try {
     verified = await attempts.verifyAndConsume({
-      realm: TRANSCRIPT_MUTATION_PIN_REALM,
+      realm,
       reservationId,
       requestId,
       pin: typeof pin === "string" ? pin : "",
@@ -256,7 +280,7 @@ export async function validateTranscriptMutationPinAttempt(
     });
   } catch {
     await attempts.cancelAndConsume({
-      realm: TRANSCRIPT_MUTATION_PIN_REALM,
+      realm,
       reservationId,
       requestId,
       reason: "backend_failure",
@@ -287,6 +311,48 @@ export async function validateTranscriptMutationPinAttempt(
     statusCode: verified.status === "expired" ? 403 : 503,
     code: verified.status === "expired" ? "pin_expired" : "pin_unavailable",
   };
+}
+
+export async function reconcileTranscriptMetadataAfterMutation(
+  sessionId: string,
+  ports: {
+    mark(id: string): number;
+    scan(): Promise<{ generation?: number }>;
+    currentGeneration?(): number;
+  } = {
+    mark: markSessionTranscriptMutated,
+    scan: syncPiSessionFiles,
+    currentGeneration: getSessionCatalogGeneration,
+  },
+): Promise<number> {
+  const minimumGeneration = ports.mark(sessionId);
+  for (let attempt = 0; attempt < 32; attempt++) {
+    const result = await ports.scan();
+    // Legacy scanner results predate catalog generations. One completed parse
+    // remains their strongest available reconciliation boundary.
+    if (result.generation === undefined) return minimumGeneration;
+    const currentGeneration = ports.currentGeneration?.() ?? minimumGeneration;
+    if (result.generation >= minimumGeneration && result.generation >= currentGeneration) {
+      return result.generation;
+    }
+  }
+  throw new TranscriptMutationError(
+    "Session metadata reconciliation did not reach the transcript mutation generation.",
+    500,
+    "metadata_reconciliation_failed",
+  );
+}
+
+export function validateSessionDeletionPinAttempt(
+  pin: unknown,
+  operation: unknown,
+): Promise<TranscriptMutationPinValidationResult> {
+  return validateTranscriptMutationPinAttempt(
+    transcriptMutationPinAttempts,
+    pin,
+    operation,
+    SESSION_DELETION_PIN_REALM,
+  );
 }
 
 function productionDependencies(): TranscriptMutationDependencies {
@@ -331,10 +397,7 @@ function productionDependencies(): TranscriptMutationDependencies {
     async purgeSearch(id) { beginTranscriptMutationSearchFence(id); },
     releaseSearchFence: endTranscriptMutationSearchFence,
     invalidateSnapshots: invalidateSessionFileSnapshot,
-    async reconcileMetadata(id) {
-      markSessionTranscriptMutated(id);
-      await syncPiSessionFiles();
-    },
+    reconcileMetadata: reconcileTranscriptMetadataAfterMutation,
     async forceReindex(id) {
       try {
         const result = await indexSession(id, { force: true });
@@ -345,6 +408,13 @@ function productionDependencies(): TranscriptMutationDependencies {
         500,
         "reindex_failed",
       );
+    },
+    publishInvalidation(id, catalogGeneration) {
+      publishTranscriptInvalidation({
+        sessionId: id,
+        catalogGeneration,
+        reason: "canonical_mutation",
+      });
     },
   };
 }
@@ -715,6 +785,8 @@ export class TranscriptMutationService {
 
     let searchFenced = false;
     let canonicalChanged = false;
+    let reconciledGeneration: number | null = null;
+    let invalidationPublished = false;
     let mutatedSessionFile: string | null = null;
     try {
       const pin = await this.dependencies.validatePin(input.pin, {
@@ -774,10 +846,12 @@ export class TranscriptMutationService {
       canonicalChanged = true;
 
       this.dependencies.invalidateSnapshots(currentSession.pi_session_file);
-      await this.dependencies.reconcileMetadata(sessionId);
+      reconciledGeneration = await this.dependencies.reconcileMetadata(sessionId);
       this.dependencies.releaseSearchFence(sessionId);
       searchFenced = false;
       await this.dependencies.forceReindex(sessionId);
+      this.dependencies.publishInvalidation(sessionId, reconciledGeneration);
+      invalidationPublished = true;
       canonicalChanged = false;
 
       return {
@@ -789,6 +863,9 @@ export class TranscriptMutationService {
         invalidated_entry_ids: derived.map((entry) => entry.id),
         semantic_warnings: [
           ...semanticWarnings(expected),
+          ...(kind === "delete" ? [
+            "Event deletion removes only this event payload; unrelated events or independent copies are unchanged.",
+          ] : []),
           ...(derived.length > 0 ? [
             "All compaction and branch-summary events were invalidated because their exact source dependencies are not represented in Pi topology.",
           ] : []),
@@ -805,7 +882,10 @@ export class TranscriptMutationService {
       const shouldReindexWinner = searchFenced;
       if (canonicalChanged) {
         try { this.dependencies.invalidateSnapshots(mutatedSessionFile); } catch { /* best-effort safety cleanup */ }
-        try { await this.dependencies.reconcileMetadata(sessionId); } catch { /* original mutation error remains authoritative */ }
+        if (reconciledGeneration === null) {
+          try { reconciledGeneration = await this.dependencies.reconcileMetadata(sessionId); }
+          catch { /* original mutation error remains authoritative */ }
+        }
       }
       if (searchFenced) {
         try { this.dependencies.releaseSearchFence(sessionId); } catch { /* released again in finally */ }
@@ -813,6 +893,12 @@ export class TranscriptMutationService {
       }
       if (shouldReindexWinner) {
         try { await this.dependencies.forceReindex(sessionId); } catch { /* stale index was already purged */ }
+      }
+      if (canonicalChanged && reconciledGeneration !== null && !invalidationPublished) {
+        try {
+          this.dependencies.publishInvalidation(sessionId, reconciledGeneration);
+          invalidationPublished = true;
+        } catch { /* original mutation error remains authoritative */ }
       }
       throw error;
     } finally {

@@ -1,11 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   DELETED_EVENT_TOMBSTONE,
   INVALIDATED_DERIVED_EVENT_TOMBSTONE,
   MAX_TRANSCRIPT_EVENT_BYTES,
   TranscriptMutationError,
   TranscriptMutationService,
+  adaptSessionManager,
+  reconcileTranscriptMetadataAfterMutation,
   validateTranscriptMutationPinAttempt,
   type CanonicalEntry,
   type CanonicalEntryReplacement,
@@ -29,6 +32,7 @@ class FakeTranscript implements CanonicalTranscriptPort {
   getEntryCalls = 0;
   getEntriesCalls = 0;
   failId: string | null = null;
+  commitThenFail = false;
 
   constructor(
     readonly entries: CanonicalEntry[],
@@ -59,6 +63,15 @@ class FakeTranscript implements CanonicalTranscriptPort {
       const index = this.entries.findIndex((entry) => entry.id === expectedEntry.id);
       this.entries[index] = structuredClone(replacementEntry);
     }
+    if (this.commitThenFail) {
+      const error = new TranscriptMutationError(
+        "synthetic committed post-commit fault",
+        500,
+        "canonical_commit_error",
+      ) as TranscriptMutationError & { canonicalMayHaveChanged: true };
+      error.canonicalMayHaveChanged = true;
+      throw error;
+    }
   }
 }
 
@@ -77,6 +90,8 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
   let pinOk = true;
   let afterDispose: (() => void) | undefined;
   let afterPurge: (() => void) | undefined;
+  let reconcileHook: (() => void) | undefined;
+  let reindexHook: (() => void) | undefined;
   const dependencies: TranscriptMutationDependencies = {
     getSession: (id) => id === "session-1" ? ({ id, pi_session_file: "/synthetic/session.jsonl", cwd: "/synthetic" } as any) : undefined,
     validatePin: async () => ({ ok: pinOk, pinConfigured: true, ...(pinOk ? {} : { error: "Incorrect command guard identity PIN." }) }),
@@ -96,8 +111,9 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
     async purgeSearch() { events.push("purge-search"); afterPurge?.(); },
     releaseSearchFence() { events.push("release-search-fence"); },
     invalidateSnapshots() { events.push("invalidate-snapshot"); },
-    async reconcileMetadata() { events.push("reconcile-metadata"); },
-    async forceReindex() { events.push("force-reindex"); },
+    async reconcileMetadata() { events.push("reconcile-metadata"); reconcileHook?.(); return 7; },
+    async forceReindex() { events.push("force-reindex"); reindexHook?.(); },
+    publishInvalidation(_id, generation) { events.push(`publish-invalidation:${generation}`); }
   };
   return {
     service: new TranscriptMutationService(dependencies),
@@ -109,6 +125,8 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
     setPinOk(value: boolean) { pinOk = value; },
     setAfterDispose(callback: () => void) { afterDispose = callback; },
     setAfterPurge(callback: () => void) { afterPurge = callback; },
+    setReconcileHook(callback: () => void) { reconcileHook = callback; },
+    setReindexHook(callback: () => void) { reindexHook = callback; },
   };
 }
 
@@ -202,6 +220,7 @@ test("edit atomically invalidates all summaries including sibling branches, then
     "reconcile-metadata",
     "release-search-fence",
     "force-reindex",
+    "publish-invalidation:7",
     "unlock",
   ]);
   assert.deepEqual(result.invalidated_entry_ids, ["compact", "summary", "sibling-summary"]);
@@ -243,6 +262,95 @@ test("delete creates a content-free same-topology tombstone without retaining ol
   assert.equal(JSON.stringify(tombstone).includes(OLD_SECRET), false);
   assert.equal(JSON.stringify(result).includes(OLD_SECRET), false);
   assert.equal(result.revision_retained, false);
+  assert.match(result.semantic_warnings.join(" "), /only this event payload/i);
+});
+
+test("metadata reconciliation loops past a paused older discarded catalog scan", async () => {
+  let releaseOld!: () => void;
+  const oldScan = new Promise<{ generation: number }>((resolve) => {
+    releaseOld = () => resolve({ generation: 4 });
+  });
+  let scans = 0;
+  const waiting = reconcileTranscriptMetadataAfterMutation("session-1", {
+    mark: () => 5,
+    scan: async () => {
+      scans++;
+      return scans === 1 ? oldScan : { generation: 6 };
+    },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(scans, 1, "new-generation scan must wait for the older in-flight result");
+  releaseOld();
+  assert.equal(await waiting, 6);
+  assert.equal(scans, 2, "discarded old generation must drive a fresh scan");
+});
+
+test("force reindex observes metadata-only reconciliation changes, never the pre-scan projection", async () => {
+  const target = message("target", null, "before");
+  const f = fixture([target]);
+  let projectedTitle = "stale title";
+  f.setReconcileHook(() => { projectedTitle = "rederived title"; });
+  f.setReindexHook(() => assert.equal(projectedTitle, "rederived title"));
+  await f.service.mutateEvent("session-1", "target", "delete", {
+    pin: "opaque",
+    expectedEntry: target,
+  });
+  assert.ok(f.events.indexOf("reconcile-metadata") < f.events.indexOf("force-reindex"));
+});
+
+test("adapter recognizes typed committed post-commit faults and marks the canonical winner", () => {
+  const expected = message("target", null, "before");
+  const replacement = message("target", null, "after");
+  for (const committedFault of [
+    { committed: true, code: "SYNTHETIC_POST_COMMIT" },
+    { code: "ERR_SESSION_MUTATION_COMMITTED" },
+    { code: "ERR_SESSION_REWRITE_POST_COMMIT" },
+  ]) {
+    let current = structuredClone(expected);
+    const manager = {
+      getHeader: () => ({}),
+      getEntry: (id: string) => id === current.id ? current : undefined,
+      getEntries: () => [current],
+      getBranch: () => [current],
+      replaceEntriesIfCurrent(replacements: readonly CanonicalEntryReplacement[]) {
+        current = structuredClone(replacements[0]!.replacementEntry);
+        throw committedFault;
+      },
+    } as unknown as SessionManager;
+    const adapted = adaptSessionManager(manager);
+    assert.throws(
+      () => adapted.replaceEntriesIfCurrent([{ expectedEntry: expected, replacementEntry: replacement }]),
+      (error: unknown) => {
+        if (!(error instanceof TranscriptMutationError)) return false;
+        const candidate = error as TranscriptMutationError & { canonicalMayHaveChanged?: boolean };
+        return candidate.code === "canonical_commit_error" && candidate.canonicalMayHaveChanged === true;
+      },
+    );
+    assert.deepEqual(current, replacement);
+  }
+});
+
+test("committed post-commit service faults still invalidate, reconcile, reindex, and notify", async () => {
+  const target = message("target", null, OLD_SECRET);
+  const f = fixture([target]);
+  f.transcript.commitThenFail = true;
+  await assert.rejects(
+    f.service.mutateEvent("session-1", "target", "delete", { pin: "opaque", expectedEntry: target }),
+    (error: any) => error instanceof TranscriptMutationError && error.code === "canonical_commit_error",
+  );
+  assert.deepEqual(f.events, [
+    "lock",
+    "dispose",
+    "purge-search",
+    "replace-set:target",
+    "invalidate-snapshot",
+    "reconcile-metadata",
+    "release-search-fence",
+    "force-reindex",
+    "publish-invalidation:7",
+    "unlock",
+  ]);
+  assert.equal(f.transcript.entries[0]?.customType, DELETED_EVENT_TOMBSTONE);
 });
 
 test("exact expected-entry mismatch returns a CAS conflict before canonical rewrite", async () => {
@@ -379,6 +487,22 @@ test("one-shot transcript PIN uses the shared digest-bound persistent attempt co
   assert.deepEqual(result, { ok: true, pinConfigured: true });
   assert.match(reservation?.operationDigest ?? "", /^[a-f0-9]{64}$/u);
   assert.equal(JSON.stringify(reservation).includes("new"), false, "durable attempt state receives only the operation digest");
+});
+
+test("whole-session deletion uses a distinct realm on the same hardened cooldown port", async () => {
+  const realms: string[] = [];
+  const attempts: SettingsPinAttemptPort = {
+    async reserve(input) { realms.push(input.realm); return { status: "reserved" }; },
+    async verifyAndConsume() { return { status: "verified" }; },
+    async cancelAndConsume() {},
+  };
+  assert.equal((await validateTranscriptMutationPinAttempt(
+    attempts,
+    "87654321",
+    { kind: "delete_session", sessionId: "session-1" },
+    "wayang.session-deletion.v1",
+  )).ok, true);
+  assert.deepEqual(realms, ["wayang.session-deletion.v1"]);
 });
 
 test("shared transcript PIN cooldown fails closed without verification", async () => {

@@ -202,6 +202,39 @@ test("catalog discards first-message and model metadata when policy protects dur
   }
 });
 
+test("generation bump during an old scan reports the discarded generation and a fresh scan commits metadata", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-catalog-generation-race-"));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project, { recursive: true });
+  fs.writeFileSync(path.join(project, "race.jsonl"), syntheticSession("generation-race", project));
+  const state = createAdapter();
+  let bumped = false;
+  let catalog!: SessionCatalog;
+  catalog = new SessionCatalog(state.adapter, root, {
+    authorizeCwd: () => true,
+    getPolicyGeneration: () => 1,
+    refreshProjection: () => undefined,
+    onAuthorizedBodyTransferred() {
+      if (bumped) return;
+      bumped = true;
+      catalog.bumpGeneration();
+    },
+  });
+  try {
+    const old = await catalog.scan();
+    assert.equal(old.generation, 1, "discarded scan reports the generation it actually observed");
+    assert.equal(state.commits.length, 0);
+    const fresh = await catalog.scan();
+    assert.ok(fresh.generation >= 2);
+    assert.equal(fresh.parsed, 1);
+    assert.equal(state.commits.length, 1);
+    assert.equal(state.commits[0]?.generation, 2);
+  } finally {
+    await catalog.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("large metadata parsing stays off the main event loop", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-catalog-loop-test-"));
   const project = path.join(root, "--synthetic-project--");

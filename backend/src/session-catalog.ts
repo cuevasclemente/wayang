@@ -363,7 +363,10 @@ export class SessionCatalog {
         headerBytes,
         parseFailures,
         durationMs,
-        generation: this.generation,
+        // Report the generation this discarded scan actually observed. Callers
+        // awaiting a mutation fence must loop and drive a fresh scan rather
+        // than mistaking the newer process generation for committed metadata.
+        generation: scanGeneration,
       };
     }
 

@@ -286,9 +286,10 @@ function updateTranscriptCwd(row: SessionRow, cwd: string, store = getStore()): 
   return true;
 }
 
-function publishDirectMutation(triggerScan = false): void {
-  sessionCatalog?.bumpGeneration();
+function publishDirectMutation(triggerScan = false): number {
+  const generation = sessionCatalog?.bumpGeneration() ?? 1;
   if (triggerScan) sessionCatalog?.requestScan("internal-write", 0);
+  return generation;
 }
 
 /** Publish a change to a field derived into the existing session summaries. */
@@ -1016,7 +1017,7 @@ export function touchSession(id: string): void {
  * must re-read the file and reconcile title/model/activity metadata instead of
  * committing a pre-mutation fingerprint.
  */
-export function markSessionTranscriptMutated(id: string): void {
+export function markSessionTranscriptMutated(id: string): number {
   const committed = commitStoreMutation((draft) => {
     const row = draft.sessions.find((candidate) => candidate.id === id);
     if (!row) throw new WorkspaceStoreError("Session not found", 404);
@@ -1034,7 +1035,7 @@ export function markSessionTranscriptMutated(id: string): void {
     incrementDirectMutation(row);
     return true;
   });
-  if (committed) publishDirectMutation(true);
+  return committed ? publishDirectMutation(true) : getSessionCatalogGeneration();
 }
 
 export function updateSessionError(id: string, error: string | null): void {
