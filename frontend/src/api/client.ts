@@ -57,18 +57,26 @@ export interface TranscriptEventWarning {
 }
 
 /**
- * Isolated frontend projection for the transcript mutation REST API. The
- * envelope is display-only; callers may submit only `payload` for edits.
+ * Isolated frontend projection for the finalized session-event REST API.
+ * Envelope fields are display-only; edit callers rebuild a replacement entry.
  */
+export interface TranscriptEventEnvelope {
+  type: unknown;
+  id: unknown;
+  parentId?: unknown;
+  timestamp?: unknown;
+}
+
 export interface TranscriptEvent {
   event_id: string;
-  expected_digest: string;
   event_type: string;
-  branch: string | null;
   active_branch: boolean;
   hidden_event_type: boolean;
-  envelope: Readonly<Record<string, unknown>>;
-  payload: unknown;
+  envelope: Readonly<TranscriptEventEnvelope>;
+  payload: Readonly<Record<string, unknown>>;
+  expected_entry: Readonly<Record<string, unknown>>;
+  /** UI intent identity only; never sent as authorization or a CAS hash. */
+  intent_token: string;
   editable_text: string | null;
   edited: boolean;
   deleted: boolean;
@@ -82,28 +90,15 @@ export interface TranscriptEventsResponse {
 
 export type TranscriptMutationOperation = "edit" | "delete";
 
-export interface TranscriptMutationRequest {
-  operation: TranscriptMutationOperation;
-  expected_digest: string;
-  payload?: unknown;
-  acknowledge_warnings?: boolean;
-  pin: string;
-}
-
 export interface TranscriptMutationResult {
-  event: TranscriptEvent | null;
+  replacement: Readonly<Record<string, unknown>> | null;
   warnings: TranscriptEventWarning[];
 }
 
 export function apiErrorCode(error: unknown): string | null {
   if (!(error instanceof ApiError) || !error.body || typeof error.body !== "object") return null;
   const body = error.body as Record<string, unknown>;
-  if (typeof body.code === "string") return body.code;
-  if (typeof body.error_code === "string") return body.error_code;
-  if (body.error && typeof body.error === "object" && typeof (body.error as Record<string, unknown>).code === "string") {
-    return (body.error as { code: string }).code;
-  }
-  return null;
+  return typeof body.code === "string" ? body.code : null;
 }
 
 export interface Session {
@@ -1010,40 +1005,53 @@ function normalizeTranscriptWarnings(value: unknown): TranscriptEventWarning[] {
   });
 }
 
+function transcriptEditableText(payload: Record<string, unknown>): string | null {
+  if (typeof payload.content === "string") return payload.content;
+  const message = transcriptRecord(payload.message);
+  if (!message) return null;
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content) || message.content.length !== 1) return null;
+  const block = transcriptRecord(message.content[0]);
+  return block?.type === "text" && typeof block.text === "string" ? block.text : null;
+}
+
 function normalizeTranscriptEvent(value: unknown): TranscriptEvent {
-  const event = transcriptRecord(value);
-  const envelope = transcriptRecord(event.envelope);
-  const eventId = typeof event.event_id === "string"
-    ? event.event_id
-    : typeof event.id === "string" ? event.id : "";
-  const digest = typeof event.expected_digest === "string"
-    ? event.expected_digest
-    : typeof event.digest === "string" ? event.digest : "";
-  if (!eventId || !digest) throw new Error("Transcript event projection is missing its id or digest");
+  const projection = transcriptRecord(value);
+  const entry = transcriptRecord(projection.entry);
+  const eventId = typeof entry.id === "string" ? entry.id : "";
+  const eventType = typeof entry.type === "string" ? entry.type : "unknown";
+  if (!eventId) throw new Error("Session event projection is missing entry.id");
+
+  const envelope: TranscriptEventEnvelope = {
+    type: entry.type,
+    id: entry.id,
+    ...(Object.prototype.hasOwnProperty.call(entry, "parentId") ? { parentId: entry.parentId } : {}),
+    ...(Object.prototype.hasOwnProperty.call(entry, "timestamp") ? { timestamp: entry.timestamp } : {}),
+  };
+  const payload = { ...entry };
+  delete payload.type;
+  delete payload.id;
+  delete payload.parentId;
+  delete payload.timestamp;
+  const mutationStatus = entry.mutation_status;
+
   return {
     event_id: eventId,
-    expected_digest: digest,
-    event_type: typeof event.event_type === "string"
-      ? event.event_type
-      : typeof event.type === "string" ? event.type : "unknown",
-    branch: typeof event.branch === "string"
-      ? event.branch
-      : typeof envelope.branch === "string" ? envelope.branch : null,
-    active_branch: event.active_branch !== false && event.is_active_branch !== false,
-    hidden_event_type: event.hidden_event_type === true || event.hidden === true,
-    envelope: Object.freeze({ ...envelope }),
-    payload: event.payload,
-    editable_text: typeof event.editable_text === "string" ? event.editable_text : null,
-    edited: event.edited === true || event.mutation_status === "edited",
-    deleted: event.deleted === true || event.mutation_status === "deleted",
-    warnings: normalizeTranscriptWarnings(event.warnings),
+    event_type: eventType,
+    active_branch: projection.active_branch === true,
+    hidden_event_type: eventType !== "message",
+    envelope: Object.freeze(envelope),
+    payload: Object.freeze(payload),
+    expected_entry: Object.freeze({ ...entry }),
+    intent_token: JSON.stringify(entry),
+    editable_text: transcriptEditableText(payload),
+    edited: mutationStatus === "edited",
+    deleted: mutationStatus === "deleted",
+    warnings: normalizeTranscriptWarnings(projection.semantic_warnings),
   };
 }
 
 export interface FetchTranscriptEventOptions {
-  allBranches?: boolean;
-  includeHiddenEventTypes?: boolean;
-  eventId?: string;
   cursor?: string;
   limit?: number;
   includePayload?: boolean;
@@ -1055,69 +1063,89 @@ export async function fetchTranscriptEvents(
   signal?: AbortSignal,
 ): Promise<TranscriptEventsResponse> {
   const params = new URLSearchParams();
-  if (options.allBranches) params.set("all_branches", "1");
-  if (options.includeHiddenEventTypes) params.set("include_hidden_event_types", "1");
-  if (options.eventId) params.set("event_id", options.eventId);
-  if (options.cursor) params.set("cursor", options.cursor);
+  if (options.cursor) {
+    const offset = Number(options.cursor);
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid session-event offset cursor");
+    params.set("offset", String(offset));
+  }
   if (options.limit != null) params.set("limit", String(options.limit));
   if (options.includePayload != null) params.set("include_payload", options.includePayload ? "1" : "0");
   const query = params.size > 0 ? `?${params.toString()}` : "";
   const value = await request<unknown>(
     "GET",
-    `/api/sessions/${encodeURIComponent(sessionId)}/transcript-events${query}`,
+    `/api/sessions/${encodeURIComponent(sessionId)}/events${query}`,
     undefined,
     signal,
     true,
     "no-store",
   );
   const body = transcriptRecord(value);
-  const rows = Array.isArray(value) ? value : Array.isArray(body.events) ? body.events : [];
+  const rows = Array.isArray(body.events) ? body.events : [];
   return {
     events: rows.map(normalizeTranscriptEvent),
-    next_cursor: typeof body.next_cursor === "string"
-      ? body.next_cursor
-      : typeof body.nextCursor === "string" ? body.nextCursor : null,
+    next_cursor: typeof body.next_offset === "number" && Number.isSafeInteger(body.next_offset)
+      ? String(body.next_offset)
+      : null,
   };
 }
 
-/** Fetches one exact current projection; it never falls back to a cached row. */
+/** Fetches one exact current entry with its complete payload. */
 export async function fetchTranscriptEvent(
   sessionId: string,
   eventId: string,
   signal?: AbortSignal,
 ): Promise<TranscriptEvent> {
-  const result = await fetchTranscriptEvents(sessionId, {
-    allBranches: true,
-    includeHiddenEventTypes: true,
-    eventId,
-    limit: 1,
-    includePayload: true,
-  }, signal);
-  const exact = result.events.filter((event) => event.event_id === eventId);
-  if (exact.length !== 1) throw new ApiError(404, { code: "transcript_event_not_found" }, "Transcript event was not found");
-  return exact[0];
+  const value = await request<unknown>(
+    "GET",
+    `/api/sessions/${encodeURIComponent(sessionId)}/events/${encodeURIComponent(eventId)}`,
+    undefined,
+    signal,
+    true,
+    "no-store",
+  );
+  return normalizeTranscriptEvent(value);
 }
 
-export async function mutateTranscriptEvent(
+function normalizeTranscriptMutationResult(value: unknown): TranscriptMutationResult {
+  const body = transcriptRecord(value);
+  return {
+    replacement: body.replacement && typeof body.replacement === "object"
+      ? Object.freeze({ ...(body.replacement as Record<string, unknown>) })
+      : null,
+    warnings: normalizeTranscriptWarnings(body.semantic_warnings),
+  };
+}
+
+export async function editTranscriptEvent(
   sessionId: string,
   eventId: string,
-  input: TranscriptMutationRequest,
+  input: { pin: string; expected_entry: Readonly<Record<string, unknown>>; replacement_entry: Readonly<Record<string, unknown>> },
   signal?: AbortSignal,
 ): Promise<TranscriptMutationResult> {
-  const value = await request<unknown>(
+  return normalizeTranscriptMutationResult(await request<unknown>(
     "POST",
-    `/api/sessions/${encodeURIComponent(sessionId)}/transcript-events/${encodeURIComponent(eventId)}/mutate`,
+    `/api/sessions/${encodeURIComponent(sessionId)}/events/${encodeURIComponent(eventId)}/edit`,
     input,
     signal,
     false,
     "no-store",
-  );
-  const record = transcriptRecord(value);
-  const eventValue = record.event ?? (typeof record.event_id === "string" || typeof record.id === "string" ? value : null);
-  return {
-    event: eventValue ? normalizeTranscriptEvent(eventValue) : null,
-    warnings: normalizeTranscriptWarnings(record.warnings),
-  };
+  ));
+}
+
+export async function deleteTranscriptEvent(
+  sessionId: string,
+  eventId: string,
+  input: { pin: string; expected_entry: Readonly<Record<string, unknown>> },
+  signal?: AbortSignal,
+): Promise<TranscriptMutationResult> {
+  return normalizeTranscriptMutationResult(await request<unknown>(
+    "POST",
+    `/api/sessions/${encodeURIComponent(sessionId)}/events/${encodeURIComponent(eventId)}/delete`,
+    input,
+    signal,
+    false,
+    "no-store",
+  ));
 }
 
 export function archiveSession(id: string): Promise<null> {

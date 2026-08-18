@@ -15,9 +15,10 @@ import { AlertTriangle, FileJson, ListTree, Pencil, Settings2, Trash2, X } from 
 import {
   ApiError,
   apiErrorCode,
+  deleteTranscriptEvent,
+  editTranscriptEvent,
   fetchTranscriptEvent,
   fetchTranscriptEvents,
-  mutateTranscriptEvent,
   type TranscriptEvent,
   type TranscriptEventWarning,
   type TranscriptMutationOperation,
@@ -26,15 +27,7 @@ import {
 const MAX_ADVANCED_PAYLOAD_CHARS = 100_000;
 const MAX_PREVIEW_CHARS = 12_000;
 const INSPECTOR_PAGE_SIZE = 40;
-const CONFLICT_CODES = new Set([
-  "digest_conflict",
-  "expected_digest_mismatch",
-  "stale_digest",
-  "stale_event",
-  "revision_conflict",
-  "event_digest_mismatch",
-  "transcript_event_conflict",
-]);
+const CONFLICT_CODES = new Set(["cas_conflict"]);
 
 type MutationMarker = "edited" | "deleted" | "partially modified" | null;
 
@@ -91,7 +84,7 @@ function errorMessage(error: unknown): string {
   const code = apiErrorCode(error);
   if (code === "pin_cooldown" || code === "cooldown") return "PIN verification is cooling down. Wait, then enter the PIN again.";
   if (code === "invalid_pin" || code === "wrong_pin" || code === "pin_invalid") return "The identity PIN was not accepted.";
-  if (code === "transcript_event_not_found") return "This persisted event is no longer available.";
+  if (code === "event_not_found") return "This persisted event is no longer available.";
   if (code === "runtime_busy" || code === "session_mutable") return "The session changed while this dialog was open. Wait for an idle, authoritative transcript and review again.";
   if (error instanceof ApiError) return error.message || `The request failed (HTTP ${error.status}).`;
   return error instanceof Error ? error.message : "The request failed unexpectedly.";
@@ -131,6 +124,10 @@ function friendlyEditorForPayload(payload: unknown): FriendlyEditor | null {
   return nested
     ? { text: nested.text, buildPayload: (text) => ({ ...outer, message: nested.buildPayload(text) }) }
     : null;
+}
+
+function replacementEntry(event: TranscriptEvent, payload: Record<string, unknown>): Readonly<Record<string, unknown>> {
+  return Object.freeze({ ...payload, ...event.envelope });
 }
 
 function inferredWarnings(event: TranscriptEvent, advanced: boolean): TranscriptEventWarning[] {
@@ -556,8 +553,6 @@ function TranscriptEventInspector({
     setLoading(true);
     setError("");
     void fetchTranscriptEvents(sessionId, {
-      allBranches,
-      includeHiddenEventTypes: hiddenTypes,
       cursor: nextCursor ?? undefined,
       limit: INSPECTOR_PAGE_SIZE,
       includePayload: false,
@@ -572,13 +567,17 @@ function TranscriptEventInspector({
       if (mountedRef.current && !controller.signal.aborted && generation === generationRef.current) setLoading(false);
     });
     return () => controller.abort();
-  }, [allBranches, hiddenTypes, sessionId]);
+  }, [sessionId]);
 
   useEffect(() => {
     setEvents([]);
     setCursor(null);
     return loadPage(null, false);
   }, [loadPage, selectionKey]);
+
+  const visibleEvents = useMemo(() => events.filter((event) => (
+    (allBranches || event.active_branch) && (hiddenTypes || !event.hidden_event_type)
+  )), [allBranches, events, hiddenTypes]);
 
   return (
     <ModalFrame testId="transcript-event-inspector" labelledBy="transcript-inspector-title" suspended={suspended} onClose={onClose} initialFocusRef={closeRef}>
@@ -587,11 +586,11 @@ function TranscriptEventInspector({
         <div className="flex flex-wrap gap-4 border-b border-neutral-800 bg-neutral-900/40 px-4 py-2 text-xs"><label className="inline-flex min-h-8 items-center gap-2"><input data-testid="transcript-inspector-all-branches" type="checkbox" checked={allBranches} onChange={(change) => setAllBranches(change.target.checked)} /> Show all branches</label><label className="inline-flex min-h-8 items-center gap-2"><input data-testid="transcript-inspector-hidden-types" type="checkbox" checked={hiddenTypes} onChange={(change) => setHiddenTypes(change.target.checked)} /> Show hidden event types</label>{loading && <span role="status" className="self-center text-blue-300">Loading…</span>}</div>
         {error && <div role="alert" className="border-b border-red-900/60 bg-red-950/30 px-4 py-2 text-sm text-red-200">{error}</div>}
         <ol className="min-h-0 flex-1 space-y-2 overflow-y-auto p-4">
-          {events.map((event) => {
+          {visibleEvents.map((event) => {
             const summary: TranscriptEventRowSummary = { eventId: event.event_id, label: event.event_type, preview: event.editable_text ?? undefined, marker: event.deleted ? "deleted" : event.edited ? "edited" : undefined };
-            return <li key={event.event_id} data-testid="transcript-inspector-event" data-event-id={event.event_id} className="group rounded border border-neutral-800 bg-neutral-900/50 p-3"><div className="flex flex-wrap items-start justify-between gap-2"><div><div className="flex flex-wrap items-center gap-2 text-xs"><span className="font-semibold">{event.event_type}</span><span className="font-mono text-[10px] text-neutral-600">{event.event_id}</span>{!event.active_branch && <span className="text-[10px] text-amber-300">other branch</span>}{event.hidden_event_type && <span className="text-[10px] text-neutral-500">hidden type</span>}<TranscriptMutationMarker marker={summary.marker ?? null} /></div>{event.branch && <div className="mt-1 text-[10px] text-neutral-500">branch: {event.branch}</div>}</div><button type="button" data-testid="transcript-inspector-manage-event" disabled={!availability.available} onClick={(click) => onManage([summary], click.currentTarget)} className="min-h-9 rounded border border-neutral-700 px-2 text-xs hover:bg-neutral-800 disabled:opacity-35">Manage</button></div><LazyEventDetails sessionId={sessionId} event={event} /></li>;
+            return <li key={event.event_id} data-testid="transcript-inspector-event" data-event-id={event.event_id} className="group rounded border border-neutral-800 bg-neutral-900/50 p-3"><div className="flex flex-wrap items-start justify-between gap-2"><div><div className="flex flex-wrap items-center gap-2 text-xs"><span className="font-semibold">{event.event_type}</span><span className="font-mono text-[10px] text-neutral-600">{event.event_id}</span>{!event.active_branch && <span className="text-[10px] text-amber-300">other branch</span>}{event.hidden_event_type && <span className="text-[10px] text-neutral-500">hidden type</span>}<TranscriptMutationMarker marker={summary.marker ?? null} /></div></div><button type="button" data-testid="transcript-inspector-manage-event" disabled={!availability.available} onClick={(click) => onManage([summary], click.currentTarget)} className="min-h-9 rounded border border-neutral-700 px-2 text-xs hover:bg-neutral-800 disabled:opacity-35">Manage</button></div><LazyEventDetails sessionId={sessionId} event={event} /></li>;
           })}
-          {!loading && events.length === 0 && <li className="py-10 text-center text-sm text-neutral-500">No events match this view.</li>}
+          {!loading && visibleEvents.length === 0 && <li className="py-10 text-center text-sm text-neutral-500">No events in the loaded page match this view.</li>}
           {cursor && <li className="flex justify-center py-2"><button type="button" data-testid="transcript-inspector-load-more" disabled={loading} onClick={() => loadPage(cursor, true)} className="min-h-10 rounded border border-neutral-700 px-4 text-xs hover:bg-neutral-800 disabled:opacity-40">Load more</button></li>}
         </ol>
       </section>
@@ -677,7 +676,7 @@ function TranscriptMutationDialog({
   const friendly = useMemo(() => event ? friendlyEditorForPayload(event.payload) : null, [event]);
   const warnings = useMemo(() => event ? inferredWarnings(event, advanced) : [], [advanced, event]);
   const warningKey = warnings.map((warning) => `${warning.code}:${warning.message}:${warning.requires_acknowledgement}`).join("|");
-  const intentKey = `${operation}\0${event?.expected_digest ?? ""}\0${advanced}\0${advanced || !friendly ? json : text}\0${warningKey}\0${reviewRevision}`;
+  const intentKey = `${operation}\0${event?.intent_token ?? ""}\0${advanced}\0${advanced || !friendly ? json : text}\0${warningKey}\0${reviewRevision}`;
   const previousIntentRef = useRef(intentKey);
   useEffect(() => {
     if (previousIntentRef.current !== intentKey) {
@@ -700,28 +699,39 @@ function TranscriptMutationDialog({
   const submit = async (formEvent: FormEvent) => {
     formEvent.preventDefault();
     if (!event || !pinValid || submitting || (requiresAcknowledgement && !acknowledged)) return;
-    let payload: unknown;
+    let payload: Record<string, unknown> | null = null;
     if (operation === "edit") {
-      if (!advanced && friendly) payload = friendly.buildPayload(text);
-      else {
+      let candidate: unknown;
+      if (!advanced && friendly) {
+        candidate = friendly.buildPayload(text);
+      } else {
         if (json.length > MAX_ADVANCED_PAYLOAD_CHARS) { setError(`Payload JSON must be ${MAX_ADVANCED_PAYLOAD_CHARS.toLocaleString()} characters or fewer.`); setPin(""); return; }
-        try { payload = JSON.parse(json); } catch { setError("Payload JSON is invalid."); setPin(""); return; }
+        try { candidate = JSON.parse(json) as unknown; } catch { setError("Payload JSON is invalid."); setPin(""); return; }
       }
+      const candidateRecord = record(candidate);
+      if (!candidateRecord) { setError("Payload JSON must be an object."); setPin(""); return; }
+      payload = candidateRecord;
     }
-    const capturedDigest = event.expected_digest;
+    const capturedIntentToken = event.intent_token;
+    const expectedEntry = event.expected_entry;
     const controller = new AbortController();
     requestRef.current = controller;
     setSubmitting(true);
     setError("");
     try {
-      await mutateTranscriptEvent(sessionId, eventId, {
-        operation,
-        expected_digest: capturedDigest,
-        ...(operation === "edit" ? { payload } : {}),
-        ...(requiresAcknowledgement ? { acknowledge_warnings: true } : {}),
-        pin,
-      }, controller.signal);
-      if (!controller.signal.aborted && isScopeCurrent(selectionKey)) onSuccess();
+      if (operation === "edit" && payload) {
+        await editTranscriptEvent(sessionId, eventId, {
+          pin,
+          expected_entry: expectedEntry,
+          replacement_entry: replacementEntry(event, payload),
+        }, controller.signal);
+      } else {
+        await deleteTranscriptEvent(sessionId, eventId, {
+          pin,
+          expected_entry: expectedEntry,
+        }, controller.signal);
+      }
+      if (!controller.signal.aborted && isScopeCurrent(selectionKey) && event.intent_token === capturedIntentToken) onSuccess();
     } catch (submitError: unknown) {
       if (!controller.signal.aborted && isScopeCurrent(selectionKey)) {
         if (submitError instanceof ApiError && submitError.status === 409 && CONFLICT_CODES.has(apiErrorCode(submitError) ?? "")) {
@@ -748,13 +758,13 @@ function TranscriptMutationDialog({
         className="flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-neutral-700 bg-neutral-950 shadow-2xl"
         data-operation={operation}
         data-selection-key={selectionKey}
-        data-expected-digest={event?.expected_digest ?? ""}
+        data-review-revision={reviewRevision}
       >
         <header className="border-b border-neutral-800 px-4 py-3"><div className={`text-[10px] font-semibold uppercase tracking-wider ${operation === "delete" ? "text-red-400" : "text-blue-400"}`}>PIN-gated transcript mutation</div><h2 id="transcript-mutation-title" className="mt-1 text-base font-semibold">{operation === "delete" ? "Delete transcript event?" : "Edit transcript event"}</h2><p className="mt-1 break-all font-mono text-[10px] text-neutral-600">{eventId}</p></header>
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4">
           {loading && <p role="status" className="text-sm text-neutral-400">Loading the latest exact event…</p>}
           {error && <div role="alert" data-testid="transcript-mutation-error" className="rounded border border-red-900/60 bg-red-950/30 px-3 py-2 text-sm text-red-200">{error}</div>}
-          {event && <><dl className="grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 rounded border border-neutral-800 bg-neutral-900/40 p-3 text-xs"><dt className="text-neutral-500">Type</dt><dd>{event.event_type}</dd><dt className="text-neutral-500">Branch</dt><dd>{event.branch ?? "active"}</dd><dt className="text-neutral-500">Digest</dt><dd className="break-all font-mono text-[10px] text-neutral-500">{event.expected_digest}</dd></dl><details className="rounded border border-neutral-800 px-3 py-2 text-xs"><summary className="cursor-pointer text-neutral-400">Read-only envelope</summary><pre className="mt-2 max-h-40 overflow-auto rounded bg-neutral-900 p-2 font-mono text-[11px] text-neutral-400">{bounded(prettyJson(event.envelope))}</pre></details>
+          {event && <><dl className="grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 rounded border border-neutral-800 bg-neutral-900/40 p-3 text-xs"><dt className="text-neutral-500">Type</dt><dd>{event.event_type}</dd><dt className="text-neutral-500">Branch</dt><dd>{event.active_branch ? "active" : "other"}</dd><dt className="text-neutral-500">Event ID</dt><dd className="break-all font-mono text-[10px] text-neutral-500">{event.event_id}</dd></dl><details className="rounded border border-neutral-800 px-3 py-2 text-xs"><summary className="cursor-pointer text-neutral-400">Read-only envelope</summary><pre className="mt-2 max-h-40 overflow-auto rounded bg-neutral-900 p-2 font-mono text-[11px] text-neutral-400">{bounded(prettyJson(event.envelope))}</pre></details>
           {operation === "delete" ? <div data-testid="transcript-delete-preview" className="space-y-2 rounded border border-red-900/60 bg-red-950/20 p-3"><div className="text-xs font-semibold uppercase tracking-wider text-red-300">Exact content to remove</div>{friendly?.text && <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-950 p-2 text-xs text-neutral-200">{bounded(friendly.text)}</pre>}<pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-950 p-2 font-mono text-[11px] text-neutral-300">{previewJson}</pre><p className="text-xs leading-relaxed text-red-100/80">Deletion replaces this event with a content-free tombstone and removes it from future context and search.</p></div> : <div>{friendly && <div className="mb-2 flex items-center justify-between"><span className="text-xs font-medium">{advanced ? "Advanced payload JSON" : "Message text"}</span><button type="button" data-testid="transcript-edit-mode-toggle" onClick={() => setAdvanced((value) => !value)} className="inline-flex min-h-9 items-center gap-1 rounded border border-neutral-700 px-2 text-xs"><FileJson size={12} /> {advanced ? "Use text editor" : "Advanced JSON"}</button></div>}{!friendly || advanced ? <textarea ref={editorRef} data-testid="transcript-event-json-input" aria-label="Advanced event payload JSON" value={json} maxLength={MAX_ADVANCED_PAYLOAD_CHARS} onChange={(change) => setJson(change.target.value)} className="h-64 w-full resize-y rounded border border-neutral-700 bg-neutral-900 p-3 font-mono text-xs outline-none focus:border-blue-500" spellCheck={false} /> : <textarea ref={editorRef} data-testid="transcript-event-text-input" aria-label="Message text" value={text} maxLength={MAX_ADVANCED_PAYLOAD_CHARS} onChange={(change) => setText(change.target.value)} className="h-44 w-full resize-y rounded border border-neutral-700 bg-neutral-900 p-3 text-sm outline-none focus:border-blue-500" />}</div>}
           {warnings.length > 0 && <div data-testid="transcript-mutation-warnings" className="space-y-2 rounded border border-amber-900/60 bg-amber-950/20 p-3"><div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-amber-300"><AlertTriangle size={14} /> Review consequences</div><ul className="list-disc space-y-1 pl-5 text-xs text-amber-100/80">{warnings.map((warning) => <li key={`${warning.code}:${warning.message}`}>{warning.message}</li>)}</ul>{requiresAcknowledgement && <label className="flex min-h-9 items-start gap-2 text-xs"><input data-testid="transcript-warning-acknowledgement" type="checkbox" checked={acknowledged} onChange={(change) => setAcknowledged(change.target.checked)} /> I understand these warnings and want to continue.</label>}</div>}
           <div><label htmlFor="transcript-mutation-pin" className="text-xs font-medium">8-digit identity PIN</label><p className="mt-1 text-[11px] text-neutral-500">Cleared whenever the reviewed intent changes and after submit, cancel, error, selection change, or visibility loss.</p><input ref={pinRef} id="transcript-mutation-pin" data-testid="transcript-mutation-pin" type="password" inputMode="numeric" autoComplete="off" pattern="[0-9]{8}" minLength={8} maxLength={8} value={pin} onChange={(change) => setPin(change.target.value.replace(/\D/g, "").slice(0, 8))} className="mt-2 w-full rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm outline-none focus:border-red-500 sm:max-w-xs" placeholder="8-digit PIN" /></div></>}
