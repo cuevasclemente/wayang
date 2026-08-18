@@ -246,16 +246,22 @@ export function TranscriptMutationProvider({
   sessionId,
   selectionKey,
   availability,
+  otherwiseAvailable,
+  runtimeMutationLocked,
   paneVisible,
   historyRevision,
+  onAwaitAuthoritativeHistory,
   onAuthoritativeRefresh,
   children,
 }: {
   sessionId: string;
   selectionKey: string;
   availability: MutationAvailability;
+  otherwiseAvailable: boolean;
+  runtimeMutationLocked: boolean;
   paneVisible: boolean;
   historyRevision: number;
+  onAwaitAuthoritativeHistory: () => void;
   onAuthoritativeRefresh: () => void;
   children: ReactNode;
 }) {
@@ -263,14 +269,24 @@ export function TranscriptMutationProvider({
   const [manage, setManage] = useState<{ summaries: TranscriptEventRowSummary[]; trigger: HTMLButtonElement } | null>(null);
   const [mutation, setMutation] = useState<{ eventId: string; operation: TranscriptMutationOperation; trigger: HTMLButtonElement } | null>(null);
   const [pending, setPending] = useState<{ eventId: string; operation: TranscriptMutationOperation; afterRevision: number; ambiguous: boolean } | null>(null);
+  const [requestInFlight, setRequestInFlight] = useState(false);
   const hasOpenModal = Boolean(inspectorOpen || manage || mutation);
   const inspectorTriggerRef = useRef<HTMLButtonElement | null>(null);
   const pendingRef = useRef<HTMLDivElement | null>(null);
   const hadPendingRef = useRef(false);
   const scopeRef = useRef<string | null>(selectionKey);
   const availableRef = useRef(availability.available && paneVisible);
+  const paneVisibleRef = useRef(paneVisible && document.visibilityState === "visible");
+  const ownedMutationLockRef = useRef(false);
+  const requestInFlightRef = useRef(false);
+  const runtimeMutationLockedRef = useRef(runtimeMutationLocked);
+  const requestStartedHistoryRevisionRef = useRef<number | null>(null);
+  const historyRevisionRef = useRef(historyRevision);
   scopeRef.current = selectionKey;
   availableRef.current = availability.available && paneVisible;
+  paneVisibleRef.current = paneVisible && document.visibilityState === "visible";
+  historyRevisionRef.current = historyRevision;
+  runtimeMutationLockedRef.current = runtimeMutationLocked;
 
   useEffect(() => () => { scopeRef.current = null; availableRef.current = false; }, []);
   useEffect(() => {
@@ -297,6 +313,16 @@ export function TranscriptMutationProvider({
     if (historyRevision > (pending?.afterRevision ?? Number.MAX_SAFE_INTEGER)) setPending(null);
   }, [historyRevision, pending?.afterRevision]);
   useEffect(() => {
+    if (!pending || pending.ambiguous) return;
+    const timer = window.setTimeout(() => {
+      if (historyRevisionRef.current <= pending.afterRevision) onAuthoritativeRefresh();
+    }, 1_750);
+    return () => window.clearTimeout(timer);
+  }, [onAuthoritativeRefresh, pending]);
+  useEffect(() => {
+    if (!runtimeMutationLocked) ownedMutationLockRef.current = false;
+  }, [runtimeMutationLocked]);
+  useEffect(() => {
     if (pending) {
       hadPendingRef.current = true;
       pendingRef.current?.focus();
@@ -313,16 +339,25 @@ export function TranscriptMutationProvider({
   }, []);
 
   useEffect(() => {
-    if (!availability.available || !paneVisible) closeTransient();
-  }, [availability.available, closeTransient, paneVisible]);
+    if (availability.available && paneVisible) return;
+    const preserveSubmittedRequest = Boolean(mutation && requestInFlightRef.current && paneVisible);
+    const preserveOwnedTemporaryLock = Boolean(
+      mutation
+      && runtimeMutationLocked
+      && otherwiseAvailable
+      && ownedMutationLockRef.current,
+    );
+    if (!preserveSubmittedRequest && !preserveOwnedTemporaryLock) closeTransient();
+  }, [availability.available, closeTransient, mutation, otherwiseAvailable, paneVisible, requestInFlight, runtimeMutationLocked]);
 
   useEffect(() => {
     const visibilityChanged = () => {
+      paneVisibleRef.current = paneVisible && document.visibilityState === "visible";
       if (document.visibilityState !== "visible") closeTransient();
     };
     document.addEventListener("visibilitychange", visibilityChanged);
     return () => document.removeEventListener("visibilitychange", visibilityChanged);
-  }, [closeTransient]);
+  }, [closeTransient, paneVisible]);
 
   const openManage = useCallback((summaries: TranscriptEventRowSummary[], trigger: HTMLButtonElement) => {
     if (!availableRef.current || summaries.length === 0) return;
@@ -339,19 +374,36 @@ export function TranscriptMutationProvider({
     inspectorTriggerRef.current = null;
   }, []);
   const isScopeCurrent = useCallback((captured: string) => (
-    scopeRef.current === captured && availableRef.current
+    scopeRef.current === captured && paneVisibleRef.current
   ), []);
+  const handleRequestInFlightChange = useCallback((inFlight: boolean) => {
+    requestInFlightRef.current = inFlight;
+    if (inFlight) {
+      ownedMutationLockRef.current = true;
+      requestStartedHistoryRevisionRef.current = historyRevisionRef.current;
+    } else if (!runtimeMutationLockedRef.current) {
+      ownedMutationLockRef.current = false;
+    }
+    setRequestInFlight(inFlight);
+  }, []);
   const beginAuthoritativeRefresh = useCallback((
     eventId: string,
     operation: TranscriptMutationOperation,
     ambiguous: boolean,
   ) => {
-    setPending({ eventId, operation, afterRevision: historyRevision, ambiguous });
+    const afterRevision = requestStartedHistoryRevisionRef.current ?? historyRevision;
+    requestStartedHistoryRevisionRef.current = null;
     setMutation(null);
     setManage(null);
     setInspectorOpen(false);
-    onAuthoritativeRefresh();
-  }, [historyRevision, onAuthoritativeRefresh]);
+    if (!ambiguous && historyRevisionRef.current > afterRevision) {
+      setPending(null);
+      return;
+    }
+    setPending({ eventId, operation, afterRevision, ambiguous });
+    onAwaitAuthoritativeHistory();
+    if (ambiguous) onAuthoritativeRefresh();
+  }, [historyRevision, onAuthoritativeRefresh, onAwaitAuthoritativeHistory]);
 
   const context = useMemo<TranscriptMutationContextValue>(() => ({ availability, openManage, openInspector }), [availability, openInspector, openManage]);
 
@@ -361,6 +413,7 @@ export function TranscriptMutationProvider({
         className="h-full"
         data-testid="transcript-mutation-scope"
         data-modal-open={hasOpenModal ? "true" : "false"}
+        data-request-in-flight={requestInFlight ? "true" : "false"}
         data-selection-key={selectionKey}
         data-mutation-available={availability.available ? "true" : "false"}
         data-unavailable-reason={availability.reason}
@@ -373,6 +426,7 @@ export function TranscriptMutationProvider({
           tabIndex={-1}
           data-testid="transcript-mutation-pending"
           data-completion={pending.ambiguous ? "ambiguous" : "confirmed"}
+          data-after-history-revision={pending.afterRevision}
           role="status"
           className="fixed bottom-20 left-1/2 z-[65] -translate-x-1/2 rounded-full border border-blue-800 bg-blue-950 px-4 py-2 text-xs text-blue-100 shadow-xl"
         >
@@ -410,7 +464,9 @@ export function TranscriptMutationProvider({
           eventId={mutation.eventId}
           operation={mutation.operation}
           trigger={mutation.trigger}
+          mutationAvailable={availability.available}
           isScopeCurrent={isScopeCurrent}
+          onRequestInFlightChange={handleRequestInFlightChange}
           onSuccess={() => {
             if (!isScopeCurrent(selectionKey)) return;
             beginAuthoritativeRefresh(mutation.eventId, mutation.operation, false);
@@ -639,7 +695,9 @@ function TranscriptMutationDialog({
   eventId,
   operation,
   trigger,
+  mutationAvailable,
   isScopeCurrent,
+  onRequestInFlightChange,
   onSuccess,
   onAmbiguous,
   onClose,
@@ -649,7 +707,9 @@ function TranscriptMutationDialog({
   eventId: string;
   operation: TranscriptMutationOperation;
   trigger: HTMLButtonElement;
+  mutationAvailable: boolean;
   isScopeCurrent: (captured: string) => boolean;
+  onRequestInFlightChange: (inFlight: boolean) => void;
   onSuccess: () => void;
   onAmbiguous: () => void;
   onClose: () => void;
@@ -671,12 +731,15 @@ function TranscriptMutationDialog({
   const submittedRef = useRef(false);
   const ambiguitySignalledRef = useRef(false);
   const onAmbiguousRef = useRef(onAmbiguous);
+  const onRequestInFlightChangeRef = useRef(onRequestInFlightChange);
   onAmbiguousRef.current = onAmbiguous;
+  onRequestInFlightChangeRef.current = onRequestInFlightChange;
 
   const signalAmbiguousCompletion = useCallback(() => {
     if (!submittedRef.current || ambiguitySignalledRef.current) return;
     ambiguitySignalledRef.current = true;
     submittedRef.current = false;
+    onRequestInFlightChangeRef.current(false);
     onAmbiguousRef.current();
   }, []);
 
@@ -749,7 +812,7 @@ function TranscriptMutationDialog({
   const pinValid = /^\d{8}$/.test(pin);
   const submit = async (formEvent: FormEvent) => {
     formEvent.preventDefault();
-    if (!event || !pinValid || submitting || (requiresAcknowledgement && !acknowledged)) return;
+    if (!event || !mutationAvailable || !pinValid || submitting || (requiresAcknowledgement && !acknowledged)) return;
     let payload: Record<string, unknown> | null = null;
     if (operation === "edit") {
       let candidate: unknown;
@@ -769,6 +832,7 @@ function TranscriptMutationDialog({
     requestRef.current = controller;
     ambiguitySignalledRef.current = false;
     submittedRef.current = true;
+    onRequestInFlightChangeRef.current(true);
     setSubmitting(true);
     setError("");
     try {
@@ -791,12 +855,14 @@ function TranscriptMutationDialog({
         return;
       }
       submittedRef.current = false;
+      onRequestInFlightChangeRef.current(false);
       onSuccess();
     } catch (submitError: unknown) {
       if (isAmbiguousMutationError(submitError)) {
         signalAmbiguousCompletion();
       } else if (!controller.signal.aborted && isScopeCurrent(selectionKey)) {
         submittedRef.current = false;
+        onRequestInFlightChangeRef.current(false);
         if (submitError instanceof ApiError && submitError.status === 409 && CONFLICT_CODES.has(apiErrorCode(submitError) ?? "")) {
           setPin("");
           setAcknowledged(false);
@@ -834,7 +900,7 @@ function TranscriptMutationDialog({
           {warnings.length > 0 && <div data-testid="transcript-mutation-warnings" className="space-y-2 rounded border border-amber-900/60 bg-amber-950/20 p-3"><div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-amber-300"><AlertTriangle size={14} /> Review consequences</div><ul className="list-disc space-y-1 pl-5 text-xs text-amber-100/80">{warnings.map((warning) => <li key={`${warning.code}:${warning.message}`}>{warning.message}</li>)}</ul>{requiresAcknowledgement && <label className="flex min-h-9 items-start gap-2 text-xs"><input data-testid="transcript-warning-acknowledgement" type="checkbox" checked={acknowledged} onChange={(change) => setAcknowledged(change.target.checked)} /> I understand these warnings and want to continue.</label>}</div>}
           <div><label htmlFor="transcript-mutation-pin" className="text-xs font-medium">8-digit identity PIN</label><p className="mt-1 text-[11px] text-neutral-500">Cleared whenever the reviewed intent changes and after submit, cancel, error, selection change, or visibility loss.</p><input ref={pinRef} id="transcript-mutation-pin" data-testid="transcript-mutation-pin" type="password" inputMode="numeric" autoComplete="off" pattern="[0-9]{8}" minLength={8} maxLength={8} value={pin} onChange={(change) => setPin(change.target.value.replace(/\D/g, "").slice(0, 8))} className="mt-2 w-full rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm outline-none focus:border-red-500 sm:max-w-xs" placeholder="8-digit PIN" /></div></>}
         </div>
-        <footer className="flex justify-end gap-2 border-t border-neutral-800 px-4 py-3"><button ref={cancelRef} type="button" onClick={close} disabled={submitting} className="min-h-10 rounded px-3 text-xs text-neutral-400 hover:bg-neutral-800 disabled:opacity-50">Cancel</button><button type="submit" data-testid="transcript-mutation-submit" disabled={!event || loading || !pinValid || submitting || (requiresAcknowledgement && !acknowledged)} className={`min-h-10 rounded px-4 text-xs font-semibold text-white disabled:opacity-40 ${operation === "delete" ? "bg-red-700" : "bg-blue-700"}`}>{submitting ? "Submitting…" : operation === "delete" ? "Delete event" : "Save edit"}</button></footer>
+        <footer className="flex justify-end gap-2 border-t border-neutral-800 px-4 py-3"><button ref={cancelRef} type="button" onClick={close} disabled={submitting} className="min-h-10 rounded px-3 text-xs text-neutral-400 hover:bg-neutral-800 disabled:opacity-50">Cancel</button><button type="submit" data-testid="transcript-mutation-submit" disabled={!event || !mutationAvailable || loading || !pinValid || submitting || (requiresAcknowledgement && !acknowledged)} className={`min-h-10 rounded px-4 text-xs font-semibold text-white disabled:opacity-40 ${operation === "delete" ? "bg-red-700" : "bg-blue-700"}`}>{submitting ? "Submitting…" : operation === "delete" ? "Delete event" : "Save edit"}</button></footer>
       </form>
     </ModalFrame>
   );

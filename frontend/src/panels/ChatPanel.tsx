@@ -5144,23 +5144,24 @@ export function ChatPanel({
     wsStatus,
   ]);
 
-  const handleTranscriptMutationSuccess = useCallback(() => {
-    const sessionId = activeSessionIdRef.current;
-    const selectionId = selectionIdRef.current;
-    if (!sessionId || !selectionId) return;
-    // The REST commit is canonical. Do not infer its shape into the current
-    // history array; hide that stale projection until the WebSocket returns a
-    // fresh authoritative snapshot for this exact selection.
+  const handleAwaitAuthoritativeMutationHistory = useCallback(() => {
+    if (!activeSessionIdRef.current || !selectionIdRef.current) return;
+    // Hide the stale projection immediately, but let the backend's correlated
+    // invalidation/setup history win before considering a reconnect fallback.
     setMessagesOwnerSessionId(null);
     setIsSessionHistoryLoading(true);
+    onSessionChange?.();
+  }, [onSessionChange]);
+
+  const handleTranscriptMutationRefreshFallback = useCallback(() => {
+    if (!activeSessionIdRef.current || !selectionIdRef.current) return;
     const socket = wsRef.current;
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.close(1012, "refresh transcript after mutation");
+      socket.close(1012, "fallback refresh after transcript mutation");
     } else if (!wsRef.current) {
       connectRef.current();
     }
-    onSessionChange?.();
-  }, [onSessionChange]);
+  }, []);
 
   const handleInterrupt = useCallback(() => {
     const restoredQueuedMessages = restoreQueuedMessagesToComposer();
@@ -5668,27 +5669,28 @@ export function ChatPanel({
   const hasStreamingContent = displayedStreamingBlocks.content.length > 0;
   const isAgentRunning = isStreaming || hasStreamingContent || isCompacting;
   const isTranscriptLoading = !transcriptOwnedBySelection || isSessionHistoryLoading || wsStatus === "connecting";
-  const transcriptMutationUnavailableReason = !paneVisible
+  const transcriptMutationOtherwiseUnavailableReason = !paneVisible
     ? "Transcript mutation controls close when the Chat pane is not visible"
     : wsStatus !== "connected"
       ? "Wait for the session connection"
       : isTranscriptLoading
         ? "Wait for authoritative transcript history"
-        : runtimeMutationLocked
-          ? "The session runtime is mutation-locked"
-          : isAgentRunning || activeSession?.runtime_status === "starting"
-            ? "Wait for the running or compacting agent to settle"
-            : resendingMessageId
-              ? "Wait for resend reconciliation"
-              : queuedUserMessages.length > 0 || deferredUserMessages.length > 0
-                ? "Wait for queued transcript changes to settle"
-                : activeInterview || activeSudoPrompt || activeCommandGuardPinPrompt || visibleExternalActionApprovals.some((request) => request.live)
-                  ? "Finish the active session interaction first"
-                  : isAgentSwitching || isAgentPreviewing || isModelSaving
-                    ? "Wait for the session selection change to finish"
-                    : !transcriptSelectionKey
-                      ? "The current transcript selection is not authoritative"
-                      : "";
+        : isAgentRunning || activeSession?.runtime_status === "starting"
+          ? "Wait for the running or compacting agent to settle"
+          : resendingMessageId
+            ? "Wait for resend reconciliation"
+            : queuedUserMessages.length > 0 || deferredUserMessages.length > 0
+              ? "Wait for queued transcript changes to settle"
+              : activeInterview || activeSudoPrompt || activeCommandGuardPinPrompt || visibleExternalActionApprovals.some((request) => request.live)
+                ? "Finish the active session interaction first"
+                : isAgentSwitching || isAgentPreviewing || isModelSaving
+                  ? "Wait for the session selection change to finish"
+                  : !transcriptSelectionKey
+                    ? "The current transcript selection is not authoritative"
+                    : "";
+  const transcriptMutationOtherwiseAvailable = transcriptMutationOtherwiseUnavailableReason === "";
+  const transcriptMutationUnavailableReason = transcriptMutationOtherwiseUnavailableReason
+    || (runtimeMutationLocked ? "The session runtime is mutation-locked" : "");
   const transcriptMutationAvailability = useMemo(() => ({
     available: transcriptMutationUnavailableReason === "",
     reason: transcriptMutationUnavailableReason,
@@ -5713,9 +5715,12 @@ export function ChatPanel({
       sessionId={activeSessionId}
       selectionKey={transcriptSelectionKey}
       availability={transcriptMutationAvailability}
+      otherwiseAvailable={transcriptMutationOtherwiseAvailable}
+      runtimeMutationLocked={runtimeMutationLocked}
       paneVisible={paneVisible}
       historyRevision={transcriptHistoryRevision}
-      onAuthoritativeRefresh={handleTranscriptMutationSuccess}
+      onAwaitAuthoritativeHistory={handleAwaitAuthoritativeMutationHistory}
+      onAuthoritativeRefresh={handleTranscriptMutationRefreshFallback}
     >
     <section ref={chatPanelRootRef} className="h-full flex flex-col bg-neutral-950 text-neutral-100">
       {/* ---- Top bar ---- */}
