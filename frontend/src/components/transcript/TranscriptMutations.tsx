@@ -249,7 +249,8 @@ export function TranscriptMutationProvider({
   otherwiseAvailable,
   runtimeMutationLocked,
   paneVisible,
-  historyRevision,
+  transportGeneration,
+  historyTransportGeneration,
   onAwaitAuthoritativeHistory,
   onAuthoritativeRefresh,
   children,
@@ -260,7 +261,8 @@ export function TranscriptMutationProvider({
   otherwiseAvailable: boolean;
   runtimeMutationLocked: boolean;
   paneVisible: boolean;
-  historyRevision: number;
+  transportGeneration: number;
+  historyTransportGeneration: number;
   onAwaitAuthoritativeHistory: () => void;
   onAuthoritativeRefresh: () => void;
   children: ReactNode;
@@ -268,7 +270,7 @@ export function TranscriptMutationProvider({
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [manage, setManage] = useState<{ summaries: TranscriptEventRowSummary[]; trigger: HTMLButtonElement } | null>(null);
   const [mutation, setMutation] = useState<{ eventId: string; operation: TranscriptMutationOperation; trigger: HTMLButtonElement } | null>(null);
-  const [pending, setPending] = useState<{ eventId: string; operation: TranscriptMutationOperation; afterRevision: number; ambiguous: boolean } | null>(null);
+  const [pending, setPending] = useState<{ eventId: string; operation: TranscriptMutationOperation; afterTransportGeneration: number; ambiguous: boolean } | null>(null);
   const [requestInFlight, setRequestInFlight] = useState(false);
   const hasOpenModal = Boolean(inspectorOpen || manage || mutation);
   const inspectorTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -280,11 +282,11 @@ export function TranscriptMutationProvider({
   const ownedMutationLockRef = useRef(false);
   const requestInFlightRef = useRef(false);
   const runtimeMutationLockedRef = useRef(runtimeMutationLocked);
-  const historyRevisionRef = useRef(historyRevision);
+  const transportGenerationRef = useRef(transportGeneration);
   scopeRef.current = selectionKey;
   availableRef.current = availability.available && paneVisible;
   paneVisibleRef.current = paneVisible && document.visibilityState === "visible";
-  historyRevisionRef.current = historyRevision;
+  transportGenerationRef.current = transportGeneration;
   runtimeMutationLockedRef.current = runtimeMutationLocked;
 
   useEffect(() => () => { scopeRef.current = null; availableRef.current = false; }, []);
@@ -309,15 +311,10 @@ export function TranscriptMutationProvider({
     };
   }, [hasOpenModal, selectionKey]);
   useEffect(() => {
-    if (historyRevision > (pending?.afterRevision ?? Number.MAX_SAFE_INTEGER)) setPending(null);
-  }, [historyRevision, pending?.afterRevision]);
-  useEffect(() => {
-    if (!pending || pending.ambiguous) return;
-    const timer = window.setTimeout(() => {
-      if (historyRevisionRef.current <= pending.afterRevision) onAuthoritativeRefresh();
-    }, 1_750);
-    return () => window.clearTimeout(timer);
-  }, [onAuthoritativeRefresh, pending]);
+    if (historyTransportGeneration > (pending?.afterTransportGeneration ?? Number.MAX_SAFE_INTEGER)) {
+      setPending(null);
+    }
+  }, [historyTransportGeneration, pending?.afterTransportGeneration]);
   useEffect(() => {
     if (!runtimeMutationLocked) ownedMutationLockRef.current = false;
   }, [runtimeMutationLocked]);
@@ -389,17 +386,16 @@ export function TranscriptMutationProvider({
     operation: TranscriptMutationOperation,
     ambiguous: boolean,
   ) => {
-    // Only history strictly newer than the POST response can settle a confirmed
-    // mutation. Lock-era or duplicate history observed during the request is
-    // deliberately excluded; the bounded reconnect fallback handles a backend
-    // broadcast that raced ahead of the response.
-    const responseHistoryRevision = historyRevisionRef.current;
+    // Every completed POST retires the initiating socket. Only history painted
+    // from a newer client transport generation can settle this pending state;
+    // delayed frames already queued on the old socket are never authoritative.
+    const initiatingTransportGeneration = transportGenerationRef.current;
     setMutation(null);
     setManage(null);
     setInspectorOpen(false);
-    setPending({ eventId, operation, afterRevision: responseHistoryRevision, ambiguous });
+    setPending({ eventId, operation, afterTransportGeneration: initiatingTransportGeneration, ambiguous });
     onAwaitAuthoritativeHistory();
-    if (ambiguous) onAuthoritativeRefresh();
+    onAuthoritativeRefresh();
   }, [onAuthoritativeRefresh, onAwaitAuthoritativeHistory]);
 
   const context = useMemo<TranscriptMutationContextValue>(() => ({ availability, openManage, openInspector }), [availability, openInspector, openManage]);
@@ -423,8 +419,8 @@ export function TranscriptMutationProvider({
           tabIndex={-1}
           data-testid="transcript-mutation-pending"
           data-completion={pending.ambiguous ? "ambiguous" : "confirmed"}
-          data-after-history-revision={pending.afterRevision}
-          data-history-baseline="response-time"
+          data-after-transport-generation={pending.afterTransportGeneration}
+          data-history-authority="new-transport"
           role="status"
           className="fixed bottom-20 left-1/2 z-[65] -translate-x-1/2 rounded-full border border-blue-800 bg-blue-950 px-4 py-2 text-xs text-blue-100 shadow-xl"
         >

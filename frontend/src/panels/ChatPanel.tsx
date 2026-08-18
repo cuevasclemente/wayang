@@ -2914,7 +2914,8 @@ export function ChatPanel({
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [activeTurnScrollAnchorText, setActiveTurnScrollAnchorText] = useState<string | null>(null);
   const [transcriptSelectionKey, setTranscriptSelectionKey] = useState("");
-  const [transcriptHistoryRevision, setTranscriptHistoryRevision] = useState(0);
+  const [transcriptTransportGeneration, setTranscriptTransportGeneration] = useState(0);
+  const [transcriptHistoryTransportGeneration, setTranscriptHistoryTransportGeneration] = useState(0);
   const [paneVisible, setPaneVisible] = useState(true);
 
   const currentGoal = activeSession?.goal ?? null;
@@ -3486,6 +3487,7 @@ export function ChatPanel({
 
       const attemptId = ++wsAttemptIdRef.current;
       const transportGeneration = ++transportGenerationRef.current;
+      setTranscriptTransportGeneration(transportGeneration);
       clearExternalActionAuthority();
       const connectStart = performance.now();
       chatWsProfile("connect_start", { sessionId, selectionId: selectionIdRef.current, attemptId });
@@ -3819,7 +3821,7 @@ export function ChatPanel({
           requestAnimationFrame(() => requestAnimationFrame(() => {
             if (selectionIdRef.current !== acceptedSelectionId) return;
             setIsSessionHistoryLoading(false);
-            setTranscriptHistoryRevision((revision) => revision + 1);
+            setTranscriptHistoryTransportGeneration(transportGeneration);
             chatWsProfile("history_painted", {
               sessionId: activeSessionIdRef.current,
               selectionId: acceptedSelectionId,
@@ -5146,18 +5148,17 @@ export function ChatPanel({
 
   const handleAwaitAuthoritativeMutationHistory = useCallback(() => {
     if (!activeSessionIdRef.current || !selectionIdRef.current) return;
-    // Hide the stale projection immediately, but let the backend's correlated
-    // invalidation/setup history win before considering a reconnect fallback.
+    // Hide the stale projection before retiring the initiating transport.
     setMessagesOwnerSessionId(null);
     setIsSessionHistoryLoading(true);
     onSessionChange?.();
   }, [onSessionChange]);
 
-  const handleTranscriptMutationRefreshFallback = useCallback(() => {
+  const handleTranscriptMutationControlledReconnect = useCallback(() => {
     if (!activeSessionIdRef.current || !selectionIdRef.current) return;
     const socket = wsRef.current;
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.close(1012, "fallback refresh after transcript mutation");
+      socket.close(1012, "authoritative refresh after transcript mutation");
     } else if (!wsRef.current) {
       connectRef.current();
     }
@@ -5718,9 +5719,10 @@ export function ChatPanel({
       otherwiseAvailable={transcriptMutationOtherwiseAvailable}
       runtimeMutationLocked={runtimeMutationLocked}
       paneVisible={paneVisible}
-      historyRevision={transcriptHistoryRevision}
+      transportGeneration={transcriptTransportGeneration}
+      historyTransportGeneration={transcriptHistoryTransportGeneration}
       onAwaitAuthoritativeHistory={handleAwaitAuthoritativeMutationHistory}
-      onAuthoritativeRefresh={handleTranscriptMutationRefreshFallback}
+      onAuthoritativeRefresh={handleTranscriptMutationControlledReconnect}
     >
     <section ref={chatPanelRootRef} className="h-full flex flex-col bg-neutral-950 text-neutral-100">
       {/* ---- Top bar ---- */}
