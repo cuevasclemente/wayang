@@ -117,6 +117,7 @@ function isCommittedPostCommitFailure(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const candidate = error as { committed?: unknown; code?: unknown };
   return candidate.committed === true
+    || candidate.code === "ESESSIONREPLACEMENTCOMMITTED"
     || candidate.code === "ERR_SESSION_MUTATION_COMMITTED"
     || candidate.code === "ERR_SESSION_REWRITE_COMMITTED"
     || candidate.code === "ERR_SESSION_REWRITE_POST_COMMIT";

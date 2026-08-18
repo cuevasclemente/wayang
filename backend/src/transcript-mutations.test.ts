@@ -303,6 +303,7 @@ test("adapter recognizes typed committed post-commit faults and marks the canoni
   const replacement = message("target", null, "after");
   for (const committedFault of [
     { committed: true, code: "SYNTHETIC_POST_COMMIT" },
+    { code: "ESESSIONREPLACEMENTCOMMITTED" },
     { code: "ERR_SESSION_MUTATION_COMMITTED" },
     { code: "ERR_SESSION_REWRITE_POST_COMMIT" },
   ]) {
@@ -312,8 +313,8 @@ test("adapter recognizes typed committed post-commit faults and marks the canoni
       getEntry: (id: string) => id === current.id ? current : undefined,
       getEntries: () => [current],
       getBranch: () => [current],
-      replaceEntriesIfCurrent(replacements: readonly CanonicalEntryReplacement[]) {
-        current = structuredClone(replacements[0]!.replacementEntry);
+      replaceEntriesIfCurrent(replacements: ReadonlyArray<{ expectedEntry: CanonicalEntry; replacement: CanonicalEntry }>) {
+        current = structuredClone(replacements[0]!.replacement);
         throw committedFault;
       },
     } as unknown as SessionManager;
