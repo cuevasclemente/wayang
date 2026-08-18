@@ -94,6 +94,7 @@ async function openMutationDialog(page: Page, eventId: string, oldText: string):
   await expect(page.getByTestId("transcript-event-manager")).toBeVisible();
   await page.getByTestId("transcript-event-edit").click();
   await expect(page.getByTestId("transcript-mutation-dialog")).toBeVisible();
+  await expect(page.locator("#root")).toHaveAttribute("inert", "");
   await expect(page.getByTestId("transcript-event-text-input")).toHaveValue(oldText);
 }
 
@@ -111,6 +112,7 @@ async function searchContainsSession(
 test("PIN-gated human event edit refreshes canonical history and purges old search text", async ({ page, request }) => {
   const oldText = `accidental-wrong-session-${Date.now()}`;
   const replacementText = `corrected-session-message-${Date.now()}`;
+  const finalText = `corrected-session-message-final-${Date.now()}`;
   const seeded = await seedMutationSession(request, oldText);
 
   await openSessionInUi(page, seeded.session);
@@ -122,8 +124,26 @@ test("PIN-gated human event edit refreshes canonical history and purges old sear
   await page.getByTestId("transcript-mutation-submit").click();
 
   await expect(page.getByTestId("transcript-mutation-dialog")).toHaveCount(0);
+  await expect(page.locator("#root")).not.toHaveAttribute("inert", "");
+  await expect.poll(() => fs.readFileSync(seeded.transcriptPath, "utf8"), { timeout: 10_000 }).toContain(replacementText);
   await expect(page.getByTestId("chat-message-list").getByText(replacementText, { exact: true })).toBeVisible({ timeout: 45_000 });
   await expect(page.getByTestId("chat-message-list").getByText(oldText, { exact: true })).toHaveCount(0);
+
+  // A trusted server marker from the first edit must remain in expected_entry
+  // for CAS, while being stripped from the second editable replacement payload.
+  await openMutationDialog(page, seeded.userEventId, replacementText);
+  await page.getByTestId("transcript-event-text-input").fill(finalText);
+  await page.getByTestId("transcript-mutation-pin").fill(SYNTHETIC_PIN);
+  await page.getByTestId("transcript-mutation-submit").click();
+  // The shared hardened PIN authority deliberately rate-limits a second
+  // mutation in the same session. Keep the exact reviewed dialog open, wait
+  // beyond the 30-second cooldown, then resubmit with a freshly entered PIN.
+  await expect(page.getByTestId("transcript-mutation-error")).toContainText("cooling down");
+  await expect(page.getByTestId("transcript-mutation-pin")).toHaveValue("");
+  await page.waitForTimeout(31_000);
+  await page.getByTestId("transcript-mutation-pin").fill(SYNTHETIC_PIN);
+  await page.getByTestId("transcript-mutation-submit").click();
+  await expect(page.getByTestId("chat-message-list").getByText(finalText, { exact: true })).toBeVisible({ timeout: 45_000 });
 
   const exact = await request.get(`/api/sessions/${encodeURIComponent(seeded.session.id)}/events/${encodeURIComponent(seeded.userEventId)}`);
   expect(exact.ok(), await exact.text()).toBe(true);
@@ -133,14 +153,42 @@ test("PIN-gated human event edit refreshes canonical history and purges old sear
       wayangMutation?: { version?: number; kind?: string; at?: string };
     };
   };
-  expect(exactBody.entry?.message?.content?.[0]?.text).toBe(replacementText);
+  expect(exactBody.entry?.message?.content?.[0]?.text).toBe(finalText);
   expect(exactBody.entry?.wayangMutation).toMatchObject({ version: 1, kind: "edited" });
 
   const canonicalBytes = fs.readFileSync(seeded.transcriptPath, "utf8");
-  expect(canonicalBytes).toContain(replacementText);
+  expect(canonicalBytes).toContain(finalText);
+  expect(canonicalBytes).not.toContain(replacementText);
   expect(canonicalBytes).not.toContain(oldText);
-  expect(await searchContainsSession(request, replacementText, seeded.session.id)).toBe(true);
+  expect(await searchContainsSession(request, finalText, seeded.session.id)).toBe(true);
+  expect(await searchContainsSession(request, replacementText, seeded.session.id)).toBe(false);
   expect(await searchContainsSession(request, oldText, seeded.session.id)).toBe(false);
+});
+
+test("an ambiguous client failure after commit forces authoritative history refresh", async ({ page, request }) => {
+  const oldText = `ambiguous-original-${Date.now()}`;
+  const replacementText = `ambiguous-committed-${Date.now()}`;
+  const seeded = await seedMutationSession(request, oldText);
+  // The previous test intentionally completes a verified mutation; the shared
+  // synthetic PIN authority preserves its cooldown across browser tests.
+  await page.waitForTimeout(31_000);
+
+  await openSessionInUi(page, seeded.session);
+  await expect(page.getByTestId("chat-message-list")).toHaveAttribute("data-transcript-state", "ready", { timeout: 45_000 });
+  await openMutationDialog(page, seeded.userEventId, oldText);
+
+  const editUrl = `**/api/sessions/${encodeURIComponent(seeded.session.id)}/events/${encodeURIComponent(seeded.userEventId)}/edit`;
+  await page.route(editUrl, async (route) => {
+    await route.fetch();
+    await route.abort("failed");
+  }, { times: 1 });
+  await page.getByTestId("transcript-event-text-input").fill(replacementText);
+  await page.getByTestId("transcript-mutation-pin").fill(SYNTHETIC_PIN);
+  await page.getByTestId("transcript-mutation-submit").click();
+
+  await expect(page.getByTestId("transcript-mutation-dialog")).toHaveCount(0);
+  await expect(page.getByTestId("chat-message-list").getByText(replacementText, { exact: true })).toBeVisible({ timeout: 45_000 });
+  expect(fs.readFileSync(seeded.transcriptPath, "utf8")).toContain(replacementText);
 });
 
 test("a rejected PIN leaves canonical event bytes unchanged", async ({ page, request }) => {
