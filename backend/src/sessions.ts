@@ -1083,17 +1083,9 @@ export function deleteSession(id: string): DeleteSessionResult | null {
 
   const session = store.sessions[index]!;
   assertSessionNotActivelyMessagingBound(id, "delete");
-  let deletedSessionFile: string | null = null;
-  if (session.pi_session_file) {
-    deletedSessionFiles.add(session.pi_session_file);
-    missingSince.delete(session.pi_session_file);
-    if (fs.existsSync(session.pi_session_file)) {
-      fs.unlinkSync(session.pi_session_file);
-      deletedSessionFile = session.pi_session_file;
-    }
-  }
 
-  deletedSessionIds.add(session.id);
+  // Persist metadata removal first. A failed store transaction must not unlink
+  // canonical bytes or install process-local rediscovery fences.
   const deleted = commitStoreMutation((draft) => {
     const draftIndex = draft.sessions.findIndex((row) => row.id === id);
     if (draftIndex < 0) throw new WorkspaceStoreError("Session disappeared during deletion", 409);
@@ -1106,6 +1098,17 @@ export function deleteSession(id: string): DeleteSessionResult | null {
     draft.sessions.splice(draftIndex, 1);
     return cloneSession(target);
   });
+
+  let deletedSessionFile: string | null = null;
+  deletedSessionIds.add(deleted.id);
+  if (deleted.pi_session_file) {
+    deletedSessionFiles.add(deleted.pi_session_file);
+    missingSince.delete(deleted.pi_session_file);
+    if (fs.existsSync(deleted.pi_session_file)) {
+      fs.unlinkSync(deleted.pi_session_file);
+      deletedSessionFile = deleted.pi_session_file;
+    }
+  }
   publishDirectMutation(false);
   return { session: deleted, deletedSessionFile };
 }

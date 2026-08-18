@@ -17,6 +17,7 @@ process.env.WAYANG_DATA_DIR = tmpRoot;
 // Import after env is set so getConfig() reads the temp dir.
 const dbMod = await import("../db.js");
 const projectsMod = await import("../projects.js");
+const sessionsMod = await import("../sessions.js");
 const agentProfilesMod = await import("../agent-profiles.js");
 const searchRouteMod = await import("../routes/search.js");
 const searchDbMod = await import("./db.js");
@@ -198,6 +199,65 @@ test("force reindex picks up file changes even with same mtime", async () => {
   await indexerMod.indexSession(id, { force: true });
   const after = searchMod.runSearch("zulu");
   assert.ok(after.results.some((r) => r.session_id === id));
+});
+
+test("metadata generation CAS retries a paused stale clone and commits only the fresh goal projection", async () => {
+  const oldGoal = "old metadata projection canary";
+  const newGoal = "fresh metadata projection platypus";
+  const id = seedSession({
+    title: "Metadata CAS fixture",
+    goal: oldGoal,
+    transcript: [{ role: "user", text: "neutral transcript body" }],
+  });
+  let release!: () => void;
+  let paused!: () => void;
+  const pauseReached = new Promise<void>((resolve) => { paused = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let hookCalls = 0;
+  const indexing = indexerMod.indexSession(id, {
+    force: true,
+    async afterChunkingForTests() {
+      hookCalls++;
+      if (hookCalls === 1) {
+        paused();
+        await gate;
+      }
+    },
+  });
+  await pauseReached;
+  sessionsMod.updateGoal(id, newGoal, "pending");
+  release();
+  const result = await indexing;
+  assert.equal(result.error, undefined);
+  assert.equal(result.skipped, false);
+  assert.ok(hookCalls >= 2, "metadata mutation must retry from a fresh durable row");
+
+  const db = searchDbMod.getSearchDb();
+  const rows = db.prepare("SELECT DISTINCT goal, title FROM chunks WHERE session_id = ?").all(id) as Array<{ goal: string | null; title: string }>;
+  assert.deepEqual(rows, [{ goal: newGoal, title: "Metadata CAS fixture" }]);
+  assert.equal(searchMod.runSearch("platypus").results.some((row) => row.session_id === id), true);
+  assert.equal(searchMod.runSearch("old metadata projection").results.some((row) => row.session_id === id), false);
+});
+
+test("repeated metadata churn purges and returns a fixed retryable indexing error", async () => {
+  const id = seedSession({
+    title: "Repeated metadata churn",
+    goal: "initial churn goal",
+    transcript: [{ role: "user", text: "neutral repeated churn body" }],
+  });
+  let revision = 0;
+  const result = await indexerMod.indexSession(id, {
+    force: true,
+    afterChunkingForTests() {
+      revision++;
+      sessionsMod.updateGoal(id, `churn goal ${revision}`, "pending");
+    },
+  });
+  assert.equal(result.skipped, true);
+  assert.equal(result.retryable, true);
+  assert.equal(result.error, "Session metadata changed repeatedly during indexing; retry later.");
+  const db = searchDbMod.getSearchDb();
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?").get(id) as { n: number }).n, 0);
 });
 
 test("transcript mutation fence purges first and blocks watcher/manual stale reindex until released", async () => {

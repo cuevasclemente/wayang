@@ -2,7 +2,10 @@ import { Router, type Request, type Response } from "express";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createSession, listSessions, syncPiSessionFiles, persistManualSessionTitle, archiveSession, deleteSession, getSessionById, updateGoal, getSessionCatalogGeneration, onSessionCatalogGeneration, validateManualSessionTitle, type SessionRow } from "../sessions.js";
 import { classifyAssistantErrorKind, getPiSession, getPiSessionBashMode, getPiSessionBrowserAgentDiagnostic, getPiSessionBrowserMode, getPiSessionRuntimeState, listModels, listSlashCommands, previewSessionAgentSwitch, setSessionDefaultModel, setSessionModel, stopPiSession, switchSessionAgent } from "../pi-bridge.js";
-import { removeSession as removeSearchSession } from "../search/indexer.js";
+import {
+  indexSession as forceIndexSession,
+  removeSession as removeSearchSession,
+} from "../search/indexer.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
 import { listHumanAttentionForSession, type HumanAttentionSummary } from "../human-attention.js";
 import type { Session as ProtocolSession } from "@wayang/protocol";
@@ -237,6 +240,20 @@ router.delete("/sessions/:id", async (req: Request, res: Response) => {
 // Delete session (requires command guard identity PIN)
 // ---------------------------------------------------------------------------
 
+/** @internal Rebuild logically purged search only while canonical row/file remain. */
+export async function recoverSearchAfterFailedSessionDelete(
+  sessionId: string,
+  index: typeof forceIndexSession = forceIndexSession,
+): Promise<boolean> {
+  if (!getSessionById(sessionId)) return false;
+  try {
+    const result = await index(sessionId, { force: true });
+    return !result.error;
+  } catch {
+    return false;
+  }
+}
+
 router.post("/sessions/:id/delete", async (req: Request, res: Response) => {
   try {
     const session = getSessionById(req.params.id);
@@ -275,8 +292,19 @@ router.post("/sessions/:id/delete", async (req: Request, res: Response) => {
 
       await stopPiSession(req.params.id, { kind: "close_session", reason: "session_delete" });
       await removeSearchSession(req.params.id);
-      const deleted = deleteSession(req.params.id);
+      let deleted: ReturnType<typeof deleteSession>;
+      try {
+        deleted = deleteSession(req.params.id);
+      } catch {
+        const canonicalRetained = Boolean(getSessionById(req.params.id));
+        if (canonicalRetained) await recoverSearchAfterFailedSessionDelete(req.params.id);
+        res.status(500).json(canonicalRetained
+          ? { error: "Session deletion failed; canonical transcript was retained.", code: "session_delete_failed" }
+          : { error: "Session deletion cleanup is incomplete.", code: "session_delete_incomplete" });
+        return;
+      }
       if (!deleted) {
+        await recoverSearchAfterFailedSessionDelete(req.params.id);
         res.status(404).json({ error: "Session not found" });
         return;
       }

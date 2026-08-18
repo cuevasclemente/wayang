@@ -93,6 +93,7 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
   let afterDispose: (() => void) | undefined;
   let afterPurge: (() => void) | undefined;
   let reconcileHook: (() => void) | undefined;
+  let reconcileFailure: Error | undefined;
   let reindexHook: (() => void) | undefined;
   const dependencies: TranscriptMutationDependencies = {
     getSession: (id) => id === "session-1" ? ({ id, pi_session_file: "/synthetic/session.jsonl", cwd: "/synthetic" } as any) : undefined,
@@ -118,8 +119,14 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
     async purgeSearch() { events.push("purge-search"); afterPurge?.(); },
     releaseSearchFence() { events.push("release-search-fence"); },
     invalidateSnapshots() { events.push("invalidate-snapshot"); },
-    async reconcileMetadata() { events.push("reconcile-metadata"); reconcileHook?.(); return 7; },
+    async reconcileMetadata() {
+      events.push("reconcile-metadata");
+      reconcileHook?.();
+      if (reconcileFailure) throw reconcileFailure;
+      return 7;
+    },
     async forceReindex() { events.push("force-reindex"); reindexHook?.(); },
+    getCatalogGeneration() { return 11; },
     publishInvalidation(_id, generation) {
       assert.equal(runtimeLocked, false, "invalidation must publish only after runtime unlock");
       events.push(`publish-invalidation:${generation}`);
@@ -137,6 +144,7 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
     setAfterDispose(callback: () => void) { afterDispose = callback; },
     setAfterPurge(callback: () => void) { afterPurge = callback; },
     setReconcileHook(callback: () => void) { reconcileHook = callback; },
+    setReconcileFailure(error: Error) { reconcileFailure = error; },
     setReindexHook(callback: () => void) { reindexHook = callback; },
     setPublishHook(callback: () => void) { publishHook = callback; },
     isRuntimeLocked() { return runtimeLocked; },
@@ -332,6 +340,33 @@ test("normal invalidation publishes after unlock so a selected client refresh ca
     pin: "opaque",
     expectedEntry: target,
   }));
+});
+
+test("persistent reconciliation failure keeps search denied and notifies after unlock with fixed attention error", async () => {
+  const target = message("target", null, OLD_SECRET);
+  const f = fixture([target]);
+  f.setReconcileFailure(new Error("private paused catalog failure"));
+  await assert.rejects(
+    f.service.mutateEvent("session-1", "target", "delete", { pin: "opaque", expectedEntry: target }),
+    (error: unknown) => error instanceof TranscriptMutationError
+      && error.statusCode === 503
+      && error.code === "mutation_reconciliation_attention"
+      && !error.message.includes("private paused"),
+  );
+  assert.equal(f.transcript.entries[0]?.customType, DELETED_EVENT_TOMBSTONE, "canonical new bytes remain committed");
+  assert.deepEqual(f.events, [
+    "lock",
+    "dispose",
+    "purge-search",
+    "replace-set:target",
+    "invalidate-snapshot",
+    "reconcile-metadata",
+    "invalidate-snapshot",
+    "unlock",
+    "publish-invalidation:11",
+  ]);
+  assert.equal(f.events.includes("release-search-fence"), false);
+  assert.equal(f.events.includes("force-reindex"), false);
 });
 
 test("adapter recognizes typed committed post-commit faults and marks the canonical winner", () => {

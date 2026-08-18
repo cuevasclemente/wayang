@@ -14,6 +14,7 @@ import {
   observeNextStoreMigrationPersistenceForTests,
 } from "./db.js";
 import { createOpenInterview, getInterviewForSession } from "./interviews.js";
+import { recoverSearchAfterFailedSessionDelete } from "./routes/sessions.js";
 import { createAgentProfile } from "./agent-profiles.js";
 import type { MessagingEndpointDeclaration } from "./messaging/contracts.js";
 import {
@@ -350,6 +351,58 @@ test("transcript mutation invalidation clears derived title/error without retain
     assert.equal(invalidated.catalog_mutation_version, beforeVersion + 1);
     assert.equal(JSON.stringify(invalidated).includes("removed synthetic"), false);
   } finally {
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("deleteSession persistence failure leaves row/file unfenced and purged search recoverable", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-session-delete-persistence-failure-"));
+  const projectDir = path.join(dir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const sessionFile = path.join(dir, "session.jsonl");
+  fs.writeFileSync(sessionFile, "{}\n");
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = dir;
+  const originalListAll = SessionManager.listAll;
+  try {
+    init();
+    const session = createSession(projectDir, "Retained after failed delete");
+    updatePiSessionFile(session.id, sessionFile);
+    const beforeActivity = getSessionById(session.id)!.last_active;
+    failNextCommitStoreMutationPersistenceForTests();
+
+    assert.throws(() => deleteSession(session.id), /Synthetic store persistence failure/);
+    assert.equal(getSessionById(session.id)?.id, session.id);
+    assert.equal(fs.existsSync(sessionFile), true, "store failure must precede transcript unlink");
+
+    let reindexed = 0;
+    assert.equal(await recoverSearchAfterFailedSessionDelete(session.id, async (id, options) => {
+      reindexed++;
+      assert.equal(id, session.id);
+      assert.equal(options?.force, true);
+      return { sessionId: id, chunkCount: 1, skipped: false };
+    }), true);
+    assert.equal(reindexed, 1);
+
+    SessionManager.listAll = async () => [{
+      path: sessionFile,
+      id: session.id,
+      cwd: projectDir,
+      name: "Retained after failed delete",
+      created: new Date(session.created_at),
+      modified: new Date(beforeActivity + 5_000),
+      messageCount: 1,
+      firstMessage: "retained synthetic content",
+      allMessagesText: "retained synthetic content",
+    } satisfies SessionInfo];
+    await syncPiSessionFiles();
+    assert.equal(getSessionById(session.id)?.last_active, beforeActivity + 5_000,
+      "failed delete must not install process suppression fences");
+  } finally {
+    SessionManager.listAll = originalListAll;
     close();
     if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
     else process.env.WAYANG_DATA_DIR = previousDataDir;

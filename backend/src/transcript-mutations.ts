@@ -200,6 +200,7 @@ export interface TranscriptMutationDependencies {
   invalidateSnapshots(sessionFile: string | null): void;
   reconcileMetadata(id: string): Promise<number>;
   forceReindex(id: string): Promise<void>;
+  getCatalogGeneration(): number;
   publishInvalidation(id: string, catalogGeneration: number): void;
 }
 
@@ -410,6 +411,7 @@ function productionDependencies(): TranscriptMutationDependencies {
         "reindex_failed",
       );
     },
+    getCatalogGeneration: getSessionCatalogGeneration,
     publishInvalidation(id, catalogGeneration) {
       publishTranscriptInvalidation({
         sessionId: id,
@@ -787,6 +789,8 @@ export class TranscriptMutationService {
     let searchFenced = false;
     let canonicalChanged = false;
     let reconciledGeneration: number | null = null;
+    let reconciliationAttempted = false;
+    let retainSearchFence = false;
     let invalidationNeeded = false;
     let mutatedSessionFile: string | null = null;
     try {
@@ -847,6 +851,7 @@ export class TranscriptMutationService {
       canonicalChanged = true;
 
       this.dependencies.invalidateSnapshots(currentSession.pi_session_file);
+      reconciliationAttempted = true;
       reconciledGeneration = await this.dependencies.reconcileMetadata(sessionId);
       this.dependencies.releaseSearchFence(sessionId);
       searchFenced = false;
@@ -873,6 +878,7 @@ export class TranscriptMutationService {
         revision_retained: false,
       };
     } catch (error) {
+      let outwardError = error;
       // The Pi operation is one atomic replacement-set CAS. A post-commit
       // adapter verification failure may still mean the canonical rewrite won;
       // reconcile that winner without retaining or rolling back old content.
@@ -882,22 +888,36 @@ export class TranscriptMutationService {
       const shouldReindexWinner = searchFenced;
       if (canonicalChanged) {
         try { this.dependencies.invalidateSnapshots(mutatedSessionFile); } catch { /* best-effort safety cleanup */ }
-        if (reconciledGeneration === null) {
+        if (reconciledGeneration === null && !reconciliationAttempted) {
+          reconciliationAttempted = true;
           try { reconciledGeneration = await this.dependencies.reconcileMetadata(sessionId); }
-          catch { /* original mutation error remains authoritative */ }
+          catch { /* handled as persistent failure below */ }
+        }
+        if (reconciledGeneration === null && reconciliationAttempted) {
+          // Keep the in-process search fence installed. No stale metadata may
+          // be republished. A service restart loses this process fence, after
+          // which catalog bootstrap reparses canonical bytes before indexing.
+          retainSearchFence = true;
+          reconciledGeneration = this.dependencies.getCatalogGeneration();
+          invalidationNeeded = true;
+          outwardError = new TranscriptMutationError(
+            "Transcript changed, but metadata reconciliation needs attention; search remains unavailable for this session.",
+            503,
+            "mutation_reconciliation_attention",
+          );
         }
       }
-      if (searchFenced) {
+      if (searchFenced && !retainSearchFence) {
         try { this.dependencies.releaseSearchFence(sessionId); } catch { /* released again in finally */ }
         searchFenced = false;
       }
-      if (shouldReindexWinner) {
+      if (shouldReindexWinner && !retainSearchFence) {
         try { await this.dependencies.forceReindex(sessionId); } catch { /* stale index was already purged */ }
       }
       if (canonicalChanged && reconciledGeneration !== null) invalidationNeeded = true;
-      throw error;
+      throw outwardError;
     } finally {
-      if (searchFenced) this.dependencies.releaseSearchFence(sessionId);
+      if (searchFenced && !retainSearchFence) this.dependencies.releaseSearchFence(sessionId);
       this.dependencies.releaseRuntimeLock(sessionId);
       if (invalidationNeeded && reconciledGeneration !== null) {
         try { this.dependencies.publishInvalidation(sessionId, reconciledGeneration); }
