@@ -87,6 +87,7 @@ import {
   type MatrixProductionBootstrap,
 } from "./messaging/connectors/matrix/index.js";
 import { getProject } from "./projects.js";
+import { recoverTranscriptRecoveryJournal } from "./transcript-recovery.js";
 import { authorizeProjectAction } from "./policy.js";
 
 const serverCredentialBrokers = new WeakMap<http.Server, CredentialBroker>();
@@ -457,10 +458,21 @@ export function start() {
   // Durable submissions survive a backend restart. Delivery failures stay in
   // the store and are retried again when their session's WebSocket attaches.
   void drainSubmittedInterviews();
-  schedulerManager.start();
-  startWatcher();
   startLatencyMetrics();
-  startSessionCatalog();
+  // Durable canonical-mutation recovery runs before ordinary catalog/search
+  // watchers. Failure leaves content-free markers whose policy denies stale
+  // indexing/import; the next restart retries recovery.
+  void recoverTranscriptRecoveryJournal()
+    .catch(() => ({ recovered: 0, pending: -1 }))
+    .then((recovery) => {
+      if (shutdownServicesStarted) return;
+      if (recovery.pending !== 0) {
+        console.error("[transcript-recovery] canonical transcript recovery remains pending");
+      }
+      schedulerManager.start();
+      startWatcher();
+      startSessionCatalog();
+    });
   void credentialBroker.startUnlockSocket().catch(() => {
     console.error("[browser-credentials] private unlock socket could not be started");
   });

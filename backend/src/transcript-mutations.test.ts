@@ -89,6 +89,8 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
   let durableHumanGate = false;
   let pinOk = true;
   let runtimeLocked = false;
+  let recoveryMarkerExists = false;
+  let recoveryMarkerFailure: Error | undefined;
   let publishHook: (() => void) | undefined;
   let afterDispose: (() => void) | undefined;
   let afterPurge: (() => void) | undefined;
@@ -116,6 +118,17 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
       return true;
     },
     openTranscript: () => transcript,
+    createRecoveryMarker() {
+      if (recoveryMarkerFailure) throw recoveryMarkerFailure;
+      recoveryMarkerExists = true;
+      return { id: "recovery-marker" };
+    },
+    clearRecoveryMarker(markerId) {
+      assert.equal(markerId, "recovery-marker");
+      if (!recoveryMarkerExists) return false;
+      recoveryMarkerExists = false;
+      return true;
+    },
     async purgeSearch() { events.push("purge-search"); afterPurge?.(); },
     releaseSearchFence() { events.push("release-search-fence"); },
     invalidateSnapshots() { events.push("invalidate-snapshot"); },
@@ -148,6 +161,8 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
     setReindexHook(callback: () => void) { reindexHook = callback; },
     setPublishHook(callback: () => void) { publishHook = callback; },
     isRuntimeLocked() { return runtimeLocked; },
+    hasRecoveryMarker() { return recoveryMarkerExists; },
+    setRecoveryMarkerFailure(error: Error) { recoveryMarkerFailure = error; },
   };
 }
 
@@ -342,6 +357,19 @@ test("normal invalidation publishes after unlock so a selected client refresh ca
   }));
 });
 
+test("event recovery marker persistence failure aborts before search purge or canonical CAS", async () => {
+  const target = message("target", null, OLD_SECRET);
+  const f = fixture([target]);
+  f.setRecoveryMarkerFailure(new Error("synthetic marker store failure"));
+  await assert.rejects(
+    f.service.mutateEvent("session-1", "target", "delete", { pin: "opaque", expectedEntry: target }),
+    /synthetic marker store failure/,
+  );
+  assert.deepEqual(f.transcript.entries, [target]);
+  assert.deepEqual(f.events, ["lock", "dispose", "unlock"]);
+  assert.equal(f.hasRecoveryMarker(), false);
+});
+
 test("persistent reconciliation failure keeps search denied and notifies after unlock with fixed attention error", async () => {
   const target = message("target", null, OLD_SECRET);
   const f = fixture([target]);
@@ -367,6 +395,7 @@ test("persistent reconciliation failure keeps search denied and notifies after u
   ]);
   assert.equal(f.events.includes("release-search-fence"), false);
   assert.equal(f.events.includes("force-reindex"), false);
+  assert.equal(f.hasRecoveryMarker(), true);
 });
 
 test("adapter recognizes typed committed post-commit faults and marks the canonical winner", () => {

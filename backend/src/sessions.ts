@@ -9,6 +9,12 @@ import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
 import { ensureProjectForCwd, ensureProjectForCwdDraft, resolveEffectiveSessionDefaults } from "./projects.js";
 import { WorkspaceStoreError, type PendingAgentSwitch, type SessionTitleSource } from "./workspace-types.js";
 import { isProjectableOpenInterview } from "./interview-attention-policy.js";
+import {
+  appendTranscriptRecoveryMarkerDraft,
+  clearTranscriptRecoveryMarker,
+  sessionDeleteRecoveryMarkerMatches,
+  unlinkRecoveryTranscriptIfPresent,
+} from "./transcript-recovery-journal.js";
 
 export type { SessionRow };
 
@@ -349,7 +355,8 @@ function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; upda
 
   for (const parsed of scan.parsed) {
     const info = parsed.metadata;
-    if (deletedSessionIds.has(info.id) || deletedSessionFiles.has(info.path)) continue;
+    if (deletedSessionIds.has(info.id) || deletedSessionFiles.has(info.path)
+      || sessionDeleteRecoveryMarkerMatches(info.id, info.path)) continue;
     let row = byPath.get(info.path);
     const matchedByPath = Boolean(row);
     row ??= byId.get(info.id);
@@ -544,7 +551,8 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
 
   for (const info of infos) {
     const sessionFile = info.path;
-    if (deletedSessionIds.has(info.id) || deletedSessionFiles.has(sessionFile)) {
+    if (deletedSessionIds.has(info.id) || deletedSessionFiles.has(sessionFile)
+      || sessionDeleteRecoveryMarkerMatches(info.id, sessionFile)) {
       continue;
     }
     const projectResult = ensureProjectForCwd(normalizeSessionCwd(info.cwd), false);
@@ -1074,9 +1082,13 @@ export function archiveSession(id: string): void {
 export interface DeleteSessionResult {
   session: SessionRow;
   deletedSessionFile: string | null;
+  recoveryJournalId: string | null;
 }
 
-export function deleteSession(id: string): DeleteSessionResult | null {
+export function deleteSession(
+  id: string,
+  options: { searchPurged?: boolean } = {},
+): DeleteSessionResult | null {
   const store = getStore();
   const index = store.sessions.findIndex((row) => row.id === id);
   if (index < 0) return null;
@@ -1084,9 +1096,12 @@ export function deleteSession(id: string): DeleteSessionResult | null {
   const session = store.sessions[index]!;
   assertSessionNotActivelyMessagingBound(id, "delete");
 
-  // Persist metadata removal first. A failed store transaction must not unlink
-  // canonical bytes or install process-local rediscovery fences.
-  const deleted = commitStoreMutation((draft) => {
+  const canonicalSessionFile = session.pi_session_file
+    ? fs.realpathSync.native(session.pi_session_file)
+    : null;
+  // Persist metadata removal and recovery authority together. A failed store
+  // transaction must not unlink bytes or install process-local fences.
+  const committed = commitStoreMutation((draft) => {
     const draftIndex = draft.sessions.findIndex((row) => row.id === id);
     if (draftIndex < 0) throw new WorkspaceStoreError("Session disappeared during deletion", 409);
     const target = draft.sessions[draftIndex]!;
@@ -1096,19 +1111,32 @@ export function deleteSession(id: string): DeleteSessionResult | null {
     draft.interviews = draft.interviews.filter((record) => record.session_id !== target.id);
     draft.sessionBrowserStates = draft.sessionBrowserStates.filter((record) => record.session_id !== target.id);
     draft.sessions.splice(draftIndex, 1);
-    return cloneSession(target);
+    const recovery = canonicalSessionFile
+      ? appendTranscriptRecoveryMarkerDraft(draft, {
+          kind: "session_delete",
+          sessionId: target.id,
+          piSessionFile: canonicalSessionFile,
+        })
+      : null;
+    return { session: cloneSession(target), recovery };
   });
 
+  const deleted = committed.session;
   let deletedSessionFile: string | null = null;
   deletedSessionIds.add(deleted.id);
-  if (deleted.pi_session_file) {
-    deletedSessionFiles.add(deleted.pi_session_file);
-    missingSince.delete(deleted.pi_session_file);
-    if (fs.existsSync(deleted.pi_session_file)) {
-      fs.unlinkSync(deleted.pi_session_file);
-      deletedSessionFile = deleted.pi_session_file;
-    }
+  if (canonicalSessionFile) {
+    deletedSessionFiles.add(canonicalSessionFile);
+    missingSince.delete(canonicalSessionFile);
+    const result = unlinkRecoveryTranscriptIfPresent(canonicalSessionFile);
+    if (result === "unlinked") deletedSessionFile = canonicalSessionFile;
+  }
+  if (committed.recovery && options.searchPurged) {
+    clearTranscriptRecoveryMarker(committed.recovery.id);
   }
   publishDirectMutation(false);
-  return { session: deleted, deletedSessionFile };
+  return {
+    session: deleted,
+    deletedSessionFile,
+    recoveryJournalId: committed.recovery?.id ?? null,
+  };
 }

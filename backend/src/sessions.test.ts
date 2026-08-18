@@ -643,6 +643,7 @@ test("schema-2 migration classifies blank and nonblank historical titles", () =>
     const storePath = path.join(dir, "store.json");
     const raw = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, any>;
     raw.schema_version = 2;
+    delete raw.transcriptRecoveryJournal;
     delete raw.protectedAutomationJobs;
     delete raw.protectedAutomationRuns;
     delete raw.messagingEndpoints;
@@ -686,6 +687,7 @@ test("schema-3 migration binds only exact Project cwd matches", () => {
     const storePath = path.join(dir, "store.json");
     const raw = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, any>;
     raw.schema_version = 3;
+    delete raw.transcriptRecoveryJournal;
     delete raw.messagingEndpoints;
     delete raw.messagingEvents;
     delete raw.messagingTransactions;
@@ -946,7 +948,7 @@ test("catalog title reconciliation respects explicit and narrow legacy fallback 
   assert.equal(legacyHuman.title, "Different historical title");
 });
 
-test("schema-4 migration through schema 6 is backup-first and preserves schema-4 attention state", () => {
+test("schema-4 migration through schema 7 is backup-first and preserves schema-4 attention state", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-title-schema5-migration-"));
   const projectDir = path.join(dir, "project");
   fs.mkdirSync(projectDir, { recursive: true });
@@ -968,6 +970,7 @@ test("schema-4 migration through schema 6 is backup-first and preserves schema-4
     const storePath = path.join(dir, "store.json");
     const schemaFour = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, any>;
     schemaFour.schema_version = 4;
+    delete schemaFour.transcriptRecoveryJournal;
     delete schemaFour.browserProfiles;
     delete schemaFour.projectBrowserDefaults;
     delete schemaFour.sessionBrowserStates;
@@ -981,7 +984,7 @@ test("schema-4 migration through schema 6 is backup-first and preserves schema-4
     observeNextStoreMigrationPersistenceForTests((phase) => persistencePhases.push(phase));
     init();
     assert.deepEqual(persistencePhases, ["backup_durable", "store_published"]);
-    assert.equal(getStore().schema_version, 6);
+    assert.equal(getStore().schema_version, 7);
     assert.equal(getSessionById(session.id)?.title_source, "legacy_unknown");
     assert.equal(getSessionById(emptySession.id)?.title_source, "provisional");
     assert.equal(getSessionById(whitespaceSession.id)?.title_source, "provisional");

@@ -43,6 +43,8 @@ export interface IndexBatchSummary {
 export interface IndexerOptions {
   includeThinking?: boolean;
   force?: boolean;
+  /** Exact durable marker authorizing startup/mutation recovery reindex only. */
+  recoveryMarkerId?: string;
   /** @internal Pauses after transcript chunking for deterministic CAS tests. */
   afterChunkingForTests?: () => void | Promise<void>;
 }
@@ -158,7 +160,7 @@ async function indexSessionAttempt(
 
   // Authorization precedes search DB lookup, transcript stat/read, and the
   // unchanged shortcut. Denial removes stale indexed content.
-  const initialDenial = policyDenial(row);
+  const initialDenial = policyDenial(row, options.recoveryMarkerId);
   if (initialDenial) return purgePolicyDeniedSession(sessionId, initialDenial);
   const db = getSearchDb();
   const filePath = row.pi_session_file;
@@ -181,7 +183,7 @@ async function indexSessionAttempt(
     purgeSessionIndex(sessionId);
     return { sessionId, chunkCount: 0, skipped: true, mutationFenced: true };
   }
-  const postStatDenial = policyDenial(row);
+  const postStatDenial = policyDenial(row, options.recoveryMarkerId);
   if (postStatDenial) return purgePolicyDeniedSession(sessionId, postStatDenial);
 
   // Skip if unchanged.
@@ -234,7 +236,7 @@ async function indexSessionAttempt(
 
   const meta = makeMeta(row);
   if (filePath && fileMtime != null) {
-    const preReadDenial = policyDenial(row);
+    const preReadDenial = policyDenial(row, options.recoveryMarkerId);
     if (preReadDenial) return purgePolicyDeniedSession(sessionId, preReadDenial);
     try {
       const result = await chunkJsonlFile(filePath, meta, {
@@ -280,7 +282,7 @@ async function indexSessionAttempt(
     purgeSessionIndex(sessionId);
     return { sessionId, chunkCount: 0, skipped: true, mutationFenced: true };
   }
-  const preCommitDenial = policyDenial(row);
+  const preCommitDenial = policyDenial(row, options.recoveryMarkerId);
   if (preCommitDenial) return purgePolicyDeniedSession(sessionId, preCommitDenial);
   const afterChunkingRow = await loadSessionRow(sessionId);
   if (!afterChunkingRow || !sameIndexMetadata(expectedMetadata, indexMetadataProjection(afterChunkingRow))) {
@@ -423,11 +425,11 @@ export async function reindexAll(options: IndexerOptions = {}): Promise<IndexBat
   };
 }
 
-function policyDenial(row: SessionRow): string | null {
+function policyDenial(row: SessionRow, recoveryMarkerId?: string): string | null {
   // Re-resolve the durable row on every phase check so a quarantine committed
   // while the streaming chunker yields cannot publish derived private text.
   const current = getStore().sessions.find((candidate) => candidate.id === row.id);
-  return current && isSessionIndexable(current)
+  return current && isSessionIndexable(current, { recoveryMarkerId })
     ? null
     : "Session indexing denied by project or legacy private-data policy";
 }

@@ -97,6 +97,7 @@ test("schema 3 migrates through current schema with no messaging or browser auth
   close();
   const schemaThree = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, unknown>;
   schemaThree.schema_version = 3;
+  delete schemaThree.transcriptRecoveryJournal;
   delete schemaThree.messagingEndpoints;
   delete schemaThree.messagingEvents;
   delete schemaThree.messagingTransactions;
@@ -197,7 +198,7 @@ test("current-schema structural corruption aborts without normalization", () => 
   assert.equal(fs.readFileSync(storePath, "utf-8"), malformedCurrent);
 }));
 
-test("gate-off new stores remain schema 5 with one generic restricted workspace default and no Browser catalog", () => withDataDir((dir) => {
+test("gate-off new stores use schema 7 with one generic restricted workspace default and empty Browser catalog", () => withDataDir((dir) => {
   init();
   const store = getStore();
   assert.equal(store.agentProfiles.length, 1);
@@ -209,11 +210,12 @@ test("gate-off new stores remain schema 5 with one generic restricted workspace 
   assert.deepEqual(store.workspaceCapabilityAssociations, []);
   assert.deepEqual(store.workspaceCapabilityApprovalEvents, []);
   const persisted = JSON.parse(fs.readFileSync(path.join(dir, "store.json"), "utf-8"));
-  assert.equal(persisted.schema_version, 5);
-  assert.equal("browserProfiles" in persisted, false);
-  assert.equal("projectBrowserDefaults" in persisted, false);
-  assert.equal("sessionBrowserStates" in persisted, false);
-  assert.equal("browserCleanups" in persisted, false);
+  assert.equal(persisted.schema_version, 7);
+  assert.deepEqual(persisted.browserProfiles, []);
+  assert.deepEqual(persisted.projectBrowserDefaults, []);
+  assert.deepEqual(persisted.sessionBrowserStates, []);
+  assert.deepEqual(persisted.browserCleanups, []);
+  assert.deepEqual(persisted.transcriptRecoveryJournal, []);
   assert.equal(persisted.agentProfiles.length, 1);
   assert.deepEqual(persisted.workspaceCapabilityAssociations, []);
   assert.deepEqual(persisted.workspaceCapabilityApprovalEvents, []);

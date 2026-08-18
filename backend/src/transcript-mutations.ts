@@ -34,6 +34,10 @@ import {
 } from "./sessions.js";
 import { publishTranscriptInvalidation } from "./transcript-invalidation.js";
 import {
+  clearTranscriptRecoveryMarker,
+  createEventReconcileMarker,
+} from "./transcript-recovery-journal.js";
+import {
   DELETED_EVENT_TOMBSTONE,
   INVALIDATED_DERIVED_EVENT_TOMBSTONE,
 } from "./transcript-mutation-markers.js";
@@ -195,11 +199,13 @@ export interface TranscriptMutationDependencies {
   hasDurableHumanGate(id: string): boolean;
   disposeIdleRuntime(id: string): Promise<boolean>;
   openTranscript(session: SessionRow): CanonicalTranscriptPort;
+  createRecoveryMarker(id: string, sessionFile: string): { id: string };
+  clearRecoveryMarker(markerId: string): boolean;
   purgeSearch(id: string): Promise<void>;
   releaseSearchFence(id: string): void;
   invalidateSnapshots(sessionFile: string | null): void;
   reconcileMetadata(id: string): Promise<number>;
-  forceReindex(id: string): Promise<void>;
+  forceReindex(id: string, recoveryMarkerId?: string): Promise<void>;
   getCatalogGeneration(): number;
   publishInvalidation(id: string, catalogGeneration: number): void;
 }
@@ -396,13 +402,15 @@ function productionDependencies(): TranscriptMutationDependencies {
       if (!manager) throw new TranscriptMutationError("Session has no canonical transcript", 409, "transcript_unavailable");
       return adaptSessionManager(manager);
     },
+    createRecoveryMarker: createEventReconcileMarker,
+    clearRecoveryMarker: clearTranscriptRecoveryMarker,
     async purgeSearch(id) { beginTranscriptMutationSearchFence(id); },
     releaseSearchFence: endTranscriptMutationSearchFence,
     invalidateSnapshots: invalidateSessionFileSnapshot,
     reconcileMetadata: reconcileTranscriptMetadataAfterMutation,
-    async forceReindex(id) {
+    async forceReindex(id, recoveryMarkerId) {
       try {
-        const result = await indexSession(id, { force: true });
+        const result = await indexSession(id, { force: true, recoveryMarkerId });
         if (!result.error) return;
       } catch { /* fixed public error below */ }
       throw new TranscriptMutationError(
@@ -792,6 +800,7 @@ export class TranscriptMutationService {
     let reconciliationAttempted = false;
     let retainSearchFence = false;
     let invalidationNeeded = false;
+    let recoveryMarkerId: string | null = null;
     let mutatedSessionFile: string | null = null;
     try {
       const pin = await this.dependencies.validatePin(input.pin, {
@@ -832,6 +841,16 @@ export class TranscriptMutationService {
       if (entryIds.size !== entries.length) throw new TranscriptMutationError("Transcript contains duplicate event ids", 409, "invalid_topology");
       const derived = contentBearingDerivedEntries(entries, eventId);
 
+      // Durable content-free recovery authority must commit before search or
+      // canonical bytes can change. Persistence failure aborts with no mutation.
+      if (!currentSession.pi_session_file) {
+        throw new TranscriptMutationError("Session has no canonical transcript", 409, "transcript_unavailable");
+      }
+      recoveryMarkerId = this.dependencies.createRecoveryMarker(
+        sessionId,
+        currentSession.pi_session_file,
+      ).id;
+
       // Search is purged before the first canonical rewrite. If any later step
       // fails, stale removed text remains unavailable rather than being served.
       await this.dependencies.purgeSearch(sessionId);
@@ -855,7 +874,15 @@ export class TranscriptMutationService {
       reconciledGeneration = await this.dependencies.reconcileMetadata(sessionId);
       this.dependencies.releaseSearchFence(sessionId);
       searchFenced = false;
-      await this.dependencies.forceReindex(sessionId);
+      await this.dependencies.forceReindex(sessionId, recoveryMarkerId);
+      if (!this.dependencies.clearRecoveryMarker(recoveryMarkerId)) {
+        throw new TranscriptMutationError(
+          "Transcript recovery journal could not be finalized; search remains unavailable for this session.",
+          503,
+          "mutation_recovery_attention",
+        );
+      }
+      recoveryMarkerId = null;
       invalidationNeeded = true;
       canonicalChanged = false;
 
@@ -886,6 +913,12 @@ export class TranscriptMutationService {
         canonicalChanged = true;
       }
       const shouldReindexWinner = searchFenced;
+      if (!canonicalChanged && recoveryMarkerId) {
+        try {
+          this.dependencies.clearRecoveryMarker(recoveryMarkerId);
+          recoveryMarkerId = null;
+        } catch { /* harmless startup recovery remains if marker persistence is unavailable */ }
+      }
       if (canonicalChanged) {
         try { this.dependencies.invalidateSnapshots(mutatedSessionFile); } catch { /* best-effort safety cleanup */ }
         if (reconciledGeneration === null && !reconciliationAttempted) {
@@ -911,8 +944,17 @@ export class TranscriptMutationService {
         try { this.dependencies.releaseSearchFence(sessionId); } catch { /* released again in finally */ }
         searchFenced = false;
       }
+      let winnerReindexed = false;
       if (shouldReindexWinner && !retainSearchFence) {
-        try { await this.dependencies.forceReindex(sessionId); } catch { /* stale index was already purged */ }
+        try {
+          await this.dependencies.forceReindex(sessionId, recoveryMarkerId ?? undefined);
+          winnerReindexed = true;
+        } catch { /* stale index was already purged */ }
+      }
+      if (canonicalChanged && winnerReindexed && recoveryMarkerId) {
+        try {
+          if (this.dependencies.clearRecoveryMarker(recoveryMarkerId)) recoveryMarkerId = null;
+        } catch { /* durable marker keeps search denied for startup recovery */ }
       }
       if (canonicalChanged && reconciledGeneration !== null) invalidationNeeded = true;
       throw outwardError;
