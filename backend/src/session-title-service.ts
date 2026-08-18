@@ -11,6 +11,7 @@ import {
 import { TerraTitleProvider, type TitleProvider } from "./terra-title-provider.js";
 export type { TitleProvider } from "./terra-title-provider.js";
 import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
+import { isSessionRuntimeMutationLocked } from "./session-runtime-mutation-lock.js";
 
 export type AutoTitleOutcome = "attempt" | "success" | "validation_rejection" | "unavailable" | "timeout" | "cas_lost";
 const telemetry = new Map<AutoTitleOutcome, number>();
@@ -98,6 +99,7 @@ interface PhysicalCandidate {
 }
 
 function readPhysicalCandidate(sessionId: string): PhysicalCandidate | null {
+  if (isSessionRuntimeMutationLocked(sessionId)) return null;
   const row = getSessionById(sessionId);
   if (!row || !rowEligible(row) || !row.pi_session_file) return null;
   try {

@@ -3,6 +3,12 @@
  */
 
 import { normalizeHumanAttention, type HumanAttention } from "../humanAttention";
+import { editableTranscriptPayload } from "../components/transcript/transcriptMutationHelpers";
+
+export {
+  editableTranscriptPayload,
+  reconstructTranscriptEntry,
+} from "../components/transcript/transcriptMutationHelpers";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -50,6 +56,58 @@ export interface PendingAgentSwitch {
   changed_at: number;
 }
 
+export interface TranscriptEventWarning {
+  code: string;
+  message: string;
+  requires_acknowledgement: boolean;
+}
+
+/**
+ * Isolated frontend projection for the finalized session-event REST API.
+ * Envelope fields are display-only; edit callers rebuild a replacement entry.
+ */
+export interface TranscriptEventEnvelope {
+  type: unknown;
+  id: unknown;
+  parentId?: unknown;
+  timestamp?: unknown;
+}
+
+export interface TranscriptEvent {
+  event_id: string;
+  event_type: string;
+  active_branch: boolean;
+  hidden_event_type: boolean;
+  envelope: Readonly<TranscriptEventEnvelope>;
+  payload: Readonly<Record<string, unknown>>;
+  expected_entry: Readonly<Record<string, unknown>>;
+  /** UI intent identity only; never sent as authorization or a CAS hash. */
+  intent_token: string;
+  editable_text: string | null;
+  edited: boolean;
+  deleted: boolean;
+  warnings: TranscriptEventWarning[];
+}
+
+export interface TranscriptEventsResponse {
+  events: TranscriptEvent[];
+  next_cursor: string | null;
+}
+
+export type TranscriptMutationOperation = "edit" | "delete";
+
+export interface TranscriptMutationResult {
+  replacement: Readonly<Record<string, unknown>> | null;
+  warnings: TranscriptEventWarning[];
+  reindex_failed: boolean;
+}
+
+export function apiErrorCode(error: unknown): string | null {
+  if (!(error instanceof ApiError) || !error.body || typeof error.body !== "object") return null;
+  const body = error.body as Record<string, unknown>;
+  return typeof body.code === "string" ? body.code : null;
+}
+
 export interface Session {
   id: string;
   pi_session_file: string | null;
@@ -71,6 +129,7 @@ export interface Session {
   runtime_status: SessionRuntimeStatus;
   runtime_is_streaming: boolean;
   runtime_is_compacting: boolean;
+  runtime_mutation_locked?: boolean;
   runtime_subscriber_count: number;
   runtime_last_activity_at: number | null;
   bash_mode: BashMode;
@@ -220,9 +279,11 @@ async function request<T>(
     const message =
       parsed && typeof parsed === "object" && "error" in parsed && typeof parsed.error === "string"
         ? parsed.error
-        : parsed && typeof parsed === "object" && "detail" in parsed && typeof parsed.detail === "string"
-          ? parsed.detail
-          : undefined;
+        : parsed && typeof parsed === "object" && "error" in parsed && parsed.error && typeof parsed.error === "object" && "message" in parsed.error && typeof parsed.error.message === "string"
+          ? parsed.error.message
+          : parsed && typeof parsed === "object" && "detail" in parsed && typeof parsed.detail === "string"
+            ? parsed.detail
+            : undefined;
     throw new ApiError(res.status, parsed, message);
   }
   if (res.status === 204) return null as T;
@@ -929,6 +990,171 @@ export async function switchSessionAgent(
 
 export async function getSession(id: string): Promise<Session> {
   return normalizeSessionPayload(await apiGet<unknown>(`/api/sessions/${encodeURIComponent(id)}`));
+}
+
+function transcriptRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? value as Record<string, unknown> : {};
+}
+
+function normalizeTranscriptWarnings(value: unknown): TranscriptEventWarning[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate): TranscriptEventWarning[] => {
+    if (typeof candidate === "string" && candidate) {
+      return [{ code: "warning", message: candidate, requires_acknowledgement: true }];
+    }
+    const warning = transcriptRecord(candidate);
+    if (typeof warning.message !== "string" || !warning.message) return [];
+    return [{
+      code: typeof warning.code === "string" ? warning.code : "warning",
+      message: warning.message,
+      requires_acknowledgement: warning.requires_acknowledgement !== false,
+    }];
+  });
+}
+
+function transcriptEditableText(payload: Record<string, unknown>): string | null {
+  if (typeof payload.content === "string") return payload.content;
+  const message = transcriptRecord(payload.message);
+  if (!message) return null;
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content) || message.content.length !== 1) return null;
+  const block = transcriptRecord(message.content[0]);
+  return block?.type === "text" && typeof block.text === "string" ? block.text : null;
+}
+
+function normalizeTranscriptEvent(value: unknown): TranscriptEvent {
+  const projection = transcriptRecord(value);
+  const entry = transcriptRecord(projection.entry);
+  const eventId = typeof entry.id === "string" ? entry.id : "";
+  const eventType = typeof entry.type === "string" ? entry.type : "unknown";
+  if (!eventId) throw new Error("Session event projection is missing entry.id");
+
+  const envelope: TranscriptEventEnvelope = {
+    type: entry.type,
+    id: entry.id,
+    ...(Object.prototype.hasOwnProperty.call(entry, "parentId") ? { parentId: entry.parentId } : {}),
+    ...(Object.prototype.hasOwnProperty.call(entry, "timestamp") ? { timestamp: entry.timestamp } : {}),
+  };
+  const payload = editableTranscriptPayload(entry);
+  const mutationStatus = entry.mutation_status;
+  const trustedMutation = transcriptRecord(entry.wayangMutation);
+  const edited = mutationStatus === "edited"
+    || (trustedMutation?.version === 1 && trustedMutation.kind === "edited" && typeof trustedMutation.at === "string");
+  const deleted = mutationStatus === "deleted"
+    || (eventType === "custom" && entry.customType === "wayang-deleted-event-v1");
+
+  return {
+    event_id: eventId,
+    event_type: eventType,
+    active_branch: projection.active_branch === true,
+    hidden_event_type: eventType !== "message",
+    envelope: Object.freeze(envelope),
+    payload: Object.freeze(payload),
+    expected_entry: Object.freeze({ ...entry }),
+    intent_token: JSON.stringify(entry),
+    editable_text: transcriptEditableText(payload),
+    edited,
+    deleted,
+    warnings: normalizeTranscriptWarnings(projection.semantic_warnings),
+  };
+}
+
+export interface FetchTranscriptEventOptions {
+  cursor?: string;
+  limit?: number;
+  includePayload?: boolean;
+}
+
+export async function fetchTranscriptEvents(
+  sessionId: string,
+  options: FetchTranscriptEventOptions = {},
+  signal?: AbortSignal,
+): Promise<TranscriptEventsResponse> {
+  const params = new URLSearchParams();
+  if (options.cursor) {
+    const offset = Number(options.cursor);
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid session-event offset cursor");
+    params.set("offset", String(offset));
+  }
+  if (options.limit != null) params.set("limit", String(options.limit));
+  if (options.includePayload != null) params.set("include_payload", options.includePayload ? "1" : "0");
+  const query = params.size > 0 ? `?${params.toString()}` : "";
+  const value = await request<unknown>(
+    "GET",
+    `/api/sessions/${encodeURIComponent(sessionId)}/events${query}`,
+    undefined,
+    signal,
+    true,
+    "no-store",
+  );
+  const body = transcriptRecord(value);
+  const rows = Array.isArray(body.events) ? body.events : [];
+  return {
+    events: rows.map(normalizeTranscriptEvent),
+    next_cursor: typeof body.next_offset === "number" && Number.isSafeInteger(body.next_offset)
+      ? String(body.next_offset)
+      : null,
+  };
+}
+
+/** Fetches one exact current entry with its complete payload. */
+export async function fetchTranscriptEvent(
+  sessionId: string,
+  eventId: string,
+  signal?: AbortSignal,
+): Promise<TranscriptEvent> {
+  const value = await request<unknown>(
+    "GET",
+    `/api/sessions/${encodeURIComponent(sessionId)}/events/${encodeURIComponent(eventId)}`,
+    undefined,
+    signal,
+    true,
+    "no-store",
+  );
+  return normalizeTranscriptEvent(value);
+}
+
+function normalizeTranscriptMutationResult(value: unknown): TranscriptMutationResult {
+  const body = transcriptRecord(value);
+  return {
+    replacement: body.replacement && typeof body.replacement === "object"
+      ? Object.freeze({ ...(body.replacement as Record<string, unknown>) })
+      : null,
+    warnings: normalizeTranscriptWarnings(body.semantic_warnings),
+    reindex_failed: body.reindex_failed === true || body.code === "reindex_failed",
+  };
+}
+
+export async function editTranscriptEvent(
+  sessionId: string,
+  eventId: string,
+  input: { pin: string; expected_entry: Readonly<Record<string, unknown>>; replacement_entry: Readonly<Record<string, unknown>> },
+  signal?: AbortSignal,
+): Promise<TranscriptMutationResult> {
+  return normalizeTranscriptMutationResult(await request<unknown>(
+    "POST",
+    `/api/sessions/${encodeURIComponent(sessionId)}/events/${encodeURIComponent(eventId)}/edit`,
+    input,
+    signal,
+    false,
+    "no-store",
+  ));
+}
+
+export async function deleteTranscriptEvent(
+  sessionId: string,
+  eventId: string,
+  input: { pin: string; expected_entry: Readonly<Record<string, unknown>> },
+  signal?: AbortSignal,
+): Promise<TranscriptMutationResult> {
+  return normalizeTranscriptMutationResult(await request<unknown>(
+    "POST",
+    `/api/sessions/${encodeURIComponent(sessionId)}/events/${encodeURIComponent(eventId)}/delete`,
+    input,
+    signal,
+    false,
+    "no-store",
+  ));
 }
 
 export function archiveSession(id: string): Promise<null> {

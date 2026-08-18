@@ -340,6 +340,7 @@ test("schema-1 migration creates zero positive authority and removes subject aut
   delete initial.workspaceSettings;
   delete initial.workspaceCapabilityAssociations;
   delete initial.workspaceCapabilityApprovalEvents;
+  delete initial.transcriptRecoveryJournal;
   delete initial.protectedAutomationJobs;
   delete initial.protectedAutomationRuns;
   delete initial.messagingEndpoints;
@@ -374,13 +375,14 @@ test("schema-1 migration creates zero positive authority and removes subject aut
 
   init();
   const migrated = getStore();
-  assert.equal(migrated.schema_version, 6);
+  assert.equal(migrated.schema_version, 7);
   assert.deepEqual(migrated.workspaceCapabilityAssociations, []);
   assert.deepEqual(migrated.workspaceCapabilityApprovalEvents, []);
   assert.deepEqual(migrated.protectedAutomationJobs, []);
   assert.deepEqual(migrated.protectedAutomationRuns, []);
   assert.deepEqual(migrated.messagingEndpoints, []);
   assert.deepEqual(migrated.messagingEvents, []);
+  assert.deepEqual(migrated.transcriptRecoveryJournal, []);
   assert.ok(migrated.agentProfiles.every((profile) => !("capability_grants" in profile) && !("authorization_revision" in profile)));
   assert.ok(migrated.projects.every((project) => !("capability_grants" in project) && !("authorization_revision" in project)));
   assert.equal(migrated.sessions[0]!.title_source, "legacy_unknown");

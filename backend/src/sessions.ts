@@ -9,6 +9,12 @@ import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
 import { ensureProjectForCwd, ensureProjectForCwdDraft, resolveEffectiveSessionDefaults } from "./projects.js";
 import { WorkspaceStoreError, type PendingAgentSwitch, type SessionTitleSource } from "./workspace-types.js";
 import { isProjectableOpenInterview } from "./interview-attention-policy.js";
+import {
+  appendTranscriptRecoveryMarkerDraft,
+  clearTranscriptRecoveryMarker,
+  sessionDeleteRecoveryMarkerMatches,
+  unlinkRecoveryTranscriptIfPresent,
+} from "./transcript-recovery-journal.js";
 
 export type { SessionRow };
 
@@ -286,9 +292,10 @@ function updateTranscriptCwd(row: SessionRow, cwd: string, store = getStore()): 
   return true;
 }
 
-function publishDirectMutation(triggerScan = false): void {
-  sessionCatalog?.bumpGeneration();
+function publishDirectMutation(triggerScan = false): number {
+  const generation = sessionCatalog?.bumpGeneration() ?? 1;
   if (triggerScan) sessionCatalog?.requestScan("internal-write", 0);
+  return generation;
 }
 
 /** Publish a change to a field derived into the existing session summaries. */
@@ -348,7 +355,8 @@ function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; upda
 
   for (const parsed of scan.parsed) {
     const info = parsed.metadata;
-    if (deletedSessionIds.has(info.id) || deletedSessionFiles.has(info.path)) continue;
+    if (deletedSessionIds.has(info.id) || deletedSessionFiles.has(info.path)
+      || sessionDeleteRecoveryMarkerMatches(info.id, info.path)) continue;
     let row = byPath.get(info.path);
     const matchedByPath = Boolean(row);
     row ??= byId.get(info.id);
@@ -543,7 +551,8 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
 
   for (const info of infos) {
     const sessionFile = info.path;
-    if (deletedSessionIds.has(info.id) || deletedSessionFiles.has(sessionFile)) {
+    if (deletedSessionIds.has(info.id) || deletedSessionFiles.has(sessionFile)
+      || sessionDeleteRecoveryMarkerMatches(info.id, sessionFile)) {
       continue;
     }
     const projectResult = ensureProjectForCwd(normalizeSessionCwd(info.cwd), false);
@@ -1011,6 +1020,32 @@ export function touchSession(id: string): void {
   }
 }
 
+/**
+ * Fence catalog workers after a canonical transcript rewrite. The next scan
+ * must re-read the file and reconcile title/model/activity metadata instead of
+ * committing a pre-mutation fingerprint.
+ */
+export function markSessionTranscriptMutated(id: string): number {
+  const committed = commitStoreMutation((draft) => {
+    const row = draft.sessions.find((candidate) => candidate.id === id);
+    if (!row) throw new WorkspaceStoreError("Session not found", 404);
+    row.catalog_fingerprint = null;
+    // Non-explicit titles and terminal errors are transcript projections. Clear
+    // them before reparsing so removed event text cannot survive in Wayang
+    // metadata or its meta search chunk if reconciliation later fails.
+    if (row.title_source !== "explicit") {
+      row.title = "";
+      row.title_source = "provisional";
+    }
+    row.error = null;
+    row.provider = null;
+    row.model = null;
+    incrementDirectMutation(row);
+    return true;
+  });
+  return committed ? publishDirectMutation(true) : getSessionCatalogGeneration();
+}
+
 export function updateSessionError(id: string, error: string | null): void {
   const store = getStore();
   for (const row of store.sessions) {
@@ -1047,27 +1082,26 @@ export function archiveSession(id: string): void {
 export interface DeleteSessionResult {
   session: SessionRow;
   deletedSessionFile: string | null;
+  recoveryJournalId: string | null;
 }
 
-export function deleteSession(id: string): DeleteSessionResult | null {
+export function deleteSession(
+  id: string,
+  options: { searchPurged?: boolean } = {},
+): DeleteSessionResult | null {
   const store = getStore();
   const index = store.sessions.findIndex((row) => row.id === id);
   if (index < 0) return null;
 
   const session = store.sessions[index]!;
   assertSessionNotActivelyMessagingBound(id, "delete");
-  let deletedSessionFile: string | null = null;
-  if (session.pi_session_file) {
-    deletedSessionFiles.add(session.pi_session_file);
-    missingSince.delete(session.pi_session_file);
-    if (fs.existsSync(session.pi_session_file)) {
-      fs.unlinkSync(session.pi_session_file);
-      deletedSessionFile = session.pi_session_file;
-    }
-  }
 
-  deletedSessionIds.add(session.id);
-  const deleted = commitStoreMutation((draft) => {
+  const canonicalSessionFile = session.pi_session_file
+    ? fs.realpathSync.native(session.pi_session_file)
+    : null;
+  // Persist metadata removal and recovery authority together. A failed store
+  // transaction must not unlink bytes or install process-local fences.
+  const committed = commitStoreMutation((draft) => {
     const draftIndex = draft.sessions.findIndex((row) => row.id === id);
     if (draftIndex < 0) throw new WorkspaceStoreError("Session disappeared during deletion", 409);
     const target = draft.sessions[draftIndex]!;
@@ -1077,8 +1111,32 @@ export function deleteSession(id: string): DeleteSessionResult | null {
     draft.interviews = draft.interviews.filter((record) => record.session_id !== target.id);
     draft.sessionBrowserStates = draft.sessionBrowserStates.filter((record) => record.session_id !== target.id);
     draft.sessions.splice(draftIndex, 1);
-    return cloneSession(target);
+    const recovery = canonicalSessionFile
+      ? appendTranscriptRecoveryMarkerDraft(draft, {
+          kind: "session_delete",
+          sessionId: target.id,
+          piSessionFile: canonicalSessionFile,
+        })
+      : null;
+    return { session: cloneSession(target), recovery };
   });
+
+  const deleted = committed.session;
+  let deletedSessionFile: string | null = null;
+  deletedSessionIds.add(deleted.id);
+  if (canonicalSessionFile) {
+    deletedSessionFiles.add(canonicalSessionFile);
+    missingSince.delete(canonicalSessionFile);
+    const result = unlinkRecoveryTranscriptIfPresent(canonicalSessionFile);
+    if (result === "unlinked") deletedSessionFile = canonicalSessionFile;
+  }
+  if (committed.recovery && options.searchPurged) {
+    clearTranscriptRecoveryMarker(committed.recovery.id);
+  }
   publishDirectMutation(false);
-  return { session: deleted, deletedSessionFile };
+  return {
+    session: deleted,
+    deletedSessionFile,
+    recoveryJournalId: committed.recovery?.id ?? null,
+  };
 }

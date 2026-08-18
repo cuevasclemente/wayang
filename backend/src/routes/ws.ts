@@ -114,6 +114,14 @@ import { authorizeProjectAction } from "../policy.js";
 import type { AuthService } from "../auth/service.js";
 import { prepareAttachments } from "../attachments.js";
 import { logSessionRuntimeStartFailure } from "../session-runtime-logging.js";
+import {
+  onTranscriptInvalidation,
+  type TranscriptInvalidationEvent,
+} from "../transcript-invalidation.js";
+import {
+  acquireSessionRuntimeMutationLock,
+  releaseSessionRuntimeMutationLock,
+} from "../session-runtime-mutation-lock.js";
 
 export const router = Router();
 
@@ -145,6 +153,45 @@ export function serializeSessionRuntimeState(sessionId: string, selectionId: str
     session_id: sessionId,
     ...(selectionId ? { selection_id: selectionId } : {}),
     bash_mode: getPiSessionBashMode(sessionId),
+    mutation_locked: getRuntimeMutationSessionState(sessionId).mutation_locked,
+  };
+}
+
+/** @internal Shared wire projection used by every selected client. */
+export function subscribeTranscriptInvalidationForSelection(input: {
+  sessionId: string;
+  selectionId: string | null;
+  isCurrent: () => boolean;
+  send: (message: Record<string, unknown>) => void;
+  refresh?: () => void;
+}): () => void {
+  return onTranscriptInvalidation((event: TranscriptInvalidationEvent) => {
+    if (event.sessionId !== input.sessionId || !input.isCurrent()) return;
+    input.send({
+      type: "transcript_invalidated",
+      session_id: input.sessionId,
+      ...(input.selectionId ? { selection_id: input.selectionId } : {}),
+      catalog_generation: event.catalogGeneration,
+      reason: event.reason,
+      reconnect_required: true,
+    });
+    input.refresh?.();
+  });
+}
+
+/** @internal Exported for transcript-writer lock race tests. */
+export function isSessionClientMutationAllowed(sessionId: string): boolean {
+  return !getRuntimeMutationSessionState(sessionId).mutation_locked;
+}
+
+/** @internal Holds the same exclusion lock for the complete async compaction. */
+export function beginSessionCompactionMutationLease(sessionId: string): (() => void) | null {
+  if (!acquireSessionRuntimeMutationLock(sessionId)) return null;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseSessionRuntimeMutationLock(sessionId);
   };
 }
 
@@ -278,6 +325,7 @@ function handleConnection(
   let actionApprovalTerminalUnsub: (() => void) | null = null;
   let filePollTimer: NodeJS.Timeout | null = null;
   let runtimeEventUnsub: (() => void) | null = null;
+  let transcriptInvalidationUnsub: (() => void) | null = null;
   const pendingMessages: any[] = [];
 
   const sendCorrelatedClientFailure = (targetSessionId: string, msg: any, error: string): boolean => {
@@ -325,6 +373,8 @@ function handleConnection(
     sudoBridgeUnsub = null;
     commandGuardIdentityBridgeUnsub?.();
     commandGuardIdentityBridgeUnsub = null;
+    transcriptInvalidationUnsub?.();
+    transcriptInvalidationUnsub = null;
     actionApprovalDetach?.();
     actionApprovalDetach = null;
     actionApprovalRequestUnsub?.();
@@ -590,6 +640,19 @@ function handleConnection(
       ready = true;
       sendSafe(ws, { type: "session_ready", session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
       wsProfile(nextSessionId, "sent_session_ready", `setup_elapsed=${elapsedMs(setupStart)}`);
+      transcriptInvalidationUnsub = subscribeTranscriptInvalidationForSelection({
+        sessionId: nextSessionId,
+        selectionId,
+        isCurrent: () => alive && version === setupVersion
+          && currentSessionId === nextSessionId && currentSelectionId === selectionId,
+        send: (message) => sendSafe(ws, message),
+        refresh: () => queueMicrotask(() => {
+          if (!alive || version !== setupVersion) return;
+          void setupSession(nextSessionId, selectionId).catch((error) => {
+            sendSafe(ws, { type: "session_error", session_id: nextSessionId, error: safeSessionError(nextSessionId, error) });
+          });
+        }),
+      });
 
       // External actions bind only to an exact, non-empty selection
       // generation. Legacy/invalid sockets without one can still read chat but
@@ -1079,15 +1142,28 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
     }
 
     case "compact": {
+      const releaseCompactionLease = beginSessionCompactionMutationLease(sessionId);
+      if (!releaseCompactionLease) {
+        sendSafe(ws, { type: "error", error: "Session transcript mutation is in progress" });
+        return true;
+      }
       sendCommandNotice(ws, "Compacting session context…");
-      handle.session.compact(parsed.args.trim() || undefined)
+      let compaction: Promise<unknown>;
+      try {
+        compaction = Promise.resolve(handle.session.compact(parsed.args.trim() || undefined));
+      } catch {
+        releaseCompactionLease();
+        throw new Error("Session compaction could not start");
+      }
+      compaction
         .then(() => {
           sendCommandNotice(ws, "Compaction complete.");
           sendContextUsage(ws, sessionId);
         })
         // AgentSession emits the authoritative structured compaction_end event,
         // including a bounded failure message. Avoid a second generic error.
-        .catch(() => {});
+        .catch(() => {})
+        .finally(releaseCompactionLease);
       return true;
     }
 
@@ -1141,6 +1217,38 @@ function queuedAttachmentNames(value: unknown): string[] {
   ));
 }
 
+/** @internal Machine-coded lock rejection; callers must not persist it as a session error. */
+export function serializeMutationLockedRejection(
+  sessionId: string,
+  selectionId: string | null,
+  message: unknown,
+): Array<Record<string, unknown>> {
+  const error = "Session transcript mutation is in progress";
+  const response: Array<Record<string, unknown>> = [];
+  const value = message as { type?: unknown; client_message_id?: unknown } | null;
+  if (value?.type === "message") {
+    try {
+      const clientMessageId = optionalClientMessageId(value.client_message_id);
+      if (clientMessageId) response.push({
+        type: "queued_message_ack",
+        session_id: sessionId,
+        client_message_id: clientMessageId,
+        status: "rejected",
+        error_code: "mutation_locked",
+        error,
+      });
+    } catch { /* malformed correlation receives only the generic coded error */ }
+  }
+  response.push({
+    type: "error",
+    session_id: sessionId,
+    ...(selectionId ? { selection_id: selectionId } : {}),
+    code: "mutation_locked",
+    error,
+  });
+  return response;
+}
+
 async function handleClientMessage(
   ws: WebSocket,
   sessionId: string,
@@ -1153,6 +1261,10 @@ async function handleClientMessage(
     if (!row) throw new Error("Session not found");
     if (isLegacyPrivateSessionQuarantined(row)) {
       throw new Error("Quarantined legacy sessions are view-only");
+    }
+    if (!isSessionClientMutationAllowed(sessionId)) {
+      for (const response of serializeMutationLockedRejection(sessionId, selectionId, msg)) sendSafe(ws, response);
+      return;
     }
     const authorization = authorizeProjectAction({
       cwd: row.cwd,

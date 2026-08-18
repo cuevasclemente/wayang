@@ -103,6 +103,14 @@ export interface SessionRow {
   catalog_mutation_version?: number;
 }
 
+export interface TranscriptRecoveryJournalRow {
+  id: string;
+  kind: "event_reconcile" | "session_delete";
+  session_id: string;
+  pi_session_file: string;
+  created_at: number;
+}
+
 export interface AgentTeamRow {
   id: string;
   name: string;
@@ -204,6 +212,7 @@ export interface StoreData {
   sessionBrowserStates: SessionBrowserStateRow[];
   browserCleanups: BrowserCleanupRow[];
   sessions: SessionRowCollection;
+  transcriptRecoveryJournal: TranscriptRecoveryJournalRow[];
   projects: ProjectRow[];
   agentProfiles: AgentProfileRow[];
   agentTeams: AgentTeamRow[];
@@ -225,7 +234,7 @@ export interface StoreData {
 
 const ARRAY_KEYS = [
   "workspaceCapabilityAssociations", "workspaceCapabilityApprovalEvents", "browserProfiles", "projectBrowserDefaults",
-  "sessionBrowserStates", "browserCleanups", "sessions", "projects", "agentProfiles",
+  "sessionBrowserStates", "browserCleanups", "sessions", "transcriptRecoveryJournal", "projects", "agentProfiles",
   "agentTeams", "teamMembers", "goals", "apps", "appStates", "appEvents", "scheduledJobs", "scheduledRuns",
   "protectedAutomationJobs", "protectedAutomationRuns", "messagingEndpoints", "messagingEvents",
   "messagingTransactions", "messagingDeliveries", "interviews",
@@ -567,6 +576,7 @@ function emptyStore(now = Date.now()): StoreData {
     sessionBrowserStates: [],
     browserCleanups: [],
     sessions: [],
+    transcriptRecoveryJournal: [],
     projects: [],
     agentProfiles: [defaultProfile],
     agentTeams: [],
@@ -873,6 +883,34 @@ function validateCurrentStore(raw: Record<string, unknown>): StoreData {
     if (sessionIds.has(sessionId)) throw new Error("Wayang store contains duplicate session ids");
     sessionIds.add(sessionId);
   }
+  const recoveryIds = new Set<string>();
+  const recoverySessions = new Set<string>();
+  for (const [index, candidate] of (raw.transcriptRecoveryJournal as unknown[]).entries()) {
+    const value = candidate as Partial<TranscriptRecoveryJournalRow> | null;
+    if (!value || typeof value !== "object"
+      || !exactObjectKeys(value, ["id", "kind", "session_id", "pi_session_file", "created_at"])
+      || !validStableId(value.id) || !["event_reconcile", "session_delete"].includes(value.kind ?? "")
+      || !validStableId(value.session_id)
+      || typeof value.pi_session_file !== "string" || !path.isAbsolute(value.pi_session_file)
+      || path.normalize(value.pi_session_file) !== value.pi_session_file
+      || Buffer.byteLength(value.pi_session_file, "utf8") > 4096
+      || /[\u0000-\u001f\u007f]/u.test(value.pi_session_file)
+      || !finiteTimestamp(value.created_at)) {
+      throw new Error(`Wayang store contains a malformed transcript recovery journal row at index ${index}`);
+    }
+    if (recoveryIds.has(value.id) || recoverySessions.has(value.session_id)) {
+      throw new Error("Wayang store contains duplicate transcript recovery journal authority");
+    }
+    recoveryIds.add(value.id);
+    recoverySessions.add(value.session_id);
+    if (value.kind === "event_reconcile" && !sessionIds.has(value.session_id)) {
+      throw new Error("Wayang event recovery journal references a missing session");
+    }
+    if (value.kind === "session_delete" && sessionIds.has(value.session_id)) {
+      throw new Error("Wayang session-delete recovery journal conflicts with a live session row");
+    }
+  }
+
   const profileIds = new Set<string>();
   for (const profile of raw.agentProfiles as unknown[]) {
     const value = profile as Partial<AgentProfileRow> | null;
@@ -1086,6 +1124,7 @@ function normalizeLegacyStore(raw: Record<string, unknown>, browserProfilesEnabl
     && key !== "protectedAutomationJobs" && key !== "protectedAutomationRuns"
     && key !== "messagingEndpoints" && key !== "messagingEvents"
     && key !== "messagingTransactions" && key !== "messagingDeliveries"
+    && key !== "transcriptRecoveryJournal"
     && !BROWSER_CATALOG_ARRAY_KEYS.includes(key as typeof BROWSER_CATALOG_ARRAY_KEYS[number])));
   for (const key of Object.keys(raw)) {
     if (!legacyKeys.has(key)) throw new Error(`Legacy Wayang store contains unsupported field ${key}`);
@@ -1248,6 +1287,7 @@ function normalizeSchemaOneStore(raw: Record<string, unknown>, browserProfilesEn
     sessionBrowserStates: [],
     browserCleanups: [],
     sessions,
+    transcriptRecoveryJournal: [],
     projects,
     agentProfiles: profiles,
     agentTeams: structuredClone(raw.agentTeams) as AgentTeamRow[],
@@ -1275,7 +1315,8 @@ function normalizeSchemaOneStore(raw: Record<string, unknown>, browserProfilesEn
 }
 
 function normalizeSchemaTwoStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
-  const schemaTwoArrayKeys = ARRAY_KEYS.filter((key) => key !== "protectedAutomationJobs" && key !== "protectedAutomationRuns"
+  const schemaTwoArrayKeys = ARRAY_KEYS.filter((key) => key !== "transcriptRecoveryJournal"
+    && key !== "protectedAutomationJobs" && key !== "protectedAutomationRuns"
     && key !== "messagingEndpoints" && key !== "messagingEvents"
     && key !== "messagingTransactions" && key !== "messagingDeliveries"
     && !BROWSER_CATALOG_ARRAY_KEYS.includes(key as typeof BROWSER_CATALOG_ARRAY_KEYS[number]));
@@ -1307,6 +1348,7 @@ function normalizeSchemaTwoStore(raw: Record<string, unknown>, browserProfilesEn
     projectBrowserDefaults: [],
     sessionBrowserStates: [],
     browserCleanups: [],
+    transcriptRecoveryJournal: [],
   } as unknown as StoreData;
   for (const session of migrated.sessions) session.title_source = classifyMigratedSessionTitleSource(session.title);
   backfillLegacySessionProjectIds(migrated.sessions as SessionRow[], migrated.projects);
@@ -1316,7 +1358,8 @@ function normalizeSchemaTwoStore(raw: Record<string, unknown>, browserProfilesEn
 
 function normalizeSchemaThreeStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
   const messagingKeys = new Set(["messagingEndpoints", "messagingEvents", "messagingTransactions", "messagingDeliveries"]);
-  const schemaThreeArrayKeys = ARRAY_KEYS.filter((key) => !messagingKeys.has(key)
+  const schemaThreeArrayKeys = ARRAY_KEYS.filter((key) => key !== "transcriptRecoveryJournal"
+    && !messagingKeys.has(key)
     && !BROWSER_CATALOG_ARRAY_KEYS.includes(key as typeof BROWSER_CATALOG_ARRAY_KEYS[number]));
   const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaThreeArrayKeys]);
   for (const key of Object.keys(raw)) {
@@ -1338,6 +1381,7 @@ function normalizeSchemaThreeStore(raw: Record<string, unknown>, browserProfiles
     projectBrowserDefaults: [],
     sessionBrowserStates: [],
     browserCleanups: [],
+    transcriptRecoveryJournal: [],
   } as unknown as StoreData;
   for (const session of migrated.sessions) session.title_source = classifyMigratedSessionTitleSource(session.title);
   backfillLegacySessionProjectIds(migrated.sessions as SessionRow[], migrated.projects);
@@ -1346,7 +1390,8 @@ function normalizeSchemaThreeStore(raw: Record<string, unknown>, browserProfiles
 }
 
 function normalizeSchemaFourStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
-  const schemaFourArrayKeys = ARRAY_KEYS.filter((key) => !BROWSER_CATALOG_ARRAY_KEYS.includes(key as typeof BROWSER_CATALOG_ARRAY_KEYS[number]));
+  const schemaFourArrayKeys = ARRAY_KEYS.filter((key) => key !== "transcriptRecoveryJournal"
+    && !BROWSER_CATALOG_ARRAY_KEYS.includes(key as typeof BROWSER_CATALOG_ARRAY_KEYS[number]));
   const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaFourArrayKeys]);
   for (const key of Object.keys(raw)) {
     if (!allowedKeys.has(key)) throw new Error(`Schema-4 Wayang store contains unsupported field ${key}`);
@@ -1364,6 +1409,7 @@ function normalizeSchemaFourStore(raw: Record<string, unknown>, browserProfilesE
     projectBrowserDefaults: [],
     sessionBrowserStates: [],
     browserCleanups: [],
+    transcriptRecoveryJournal: [],
   } as unknown as StoreData;
   for (const session of migrated.sessions) {
     session.title_source = classifyMigratedSessionTitleSource(session.title);
@@ -1372,8 +1418,9 @@ function normalizeSchemaFourStore(raw: Record<string, unknown>, browserProfilesE
   return validateCurrentStore(migrated as unknown as Record<string, unknown>);
 }
 
-function normalizeSchemaFiveStore(raw: Record<string, unknown>): StoreData {
-  const schemaFiveArrayKeys = ARRAY_KEYS.filter((key) => !BROWSER_CATALOG_ARRAY_KEYS.includes(key as typeof BROWSER_CATALOG_ARRAY_KEYS[number]));
+function normalizeSchemaFiveStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
+  const schemaFiveArrayKeys = ARRAY_KEYS.filter((key) => key !== "transcriptRecoveryJournal"
+    && !BROWSER_CATALOG_ARRAY_KEYS.includes(key as typeof BROWSER_CATALOG_ARRAY_KEYS[number]));
   const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaFiveArrayKeys]);
   for (const key of Object.keys(raw)) {
     if (!allowedKeys.has(key)) throw new Error(`Schema-5 Wayang store contains unsupported field ${key}`);
@@ -1381,8 +1428,9 @@ function normalizeSchemaFiveStore(raw: Record<string, unknown>): StoreData {
   for (const key of schemaFiveArrayKeys) {
     if (!Array.isArray(raw[key])) throw new Error(`Schema-5 Wayang store field ${key} must be an array`);
   }
-  // Schema 5 owns canonical title provenance. Browser schema 6 preserves every
-  // byte of those rows and inventories only expected profile-root metadata.
+  // Schema 5 owns canonical title provenance. Current schema 7 preserves every
+  // byte of those rows, inventories only expected profile-root metadata when
+  // enabled, and adds an empty content-free recovery journal.
   const migrated = {
     ...structuredClone(raw),
     schema_version: STORE_SCHEMA_VERSION,
@@ -1390,9 +1438,26 @@ function normalizeSchemaFiveStore(raw: Record<string, unknown>): StoreData {
     projectBrowserDefaults: [],
     sessionBrowserStates: [],
     browserCleanups: [],
+    transcriptRecoveryJournal: [],
   } as unknown as StoreData;
-  Object.assign(migrated, browserCatalogMigrationFields(migrated));
+  Object.assign(migrated, browserCatalogMigrationFields(migrated, Date.now(), browserProfilesEnabled));
   return validateCurrentStore(migrated as unknown as Record<string, unknown>);
+}
+
+function normalizeSchemaSixStore(raw: Record<string, unknown>): StoreData {
+  const schemaSixArrayKeys = ARRAY_KEYS.filter((key) => key !== "transcriptRecoveryJournal");
+  const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaSixArrayKeys]);
+  for (const key of Object.keys(raw)) {
+    if (!allowedKeys.has(key)) throw new Error(`Schema-6 Wayang store contains unsupported field ${key}`);
+  }
+  for (const key of schemaSixArrayKeys) {
+    if (!Array.isArray(raw[key])) throw new Error(`Schema-6 Wayang store field ${key} must be an array`);
+  }
+  return validateCurrentStore({
+    ...structuredClone(raw),
+    schema_version: STORE_SCHEMA_VERSION,
+    transcriptRecoveryJournal: [],
+  });
 }
 
 function isPlausibleInterviewRecord(record: unknown): record is InterviewRecord {
@@ -1585,15 +1650,10 @@ function canonicalizeCapabilityEligibility(data: StoreData): void {
   }
 }
 
-function persistedStoreForBrowserMode(data: StoreData, browserProfilesEnabled: boolean): StoreData | Record<string, unknown> {
-  if (browserProfilesEnabled) return data;
-  const persisted = structuredClone(data) as unknown as Record<string, unknown>;
-  persisted.schema_version = 5;
-  delete persisted.browserProfiles;
-  delete persisted.projectBrowserDefaults;
-  delete persisted.sessionBrowserStates;
-  delete persisted.browserCleanups;
-  return persisted;
+function persistedStoreForBrowserMode(data: StoreData, _browserProfilesEnabled: boolean): StoreData {
+  // Schema 7 recovery authority is required in every runtime mode. Gate-off
+  // stores retain empty browser catalogs rather than projecting back to schema 5.
+  return data;
 }
 
 function saveStoreAtPath(data: StoreData, storePath: string, browserProfilesEnabled = _browserProfilesEnabled): void {
@@ -1670,23 +1730,26 @@ function loadStore(storePath: string, browserProfilesEnabled = _browserProfilesE
   }
   const raw = requireObject(parsed);
   const version = readSchemaVersion(raw);
-  if (!browserProfilesEnabled && version === STORE_SCHEMA_VERSION) {
+  if (!browserProfilesEnabled && version === 6) {
     throw new Error("Wayang store schema 6 requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1");
+  }
+  if (!browserProfilesEnabled && version === STORE_SCHEMA_VERSION) {
+    for (const key of BROWSER_CATALOG_ARRAY_KEYS) {
+      if (!Array.isArray(raw[key]) || (raw[key] as unknown[]).length !== 0) {
+        throw new Error("Wayang schema 7 browser persistence requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1");
+      }
+    }
   }
   if (version > STORE_SCHEMA_VERSION) {
     throw new Error(`Wayang store schema ${version} is newer than supported schema ${STORE_SCHEMA_VERSION}`);
   }
   if (version === STORE_SCHEMA_VERSION) return validateCurrentStore(raw);
-  // Gate-off production runs schema 5 as its durable format. Add empty Browser
-  // arrays only in memory so current code can operate without inventorying or
-  // publishing schema 6; every save projects back to exact schema 5.
-  if (!browserProfilesEnabled && version === 5) return normalizeSchemaFiveStore(raw);
-
   // Never normalize or replace an old store until its exact bytes have a
   // durable private backup. Any backup error aborts startup.
   createPrivateBackup(storePath, contents, version);
   let migrated: StoreData;
-  if (version === 5) migrated = normalizeSchemaFiveStore(raw);
+  if (version === 6) migrated = normalizeSchemaSixStore(raw);
+  else if (version === 5) migrated = normalizeSchemaFiveStore(raw, browserProfilesEnabled);
   else if (version === 4) migrated = normalizeSchemaFourStore(raw, browserProfilesEnabled);
   else if (version === 3) migrated = normalizeSchemaThreeStore(raw, browserProfilesEnabled);
   else if (version === 2) migrated = normalizeSchemaTwoStore(raw, browserProfilesEnabled);

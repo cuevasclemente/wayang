@@ -2,11 +2,19 @@ import { Router, type Request, type Response } from "express";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createSession, listSessions, syncPiSessionFiles, persistManualSessionTitle, archiveSession, deleteSession, getSessionById, updateGoal, getSessionCatalogGeneration, onSessionCatalogGeneration, validateManualSessionTitle, type SessionRow } from "../sessions.js";
 import { classifyAssistantErrorKind, getPiSession, getPiSessionBashMode, getPiSessionBrowserAgentDiagnostic, getPiSessionBrowserMode, getPiSessionRuntimeState, listModels, listSlashCommands, previewSessionAgentSwitch, setSessionDefaultModel, setSessionModel, stopPiSession, switchSessionAgent } from "../pi-bridge.js";
-import { validateCommandGuardIdentityPin } from "../command-guard-pin.js";
-import { removeSession as removeSearchSession } from "../search/indexer.js";
+import {
+  indexSession as forceIndexSession,
+  removeSession as removeSearchSession,
+} from "../search/indexer.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
 import { listHumanAttentionForSession, type HumanAttentionSummary } from "../human-attention.js";
 import type { Session as ProtocolSession } from "@wayang/protocol";
+import {
+  acquireSessionRuntimeMutationLock,
+  isSessionRuntimeMutationLocked,
+  releaseSessionRuntimeMutationLock,
+} from "../session-runtime-mutation-lock.js";
+import { validateSessionDeletionPinAttempt } from "../transcript-mutations.js";
 
 export const router = Router();
 
@@ -170,6 +178,11 @@ router.get("/sessions/:id", (req: Request, res: Response) => {
 // Update session title
 // ---------------------------------------------------------------------------
 
+/** @internal Shared lock projection for focused route race tests. */
+export function isSessionTitleWriteAllowed(sessionId: string): boolean {
+  return !isSessionRuntimeMutationLocked(sessionId);
+}
+
 export function writeStoppedPiSessionName(session: SessionRow, name: string): void {
   if (!session.pi_session_file) return;
   SessionManager.open(session.pi_session_file, undefined, session.cwd).appendSessionInfo(name);
@@ -181,6 +194,10 @@ router.put("/sessions/:id/title", (req: Request, res: Response) => {
     const session = getSessionById(req.params.id);
     if (!session) {
       res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    if (!isSessionTitleWriteAllowed(session.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
       return;
     }
     const live = getPiSession(session.id);
@@ -207,6 +224,10 @@ router.delete("/sessions/:id", async (req: Request, res: Response) => {
       res.status(404).json({ error: "Session not found" });
       return;
     }
+    if (!isSessionTitleWriteAllowed(session.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
+      return;
+    }
     archiveSession(req.params.id);
     await stopPiSession(req.params.id, { kind: "close_session", reason: "archive" });
     res.status(204).end();
@@ -219,6 +240,20 @@ router.delete("/sessions/:id", async (req: Request, res: Response) => {
 // Delete session (requires command guard identity PIN)
 // ---------------------------------------------------------------------------
 
+/** @internal Rebuild logically purged search only while canonical row/file remain. */
+export async function recoverSearchAfterFailedSessionDelete(
+  sessionId: string,
+  index: typeof forceIndexSession = forceIndexSession,
+): Promise<boolean> {
+  if (!getSessionById(sessionId)) return false;
+  try {
+    const result = await index(sessionId, { force: true });
+    return !result.error;
+  } catch {
+    return false;
+  }
+}
+
 router.post("/sessions/:id/delete", async (req: Request, res: Response) => {
   try {
     const session = getSessionById(req.params.id);
@@ -227,25 +262,57 @@ router.post("/sessions/:id/delete", async (req: Request, res: Response) => {
       return;
     }
 
-    const validation = validateCommandGuardIdentityPin(req.body?.pin);
-    if (!validation.ok) {
-      res.status(403).json({
-        error: validation.error || "Command guard identity PIN is required.",
-        pinRequired: true,
-        pinConfigured: validation.pinConfigured,
+    if (!isSessionTitleWriteAllowed(session.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
+      return;
+    }
+
+    if (!acquireSessionRuntimeMutationLock(session.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress", code: "mutation_busy" });
+      return;
+    }
+    try {
+      const validation = await validateSessionDeletionPinAttempt(req.body?.pin, {
+        kind: "delete_session",
+        sessionId: session.id,
+        catalogMutationVersion: session.catalog_mutation_version ?? 0,
       });
-      return;
-    }
+      if (!validation.ok) {
+        if (validation.retryAt !== undefined) {
+          res.setHeader("Retry-After", Math.max(1, Math.ceil((validation.retryAt - Date.now()) / 1_000)));
+        }
+        res.status(validation.statusCode ?? 403).json({
+          error: validation.error || "Command guard identity PIN is required.",
+          code: validation.code ?? "pin_rejected",
+          pinRequired: true,
+          pinConfigured: validation.pinConfigured,
+        });
+        return;
+      }
 
-    await stopPiSession(req.params.id, { kind: "close_session", reason: "session_delete" });
-    await removeSearchSession(req.params.id);
-    const deleted = deleteSession(req.params.id);
-    if (!deleted) {
-      res.status(404).json({ error: "Session not found" });
-      return;
-    }
+      await stopPiSession(req.params.id, { kind: "close_session", reason: "session_delete" });
+      await removeSearchSession(req.params.id);
+      let deleted: ReturnType<typeof deleteSession>;
+      try {
+        deleted = deleteSession(req.params.id, { searchPurged: true });
+      } catch {
+        const canonicalRetained = Boolean(getSessionById(req.params.id));
+        if (canonicalRetained) await recoverSearchAfterFailedSessionDelete(req.params.id);
+        res.status(500).json(canonicalRetained
+          ? { error: "Session deletion failed; canonical transcript was retained.", code: "session_delete_failed" }
+          : { error: "Session deletion cleanup is incomplete.", code: "session_delete_incomplete" });
+        return;
+      }
+      if (!deleted) {
+        await recoverSearchAfterFailedSessionDelete(req.params.id);
+        res.status(404).json({ error: "Session not found" });
+        return;
+      }
 
-    res.json({ deleted: true, deleted_session_file: deleted.deletedSessionFile });
+      res.json({ deleted: true, deleted_session_file: deleted.deletedSessionFile });
+    } finally {
+      releaseSessionRuntimeMutationLock(session.id);
+    }
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
@@ -260,6 +327,10 @@ router.post("/sessions/:id/stop", async (req: Request, res: Response) => {
     const session = getSessionById(req.params.id);
     if (!session) {
       res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    if (!isSessionTitleWriteAllowed(session.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
       return;
     }
     await stopPiSession(req.params.id);
@@ -292,6 +363,10 @@ router.put("/sessions/:id/agent", async (req: Request, res: Response) => {
     const agentProfileId = req.body?.agent_profile_id;
     if (typeof agentProfileId !== "string" || !agentProfileId) {
       res.status(400).json({ error: "agent_profile_id is required" });
+      return;
+    }
+    if (!isSessionTitleWriteAllowed(req.params.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
       return;
     }
     const result = await switchSessionAgent(req.params.id, agentProfileId);
@@ -327,6 +402,10 @@ router.put("/sessions/:id/model", async (req: Request, res: Response) => {
       return;
     }
 
+    if (!isSessionTitleWriteAllowed(session.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
+      return;
+    }
     if (wantsDefault) {
       await setSessionDefaultModel(req.params.id);
     } else {

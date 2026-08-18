@@ -26,6 +26,7 @@ function rewriteFreshStoreAsSchemaTwo(mutator?: (store: Record<string, unknown>)
   const storePath = path.join(dataDir, "store.json");
   const store = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, unknown>;
   store.schema_version = 2;
+  delete store.transcriptRecoveryJournal;
   delete store.protectedAutomationJobs;
   delete store.protectedAutomationRuns;
   delete store.messagingEndpoints;
@@ -45,7 +46,7 @@ test("schema 2 migrates explicitly to current schema with empty inert authority,
   init();
   const store = getStore();
   assert.equal(store.schema_version, STORE_SCHEMA_VERSION);
-  assert.equal(STORE_SCHEMA_VERSION, 6);
+  assert.equal(STORE_SCHEMA_VERSION, 7);
   assert.deepEqual(store.protectedAutomationJobs, []);
   assert.deepEqual(store.protectedAutomationRuns, []);
   assert.deepEqual(store.workspaceCapabilityAssociations, []);
@@ -56,6 +57,7 @@ test("schema 2 migrates explicitly to current schema with empty inert authority,
   assert.deepEqual(store.projectBrowserDefaults, []);
   assert.deepEqual(store.sessionBrowserStates, []);
   assert.deepEqual(store.browserCleanups, []);
+  assert.deepEqual(store.transcriptRecoveryJournal, []);
   const backups = fs.readdirSync(dataDir).filter((name) => name.startsWith("store.json.backup-v2-"));
   assert.equal(backups.length, 1);
   assert.equal(fs.statSync(path.join(dataDir, backups[0]!)).mode & 0o777, 0o600);

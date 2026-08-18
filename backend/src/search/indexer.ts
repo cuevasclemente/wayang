@@ -27,6 +27,8 @@ export interface IndexResult {
   chunkCount: number;
   skipped: boolean;
   policySkipped?: boolean;
+  mutationFenced?: boolean;
+  retryable?: boolean;
   error?: string;
 }
 
@@ -41,9 +43,14 @@ export interface IndexBatchSummary {
 export interface IndexerOptions {
   includeThinking?: boolean;
   force?: boolean;
+  /** Exact durable marker authorizing startup/mutation recovery reindex only. */
+  recoveryMarkerId?: string;
+  /** @internal Pauses after transcript chunking for deterministic CAS tests. */
+  afterChunkingForTests?: () => void | Promise<void>;
 }
 
 let _includeThinking = false;
+const transcriptMutationFences = new Set<string>();
 
 export function setIncludeThinking(v: boolean): void {
   _includeThinking = v;
@@ -59,6 +66,50 @@ async function loadSessionRow(sessionId: string): Promise<SessionRow | null> {
   return row ? { ...row } : null;
 }
 
+interface IndexMetadataProjection {
+  catalogMutationVersion: number;
+  piSessionFile: string | null;
+  title: string;
+  goal: string | null;
+  cwd: string;
+  model: string | null;
+  provider: string | null;
+  createdAt: number;
+  lastActive: number;
+  archived: number;
+  error: string | null;
+}
+
+function indexMetadataProjection(row: SessionRow): IndexMetadataProjection {
+  return {
+    catalogMutationVersion: row.catalog_mutation_version ?? 0,
+    piSessionFile: row.pi_session_file,
+    title: row.title,
+    goal: row.goal,
+    cwd: row.cwd,
+    model: row.model,
+    provider: row.provider,
+    createdAt: row.created_at,
+    lastActive: row.last_active,
+    archived: row.archived,
+    error: row.error,
+  };
+}
+
+function sameIndexMetadata(left: IndexMetadataProjection, right: IndexMetadataProjection): boolean {
+  return left.catalogMutationVersion === right.catalogMutationVersion
+    && left.piSessionFile === right.piSessionFile
+    && left.title === right.title
+    && left.goal === right.goal
+    && left.cwd === right.cwd
+    && left.model === right.model
+    && left.provider === right.provider
+    && left.createdAt === right.createdAt
+    && left.lastActive === right.lastActive
+    && left.archived === right.archived
+    && left.error === right.error;
+}
+
 function makeMeta(row: SessionRow): MetaForChunker {
   return {
     title: row.title || "(untitled)",
@@ -68,14 +119,40 @@ function makeMeta(row: SessionRow): MetaForChunker {
   };
 }
 
+const RETRY_FRESH_ROW = Symbol("retry-fresh-index-row");
+const MAX_INDEX_METADATA_CAS_ATTEMPTS = 3;
+
 export async function indexSession(
   sessionId: string,
   options: IndexerOptions = {},
 ): Promise<IndexResult> {
+  for (let attempt = 0; attempt < MAX_INDEX_METADATA_CAS_ATTEMPTS; attempt++) {
+    const result = await indexSessionAttempt(sessionId, options);
+    if (result !== RETRY_FRESH_ROW) return result;
+  }
+  purgeSessionIndex(sessionId);
+  return {
+    sessionId,
+    chunkCount: 0,
+    skipped: true,
+    retryable: true,
+    error: "Session metadata changed repeatedly during indexing; retry later.",
+  };
+}
+
+async function indexSessionAttempt(
+  sessionId: string,
+  options: IndexerOptions,
+): Promise<IndexResult | typeof RETRY_FRESH_ROW> {
+  if (transcriptMutationFences.has(sessionId)) {
+    purgeSessionIndex(sessionId);
+    return { sessionId, chunkCount: 0, skipped: true, mutationFenced: true };
+  }
   const row = await loadSessionRow(sessionId);
   if (!row) {
     return { sessionId, chunkCount: 0, skipped: true, error: "session not found" };
   }
+  const expectedMetadata = indexMetadataProjection(row);
 
   // Publish the current complete path decision before this background path can
   // touch transcript metadata. Unknown paths remain denied by the Dream runner.
@@ -83,7 +160,7 @@ export async function indexSession(
 
   // Authorization precedes search DB lookup, transcript stat/read, and the
   // unchanged shortcut. Denial removes stale indexed content.
-  const initialDenial = policyDenial(row);
+  const initialDenial = policyDenial(row, options.recoveryMarkerId);
   if (initialDenial) return purgePolicyDeniedSession(sessionId, initialDenial);
   const db = getSearchDb();
   const filePath = row.pi_session_file;
@@ -102,7 +179,11 @@ export async function indexSession(
 
   // Recheck after stat and before the unchanged shortcut so a policy change
   // cannot preserve stale searchable content merely because bytes are stable.
-  const postStatDenial = policyDenial(row);
+  if (transcriptMutationFences.has(sessionId)) {
+    purgeSessionIndex(sessionId);
+    return { sessionId, chunkCount: 0, skipped: true, mutationFenced: true };
+  }
+  const postStatDenial = policyDenial(row, options.recoveryMarkerId);
   if (postStatDenial) return purgePolicyDeniedSession(sessionId, postStatDenial);
 
   // Skip if unchanged.
@@ -120,9 +201,28 @@ export async function indexSession(
       }
     | undefined;
 
+  const indexedMetadata = db.prepare(
+    `SELECT cwd, title, goal, model, provider, created_at, last_active, archived, has_error
+       FROM chunks WHERE session_id = ? ORDER BY chunk_index LIMIT 1`,
+  ).get(sessionId) as {
+    cwd: string; title: string; goal: string | null; model: string | null; provider: string | null;
+    created_at: number; last_active: number; archived: number; has_error: number;
+  } | undefined;
+  const indexedMetadataMatches = Boolean(indexedMetadata
+    && indexedMetadata.cwd === row.cwd
+    && indexedMetadata.title === row.title
+    && indexedMetadata.goal === row.goal
+    && indexedMetadata.model === row.model
+    && indexedMetadata.provider === row.provider
+    && indexedMetadata.created_at === row.created_at
+    && indexedMetadata.last_active === row.last_active
+    && indexedMetadata.archived === (row.archived ? 1 : 0)
+    && indexedMetadata.has_error === (row.error ? 1 : 0));
+
   if (
     !options.force &&
     existing &&
+    indexedMetadataMatches &&
     existing.schema_version === SCHEMA_VERSION &&
     existing.pi_session_file === (filePath ?? null) &&
     existing.file_mtime_ms === (fileMtime ?? null) &&
@@ -136,7 +236,7 @@ export async function indexSession(
 
   const meta = makeMeta(row);
   if (filePath && fileMtime != null) {
-    const preReadDenial = policyDenial(row);
+    const preReadDenial = policyDenial(row, options.recoveryMarkerId);
     if (preReadDenial) return purgePolicyDeniedSession(sessionId, preReadDenial);
     try {
       const result = await chunkJsonlFile(filePath, meta, {
@@ -174,10 +274,20 @@ export async function indexSession(
     ];
   }
 
-  // chunkJsonlFile yields while streaming. Reauthorize after all transcript
-  // bytes have been processed and before any derived text is committed.
-  const preCommitDenial = policyDenial(row);
+  await options.afterChunkingForTests?.();
+
+  // chunkJsonlFile and test seams yield while streaming. Reauthorize and
+  // compare the complete index projection before preparing a commit.
+  if (transcriptMutationFences.has(sessionId)) {
+    purgeSessionIndex(sessionId);
+    return { sessionId, chunkCount: 0, skipped: true, mutationFenced: true };
+  }
+  const preCommitDenial = policyDenial(row, options.recoveryMarkerId);
   if (preCommitDenial) return purgePolicyDeniedSession(sessionId, preCommitDenial);
+  const afterChunkingRow = await loadSessionRow(sessionId);
+  if (!afterChunkingRow || !sameIndexMetadata(expectedMetadata, indexMetadataProjection(afterChunkingRow))) {
+    return RETRY_FRESH_ROW;
+  }
 
   const insertStmt = db.prepare(
     `INSERT INTO chunks (
@@ -206,6 +316,13 @@ export async function indexSession(
        schema_version  = excluded.schema_version,
        error           = excluded.error`,
   );
+
+  // Last synchronous CAS immediately before the SQLite transaction. No await
+  // is permitted between this durable-row read and trx().
+  const preTransactionRow = getStore().sessions.find((candidate) => candidate.id === sessionId);
+  if (!preTransactionRow || !sameIndexMetadata(expectedMetadata, indexMetadataProjection(preTransactionRow))) {
+    return RETRY_FRESH_ROW;
+  }
 
   const trx = db.transaction(() => {
     deleteStmt.run(sessionId);
@@ -246,6 +363,24 @@ export async function indexSession(
 
 export async function removeSession(sessionId: string): Promise<void> {
   purgeSessionIndex(sessionId);
+}
+
+/** Prevent watcher/manual indexing from republishing stale text during rewrite. */
+export function beginTranscriptMutationSearchFence(sessionId: string): void {
+  if (transcriptMutationFences.has(sessionId)) {
+    throw new Error("A transcript mutation search fence is already active");
+  }
+  transcriptMutationFences.add(sessionId);
+  try {
+    purgeSessionIndex(sessionId);
+  } catch (error) {
+    transcriptMutationFences.delete(sessionId);
+    throw error;
+  }
+}
+
+export function endTranscriptMutationSearchFence(sessionId: string): void {
+  transcriptMutationFences.delete(sessionId);
 }
 
 export function purgePolicyDeniedSessions(): { purged: number; errors: number } {
@@ -290,11 +425,11 @@ export async function reindexAll(options: IndexerOptions = {}): Promise<IndexBat
   };
 }
 
-function policyDenial(row: SessionRow): string | null {
+function policyDenial(row: SessionRow, recoveryMarkerId?: string): string | null {
   // Re-resolve the durable row on every phase check so a quarantine committed
   // while the streaming chunker yields cannot publish derived private text.
   const current = getStore().sessions.find((candidate) => candidate.id === row.id);
-  return current && isSessionIndexable(current)
+  return current && isSessionIndexable(current, { recoveryMarkerId })
     ? null
     : "Session indexing denied by project or legacy private-data policy";
 }

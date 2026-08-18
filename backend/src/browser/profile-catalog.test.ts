@@ -111,7 +111,7 @@ test("trash is recoverable, reference-safe, and does not mutate profile bytes", 
   assert.equal(fs.readFileSync(sentinel, "utf8"), "do-not-read-or-change");
 });
 
-test("schema 5 to 6 migration preserves title provenance and inventories only expected profile directory metadata", () => {
+test("schema 5 to 7 migration preserves title provenance and inventories only expected profile directory metadata", () => {
   const agent = createAgentProfile({ name: "Migrated agent" });
   const project = createProject({ cwd: projectRoot, name: "Migrated project", default_agent_profile_id: agent.id });
   commitWorkspaceCapabilityActivation({
@@ -133,6 +133,7 @@ test("schema 5 to 6 migration preserves title provenance and inventories only ex
   const storePath = path.join(dataDir, "store.json");
   const schemaFive = JSON.parse(fs.readFileSync(storePath, "utf8"));
   schemaFive.schema_version = 5;
+  delete schemaFive.transcriptRecoveryJournal;
   delete schemaFive.browserProfiles;
   delete schemaFive.projectBrowserDefaults;
   delete schemaFive.sessionBrowserStates;
@@ -141,11 +142,12 @@ test("schema 5 to 6 migration preserves title provenance and inventories only ex
 
   init({ browserProfilesEnabled: true });
   const store = getStore();
-  assert.equal(store.schema_version, 6);
+  assert.equal(store.schema_version, 7);
   assert.deepEqual(store.browserProfiles.map((row) => row.storage_source.kind).sort(), ["legacy_shared", "standard_pair_v1"]);
   assert.deepEqual(store.projectBrowserDefaults, []);
   assert.deepEqual(store.sessionBrowserStates, []);
   assert.deepEqual(store.browserCleanups, []);
+  assert.deepEqual(store.transcriptRecoveryJournal, []);
   const backups = fs.readdirSync(dataDir).filter((name) => name.startsWith("store.json.backup-v5-"));
   assert.equal(backups.length, 1);
   assert.equal(fs.statSync(path.join(dataDir, backups[0]!)).mode & 0o777, 0o600);

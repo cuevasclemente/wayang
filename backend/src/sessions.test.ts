@@ -14,6 +14,7 @@ import {
   observeNextStoreMigrationPersistenceForTests,
 } from "./db.js";
 import { createOpenInterview, getInterviewForSession } from "./interviews.js";
+import { recoverSearchAfterFailedSessionDelete } from "./routes/sessions.js";
 import { createAgentProfile } from "./agent-profiles.js";
 import type { MessagingEndpointDeclaration } from "./messaging/contracts.js";
 import {
@@ -30,6 +31,7 @@ import {
   getSessionById,
   isLegacyPrivateSessionQuarantined,
   listSessions,
+  markSessionTranscriptMutated,
   normalizeSessionCwd,
   persistManualSessionTitle,
   reconcileSessionTitleFromCatalog,
@@ -40,6 +42,7 @@ import {
   syncPiSessionFiles,
   updatePiSessionFile,
   updateSessionAgentProfile,
+  updateSessionError,
   updateSessionModel,
 } from "./sessions.js";
 
@@ -322,6 +325,91 @@ test("sync restores archived file-linked session after post-archive TUI activity
   }
 });
 
+test("transcript mutation invalidation clears derived title/error without retaining old text", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-session-transcript-metadata-invalidation-"));
+  const projectDir = path.join(dir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = dir;
+  try {
+    init();
+    const session = createSession(projectDir);
+    setProvisionalSessionTitle(session.id, "removed synthetic transcript canary");
+    updateSessionError(session.id, "removed synthetic assistant error");
+    updateSessionModel(session.id, "removed-model", "removed-provider");
+    const beforeVersion = getSessionById(session.id)?.catalog_mutation_version ?? 0;
+
+    markSessionTranscriptMutated(session.id);
+
+    const invalidated = getSessionById(session.id)!;
+    assert.equal(invalidated.title, "");
+    assert.equal(invalidated.title_source, "provisional");
+    assert.equal(invalidated.error, null);
+    assert.equal(invalidated.provider, null);
+    assert.equal(invalidated.model, null);
+    assert.equal(invalidated.catalog_fingerprint, null);
+    assert.equal(invalidated.catalog_mutation_version, beforeVersion + 1);
+    assert.equal(JSON.stringify(invalidated).includes("removed synthetic"), false);
+  } finally {
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("deleteSession persistence failure leaves row/file unfenced and purged search recoverable", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-session-delete-persistence-failure-"));
+  const projectDir = path.join(dir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const sessionFile = path.join(dir, "session.jsonl");
+  fs.writeFileSync(sessionFile, "{}\n");
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = dir;
+  const originalListAll = SessionManager.listAll;
+  try {
+    init();
+    const session = createSession(projectDir, "Retained after failed delete");
+    updatePiSessionFile(session.id, sessionFile);
+    const beforeActivity = getSessionById(session.id)!.last_active;
+    failNextCommitStoreMutationPersistenceForTests();
+
+    assert.throws(() => deleteSession(session.id), /Synthetic store persistence failure/);
+    assert.equal(getSessionById(session.id)?.id, session.id);
+    assert.equal(fs.existsSync(sessionFile), true, "store failure must precede transcript unlink");
+
+    let reindexed = 0;
+    assert.equal(await recoverSearchAfterFailedSessionDelete(session.id, async (id, options) => {
+      reindexed++;
+      assert.equal(id, session.id);
+      assert.equal(options?.force, true);
+      return { sessionId: id, chunkCount: 1, skipped: false };
+    }), true);
+    assert.equal(reindexed, 1);
+
+    SessionManager.listAll = async () => [{
+      path: sessionFile,
+      id: session.id,
+      cwd: projectDir,
+      name: "Retained after failed delete",
+      created: new Date(session.created_at),
+      modified: new Date(beforeActivity + 5_000),
+      messageCount: 1,
+      firstMessage: "retained synthetic content",
+      allMessagesText: "retained synthetic content",
+    } satisfies SessionInfo];
+    await syncPiSessionFiles();
+    assert.equal(getSessionById(session.id)?.last_active, beforeActivity + 5_000,
+      "failed delete must not install process suppression fences");
+  } finally {
+    SessionManager.listAll = originalListAll;
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("deleteSession permanently deletes transcript and sync skips stale discoveries", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-session-delete-test-"));
   const projectDir = path.join(dir, "project");
@@ -555,6 +643,7 @@ test("schema-2 migration classifies blank and nonblank historical titles", () =>
     const storePath = path.join(dir, "store.json");
     const raw = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, any>;
     raw.schema_version = 2;
+    delete raw.transcriptRecoveryJournal;
     delete raw.protectedAutomationJobs;
     delete raw.protectedAutomationRuns;
     delete raw.messagingEndpoints;
@@ -598,6 +687,7 @@ test("schema-3 migration binds only exact Project cwd matches", () => {
     const storePath = path.join(dir, "store.json");
     const raw = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, any>;
     raw.schema_version = 3;
+    delete raw.transcriptRecoveryJournal;
     delete raw.messagingEndpoints;
     delete raw.messagingEvents;
     delete raw.messagingTransactions;
@@ -858,7 +948,7 @@ test("catalog title reconciliation respects explicit and narrow legacy fallback 
   assert.equal(legacyHuman.title, "Different historical title");
 });
 
-test("schema-4 migration through schema 6 is backup-first and preserves schema-4 attention state", () => {
+test("schema-4 migration through schema 7 is backup-first and preserves schema-4 attention state", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-title-schema5-migration-"));
   const projectDir = path.join(dir, "project");
   fs.mkdirSync(projectDir, { recursive: true });
@@ -880,6 +970,7 @@ test("schema-4 migration through schema 6 is backup-first and preserves schema-4
     const storePath = path.join(dir, "store.json");
     const schemaFour = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, any>;
     schemaFour.schema_version = 4;
+    delete schemaFour.transcriptRecoveryJournal;
     delete schemaFour.browserProfiles;
     delete schemaFour.projectBrowserDefaults;
     delete schemaFour.sessionBrowserStates;
@@ -893,7 +984,7 @@ test("schema-4 migration through schema 6 is backup-first and preserves schema-4
     observeNextStoreMigrationPersistenceForTests((phase) => persistencePhases.push(phase));
     init();
     assert.deepEqual(persistencePhases, ["backup_durable", "store_published"]);
-    assert.equal(getStore().schema_version, 6);
+    assert.equal(getStore().schema_version, 7);
     assert.equal(getSessionById(session.id)?.title_source, "legacy_unknown");
     assert.equal(getSessionById(emptySession.id)?.title_source, "provisional");
     assert.equal(getSessionById(whitespaceSession.id)?.title_source, "provisional");

@@ -185,7 +185,8 @@ export type ChatClientMessage =
 export interface HistoryEntry {
   type: string;
   id?: string;
-  parentId?: string;
+  parentId?: string | null;
+  mutation_status?: "edited" | "deleted";
   message?: unknown;
   [key: string]: unknown;
 }
@@ -238,6 +239,16 @@ export interface SessionRuntimeStateMessage {
   session_id: string;
   selection_id?: string;
   bash_mode: BashMode;
+  mutation_locked: boolean;
+}
+
+export interface TranscriptInvalidatedMessage {
+  type: "transcript_invalidated";
+  session_id: string;
+  selection_id?: string;
+  catalog_generation: number;
+  reason: "canonical_mutation";
+  reconnect_required: true;
 }
 
 export interface TextDeltaMessage {
@@ -333,6 +344,7 @@ export interface AgentSettledMessage {
 export interface ErrorMessage {
   type: "error";
   error: string;
+  code?: string;
   session_id?: string;
   selection_id?: string;
 }
@@ -422,6 +434,7 @@ export interface QueuedMessageAckMessage {
   client_message_id: string;
   status: QueuedMessageAckStatus;
   cancellable?: boolean;
+  error_code?: "mutation_locked" | string;
   error?: string;
 }
 
@@ -660,6 +673,7 @@ export type ChatServerMessage =
   | SessionReadyMessage
   | SessionErrorMessage
   | SessionRuntimeStateMessage
+  | TranscriptInvalidatedMessage
   | TextDeltaMessage
   | ThinkingDeltaMessage
   | MessageStartMessage

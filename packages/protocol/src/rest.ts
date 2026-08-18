@@ -2,8 +2,8 @@
  * @wayang/protocol — REST payload types for the Wayang v1 HTTP API.
  *
  * Types only: no runtime code, no dependencies. The backend serializes these
- * shapes (see `backend/src/routes/sessions.ts` and `frontend/src/api/client.ts`,
- * which are the source of truth); companion apps consume them.
+ * shapes and all first-party clients should consume this package as the shared
+ * wire-contract source of truth.
  *
  * Evolution policy: additive-only. The server may add new optional fields at
  * any time; consumers MUST ignore unknown fields. Existing fields are never
@@ -95,6 +95,7 @@ export interface Session {
   runtime_status: SessionRuntimeStatus;
   runtime_is_streaming: boolean;
   runtime_is_compacting: boolean;
+  runtime_mutation_locked: boolean;
   runtime_subscriber_count: number;
   runtime_last_activity_at: number | null;
   bash_mode: BashMode;
@@ -137,6 +138,85 @@ export interface DeleteSessionRequest {
 export interface DeleteSessionResponse {
   deleted: true;
   deleted_session_file: string | null;
+}
+
+export interface TranscriptEventEnvelope {
+  type: string;
+  id: string;
+  parentId: string | null;
+}
+
+export interface TrustedEditedMutationMarker {
+  version: 1;
+  kind: "edited";
+  at: string;
+}
+
+/** Canonical Pi entry as returned by full transcript event projection. */
+export type TranscriptEventEntry = TranscriptEventEnvelope & {
+  timestamp?: string;
+  wayangMutation?: TrustedEditedMutationMarker;
+} & Record<string, unknown>;
+
+export interface TranscriptEventListQuery {
+  offset?: number;
+  limit?: number;
+  branch_offset?: number;
+  branch_limit?: number;
+  /** 1/default returns full entries; 0 returns immutable envelopes only. */
+  include_payload?: 0 | 1;
+}
+
+export interface ListedTranscriptEvent {
+  entry: TranscriptEventEntry | TranscriptEventEnvelope;
+  active_branch: boolean;
+  semantic_warnings: string[];
+}
+
+/** `GET /api/sessions/:id/events/:eventId`. */
+export interface FullListedTranscriptEvent extends ListedTranscriptEvent {
+  entry: TranscriptEventEntry;
+}
+
+/** `GET /api/sessions/:id/events`. */
+export interface TranscriptEventListResponse {
+  session_id: string;
+  header: unknown;
+  header_immutable: true;
+  total_events: number;
+  offset: number;
+  limit: number;
+  next_offset: number | null;
+  total_branches: number;
+  branch_offset: number;
+  branch_limit: number;
+  next_branch_offset: number | null;
+  branches: Array<{ tip_entry_id: string; active: boolean }>;
+  events: ListedTranscriptEvent[];
+}
+
+export interface EditTranscriptEventRequest {
+  pin: string;
+  expected_entry: TranscriptEventEntry;
+  replacement_entry: TranscriptEventEntry;
+}
+
+export interface DeleteTranscriptEventRequest {
+  pin: string;
+  expected_entry: TranscriptEventEntry;
+}
+
+export type TranscriptEventMutationKind = "edit" | "delete";
+
+export interface TranscriptEventMutationResponse {
+  mutation_id: string;
+  session_id: string;
+  event_id: string;
+  mutation: TranscriptEventMutationKind;
+  replacement: TranscriptEventEntry;
+  invalidated_entry_ids: string[];
+  semantic_warnings: string[];
+  revision_retained: false;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,4 +347,5 @@ export interface WorkspaceProject {
 export interface ApiErrorBody {
   error?: string;
   detail?: string;
+  code?: string;
 }

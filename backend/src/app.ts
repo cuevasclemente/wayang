@@ -12,6 +12,8 @@ import { createAuthRouter } from "./auth/routes.js";
 import { init } from "./db.js";
 import { isLoopbackHost } from "./loopback.js";
 import { router as sessionsRouter } from "./routes/sessions.js";
+import { router as transcriptMutationsRouter } from "./routes/transcript-mutations.js";
+import { installTranscriptMutationPinAttempts } from "./transcript-mutations.js";
 import { router as projectsRouter } from "./routes/projects.js";
 import { router as agentProfilesRouter } from "./routes/agent-profiles.js";
 import { router as fsRouter } from "./routes/fs.js";
@@ -85,6 +87,7 @@ import {
   type MatrixProductionBootstrap,
 } from "./messaging/connectors/matrix/index.js";
 import { getProject } from "./projects.js";
+import { recoverTranscriptRecoveryJournal } from "./transcript-recovery.js";
 import { authorizeProjectAction } from "./policy.js";
 
 const serverCredentialBrokers = new WeakMap<http.Server, CredentialBroker>();
@@ -256,6 +259,7 @@ export function createApp(options: CreateAppOptions = {}) {
   // `/api/sessions/search` is matched before sessionsRouter's catch-all
   // `/sessions/:id` handler treats "search" as a session id.
   app.use("/api", searchRouter);
+  app.use("/api", transcriptMutationsRouter);
   app.use("/api", sessionsRouter);
   app.use("/api", projectsRouter);
   app.use("/api", agentProfilesRouter);
@@ -378,6 +382,7 @@ export function start() {
   console.log(`[db] Store at ${config.dbPath}`);
   const workspaceCapabilities = createProductionWorkspaceCapabilityBootstrap(authService, config);
   installActionApprovalPinAttempts(workspaceCapabilities.pinAttempts);
+  installTranscriptMutationPinAttempts(workspaceCapabilities.pinAttempts);
   const protectedAutomation = bootstrapProtectedAutomationProduction({
     dataDir: config.dataDir,
     credentialBroker,
@@ -453,10 +458,21 @@ export function start() {
   // Durable submissions survive a backend restart. Delivery failures stay in
   // the store and are retried again when their session's WebSocket attaches.
   void drainSubmittedInterviews();
-  schedulerManager.start();
-  startWatcher();
   startLatencyMetrics();
-  startSessionCatalog();
+  // Durable canonical-mutation recovery runs before ordinary catalog/search
+  // watchers. Failure leaves content-free markers whose policy denies stale
+  // indexing/import; the next restart retries recovery.
+  void recoverTranscriptRecoveryJournal()
+    .catch(() => ({ recovered: 0, pending: -1 }))
+    .then((recovery) => {
+      if (shutdownServicesStarted) return;
+      if (recovery.pending !== 0) {
+        console.error("[transcript-recovery] canonical transcript recovery remains pending");
+      }
+      schedulerManager.start();
+      startWatcher();
+      startSessionCatalog();
+    });
   void credentialBroker.startUnlockSocket().catch(() => {
     console.error("[browser-credentials] private unlock socket could not be started");
   });

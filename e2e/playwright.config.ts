@@ -30,6 +30,17 @@ fs.mkdirSync(piSessionsDir, { recursive: true });
 fs.mkdirSync(syntheticHome, { recursive: true, mode: 0o700 });
 fs.mkdirSync(syntheticRuntimeDir, { recursive: true, mode: 0o700 });
 fs.mkdirSync(syntheticViteEnvDir, { recursive: true, mode: 0o700 });
+// Synthetic test-only authority. This is created before the backend starts so
+// its hardened persistent PIN-attempt service can initialize against private,
+// non-production metadata. Never copy a real command-guard PIN into E2E.
+const syntheticPinDirectory = path.join(syntheticHome, ".config", "pi");
+fs.mkdirSync(syntheticPinDirectory, { recursive: true, mode: 0o700 });
+fs.chmodSync(syntheticPinDirectory, 0o700);
+const syntheticPinPath = path.join(syntheticPinDirectory, "command-guard-identity-pin");
+if (!fs.existsSync(syntheticPinPath)) {
+  fs.writeFileSync(syntheticPinPath, "12345678\n", { mode: 0o600, flag: "wx" });
+}
+fs.chmodSync(syntheticPinPath, 0o600);
 
 const loopbackNoProxy = "127.0.0.1,localhost,::1";
 
