@@ -787,7 +787,7 @@ export class TranscriptMutationService {
     let searchFenced = false;
     let canonicalChanged = false;
     let reconciledGeneration: number | null = null;
-    let invalidationPublished = false;
+    let invalidationNeeded = false;
     let mutatedSessionFile: string | null = null;
     try {
       const pin = await this.dependencies.validatePin(input.pin, {
@@ -851,8 +851,7 @@ export class TranscriptMutationService {
       this.dependencies.releaseSearchFence(sessionId);
       searchFenced = false;
       await this.dependencies.forceReindex(sessionId);
-      this.dependencies.publishInvalidation(sessionId, reconciledGeneration);
-      invalidationPublished = true;
+      invalidationNeeded = true;
       canonicalChanged = false;
 
       return {
@@ -895,16 +894,15 @@ export class TranscriptMutationService {
       if (shouldReindexWinner) {
         try { await this.dependencies.forceReindex(sessionId); } catch { /* stale index was already purged */ }
       }
-      if (canonicalChanged && reconciledGeneration !== null && !invalidationPublished) {
-        try {
-          this.dependencies.publishInvalidation(sessionId, reconciledGeneration);
-          invalidationPublished = true;
-        } catch { /* original mutation error remains authoritative */ }
-      }
+      if (canonicalChanged && reconciledGeneration !== null) invalidationNeeded = true;
       throw error;
     } finally {
       if (searchFenced) this.dependencies.releaseSearchFence(sessionId);
       this.dependencies.releaseRuntimeLock(sessionId);
+      if (invalidationNeeded && reconciledGeneration !== null) {
+        try { this.dependencies.publishInvalidation(sessionId, reconciledGeneration); }
+        catch { /* listener failures never override the canonical result */ }
+      }
     }
   }
 

@@ -88,6 +88,8 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
   let messagingBound = false;
   let durableHumanGate = false;
   let pinOk = true;
+  let runtimeLocked = false;
+  let publishHook: (() => void) | undefined;
   let afterDispose: (() => void) | undefined;
   let afterPurge: (() => void) | undefined;
   let reconcileHook: (() => void) | undefined;
@@ -95,8 +97,13 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
   const dependencies: TranscriptMutationDependencies = {
     getSession: (id) => id === "session-1" ? ({ id, pi_session_file: "/synthetic/session.jsonl", cwd: "/synthetic" } as any) : undefined,
     validatePin: async () => ({ ok: pinOk, pinConfigured: true, ...(pinOk ? {} : { error: "Incorrect command guard identity PIN." }) }),
-    acquireRuntimeLock: () => { events.push("lock"); return true; },
-    releaseRuntimeLock: () => { events.push("unlock"); },
+    acquireRuntimeLock: () => {
+      if (runtimeLocked) return false;
+      runtimeLocked = true;
+      events.push("lock");
+      return true;
+    },
+    releaseRuntimeLock: () => { runtimeLocked = false; events.push("unlock"); },
     inspectRuntime: () => ({ ...runtime }),
     isMessagingBound: () => messagingBound,
     hasPendingSessionMutation: () => false,
@@ -113,7 +120,11 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
     invalidateSnapshots() { events.push("invalidate-snapshot"); },
     async reconcileMetadata() { events.push("reconcile-metadata"); reconcileHook?.(); return 7; },
     async forceReindex() { events.push("force-reindex"); reindexHook?.(); },
-    publishInvalidation(_id, generation) { events.push(`publish-invalidation:${generation}`); }
+    publishInvalidation(_id, generation) {
+      assert.equal(runtimeLocked, false, "invalidation must publish only after runtime unlock");
+      events.push(`publish-invalidation:${generation}`);
+      publishHook?.();
+    },
   };
   return {
     service: new TranscriptMutationService(dependencies),
@@ -127,6 +138,8 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
     setAfterPurge(callback: () => void) { afterPurge = callback; },
     setReconcileHook(callback: () => void) { reconcileHook = callback; },
     setReindexHook(callback: () => void) { reindexHook = callback; },
+    setPublishHook(callback: () => void) { publishHook = callback; },
+    isRuntimeLocked() { return runtimeLocked; },
   };
 }
 
@@ -220,8 +233,8 @@ test("edit atomically invalidates all summaries including sibling branches, then
     "reconcile-metadata",
     "release-search-fence",
     "force-reindex",
-    "publish-invalidation:7",
     "unlock",
+    "publish-invalidation:7",
   ]);
   assert.deepEqual(result.invalidated_entry_ids, ["compact", "summary", "sibling-summary"]);
   assert.equal(result.revision_retained, false);
@@ -298,6 +311,29 @@ test("force reindex observes metadata-only reconciliation changes, never the pre
   assert.ok(f.events.indexOf("reconcile-metadata") < f.events.indexOf("force-reindex"));
 });
 
+test("normal invalidation publishes after unlock so a selected client refresh can proceed", async () => {
+  const target = message("target", null, "before");
+  const f = fixture([target]);
+  let refreshProceeded = false;
+  f.setPublishHook(() => {
+    assert.equal(f.isRuntimeLocked(), false);
+    refreshProceeded = true;
+  });
+  await f.service.mutateEvent("session-1", "target", "delete", {
+    pin: "opaque",
+    expectedEntry: target,
+  });
+  assert.equal(refreshProceeded, true);
+  assert.ok(f.events.indexOf("unlock") < f.events.indexOf("publish-invalidation:7"));
+
+  const listenerFailure = fixture([target]);
+  listenerFailure.setPublishHook(() => { throw new Error("synthetic listener failure"); });
+  await assert.doesNotReject(listenerFailure.service.mutateEvent("session-1", "target", "delete", {
+    pin: "opaque",
+    expectedEntry: target,
+  }));
+});
+
 test("adapter recognizes typed committed post-commit faults and marks the canonical winner", () => {
   const expected = message("target", null, "before");
   const replacement = message("target", null, "after");
@@ -348,8 +384,8 @@ test("committed post-commit service faults still invalidate, reconcile, reindex,
     "reconcile-metadata",
     "release-search-fence",
     "force-reindex",
-    "publish-invalidation:7",
     "unlock",
+    "publish-invalidation:7",
   ]);
   assert.equal(f.transcript.entries[0]?.customType, DELETED_EVENT_TOMBSTONE);
 });
