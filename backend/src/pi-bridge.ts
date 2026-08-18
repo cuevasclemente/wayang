@@ -136,6 +136,11 @@ import {
 } from "./audio-experiment/types.js";
 import { createFileAudioExperimentRuntime } from "./audio-experiment/tools.js";
 import {
+  DELETED_EVENT_TOMBSTONE,
+  INVALIDATED_DERIVED_EVENT_TOMBSTONE,
+  trustedEditedMutationMarker,
+} from "./transcript-mutation-markers.js";
+import {
   acquireSessionRuntimeMutationLock,
   isSessionRuntimeMutationLocked,
   releaseSessionRuntimeMutationLock,
@@ -196,6 +201,7 @@ export interface PiSessionHandle {
 
 export interface SerializedMessage {
   type: string;
+  mutation_status?: "edited" | "deleted";
   [key: string]: unknown;
 }
 
@@ -4754,6 +4760,10 @@ const OVERFLOW_RETRY_MARKER = "wayang-overflow-retry-v1";
 
 export function serializeHistoryEntries(entries: any[]): SerializedMessage[] {
   const serialized: SerializedMessage[] = [];
+  const addMutationStatus = (row: SerializedMessage, entry: any): SerializedMessage => {
+    if (trustedEditedMutationMarker(entry?.wayangMutation)) row.mutation_status = "edited";
+    return row;
+  };
   // Compaction entries do not persist their reason or retry outcome. Suppress a
   // provider overflow only when Wayang observed a successful assistant response
   // after Pi's compact-and-retry continuation. Markers carry validated IDs so
@@ -4786,12 +4796,12 @@ export function serializeHistoryEntries(entries: any[]): SerializedMessage[] {
       ) {
         continue;
       }
-      serialized.push({
+      serialized.push(addMutationStatus({
         type: messageRoleToHistoryType(message?.role),
         id: entry.id,
         parentId: entry.parentId,
         message: serializeMessageValue(message),
-      });
+      }, entry));
       continue;
     }
 
@@ -4799,9 +4809,28 @@ export function serializeHistoryEntries(entries: any[]): SerializedMessage[] {
       const message = customHistoryMessage(entry.customType || "custom", entry.content, entry.timestamp, entry.details, entry.display);
       message.id = entry.id;
       message.parentId = entry.parentId;
-      serialized.push(message);
+      serialized.push(addMutationStatus(message, entry));
       continue;
     }
+
+    if (entry.type === "custom" && entry.customType === DELETED_EVENT_TOMBSTONE) {
+      serialized.push({
+        type: "custom",
+        id: entry.id,
+        parentId: entry.parentId,
+        mutation_status: "deleted",
+        message: {
+          role: "custom",
+          customType: DELETED_EVENT_TOMBSTONE,
+          timestamp: entry.timestamp,
+          display: true,
+        },
+      });
+      continue;
+    }
+
+    // Derived invalidations deliberately remain invisible in ordinary chat.
+    if (entry.type === "custom" && entry.customType === INVALIDATED_DERIVED_EVENT_TOMBSTONE) continue;
 
     if (entry.type === "custom" && entry.customType === "wayang-agent-change") {
       const data = entry.data ?? {};
@@ -4814,7 +4843,7 @@ export function serializeHistoryEntries(entries: any[]): SerializedMessage[] {
       );
       message.id = entry.id;
       message.parentId = entry.parentId;
-      serialized.push(message);
+      serialized.push(addMutationStatus(message, entry));
       continue;
     }
 
@@ -4822,7 +4851,7 @@ export function serializeHistoryEntries(entries: any[]): SerializedMessage[] {
       const message = customHistoryMessage("branch-summary", entry.summary, entry.timestamp, entry.details);
       message.id = entry.id;
       message.parentId = entry.parentId;
-      serialized.push(message);
+      serialized.push(addMutationStatus(message, entry));
       continue;
     }
 
@@ -4830,7 +4859,7 @@ export function serializeHistoryEntries(entries: any[]): SerializedMessage[] {
       const message = customHistoryMessage("compaction-summary", entry.summary, entry.timestamp, entry.details);
       message.id = entry.id;
       message.parentId = entry.parentId;
-      serialized.push(message);
+      serialized.push(addMutationStatus(message, entry));
     }
   }
 

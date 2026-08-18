@@ -26,6 +26,8 @@ function message(id: string, parentId: string | null, text: string, role = "user
 
 class FakeTranscript implements CanonicalTranscriptPort {
   readonly replacementSets: CanonicalEntryReplacement[][] = [];
+  getEntryCalls = 0;
+  getEntriesCalls = 0;
   failId: string | null = null;
 
   constructor(
@@ -35,7 +37,12 @@ class FakeTranscript implements CanonicalTranscriptPort {
   ) {}
 
   getHeader() { return { type: "session", version: 3, id: "session-1", cwd: "/synthetic" }; }
-  getEntries() { return structuredClone(this.entries); }
+  getEntry(id: string) {
+    this.getEntryCalls++;
+    const entry = this.entries.find((candidate) => candidate.id === id);
+    return entry ? structuredClone(entry) : undefined;
+  }
+  getEntries() { this.getEntriesCalls++; return structuredClone(this.entries); }
   getBranch() { return this.activeIds.map((id) => structuredClone(this.entries.find((entry) => entry.id === id)!)); }
   replaceEntriesIfCurrent(replacements: readonly CanonicalEntryReplacement[]): void {
     this.events.push(`replace-set:${replacements.map(({ expectedEntry }) => expectedEntry.id).join(",")}`);
@@ -131,6 +138,36 @@ test("listing paginates every topology entry and marks active-branch membership"
   );
 });
 
+test("collection can omit payload while exact lookup always returns the full canonical event", () => {
+  const root = message("root", null, "private full payload");
+  const child = message("child", "root", "child payload", "assistant");
+  const f = fixture([root, child]);
+
+  const projected = f.service.listEvents("session-1", { includePayload: false });
+  assert.deepEqual(projected.events[0], {
+    entry: {
+      type: "message",
+      id: "root",
+      parentId: null,
+    },
+    active_branch: true,
+    semantic_warnings: [],
+  });
+  assert.equal(JSON.stringify(projected.events).includes("private full payload"), false);
+
+  const scansBeforeExact = f.transcript.getEntriesCalls;
+  const exact = f.service.getEvent("session-1", "root");
+  assert.equal(f.transcript.getEntryCalls, 1);
+  assert.equal(f.transcript.getEntriesCalls, scansBeforeExact, "exact lookup must not scan collection pages");
+  assert.deepEqual(exact.entry, root);
+  assert.equal((exact.entry.message as any).content[0].text, "private full payload");
+  assert.throws(
+    () => f.service.getEvent("session-1", "missing"),
+    (error: any) => error instanceof TranscriptMutationError
+      && error.statusCode === 404 && error.code === "event_not_found",
+  );
+});
+
 test("edit atomically invalidates all summaries including sibling branches, then reconciles and force reindexes", async () => {
   const target = message("target", null, OLD_SECRET);
   const compaction: CanonicalEntry = {
@@ -169,8 +206,13 @@ test("edit atomically invalidates all summaries including sibling branches, then
   ]);
   assert.deepEqual(result.invalidated_entry_ids, ["compact", "summary", "sibling-summary"]);
   assert.equal(result.revision_retained, false);
-  assert.equal(f.transcript.entries.find((entry) => entry.id === "target")?.message &&
-    ((f.transcript.entries.find((entry) => entry.id === "target")!.message as any).content[0].text), "replacement public text");
+  const editedTarget = f.transcript.entries.find((entry) => entry.id === "target")!;
+  assert.equal(editedTarget.message && ((editedTarget.message as any).content[0].text), "replacement public text");
+  assert.deepEqual(editedTarget.wayangMutation, result.replacement.wayangMutation);
+  assert.equal((editedTarget.wayangMutation as any).version, 1);
+  assert.equal((editedTarget.wayangMutation as any).kind, "edited");
+  assert.equal(new Date((editedTarget.wayangMutation as any).at).toISOString(), (editedTarget.wayangMutation as any).at);
+  assert.equal(Object.hasOwn(replacement, "wayangMutation"), false, "trusted marker is added to a clone, not caller input");
   for (const id of ["compact", "summary", "sibling-summary"]) {
     const invalidated = f.transcript.entries.find((entry) => entry.id === id)!;
     assert.equal(invalidated.type, "custom");

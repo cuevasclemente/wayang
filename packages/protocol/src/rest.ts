@@ -139,12 +139,22 @@ export interface DeleteSessionResponse {
   deleted_session_file: string | null;
 }
 
-/** Canonical Pi entry as returned by transcript event listing. */
-export type TranscriptEventEntry = {
+export interface TranscriptEventEnvelope {
   type: string;
   id: string;
   parentId: string | null;
+}
+
+export interface TrustedEditedMutationMarker {
+  version: 1;
+  kind: "edited";
+  at: string;
+}
+
+/** Canonical Pi entry as returned by full transcript event projection. */
+export type TranscriptEventEntry = TranscriptEventEnvelope & {
   timestamp?: string;
+  wayangMutation?: TrustedEditedMutationMarker;
 } & Record<string, unknown>;
 
 export interface TranscriptEventListQuery {
@@ -152,12 +162,19 @@ export interface TranscriptEventListQuery {
   limit?: number;
   branch_offset?: number;
   branch_limit?: number;
+  /** 1/default returns full entries; 0 returns immutable envelopes only. */
+  include_payload?: 0 | 1;
 }
 
 export interface ListedTranscriptEvent {
-  entry: TranscriptEventEntry;
+  entry: TranscriptEventEntry | TranscriptEventEnvelope;
   active_branch: boolean;
   semantic_warnings: string[];
+}
+
+/** `GET /api/sessions/:id/events/:eventId`. */
+export interface FullListedTranscriptEvent extends ListedTranscriptEvent {
+  entry: TranscriptEventEntry;
 }
 
 /** `GET /api/sessions/:id/events`. */
@@ -329,4 +346,5 @@ export interface WorkspaceProject {
 export interface ApiErrorBody {
   error?: string;
   detail?: string;
+  code?: string;
 }

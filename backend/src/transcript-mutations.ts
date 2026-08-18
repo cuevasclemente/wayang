@@ -2,7 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type {
+  FullListedTranscriptEvent,
   TranscriptEventEntry,
+  TranscriptEventEnvelope,
   TranscriptEventListResponse,
   TranscriptEventMutationKind,
   TranscriptEventMutationResponse,
@@ -30,13 +32,16 @@ import {
   syncPiSessionFiles,
 } from "./sessions.js";
 import {
+  DELETED_EVENT_TOMBSTONE,
+  INVALIDATED_DERIVED_EVENT_TOMBSTONE,
+} from "./transcript-mutation-markers.js";
+import {
   beginTranscriptMutationSearchFence,
   endTranscriptMutationSearchFence,
   indexSession,
 } from "./search/indexer.js";
 
-export const DELETED_EVENT_TOMBSTONE = "wayang-deleted-event-v1";
-export const INVALIDATED_DERIVED_EVENT_TOMBSTONE = "wayang-invalidated-derived-event-v1";
+export { DELETED_EVENT_TOMBSTONE, INVALIDATED_DERIVED_EVENT_TOMBSTONE };
 export const MAX_TRANSCRIPT_EVENT_BYTES = 1024 * 1024;
 export const MAX_TRANSCRIPT_EVENTS_PER_PAGE = 500;
 const MAX_EVENT_DEPTH = 64;
@@ -85,6 +90,7 @@ export interface CanonicalEntryReplacement {
 
 export interface CanonicalTranscriptPort {
   getHeader(): unknown;
+  getEntry(id: string): CanonicalEntry | undefined;
   getEntries(): CanonicalEntry[];
   getBranch(): CanonicalEntry[];
   replaceEntriesIfCurrent(replacements: readonly CanonicalEntryReplacement[]): void;
@@ -97,6 +103,7 @@ export interface CanonicalTranscriptPort {
  */
 interface ExpectedEntryCasSessionManager {
   getHeader(): unknown;
+  getEntry(id: string): CanonicalEntry | undefined;
   getEntries(): CanonicalEntry[];
   getBranch(): CanonicalEntry[];
   replaceEntriesIfCurrent(
@@ -108,6 +115,7 @@ function adaptSessionManager(manager: SessionManager): CanonicalTranscriptPort {
   const cas = manager as unknown as ExpectedEntryCasSessionManager;
   return {
     getHeader: () => cas.getHeader(),
+    getEntry: (id) => cas.getEntry(id),
     getEntries: () => cas.getEntries(),
     getBranch: () => cas.getBranch(),
     replaceEntriesIfCurrent(replacements) {
@@ -342,9 +350,13 @@ function productionDependencies(): TranscriptMutationDependencies {
 }
 
 export interface ListedTranscriptEntry {
-  entry: CanonicalEntry;
+  entry: CanonicalEntry | TranscriptEventEnvelope;
   active_branch: boolean;
   semantic_warnings: string[];
+}
+
+export interface FullListedTranscriptEntry extends FullListedTranscriptEvent {
+  entry: CanonicalEntry;
 }
 
 export interface TranscriptEventListing extends TranscriptEventListResponse {
@@ -535,6 +547,26 @@ function leafEntries(entries: CanonicalEntry[]): CanonicalEntry[] {
   return entries.filter((entry) => !parentIds.has(entry.id));
 }
 
+function immutableEnvelope(entry: CanonicalEntry): TranscriptEventEnvelope {
+  return {
+    type: entry.type,
+    id: entry.id,
+    parentId: entry.parentId,
+  };
+}
+
+function listedEntry(
+  entry: CanonicalEntry,
+  activeIds: ReadonlySet<string>,
+  includePayload: boolean,
+): ListedTranscriptEntry {
+  return {
+    entry: includePayload ? entry : immutableEnvelope(entry),
+    active_branch: activeIds.has(entry.id),
+    semantic_warnings: semanticWarnings(entry),
+  };
+}
+
 function listing(
   sessionId: string,
   transcript: CanonicalTranscriptPort,
@@ -542,6 +574,7 @@ function listing(
   limit: number,
   branchOffset: number,
   branchLimit: number,
+  includePayload: boolean,
 ): TranscriptEventListing {
   const entries = transcript.getEntries().map((entry) => asEntry(entry, "canonical_entry", { knownType: false }));
   const branch = transcript.getBranch();
@@ -568,11 +601,7 @@ function listing(
     branch_limit: branchLimit,
     next_branch_offset: branchOffset + branchPage.length < branchTips.length ? branchOffset + branchPage.length : null,
     branches: branchPage.map((entry) => ({ tip_entry_id: entry.id, active: entry.id === activeTip })),
-    events: page.map((entry) => ({
-      entry,
-      active_branch: activeIds.has(entry.id),
-      semantic_warnings: semanticWarnings(entry),
-    })),
+    events: page.map((entry) => listedEntry(entry, activeIds, includePayload)),
   };
 }
 
@@ -611,9 +640,33 @@ export interface TranscriptMutationResult extends TranscriptEventMutationRespons
 export class TranscriptMutationService {
   constructor(private readonly dependencies: TranscriptMutationDependencies = productionDependencies()) {}
 
+  getEvent(sessionId: string, eventId: string): FullListedTranscriptEntry {
+    if (!validId(sessionId) || !validId(eventId)) {
+      throw new TranscriptMutationError("Invalid session or event id", 400, "invalid_event_id");
+    }
+    const session = this.dependencies.getSession(sessionId);
+    if (!session) throw new TranscriptMutationError("Session not found", 404, "session_not_found");
+    const transcript = this.dependencies.openTranscript(session);
+    const current = transcript.getEntry(eventId);
+    if (!current) throw new TranscriptMutationError("Transcript event not found", 404, "event_not_found");
+    const entry = asEntry(current, "canonical_entry", { knownType: false });
+    const activeIds = new Set(transcript.getBranch().map((candidate) => candidate.id));
+    return {
+      entry,
+      active_branch: activeIds.has(entry.id),
+      semantic_warnings: semanticWarnings(entry),
+    };
+  }
+
   listEvents(
     sessionId: string,
-    options: { offset?: number; limit?: number; branchOffset?: number; branchLimit?: number } = {},
+    options: {
+      offset?: number;
+      limit?: number;
+      branchOffset?: number;
+      branchLimit?: number;
+      includePayload?: boolean;
+    } = {},
   ): TranscriptEventListing {
     if (!validId(sessionId)) throw new TranscriptMutationError("Invalid session id", 400, "invalid_session_id");
     const offset = boundedInteger(options.offset ?? 0, "offset", 0, Number.MAX_SAFE_INTEGER);
@@ -622,7 +675,15 @@ export class TranscriptMutationService {
     const branchLimit = boundedInteger(options.branchLimit ?? 100, "branch_limit", 1, MAX_TRANSCRIPT_EVENTS_PER_PAGE);
     const session = this.dependencies.getSession(sessionId);
     if (!session) throw new TranscriptMutationError("Session not found", 404, "session_not_found");
-    return listing(sessionId, this.dependencies.openTranscript(session), offset, limit, branchOffset, branchLimit);
+    return listing(
+      sessionId,
+      this.dependencies.openTranscript(session),
+      offset,
+      limit,
+      branchOffset,
+      branchLimit,
+      options.includePayload ?? true,
+    );
   }
 
   async mutateEvent(
@@ -637,7 +698,14 @@ export class TranscriptMutationService {
     const expected = asEntry(input.expectedEntry, "expected_entry", { knownType: false });
     if (expected.id !== eventId) throw new TranscriptMutationError("expected_entry id does not match the route", 400, "event_id_mismatch");
     const replacement = kind === "edit"
-      ? validateReplacement(expected, input.replacementEntry)
+      ? {
+          ...validateReplacement(expected, input.replacementEntry),
+          wayangMutation: {
+            version: 1,
+            kind: "edited",
+            at: new Date().toISOString(),
+          },
+        } satisfies CanonicalEntry
       : tombstone(expected, DELETED_EVENT_TOMBSTONE);
     const session = this.dependencies.getSession(sessionId);
     if (!session) throw new TranscriptMutationError("Session not found", 404, "session_not_found");

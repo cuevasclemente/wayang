@@ -37,10 +37,21 @@ class FakeRouteService implements TranscriptMutationRouteService {
     limit?: number;
     branchOffset?: number;
     branchLimit?: number;
+    includePayload?: boolean;
   }): unknown {
     this.calls.push(["list", sessionId, options]);
     if (this.error) throw this.error;
     return { session_id: sessionId, total_events: 0, events: [] };
+  }
+
+  getEvent(sessionId: string, eventId: string): unknown {
+    this.calls.push(["get", sessionId, eventId]);
+    if (this.error) throw this.error;
+    return {
+      entry: { type: "message", id: eventId, parentId: null, message: { role: "user", content: "full" } },
+      active_branch: true,
+      semantic_warnings: [],
+    };
   }
 
   async mutateEvent(
@@ -68,6 +79,7 @@ test("event listing route forwards strict pagination and disables caching", asyn
     limit: 25,
     branchOffset: 0,
     branchLimit: 100,
+    includePayload: true,
   }]]);
 });
 
@@ -82,13 +94,58 @@ test("event listing route rejects ambiguous or out-of-range pagination", async (
       "limit=1&limit=2",
       "branch_offset=-1",
       "branch_limit=501",
+      "include_payload=true",
+      "include_payload=2",
+      "include_payload=0&include_payload=1",
     ]) {
       const response = await fetch(`${origin}/api/sessions/session-1/events?${query}`);
       assert.equal(response.status, 400, query);
-      assert.equal((await response.json() as any).code, "invalid_bounds");
+      assert.equal(
+        (await response.json() as any).code,
+        query.startsWith("include_payload") ? "invalid_include_payload" : "invalid_bounds",
+      );
     }
   });
   assert.deepEqual(service.calls, []);
+});
+
+test("collection include_payload=0 forwards envelope-only projection mode", async () => {
+  const service = new FakeRouteService();
+  await withServer(service, async (origin) => {
+    const response = await fetch(`${origin}/api/sessions/session-1/events?include_payload=0`);
+    assert.equal(response.status, 200);
+  });
+  assert.deepEqual(service.calls, [["list", "session-1", {
+    offset: 0,
+    limit: 100,
+    branchOffset: 0,
+    branchLimit: 100,
+    includePayload: false,
+  }]]);
+});
+
+test("exact event route returns one full event and preserves machine-readable 404", async () => {
+  const service = new FakeRouteService();
+  await withServer(service, async (origin) => {
+    const response = await fetch(`${origin}/api/sessions/session-1/events/event-1`);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    const body = await response.json() as any;
+    assert.equal(body.entry.id, "event-1");
+    assert.equal(body.entry.message.content, "full");
+  });
+  assert.deepEqual(service.calls, [["get", "session-1", "event-1"]]);
+
+  const missing = new FakeRouteService();
+  missing.error = new TranscriptMutationError("Transcript event not found", 404, "event_not_found");
+  await withServer(missing, async (origin) => {
+    const response = await fetch(`${origin}/api/sessions/session-1/events/missing`);
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), {
+      error: "Transcript event not found",
+      code: "event_not_found",
+    });
+  });
 });
 
 test("edit and delete routes forward only their exact mutation fields", async () => {

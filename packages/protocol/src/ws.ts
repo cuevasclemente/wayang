@@ -185,7 +185,8 @@ export type ChatClientMessage =
 export interface HistoryEntry {
   type: string;
   id?: string;
-  parentId?: string;
+  parentId?: string | null;
+  mutation_status?: "edited" | "deleted";
   message?: unknown;
   [key: string]: unknown;
 }

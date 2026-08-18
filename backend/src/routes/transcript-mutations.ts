@@ -12,7 +12,9 @@ export interface TranscriptMutationRouteService {
     limit?: number;
     branchOffset?: number;
     branchLimit?: number;
+    includePayload?: boolean;
   }): unknown;
+  getEvent(sessionId: string, eventId: string): unknown;
   mutateEvent(
     sessionId: string,
     eventId: string,
@@ -31,6 +33,12 @@ function strictQueryInteger(value: unknown, fallback: number, label: string): nu
     throw new TranscriptMutationError(`${label} is outside the permitted bounds`, 400, "invalid_bounds");
   }
   return parsed;
+}
+
+function strictIncludePayload(value: unknown): boolean {
+  if (value === undefined || value === "1") return true;
+  if (value === "0") return false;
+  throw new TranscriptMutationError("include_payload must be exactly 0 or 1", 400, "invalid_include_payload");
 }
 
 function sendError(res: Response, error: unknown): void {
@@ -63,6 +71,7 @@ export function createTranscriptMutationRouter(
       const limit = strictQueryInteger(req.query.limit, 100, "limit");
       const branchOffset = strictQueryInteger(req.query.branch_offset, 0, "branch_offset");
       const branchLimit = strictQueryInteger(req.query.branch_limit, 100, "branch_limit");
+      const includePayload = strictIncludePayload(req.query.include_payload);
       if (limit < 1 || limit > MAX_TRANSCRIPT_EVENTS_PER_PAGE
         || branchLimit < 1 || branchLimit > MAX_TRANSCRIPT_EVENTS_PER_PAGE) {
         throw new TranscriptMutationError(
@@ -71,7 +80,22 @@ export function createTranscriptMutationRouter(
           "invalid_bounds",
         );
       }
-      res.json(service.listEvents(req.params.id, { offset, limit, branchOffset, branchLimit }));
+      res.json(service.listEvents(req.params.id, {
+        offset,
+        limit,
+        branchOffset,
+        branchLimit,
+        includePayload,
+      }));
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  router.get("/sessions/:id/events/:eventId", (req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(service.getEvent(req.params.id, req.params.eventId));
     } catch (error) {
       sendError(res, error);
     }
