@@ -100,7 +100,7 @@ interface ExpectedEntryCasSessionManager {
   getEntries(): CanonicalEntry[];
   getBranch(): CanonicalEntry[];
   replaceEntriesIfCurrent(
-    replacements: readonly CanonicalEntryReplacement[],
+    replacements: readonly Array<{ expectedEntry: CanonicalEntry; replacement: CanonicalEntry }>,
   ): void | boolean | { replaced: boolean };
 }
 
@@ -120,7 +120,10 @@ function adaptSessionManager(manager: SessionManager): CanonicalTranscriptPort {
       }
       let result: void | boolean | { replaced: boolean };
       try {
-        result = cas.replaceEntriesIfCurrent(replacements);
+        result = cas.replaceEntriesIfCurrent(replacements.map(({ expectedEntry, replacementEntry }) => ({
+          expectedEntry,
+          replacement: replacementEntry,
+        })));
       } catch (error) {
         const candidate = error as { statusCode?: unknown; code?: unknown };
         if (candidate?.statusCode === 409 || candidate?.code === "CAS_CONFLICT" || candidate?.code === "ERR_SESSION_ENTRY_CONFLICT") {

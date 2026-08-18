@@ -60,8 +60,8 @@ test("installed Pi SDK atomically replaces an exact entry set and rejects stale 
       data: { version: 1 },
     };
     const result = manager.replaceEntriesIfCurrent([
-      { expectedEntry: target, replacementEntry: replacementTarget },
-      { expectedEntry: summary, replacementEntry: replacementSummary },
+      { expectedEntry: target, replacement: replacementTarget },
+      { expectedEntry: summary, replacement: replacementSummary },
     ]);
     assert.notEqual(result, false);
     if (result && typeof result === "object") assert.equal(result.replaced, true);
@@ -77,8 +77,8 @@ test("installed Pi SDK atomically replaces an exact entry set and rejects stale 
     let conflicted = false;
     try {
       const staleResult = reopened.replaceEntriesIfCurrent([
-        { expectedEntry: target, replacementEntry: replacementTarget },
-        { expectedEntry: replacementSummary, replacementEntry: summary },
+        { expectedEntry: target, replacement: replacementTarget },
+        { expectedEntry: replacementSummary, replacement: summary },
       ]);
       conflicted = staleResult === false || Boolean(staleResult && typeof staleResult === "object" && staleResult.replaced === false);
     } catch (error) {
