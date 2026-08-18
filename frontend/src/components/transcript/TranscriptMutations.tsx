@@ -280,7 +280,6 @@ export function TranscriptMutationProvider({
   const ownedMutationLockRef = useRef(false);
   const requestInFlightRef = useRef(false);
   const runtimeMutationLockedRef = useRef(runtimeMutationLocked);
-  const requestStartedHistoryRevisionRef = useRef<number | null>(null);
   const historyRevisionRef = useRef(historyRevision);
   scopeRef.current = selectionKey;
   availableRef.current = availability.available && paneVisible;
@@ -380,7 +379,6 @@ export function TranscriptMutationProvider({
     requestInFlightRef.current = inFlight;
     if (inFlight) {
       ownedMutationLockRef.current = true;
-      requestStartedHistoryRevisionRef.current = historyRevisionRef.current;
     } else if (!runtimeMutationLockedRef.current) {
       ownedMutationLockRef.current = false;
     }
@@ -391,19 +389,18 @@ export function TranscriptMutationProvider({
     operation: TranscriptMutationOperation,
     ambiguous: boolean,
   ) => {
-    const afterRevision = requestStartedHistoryRevisionRef.current ?? historyRevision;
-    requestStartedHistoryRevisionRef.current = null;
+    // Only history strictly newer than the POST response can settle a confirmed
+    // mutation. Lock-era or duplicate history observed during the request is
+    // deliberately excluded; the bounded reconnect fallback handles a backend
+    // broadcast that raced ahead of the response.
+    const responseHistoryRevision = historyRevisionRef.current;
     setMutation(null);
     setManage(null);
     setInspectorOpen(false);
-    if (!ambiguous && historyRevisionRef.current > afterRevision) {
-      setPending(null);
-      return;
-    }
-    setPending({ eventId, operation, afterRevision, ambiguous });
+    setPending({ eventId, operation, afterRevision: responseHistoryRevision, ambiguous });
     onAwaitAuthoritativeHistory();
     if (ambiguous) onAuthoritativeRefresh();
-  }, [historyRevision, onAuthoritativeRefresh, onAwaitAuthoritativeHistory]);
+  }, [onAuthoritativeRefresh, onAwaitAuthoritativeHistory]);
 
   const context = useMemo<TranscriptMutationContextValue>(() => ({ availability, openManage, openInspector }), [availability, openInspector, openManage]);
 
@@ -427,6 +424,7 @@ export function TranscriptMutationProvider({
           data-testid="transcript-mutation-pending"
           data-completion={pending.ambiguous ? "ambiguous" : "confirmed"}
           data-after-history-revision={pending.afterRevision}
+          data-history-baseline="response-time"
           role="status"
           className="fixed bottom-20 left-1/2 z-[65] -translate-x-1/2 rounded-full border border-blue-800 bg-blue-950 px-4 py-2 text-xs text-blue-100 shadow-xl"
         >
