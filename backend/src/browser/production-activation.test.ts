@@ -33,7 +33,7 @@ async function stopChild(child: ChildProcess): Promise<void> {
   }
 }
 
-test("production gate-on startup composes before backup-first schema-6 migration", { timeout: 60_000 }, async () => {
+test("production gate-on startup accepts gate-off schema 7 only after complete browser composition", { timeout: 60_000 }, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-browser-production-activation-"));
   const dataDir = path.join(root, "data");
   const home = path.join(root, "home");
@@ -50,7 +50,13 @@ test("production gate-on startup composes before backup-first schema-6 migration
     else process.env.WAYANG_DATA_DIR = previousDataDir;
   }
   const storePath = path.join(dataDir, "store.json");
-  assert.equal(JSON.parse(fs.readFileSync(storePath, "utf8")).schema_version, 5);
+  const gateOffStore = JSON.parse(fs.readFileSync(storePath, "utf8"));
+  assert.equal(gateOffStore.schema_version, 7);
+  assert.deepEqual(gateOffStore.browserProfiles, []);
+  assert.deepEqual(gateOffStore.projectBrowserDefaults, []);
+  assert.deepEqual(gateOffStore.sessionBrowserStates, []);
+  assert.deepEqual(gateOffStore.browserCleanups, []);
+  assert.deepEqual(gateOffStore.transcriptRecoveryJournal, []);
 
   const port = await freePort();
   const backendDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -102,10 +108,10 @@ test("production gate-on startup composes before backup-first schema-6 migration
   }
 
   const migrated = JSON.parse(fs.readFileSync(storePath, "utf8"));
-  assert.equal(migrated.schema_version, 6);
+  assert.equal(migrated.schema_version, 7);
   assert.ok(Array.isArray(migrated.browserProfiles));
-  const backups = fs.readdirSync(dataDir).filter((name) => name.startsWith("store.json.backup-v5-"));
-  assert.equal(backups.length, 1);
-  assert.equal(fs.statSync(path.join(dataDir, backups[0]!)).mode & 0o777, 0o600);
+  assert.deepEqual(migrated.transcriptRecoveryJournal, []);
+  const backups = fs.readdirSync(dataDir).filter((name) => name.startsWith("store.json.backup-v"));
+  assert.equal(backups.length, 0, "current schema 7 requires no migration rewrite");
   fs.rmSync(root, { recursive: true, force: true });
 });

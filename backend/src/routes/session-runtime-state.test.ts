@@ -46,6 +46,7 @@ test("session HTTP projection reports unavailable without an active PiSessionHan
   const serialized = serializeSession(stoppedSessionRow("slice-c-http-stopped"));
 
   assert.equal(serialized.runtime_status, "stopped");
+  assert.equal(serialized.runtime_mutation_locked, false);
   assert.equal(serialized.bash_mode, "unavailable");
   assert.equal(serialized.agent_profile_id, "lookalike-wren-profile");
 });
@@ -66,6 +67,7 @@ test("session runtime WebSocket projection is selection-scoped and fail-closed",
       session_id: "slice-c-ws-stopped",
       selection_id: "selection-123",
       bash_mode: "unavailable",
+      mutation_locked: false,
     },
   );
   assert.deepEqual(
@@ -74,6 +76,7 @@ test("session runtime WebSocket projection is selection-scoped and fail-closed",
       type: "session_runtime_state",
       session_id: "slice-c-ws-stopped",
       bash_mode: "unavailable",
+      mutation_locked: false,
     },
   );
 });

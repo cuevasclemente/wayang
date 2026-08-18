@@ -1428,8 +1428,9 @@ function normalizeSchemaFiveStore(raw: Record<string, unknown>, browserProfilesE
   for (const key of schemaFiveArrayKeys) {
     if (!Array.isArray(raw[key])) throw new Error(`Schema-5 Wayang store field ${key} must be an array`);
   }
-  // Schema 5 owns canonical title provenance. Browser schema 6 preserves every
-  // byte of those rows and inventories only expected profile-root metadata.
+  // Schema 5 owns canonical title provenance. Current schema 7 preserves every
+  // byte of those rows, inventories only expected profile-root metadata when
+  // enabled, and adds an empty content-free recovery journal.
   const migrated = {
     ...structuredClone(raw),
     schema_version: STORE_SCHEMA_VERSION,
@@ -1729,6 +1730,16 @@ function loadStore(storePath: string, browserProfilesEnabled = _browserProfilesE
   }
   const raw = requireObject(parsed);
   const version = readSchemaVersion(raw);
+  if (!browserProfilesEnabled && version === 6) {
+    throw new Error("Wayang store schema 6 requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1");
+  }
+  if (!browserProfilesEnabled && version === STORE_SCHEMA_VERSION) {
+    for (const key of BROWSER_CATALOG_ARRAY_KEYS) {
+      if (!Array.isArray(raw[key]) || (raw[key] as unknown[]).length !== 0) {
+        throw new Error("Wayang schema 7 browser persistence requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1");
+      }
+    }
+  }
   if (version > STORE_SCHEMA_VERSION) {
     throw new Error(`Wayang store schema ${version} is newer than supported schema ${STORE_SCHEMA_VERSION}`);
   }
