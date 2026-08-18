@@ -3,6 +3,12 @@
  */
 
 import { normalizeHumanAttention, type HumanAttention } from "../humanAttention";
+import { editableTranscriptPayload } from "../components/transcript/transcriptMutationHelpers";
+
+export {
+  editableTranscriptPayload,
+  reconstructTranscriptEntry,
+} from "../components/transcript/transcriptMutationHelpers";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -93,6 +99,7 @@ export type TranscriptMutationOperation = "edit" | "delete";
 export interface TranscriptMutationResult {
   replacement: Readonly<Record<string, unknown>> | null;
   warnings: TranscriptEventWarning[];
+  reindex_failed: boolean;
 }
 
 export function apiErrorCode(error: unknown): string | null {
@@ -1028,11 +1035,7 @@ function normalizeTranscriptEvent(value: unknown): TranscriptEvent {
     ...(Object.prototype.hasOwnProperty.call(entry, "parentId") ? { parentId: entry.parentId } : {}),
     ...(Object.prototype.hasOwnProperty.call(entry, "timestamp") ? { timestamp: entry.timestamp } : {}),
   };
-  const payload = { ...entry };
-  delete payload.type;
-  delete payload.id;
-  delete payload.parentId;
-  delete payload.timestamp;
+  const payload = editableTranscriptPayload(entry);
   const mutationStatus = entry.mutation_status;
   const trustedMutation = transcriptRecord(entry.wayangMutation);
   const edited = mutationStatus === "edited"
@@ -1118,6 +1121,7 @@ function normalizeTranscriptMutationResult(value: unknown): TranscriptMutationRe
       ? Object.freeze({ ...(body.replacement as Record<string, unknown>) })
       : null,
     warnings: normalizeTranscriptWarnings(body.semantic_warnings),
+    reindex_failed: body.reindex_failed === true || body.code === "reindex_failed",
   };
 }
 

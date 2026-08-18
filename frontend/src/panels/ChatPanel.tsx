@@ -40,9 +40,9 @@ import {
   PersistedTranscriptEventActions,
   TranscriptInspectorButton,
   TranscriptMutationProvider,
-  transcriptMutationMarker,
   type TranscriptEventRowSummary,
 } from "../components/transcript/TranscriptMutations";
+import { transcriptMutationMarker } from "../components/transcript/transcriptMutationHelpers";
 
 // ---------------------------------------------------------------------------
 // Types

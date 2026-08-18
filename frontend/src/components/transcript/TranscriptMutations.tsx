@@ -11,6 +11,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { AlertTriangle, FileJson, ListTree, Pencil, Settings2, Trash2, X } from "lucide-react";
 import {
   ApiError,
@@ -23,13 +24,17 @@ import {
   type TranscriptEventWarning,
   type TranscriptMutationOperation,
 } from "../../api/client";
+import {
+  reconstructTranscriptEntry,
+  type TranscriptMutationMarkerValue,
+} from "./transcriptMutationHelpers";
 
 const MAX_ADVANCED_PAYLOAD_CHARS = 100_000;
 const MAX_PREVIEW_CHARS = 12_000;
 const INSPECTOR_PAGE_SIZE = 40;
 const CONFLICT_CODES = new Set(["cas_conflict"]);
 
-type MutationMarker = "edited" | "deleted" | "partially modified" | null;
+type MutationMarker = TranscriptMutationMarkerValue;
 
 export interface TranscriptEventRowSummary {
   eventId: string;
@@ -57,15 +62,6 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-export function transcriptMutationMarker(message: unknown): MutationMarker {
-  const event = record(message);
-  const nested = record(event?.message);
-  const status = event?.mutation_status ?? nested?.mutation_status;
-  if (event?.deleted === true || nested?.deleted === true || status === "deleted") return "deleted";
-  if (event?.edited === true || nested?.edited === true || status === "edited") return "edited";
-  return null;
-}
-
 export function TranscriptMutationMarker({ marker }: { marker: MutationMarker }) {
   if (!marker) return null;
   const testMarker = marker === "partially modified" ? "partial" : marker;
@@ -88,6 +84,13 @@ function errorMessage(error: unknown): string {
   if (code === "runtime_busy" || code === "session_mutable") return "The session changed while this dialog was open. Wait for an idle, authoritative transcript and review again.";
   if (error instanceof ApiError) return error.message || `The request failed (HTTP ${error.status}).`;
   return error instanceof Error ? error.message : "The request failed unexpectedly.";
+}
+
+function isAmbiguousMutationError(error: unknown): boolean {
+  if (apiErrorCode(error) === "reindex_failed") return true;
+  if (error instanceof ApiError) return error.status === 0 || error.status >= 500;
+  if (error instanceof DOMException && error.name === "AbortError") return true;
+  return error instanceof TypeError;
 }
 
 function prettyJson(value: unknown): string {
@@ -124,10 +127,6 @@ function friendlyEditorForPayload(payload: unknown): FriendlyEditor | null {
   return nested
     ? { text: nested.text, buildPayload: (text) => ({ ...outer, message: nested.buildPayload(text) }) }
     : null;
-}
-
-function replacementEntry(event: TranscriptEvent, payload: Record<string, unknown>): Readonly<Record<string, unknown>> {
-  return Object.freeze({ ...payload, ...event.envelope });
 }
 
 function inferredWarnings(event: TranscriptEvent, advanced: boolean): TranscriptEventWarning[] {
@@ -221,7 +220,7 @@ function ModalFrame({
     }
   };
 
-  return (
+  return createPortal(
     <div
       ref={rootRef}
       className={`fixed inset-0 ${zClass} flex items-center justify-center bg-black/75 p-2 sm:p-6`}
@@ -238,7 +237,8 @@ function ModalFrame({
       }}
     >
       {children}
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -262,7 +262,8 @@ export function TranscriptMutationProvider({
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [manage, setManage] = useState<{ summaries: TranscriptEventRowSummary[]; trigger: HTMLButtonElement } | null>(null);
   const [mutation, setMutation] = useState<{ eventId: string; operation: TranscriptMutationOperation; trigger: HTMLButtonElement } | null>(null);
-  const [pending, setPending] = useState<{ eventId: string; operation: TranscriptMutationOperation; afterRevision: number } | null>(null);
+  const [pending, setPending] = useState<{ eventId: string; operation: TranscriptMutationOperation; afterRevision: number; ambiguous: boolean } | null>(null);
+  const hasOpenModal = Boolean(inspectorOpen || manage || mutation);
   const inspectorTriggerRef = useRef<HTMLButtonElement | null>(null);
   const pendingRef = useRef<HTMLDivElement | null>(null);
   const hadPendingRef = useRef(false);
@@ -272,6 +273,26 @@ export function TranscriptMutationProvider({
   availableRef.current = availability.available && paneVisible;
 
   useEffect(() => () => { scopeRef.current = null; availableRef.current = false; }, []);
+  useEffect(() => {
+    if (!hasOpenModal) return;
+    const root = document.getElementById("root");
+    if (!root) return;
+    const hadInert = root.hasAttribute("inert");
+    const previousInert = root.inert;
+    const previousAriaHidden = root.getAttribute("aria-hidden");
+    const previousModalOwner = root.getAttribute("data-transcript-modal-owner");
+    root.inert = true;
+    root.setAttribute("aria-hidden", "true");
+    root.setAttribute("data-transcript-modal-owner", selectionKey);
+    return () => {
+      root.inert = previousInert;
+      if (!hadInert && !previousInert) root.removeAttribute("inert");
+      if (previousAriaHidden === null) root.removeAttribute("aria-hidden");
+      else root.setAttribute("aria-hidden", previousAriaHidden);
+      if (previousModalOwner === null) root.removeAttribute("data-transcript-modal-owner");
+      else root.setAttribute("data-transcript-modal-owner", previousModalOwner);
+    };
+  }, [hasOpenModal, selectionKey]);
   useEffect(() => {
     if (historyRevision > (pending?.afterRevision ?? Number.MAX_SAFE_INTEGER)) setPending(null);
   }, [historyRevision, pending?.afterRevision]);
@@ -320,6 +341,17 @@ export function TranscriptMutationProvider({
   const isScopeCurrent = useCallback((captured: string) => (
     scopeRef.current === captured && availableRef.current
   ), []);
+  const beginAuthoritativeRefresh = useCallback((
+    eventId: string,
+    operation: TranscriptMutationOperation,
+    ambiguous: boolean,
+  ) => {
+    setPending({ eventId, operation, afterRevision: historyRevision, ambiguous });
+    setMutation(null);
+    setManage(null);
+    setInspectorOpen(false);
+    onAuthoritativeRefresh();
+  }, [historyRevision, onAuthoritativeRefresh]);
 
   const context = useMemo<TranscriptMutationContextValue>(() => ({ availability, openManage, openInspector }), [availability, openInspector, openManage]);
 
@@ -327,9 +359,8 @@ export function TranscriptMutationProvider({
     <TranscriptMutationContext.Provider value={context}>
       <div
         className="h-full"
-        inert={Boolean(inspectorOpen || manage || mutation)}
-        aria-hidden={inspectorOpen || manage || mutation ? true : undefined}
         data-testid="transcript-mutation-scope"
+        data-modal-open={hasOpenModal ? "true" : "false"}
         data-selection-key={selectionKey}
         data-mutation-available={availability.available ? "true" : "false"}
         data-unavailable-reason={availability.reason}
@@ -337,8 +368,15 @@ export function TranscriptMutationProvider({
         {children}
       </div>
       {pending && (
-        <div ref={pendingRef} tabIndex={-1} data-testid="transcript-mutation-pending" role="status" className="fixed bottom-20 left-1/2 z-[65] -translate-x-1/2 rounded-full border border-blue-800 bg-blue-950 px-4 py-2 text-xs text-blue-100 shadow-xl">
-          Updating transcript from the authoritative session…
+        <div
+          ref={pendingRef}
+          tabIndex={-1}
+          data-testid="transcript-mutation-pending"
+          data-completion={pending.ambiguous ? "ambiguous" : "confirmed"}
+          role="status"
+          className="fixed bottom-20 left-1/2 z-[65] -translate-x-1/2 rounded-full border border-blue-800 bg-blue-950 px-4 py-2 text-xs text-blue-100 shadow-xl"
+        >
+          {pending.ambiguous ? "Mutation outcome uncertain; reloading authoritative transcript…" : "Updating transcript from the authoritative session…"}
         </div>
       )}
       {inspectorOpen && (
@@ -375,12 +413,9 @@ export function TranscriptMutationProvider({
           isScopeCurrent={isScopeCurrent}
           onSuccess={() => {
             if (!isScopeCurrent(selectionKey)) return;
-            setPending({ eventId: mutation.eventId, operation: mutation.operation, afterRevision: historyRevision });
-            setMutation(null);
-            setManage(null);
-            setInspectorOpen(false);
-            onAuthoritativeRefresh();
+            beginAuthoritativeRefresh(mutation.eventId, mutation.operation, false);
           }}
+          onAmbiguous={() => beginAuthoritativeRefresh(mutation.eventId, mutation.operation, true)}
           onClose={() => setMutation(null)}
         />
       )}
@@ -606,6 +641,7 @@ function TranscriptMutationDialog({
   trigger,
   isScopeCurrent,
   onSuccess,
+  onAmbiguous,
   onClose,
 }: {
   sessionId: string;
@@ -615,6 +651,7 @@ function TranscriptMutationDialog({
   trigger: HTMLButtonElement;
   isScopeCurrent: (captured: string) => boolean;
   onSuccess: () => void;
+  onAmbiguous: () => void;
   onClose: () => void;
 }) {
   const [event, setEvent] = useState<TranscriptEvent | null>(null);
@@ -631,6 +668,17 @@ function TranscriptMutationDialog({
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const pinRef = useRef<HTMLInputElement>(null);
   const requestRef = useRef<AbortController | null>(null);
+  const submittedRef = useRef(false);
+  const ambiguitySignalledRef = useRef(false);
+  const onAmbiguousRef = useRef(onAmbiguous);
+  onAmbiguousRef.current = onAmbiguous;
+
+  const signalAmbiguousCompletion = useCallback(() => {
+    if (!submittedRef.current || ambiguitySignalledRef.current) return;
+    ambiguitySignalledRef.current = true;
+    submittedRef.current = false;
+    onAmbiguousRef.current();
+  }, []);
 
   const applyFreshEvent = useCallback((fresh: TranscriptEvent, conflict = false) => {
     const friendly = friendlyEditorForPayload(fresh.payload);
@@ -662,8 +710,11 @@ function TranscriptMutationDialog({
 
   useEffect(() => {
     void loadFresh();
-    return () => requestRef.current?.abort();
-  }, [loadFresh]);
+    return () => {
+      signalAmbiguousCompletion();
+      requestRef.current?.abort();
+    };
+  }, [loadFresh, signalAmbiguousCompletion]);
 
   useEffect(() => {
     if (!event) return;
@@ -716,24 +767,36 @@ function TranscriptMutationDialog({
     const expectedEntry = event.expected_entry;
     const controller = new AbortController();
     requestRef.current = controller;
+    ambiguitySignalledRef.current = false;
+    submittedRef.current = true;
     setSubmitting(true);
     setError("");
     try {
-      if (operation === "edit" && payload) {
-        await editTranscriptEvent(sessionId, eventId, {
+      const result = operation === "edit" && payload
+        ? await editTranscriptEvent(sessionId, eventId, {
           pin,
           expected_entry: expectedEntry,
-          replacement_entry: replacementEntry(event, payload),
-        }, controller.signal);
-      } else {
-        await deleteTranscriptEvent(sessionId, eventId, {
-          pin,
-          expected_entry: expectedEntry,
-        }, controller.signal);
+          replacement_entry: reconstructTranscriptEntry(event.envelope, payload),
+        }, controller.signal)
+        : await deleteTranscriptEvent(sessionId, eventId, {
+            pin,
+            expected_entry: expectedEntry,
+          }, controller.signal);
+      if (result.reindex_failed) {
+        signalAmbiguousCompletion();
+        return;
       }
-      if (!controller.signal.aborted && isScopeCurrent(selectionKey) && event.intent_token === capturedIntentToken) onSuccess();
+      if (controller.signal.aborted || !isScopeCurrent(selectionKey) || event.intent_token !== capturedIntentToken) {
+        signalAmbiguousCompletion();
+        return;
+      }
+      submittedRef.current = false;
+      onSuccess();
     } catch (submitError: unknown) {
-      if (!controller.signal.aborted && isScopeCurrent(selectionKey)) {
+      if (isAmbiguousMutationError(submitError)) {
+        signalAmbiguousCompletion();
+      } else if (!controller.signal.aborted && isScopeCurrent(selectionKey)) {
+        submittedRef.current = false;
         if (submitError instanceof ApiError && submitError.status === 409 && CONFLICT_CODES.has(apiErrorCode(submitError) ?? "")) {
           setPin("");
           setAcknowledged(false);
@@ -759,13 +822,15 @@ function TranscriptMutationDialog({
         data-operation={operation}
         data-selection-key={selectionKey}
         data-review-revision={reviewRevision}
+        data-submit-started={submitting ? "true" : "false"}
+        data-ambiguity-signalled={ambiguitySignalledRef.current ? "true" : "false"}
       >
         <header className="border-b border-neutral-800 px-4 py-3"><div className={`text-[10px] font-semibold uppercase tracking-wider ${operation === "delete" ? "text-red-400" : "text-blue-400"}`}>PIN-gated transcript mutation</div><h2 id="transcript-mutation-title" className="mt-1 text-base font-semibold">{operation === "delete" ? "Delete transcript event?" : "Edit transcript event"}</h2><p className="mt-1 break-all font-mono text-[10px] text-neutral-600">{eventId}</p></header>
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4">
           {loading && <p role="status" className="text-sm text-neutral-400">Loading the latest exact event…</p>}
           {error && <div role="alert" data-testid="transcript-mutation-error" className="rounded border border-red-900/60 bg-red-950/30 px-3 py-2 text-sm text-red-200">{error}</div>}
           {event && <><dl className="grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 rounded border border-neutral-800 bg-neutral-900/40 p-3 text-xs"><dt className="text-neutral-500">Type</dt><dd>{event.event_type}</dd><dt className="text-neutral-500">Branch</dt><dd>{event.active_branch ? "active" : "other"}</dd><dt className="text-neutral-500">Event ID</dt><dd className="break-all font-mono text-[10px] text-neutral-500">{event.event_id}</dd></dl><details className="rounded border border-neutral-800 px-3 py-2 text-xs"><summary className="cursor-pointer text-neutral-400">Read-only envelope</summary><pre className="mt-2 max-h-40 overflow-auto rounded bg-neutral-900 p-2 font-mono text-[11px] text-neutral-400">{bounded(prettyJson(event.envelope))}</pre></details>
-          {operation === "delete" ? <div data-testid="transcript-delete-preview" className="space-y-2 rounded border border-red-900/60 bg-red-950/20 p-3"><div className="text-xs font-semibold uppercase tracking-wider text-red-300">Exact content to remove</div>{friendly?.text && <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-950 p-2 text-xs text-neutral-200">{bounded(friendly.text)}</pre>}<pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-950 p-2 font-mono text-[11px] text-neutral-300">{previewJson}</pre><p className="text-xs leading-relaxed text-red-100/80">Deletion replaces this event with a content-free tombstone and removes it from future context and search.</p></div> : <div>{friendly && <div className="mb-2 flex items-center justify-between"><span className="text-xs font-medium">{advanced ? "Advanced payload JSON" : "Message text"}</span><button type="button" data-testid="transcript-edit-mode-toggle" onClick={() => setAdvanced((value) => !value)} className="inline-flex min-h-9 items-center gap-1 rounded border border-neutral-700 px-2 text-xs"><FileJson size={12} /> {advanced ? "Use text editor" : "Advanced JSON"}</button></div>}{!friendly || advanced ? <textarea ref={editorRef} data-testid="transcript-event-json-input" aria-label="Advanced event payload JSON" value={json} maxLength={MAX_ADVANCED_PAYLOAD_CHARS} onChange={(change) => setJson(change.target.value)} className="h-64 w-full resize-y rounded border border-neutral-700 bg-neutral-900 p-3 font-mono text-xs outline-none focus:border-blue-500" spellCheck={false} /> : <textarea ref={editorRef} data-testid="transcript-event-text-input" aria-label="Message text" value={text} maxLength={MAX_ADVANCED_PAYLOAD_CHARS} onChange={(change) => setText(change.target.value)} className="h-44 w-full resize-y rounded border border-neutral-700 bg-neutral-900 p-3 text-sm outline-none focus:border-blue-500" />}</div>}
+          {operation === "delete" ? <div data-testid="transcript-delete-preview" className="space-y-2 rounded border border-red-900/60 bg-red-950/20 p-3"><div className="text-xs font-semibold uppercase tracking-wider text-red-300">Exact content to remove</div>{friendly?.text && <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-950 p-2 text-xs text-neutral-200">{bounded(friendly.text)}</pre>}<pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded bg-neutral-950 p-2 font-mono text-[11px] text-neutral-300">{previewJson}</pre><p className="text-xs leading-relaxed text-red-100/80">Deletion removes this event's stored payload from future context/search; copies or paraphrases in other events, external side effects, providers, and backups remain separate/outside.</p></div> : <div>{friendly && <div className="mb-2 flex items-center justify-between"><span className="text-xs font-medium">{advanced ? "Advanced payload JSON" : "Message text"}</span><button type="button" data-testid="transcript-edit-mode-toggle" onClick={() => setAdvanced((value) => !value)} className="inline-flex min-h-9 items-center gap-1 rounded border border-neutral-700 px-2 text-xs"><FileJson size={12} /> {advanced ? "Use text editor" : "Advanced JSON"}</button></div>}{!friendly || advanced ? <textarea ref={editorRef} data-testid="transcript-event-json-input" aria-label="Advanced event payload JSON" value={json} maxLength={MAX_ADVANCED_PAYLOAD_CHARS} onChange={(change) => setJson(change.target.value)} className="h-64 w-full resize-y rounded border border-neutral-700 bg-neutral-900 p-3 font-mono text-xs outline-none focus:border-blue-500" spellCheck={false} /> : <textarea ref={editorRef} data-testid="transcript-event-text-input" aria-label="Message text" value={text} maxLength={MAX_ADVANCED_PAYLOAD_CHARS} onChange={(change) => setText(change.target.value)} className="h-44 w-full resize-y rounded border border-neutral-700 bg-neutral-900 p-3 text-sm outline-none focus:border-blue-500" />}</div>}
           {warnings.length > 0 && <div data-testid="transcript-mutation-warnings" className="space-y-2 rounded border border-amber-900/60 bg-amber-950/20 p-3"><div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-amber-300"><AlertTriangle size={14} /> Review consequences</div><ul className="list-disc space-y-1 pl-5 text-xs text-amber-100/80">{warnings.map((warning) => <li key={`${warning.code}:${warning.message}`}>{warning.message}</li>)}</ul>{requiresAcknowledgement && <label className="flex min-h-9 items-start gap-2 text-xs"><input data-testid="transcript-warning-acknowledgement" type="checkbox" checked={acknowledged} onChange={(change) => setAcknowledged(change.target.checked)} /> I understand these warnings and want to continue.</label>}</div>}
           <div><label htmlFor="transcript-mutation-pin" className="text-xs font-medium">8-digit identity PIN</label><p className="mt-1 text-[11px] text-neutral-500">Cleared whenever the reviewed intent changes and after submit, cancel, error, selection change, or visibility loss.</p><input ref={pinRef} id="transcript-mutation-pin" data-testid="transcript-mutation-pin" type="password" inputMode="numeric" autoComplete="off" pattern="[0-9]{8}" minLength={8} maxLength={8} value={pin} onChange={(change) => setPin(change.target.value.replace(/\D/g, "").slice(0, 8))} className="mt-2 w-full rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm outline-none focus:border-red-500 sm:max-w-xs" placeholder="8-digit PIN" /></div></>}
         </div>
