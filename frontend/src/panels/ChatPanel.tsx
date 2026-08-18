@@ -36,6 +36,13 @@ import {
   ExternalActionApproval,
   type ExternalActionApprovalRequest,
 } from "../components/ExternalActionApproval";
+import {
+  PersistedTranscriptEventActions,
+  TranscriptInspectorButton,
+  TranscriptMutationProvider,
+  transcriptMutationMarker,
+  type TranscriptEventRowSummary,
+} from "../components/transcript/TranscriptMutations";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1297,8 +1304,31 @@ function buildDisplayAssistantMessage(parts: ChatMessage[]): ChatMessage | null 
     if (toolResultBlock) content.push(toolResultBlock);
   }
 
+  const eventSummaries: TranscriptEventRowSummary[] = parts.flatMap((part, index) => {
+    if (typeof part.id !== "string") return [];
+    const marker = transcriptMutationMarker(part);
+    const role = typeof part.message?.role === "string" ? part.message.role : part.type;
+    const text = role === "user" ? getUserMessageText(part.message) : textFromCustomMessage(part.message);
+    return [{
+      eventId: part.id,
+      label: `${role} event ${index + 1}`,
+      ...(text ? { preview: text.slice(0, 280) } : {}),
+      ...(marker === "edited" || marker === "deleted" ? { marker } : {}),
+    }];
+  });
+  const eventIds = eventSummaries.map((summary) => summary.eventId);
+  const deletedCount = eventSummaries.filter((summary) => summary.marker === "deleted").length;
+  const editedCount = eventSummaries.filter((summary) => summary.marker === "edited").length;
+  const mutationStatus = deletedCount === eventSummaries.length && deletedCount > 0
+    ? "deleted"
+    : deletedCount > 0 || (editedCount > 0 && editedCount < eventSummaries.length)
+      ? "partially modified"
+      : editedCount > 0 ? "edited" : null;
   if (content.length === 0) {
     if (assistantError) return { type: "error", error: assistantError };
+    if (mutationStatus === "deleted" && eventIds.length > 0) {
+      return { type: "transcript_tombstone", id: eventIds[0], __eventIds: eventIds, __eventSummaries: eventSummaries, __mutationStatus: "deleted" };
+    }
     return null;
   }
   // Preserve an original assistant message id for TTS lookup. Prefer the most
@@ -1311,6 +1341,9 @@ function buildDisplayAssistantMessage(parts: ChatMessage[]): ChatMessage | null 
   return {
     id: assistantId,
     type: "assistant",
+    __eventIds: eventIds,
+    __eventSummaries: eventSummaries,
+    __mutationStatus: mutationStatus,
     message: {
       ...template,
       role: "assistant",
@@ -2488,6 +2521,26 @@ function CommandGuardPinPrompt({
   );
 }
 
+function DeletedTranscriptEvent() {
+  return (
+    <div data-testid="chat-message" data-role="deleted" className="rounded-lg border border-neutral-800 bg-neutral-900/30 px-4 py-3 text-xs italic text-neutral-500">
+      Transcript event deleted
+    </div>
+  );
+}
+
+function transcriptEventIds(msg: ChatMessage): string[] {
+  if (Array.isArray(msg.__eventIds)) {
+    return msg.__eventIds.filter((id: unknown): id is string => typeof id === "string" && id.length > 0);
+  }
+  return typeof msg.id === "string" && !isLocalPendingUserMessage(msg) ? [msg.id] : [];
+}
+
+function renderedMutationMarker(msg: ChatMessage): "edited" | "deleted" | "partially modified" | null {
+  if (msg.__mutationStatus === "edited" || msg.__mutationStatus === "deleted" || msg.__mutationStatus === "partially modified") return msg.__mutationStatus;
+  return transcriptMutationMarker(msg);
+}
+
 function renderMessage(
   msg: ChatMessage,
   index: number,
@@ -2500,6 +2553,12 @@ function renderMessage(
     agentName?: string;
   } = {},
 ) {
+  if (
+    msg.type === "transcript_tombstone"
+    || (!Array.isArray(msg.__eventIds) && renderedMutationMarker(msg) === "deleted")
+  ) {
+    return <DeletedTranscriptEvent key={index} />;
+  }
   switch (msg.type) {
     case "assistant":
       return (
@@ -2544,6 +2603,73 @@ function renderMessage(
   }
 }
 
+function TranscriptMessageRowContents({
+  msg,
+  canResendUserMessage,
+  resendingMessageId,
+  onResendUserMessage,
+  sessionId,
+  ttsAllowed,
+  agentName,
+}: {
+  msg: ChatMessage;
+  canResendUserMessage: boolean;
+  resendingMessageId: string | null;
+  onResendUserMessage: (msg: ChatMessage) => void;
+  sessionId: string | null;
+  ttsAllowed: boolean;
+  agentName: string;
+}) {
+  const eventIds = transcriptEventIds(msg);
+  const label = msg.type === "user" ? "user message" : msg.type === "assistant" ? "assistant message" : msg.type;
+  const summaries: TranscriptEventRowSummary[] = Array.isArray(msg.__eventSummaries)
+    ? msg.__eventSummaries
+    : eventIds.map((eventId) => ({
+        eventId,
+        label,
+        preview: getUserMessageText(msg.message).slice(0, 280) || undefined,
+        marker: renderedMutationMarker(msg) === "edited" || renderedMutationMarker(msg) === "deleted"
+          ? renderedMutationMarker(msg) as "edited" | "deleted"
+          : undefined,
+      }));
+  const rendered = renderMessage(msg, 0, {
+    canResendUserMessage,
+    resendingMessageId,
+    onResendUserMessage,
+    sessionId,
+    ttsAllowed,
+    agentName,
+  });
+  if (!rendered) return null;
+  return (
+    <>
+      {rendered}
+      {eventIds.length > 0 && (
+        <div className="mt-1 flex min-h-7 items-center justify-end gap-2 px-1">
+          <PersistedTranscriptEventActions eventIds={eventIds} label={label} summaries={summaries} />
+        </div>
+      )}
+    </>
+  );
+}
+
+function AdditionalTranscriptEventAnchors({ eventIds, primaryId }: { eventIds: string[]; primaryId: string | null }) {
+  return (
+    <>
+      {eventIds.filter((eventId) => eventId !== primaryId).map((eventId) => (
+        <span
+          key={eventId}
+          id={`msg-${eventId}`}
+          data-message-id={eventId}
+          data-testid="coalesced-transcript-event-anchor"
+          className="block h-px scroll-mt-4"
+          aria-hidden="true"
+        />
+      ))}
+    </>
+  );
+}
+
 const MemoizedMessageRow = memo(function MemoizedMessageRow({
   msg,
   canResendUserMessage,
@@ -2562,16 +2688,19 @@ const MemoizedMessageRow = memo(function MemoizedMessageRow({
   agentName: string;
 }) {
   const messageId = typeof msg.id === "string" ? msg.id : null;
+  const eventIds = transcriptEventIds(msg);
   return (
-    <div {...(messageId ? { "data-message-id": messageId, id: `msg-${messageId}` } : {})}>
-      {renderMessage(msg, 0, {
-        canResendUserMessage,
-        resendingMessageId,
-        onResendUserMessage,
-        sessionId,
-        ttsAllowed,
-        agentName,
-      })}
+    <div className="group" {...(messageId ? { "data-message-id": messageId, id: `msg-${messageId}` } : {})}>
+      <AdditionalTranscriptEventAnchors eventIds={eventIds} primaryId={messageId} />
+      <TranscriptMessageRowContents
+        msg={msg}
+        canResendUserMessage={canResendUserMessage}
+        resendingMessageId={resendingMessageId}
+        onResendUserMessage={onResendUserMessage}
+        sessionId={sessionId}
+        ttsAllowed={ttsAllowed}
+        agentName={agentName}
+      />
     </div>
   );
 });
@@ -2726,6 +2855,7 @@ export function ChatPanel({
   const [wsStatus, setWsStatus] = useState<WsStatus>("disconnected");
   const [bashMode, setBashMode] = useState<BashMode>("unavailable");
   const [isSessionHistoryLoading, setIsSessionHistoryLoading] = useState(false);
+  const [runtimeMutationLocked, setRuntimeMutationLocked] = useState(false);
   const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
   const [defaultModel, setDefaultModel] = useState<DefaultModelOption | null>(null);
   const [modelError, setModelError] = useState("");
@@ -2783,6 +2913,9 @@ export function ChatPanel({
   const [resendingMessageId, setResendingMessageId] = useState<string | null>(null);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [activeTurnScrollAnchorText, setActiveTurnScrollAnchorText] = useState<string | null>(null);
+  const [transcriptSelectionKey, setTranscriptSelectionKey] = useState("");
+  const [transcriptHistoryRevision, setTranscriptHistoryRevision] = useState(0);
+  const [paneVisible, setPaneVisible] = useState(true);
 
   const currentGoal = activeSession?.goal ?? null;
   const currentGoalStatus = activeSession?.goal_status ?? null;
@@ -2905,6 +3038,7 @@ export function ChatPanel({
   const scrollAnchorRef = useRef<HTMLDivElement | null>(null);
   const activeTurnUserMessageRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const chatPanelRootRef = useRef<HTMLElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const wsConnectedRef = useRef(false);
@@ -2973,9 +3107,24 @@ export function ChatPanel({
       setActiveCommandGuardPinPrompt(null);
     }
     selectionIdRef.current = selectionId;
+    setTranscriptSelectionKey(selectionId ? `${activeSessionId}:${selectionId}:${selectionGenerationRef.current}` : "");
     poisonedExternalActionKeysRef.current.clear();
     externalActionTerminalTombstonesRef.current.clear();
   }, [activeSessionId]);
+
+  useEffect(() => {
+    const root = chatPanelRootRef.current;
+    if (!root || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(([entry]) => {
+      setPaneVisible(Boolean(entry?.isIntersecting && entry.intersectionRatio > 0));
+    }, { threshold: [0, 0.01] });
+    observer.observe(root);
+    return () => observer.disconnect();
+  }, [activeSessionId, transcriptSelectionKey]);
+
+  useEffect(() => {
+    setRuntimeMutationLocked(Boolean(activeSession?.runtime_mutation_locked));
+  }, [activeSession?.runtime_mutation_locked, activeSessionId]);
 
   useEffect(() => {
     isRestoringDraftRef.current = true;
@@ -3406,6 +3555,7 @@ export function ChatPanel({
             && transportGeneration === transportGenerationRef.current
           ) {
             setBashMode(isBashMode(msg.bash_mode) ? msg.bash_mode : "unavailable");
+            setRuntimeMutationLocked(msg.mutation_locked === true);
           }
           return;
         }
@@ -3669,6 +3819,7 @@ export function ChatPanel({
           requestAnimationFrame(() => requestAnimationFrame(() => {
             if (selectionIdRef.current !== acceptedSelectionId) return;
             setIsSessionHistoryLoading(false);
+            setTranscriptHistoryRevision((revision) => revision + 1);
             chatWsProfile("history_painted", {
               sessionId: activeSessionIdRef.current,
               selectionId: acceptedSelectionId,
@@ -4292,7 +4443,13 @@ export function ChatPanel({
           // the live assistant response.
           if (message.role === "user") {
             if (msg.type === "message_start") {
-              const userMessage = { type: "user", message };
+              const userMessage = {
+                type: "user",
+                message,
+                ...((typeof msg.id === "string" || typeof message.id === "string")
+                  ? { id: typeof msg.id === "string" ? msg.id : message.id }
+                  : {}),
+              };
               const wasQueuedForNextTurn = takeMatchingQueuedMessage(getUserMessageText(message));
               if (hasActiveAssistantOutput() && wasQueuedForNextTurn) {
                 insertAcceptedUsersAfterActiveStreaming([userMessage]);
@@ -4320,7 +4477,13 @@ export function ChatPanel({
               setStreamingHistoryPrefixSynced({ content: [] });
               setMessages((prev) => [
                 ...prev,
-                { type: "custom", message },
+                {
+                  type: "custom",
+                  message,
+                  ...((typeof msg.id === "string" || typeof message.id === "string")
+                    ? { id: typeof msg.id === "string" ? msg.id : message.id }
+                    : {}),
+                },
               ]);
             }
             return;
@@ -4981,6 +5144,24 @@ export function ChatPanel({
     wsStatus,
   ]);
 
+  const handleTranscriptMutationSuccess = useCallback(() => {
+    const sessionId = activeSessionIdRef.current;
+    const selectionId = selectionIdRef.current;
+    if (!sessionId || !selectionId) return;
+    // The REST commit is canonical. Do not infer its shape into the current
+    // history array; hide that stale projection until the WebSocket returns a
+    // fresh authoritative snapshot for this exact selection.
+    setMessagesOwnerSessionId(null);
+    setIsSessionHistoryLoading(true);
+    const socket = wsRef.current;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.close(1012, "refresh transcript after mutation");
+    } else if (!wsRef.current) {
+      connectRef.current();
+    }
+    onSessionChange?.();
+  }, [onSessionChange]);
+
   const handleInterrupt = useCallback(() => {
     const restoredQueuedMessages = restoreQueuedMessagesToComposer();
     sendWs({ type: "interrupt", clear_queue: restoredQueuedMessages });
@@ -5487,6 +5668,31 @@ export function ChatPanel({
   const hasStreamingContent = displayedStreamingBlocks.content.length > 0;
   const isAgentRunning = isStreaming || hasStreamingContent || isCompacting;
   const isTranscriptLoading = !transcriptOwnedBySelection || isSessionHistoryLoading || wsStatus === "connecting";
+  const transcriptMutationUnavailableReason = !paneVisible
+    ? "Transcript mutation controls close when the Chat pane is not visible"
+    : wsStatus !== "connected"
+      ? "Wait for the session connection"
+      : isTranscriptLoading
+        ? "Wait for authoritative transcript history"
+        : runtimeMutationLocked
+          ? "The session runtime is mutation-locked"
+          : isAgentRunning || activeSession?.runtime_status === "starting"
+            ? "Wait for the running or compacting agent to settle"
+            : resendingMessageId
+              ? "Wait for resend reconciliation"
+              : queuedUserMessages.length > 0 || deferredUserMessages.length > 0
+                ? "Wait for queued transcript changes to settle"
+                : activeInterview || activeSudoPrompt || activeCommandGuardPinPrompt || visibleExternalActionApprovals.some((request) => request.live)
+                  ? "Finish the active session interaction first"
+                  : isAgentSwitching || isAgentPreviewing || isModelSaving
+                    ? "Wait for the session selection change to finish"
+                    : !transcriptSelectionKey
+                      ? "The current transcript selection is not authoritative"
+                      : "";
+  const transcriptMutationAvailability = useMemo(() => ({
+    available: transcriptMutationUnavailableReason === "",
+    reason: transcriptMutationUnavailableReason,
+  }), [transcriptMutationUnavailableReason]);
   // ------------------------------------------------------------------
   // Render
   // ------------------------------------------------------------------
@@ -5502,7 +5708,16 @@ export function ChatPanel({
   }
 
   return (
-    <section className="h-full flex flex-col bg-neutral-950 text-neutral-100">
+    <TranscriptMutationProvider
+      key={`${activeSessionId}:${transcriptSelectionKey}`}
+      sessionId={activeSessionId}
+      selectionKey={transcriptSelectionKey}
+      availability={transcriptMutationAvailability}
+      paneVisible={paneVisible}
+      historyRevision={transcriptHistoryRevision}
+      onAuthoritativeRefresh={handleTranscriptMutationSuccess}
+    >
+    <section ref={chatPanelRootRef} className="h-full flex flex-col bg-neutral-950 text-neutral-100">
       {/* ---- Top bar ---- */}
       <header className="min-h-10 px-4 py-2 flex flex-col gap-1 border-b border-neutral-800 shrink-0">
         <div className="flex w-full items-center justify-between gap-3">
@@ -5584,6 +5799,7 @@ export function ChatPanel({
               </div>
             )}
           </div>
+          <TranscriptInspectorButton />
           <button
             type="button"
             onClick={handleCommandGuardToggle}
@@ -5879,15 +6095,17 @@ export function ChatPanel({
           const anchorAttrs = messageId ? { "data-message-id": messageId, id: `msg-${messageId}` } : undefined;
           if (isActiveTurnUserMessage) {
             return (
-              <div key={messageId ?? `active-turn-user-${i}`} ref={activeTurnUserMessageRef} {...anchorAttrs}>
-                {renderMessage(msg, i, {
-                  canResendUserMessage: wsStatus === "connected" && !isAgentRunning,
-                  resendingMessageId,
-                  onResendUserMessage: handleResendMessage,
-                  sessionId: activeSessionId,
-                  ttsAllowed,
-                  agentName: currentAgentLabel,
-                })}
+              <div className="group" key={messageId ?? `active-turn-user-${i}`} ref={activeTurnUserMessageRef} {...anchorAttrs}>
+                <AdditionalTranscriptEventAnchors eventIds={transcriptEventIds(msg)} primaryId={messageId} />
+                <TranscriptMessageRowContents
+                  msg={msg}
+                  canResendUserMessage={wsStatus === "connected" && !isAgentRunning}
+                  resendingMessageId={resendingMessageId}
+                  onResendUserMessage={handleResendMessage}
+                  sessionId={activeSessionId}
+                  ttsAllowed={ttsAllowed}
+                  agentName={currentAgentLabel}
+                />
               </div>
             );
           }
@@ -5920,7 +6138,17 @@ export function ChatPanel({
 
         {/* Accepted next-turn user messages wait behind the active assistant turn. */}
         {deferredUserMessages.map((msg, i) => (
-          <div key={`deferred-user-${i}`}>{renderMessage(msg, i, { sessionId: activeSessionId })}</div>
+          <div className="group" key={`deferred-user-${i}`}>
+            <TranscriptMessageRowContents
+              msg={msg}
+              canResendUserMessage={false}
+              resendingMessageId={null}
+              onResendUserMessage={handleResendMessage}
+              sessionId={activeSessionId}
+              ttsAllowed={ttsAllowed}
+              agentName={currentAgentLabel}
+            />
+          </div>
         ))}
 
         <div ref={scrollAnchorRef} />
@@ -6199,5 +6427,6 @@ export function ChatPanel({
       )}
 
     </section>
+    </TranscriptMutationProvider>
   );
 }

@@ -50,6 +50,62 @@ export interface PendingAgentSwitch {
   changed_at: number;
 }
 
+export interface TranscriptEventWarning {
+  code: string;
+  message: string;
+  requires_acknowledgement: boolean;
+}
+
+/**
+ * Isolated frontend projection for the transcript mutation REST API. The
+ * envelope is display-only; callers may submit only `payload` for edits.
+ */
+export interface TranscriptEvent {
+  event_id: string;
+  expected_digest: string;
+  event_type: string;
+  branch: string | null;
+  active_branch: boolean;
+  hidden_event_type: boolean;
+  envelope: Readonly<Record<string, unknown>>;
+  payload: unknown;
+  editable_text: string | null;
+  edited: boolean;
+  deleted: boolean;
+  warnings: TranscriptEventWarning[];
+}
+
+export interface TranscriptEventsResponse {
+  events: TranscriptEvent[];
+  next_cursor: string | null;
+}
+
+export type TranscriptMutationOperation = "edit" | "delete";
+
+export interface TranscriptMutationRequest {
+  operation: TranscriptMutationOperation;
+  expected_digest: string;
+  payload?: unknown;
+  acknowledge_warnings?: boolean;
+  pin: string;
+}
+
+export interface TranscriptMutationResult {
+  event: TranscriptEvent | null;
+  warnings: TranscriptEventWarning[];
+}
+
+export function apiErrorCode(error: unknown): string | null {
+  if (!(error instanceof ApiError) || !error.body || typeof error.body !== "object") return null;
+  const body = error.body as Record<string, unknown>;
+  if (typeof body.code === "string") return body.code;
+  if (typeof body.error_code === "string") return body.error_code;
+  if (body.error && typeof body.error === "object" && typeof (body.error as Record<string, unknown>).code === "string") {
+    return (body.error as { code: string }).code;
+  }
+  return null;
+}
+
 export interface Session {
   id: string;
   pi_session_file: string | null;
@@ -71,6 +127,7 @@ export interface Session {
   runtime_status: SessionRuntimeStatus;
   runtime_is_streaming: boolean;
   runtime_is_compacting: boolean;
+  runtime_mutation_locked?: boolean;
   runtime_subscriber_count: number;
   runtime_last_activity_at: number | null;
   bash_mode: BashMode;
@@ -220,9 +277,11 @@ async function request<T>(
     const message =
       parsed && typeof parsed === "object" && "error" in parsed && typeof parsed.error === "string"
         ? parsed.error
-        : parsed && typeof parsed === "object" && "detail" in parsed && typeof parsed.detail === "string"
-          ? parsed.detail
-          : undefined;
+        : parsed && typeof parsed === "object" && "error" in parsed && parsed.error && typeof parsed.error === "object" && "message" in parsed.error && typeof parsed.error.message === "string"
+          ? parsed.error.message
+          : parsed && typeof parsed === "object" && "detail" in parsed && typeof parsed.detail === "string"
+            ? parsed.detail
+            : undefined;
     throw new ApiError(res.status, parsed, message);
   }
   if (res.status === 204) return null as T;
@@ -929,6 +988,136 @@ export async function switchSessionAgent(
 
 export async function getSession(id: string): Promise<Session> {
   return normalizeSessionPayload(await apiGet<unknown>(`/api/sessions/${encodeURIComponent(id)}`));
+}
+
+function transcriptRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? value as Record<string, unknown> : {};
+}
+
+function normalizeTranscriptWarnings(value: unknown): TranscriptEventWarning[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate): TranscriptEventWarning[] => {
+    if (typeof candidate === "string" && candidate) {
+      return [{ code: "warning", message: candidate, requires_acknowledgement: true }];
+    }
+    const warning = transcriptRecord(candidate);
+    if (typeof warning.message !== "string" || !warning.message) return [];
+    return [{
+      code: typeof warning.code === "string" ? warning.code : "warning",
+      message: warning.message,
+      requires_acknowledgement: warning.requires_acknowledgement !== false,
+    }];
+  });
+}
+
+function normalizeTranscriptEvent(value: unknown): TranscriptEvent {
+  const event = transcriptRecord(value);
+  const envelope = transcriptRecord(event.envelope);
+  const eventId = typeof event.event_id === "string"
+    ? event.event_id
+    : typeof event.id === "string" ? event.id : "";
+  const digest = typeof event.expected_digest === "string"
+    ? event.expected_digest
+    : typeof event.digest === "string" ? event.digest : "";
+  if (!eventId || !digest) throw new Error("Transcript event projection is missing its id or digest");
+  return {
+    event_id: eventId,
+    expected_digest: digest,
+    event_type: typeof event.event_type === "string"
+      ? event.event_type
+      : typeof event.type === "string" ? event.type : "unknown",
+    branch: typeof event.branch === "string"
+      ? event.branch
+      : typeof envelope.branch === "string" ? envelope.branch : null,
+    active_branch: event.active_branch !== false && event.is_active_branch !== false,
+    hidden_event_type: event.hidden_event_type === true || event.hidden === true,
+    envelope: Object.freeze({ ...envelope }),
+    payload: event.payload,
+    editable_text: typeof event.editable_text === "string" ? event.editable_text : null,
+    edited: event.edited === true || event.mutation_status === "edited",
+    deleted: event.deleted === true || event.mutation_status === "deleted",
+    warnings: normalizeTranscriptWarnings(event.warnings),
+  };
+}
+
+export interface FetchTranscriptEventOptions {
+  allBranches?: boolean;
+  includeHiddenEventTypes?: boolean;
+  eventId?: string;
+  cursor?: string;
+  limit?: number;
+  includePayload?: boolean;
+}
+
+export async function fetchTranscriptEvents(
+  sessionId: string,
+  options: FetchTranscriptEventOptions = {},
+  signal?: AbortSignal,
+): Promise<TranscriptEventsResponse> {
+  const params = new URLSearchParams();
+  if (options.allBranches) params.set("all_branches", "1");
+  if (options.includeHiddenEventTypes) params.set("include_hidden_event_types", "1");
+  if (options.eventId) params.set("event_id", options.eventId);
+  if (options.cursor) params.set("cursor", options.cursor);
+  if (options.limit != null) params.set("limit", String(options.limit));
+  if (options.includePayload != null) params.set("include_payload", options.includePayload ? "1" : "0");
+  const query = params.size > 0 ? `?${params.toString()}` : "";
+  const value = await request<unknown>(
+    "GET",
+    `/api/sessions/${encodeURIComponent(sessionId)}/transcript-events${query}`,
+    undefined,
+    signal,
+    true,
+    "no-store",
+  );
+  const body = transcriptRecord(value);
+  const rows = Array.isArray(value) ? value : Array.isArray(body.events) ? body.events : [];
+  return {
+    events: rows.map(normalizeTranscriptEvent),
+    next_cursor: typeof body.next_cursor === "string"
+      ? body.next_cursor
+      : typeof body.nextCursor === "string" ? body.nextCursor : null,
+  };
+}
+
+/** Fetches one exact current projection; it never falls back to a cached row. */
+export async function fetchTranscriptEvent(
+  sessionId: string,
+  eventId: string,
+  signal?: AbortSignal,
+): Promise<TranscriptEvent> {
+  const result = await fetchTranscriptEvents(sessionId, {
+    allBranches: true,
+    includeHiddenEventTypes: true,
+    eventId,
+    limit: 1,
+    includePayload: true,
+  }, signal);
+  const exact = result.events.filter((event) => event.event_id === eventId);
+  if (exact.length !== 1) throw new ApiError(404, { code: "transcript_event_not_found" }, "Transcript event was not found");
+  return exact[0];
+}
+
+export async function mutateTranscriptEvent(
+  sessionId: string,
+  eventId: string,
+  input: TranscriptMutationRequest,
+  signal?: AbortSignal,
+): Promise<TranscriptMutationResult> {
+  const value = await request<unknown>(
+    "POST",
+    `/api/sessions/${encodeURIComponent(sessionId)}/transcript-events/${encodeURIComponent(eventId)}/mutate`,
+    input,
+    signal,
+    false,
+    "no-store",
+  );
+  const record = transcriptRecord(value);
+  const eventValue = record.event ?? (typeof record.event_id === "string" || typeof record.id === "string" ? value : null);
+  return {
+    event: eventValue ? normalizeTranscriptEvent(eventValue) : null,
+    warnings: normalizeTranscriptWarnings(record.warnings),
+  };
 }
 
 export function archiveSession(id: string): Promise<null> {
