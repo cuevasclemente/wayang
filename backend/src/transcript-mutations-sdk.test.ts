@@ -4,12 +4,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import type { CanonicalEntry, CanonicalEntryReplacement } from "./transcript-mutations.js";
+import type { CanonicalEntry } from "./transcript-mutations.js";
 
 interface InstalledMultiEntryCasManager {
   getEntries(): CanonicalEntry[];
   replaceEntriesIfCurrent(
-    replacements: readonly CanonicalEntryReplacement[],
+    replacements: ReadonlyArray<{ expectedEntry: CanonicalEntry; replacement: CanonicalEntry }>,
   ): void | boolean | { replaced: boolean };
 }
 

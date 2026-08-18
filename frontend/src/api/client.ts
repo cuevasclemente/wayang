@@ -1034,6 +1034,11 @@ function normalizeTranscriptEvent(value: unknown): TranscriptEvent {
   delete payload.parentId;
   delete payload.timestamp;
   const mutationStatus = entry.mutation_status;
+  const trustedMutation = transcriptRecord(entry.wayangMutation);
+  const edited = mutationStatus === "edited"
+    || (trustedMutation?.version === 1 && trustedMutation.kind === "edited" && typeof trustedMutation.at === "string");
+  const deleted = mutationStatus === "deleted"
+    || (eventType === "custom" && entry.customType === "wayang-deleted-event-v1");
 
   return {
     event_id: eventId,
@@ -1045,8 +1050,8 @@ function normalizeTranscriptEvent(value: unknown): TranscriptEvent {
     expected_entry: Object.freeze({ ...entry }),
     intent_token: JSON.stringify(entry),
     editable_text: transcriptEditableText(payload),
-    edited: mutationStatus === "edited",
-    deleted: mutationStatus === "deleted",
+    edited,
+    deleted,
     warnings: normalizeTranscriptWarnings(projection.semantic_warnings),
   };
 }

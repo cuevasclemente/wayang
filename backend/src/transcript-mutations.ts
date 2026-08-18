@@ -107,7 +107,7 @@ interface ExpectedEntryCasSessionManager {
   getEntries(): CanonicalEntry[];
   getBranch(): CanonicalEntry[];
   replaceEntriesIfCurrent(
-    replacements: readonly Array<{ expectedEntry: CanonicalEntry; replacement: CanonicalEntry }>,
+    replacements: ReadonlyArray<{ expectedEntry: CanonicalEntry; replacement: CanonicalEntry }>,
   ): void | boolean | { replaced: boolean };
 }
 
