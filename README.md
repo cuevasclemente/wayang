@@ -24,7 +24,7 @@ Read [SECURITY.md](SECURITY.md) before changing the bind address or exposing Way
 - editable Projects with reusable, deployment-defined Agent Profiles
 - project defaults, agent allowlists, memory modes, in-session agent switching, and Protected privacy policy
 - project file browsing and editing surfaces, including guarded root `AGENTS.md` editing
-- scheduled agent jobs and session history search
+- scheduled agent jobs, session history search, and PIN-gated canonical transcript event editing/deletion
 - project-local apps rendered in an Apps pane
 - optional Chromium browser workbench with capability-gated backend-owned interactive agent tools
 - optional text-to-speech integration
@@ -130,6 +130,7 @@ See [docs/configuration.md](docs/configuration.md#data-locations) for exact file
 - Projects and agent profiles: [docs/agents-and-project-settings.md](docs/agents-and-project-settings.md)
 - Project-local apps: [docs/apps-framework.md](docs/apps-framework.md)
 - Session search: [docs/session-history-search.md](docs/session-history-search.md)
+- Transcript event editing/deletion: [docs/transcript-event-mutations.md](docs/transcript-event-mutations.md)
 - Contributions: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Vulnerability reporting: [SECURITY.md](SECURITY.md)
 
