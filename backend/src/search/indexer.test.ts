@@ -200,6 +200,32 @@ test("force reindex picks up file changes even with same mtime", async () => {
   assert.ok(after.results.some((r) => r.session_id === id));
 });
 
+test("transcript mutation fence purges first and blocks watcher/manual stale reindex until released", async () => {
+  const id = seedSession({
+    title: "Mutation fence canary",
+    transcript: [{ role: "user", text: "stale searchable mutation canary" }],
+  });
+  await indexerMod.indexSession(id);
+  assert.ok(searchMod.runSearch("mutation canary").results.some((result) => result.session_id === id));
+
+  indexerMod.beginTranscriptMutationSearchFence(id);
+  try {
+    assert.equal(searchMod.runSearch("mutation canary").results.some((result) => result.session_id === id), false);
+    const blocked = await indexerMod.indexSession(id, { force: true });
+    assert.equal(blocked.skipped, true);
+    assert.equal(blocked.mutationFenced, true);
+    assert.equal(blocked.error, undefined);
+    const db = searchDbMod.getSearchDb();
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?").get(id) as { n: number }).n, 0);
+  } finally {
+    indexerMod.endTranscriptMutationSearchFence(id);
+  }
+
+  const reindexed = await indexerMod.indexSession(id, { force: true });
+  assert.equal(reindexed.skipped, false);
+  assert.ok(searchMod.runSearch("mutation canary").results.some((result) => result.session_id === id));
+});
+
 test("legacy private quarantine excludes stale chunks and blocks indexing despite project drift", async () => {
   const id = seedSession({
     title: "Legacy private quarantine canary",

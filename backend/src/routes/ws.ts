@@ -114,6 +114,10 @@ import { authorizeProjectAction } from "../policy.js";
 import type { AuthService } from "../auth/service.js";
 import { prepareAttachments } from "../attachments.js";
 import { logSessionRuntimeStartFailure } from "../session-runtime-logging.js";
+import {
+  acquireSessionRuntimeMutationLock,
+  releaseSessionRuntimeMutationLock,
+} from "../session-runtime-mutation-lock.js";
 
 export const router = Router();
 
@@ -145,6 +149,22 @@ export function serializeSessionRuntimeState(sessionId: string, selectionId: str
     session_id: sessionId,
     ...(selectionId ? { selection_id: selectionId } : {}),
     bash_mode: getPiSessionBashMode(sessionId),
+  };
+}
+
+/** @internal Exported for transcript-writer lock race tests. */
+export function isSessionClientMutationAllowed(sessionId: string): boolean {
+  return !getRuntimeMutationSessionState(sessionId).mutation_locked;
+}
+
+/** @internal Holds the same exclusion lock for the complete async compaction. */
+export function beginSessionCompactionMutationLease(sessionId: string): (() => void) | null {
+  if (!acquireSessionRuntimeMutationLock(sessionId)) return null;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseSessionRuntimeMutationLock(sessionId);
   };
 }
 
@@ -1079,15 +1099,28 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
     }
 
     case "compact": {
+      const releaseCompactionLease = beginSessionCompactionMutationLease(sessionId);
+      if (!releaseCompactionLease) {
+        sendSafe(ws, { type: "error", error: "Session transcript mutation is in progress" });
+        return true;
+      }
       sendCommandNotice(ws, "Compacting session context…");
-      handle.session.compact(parsed.args.trim() || undefined)
+      let compaction: Promise<unknown>;
+      try {
+        compaction = Promise.resolve(handle.session.compact(parsed.args.trim() || undefined));
+      } catch {
+        releaseCompactionLease();
+        throw new Error("Session compaction could not start");
+      }
+      compaction
         .then(() => {
           sendCommandNotice(ws, "Compaction complete.");
           sendContextUsage(ws, sessionId);
         })
         // AgentSession emits the authoritative structured compaction_end event,
         // including a bounded failure message. Avoid a second generic error.
-        .catch(() => {});
+        .catch(() => {})
+        .finally(releaseCompactionLease);
       return true;
     }
 
@@ -1153,6 +1186,9 @@ async function handleClientMessage(
     if (!row) throw new Error("Session not found");
     if (isLegacyPrivateSessionQuarantined(row)) {
       throw new Error("Quarantined legacy sessions are view-only");
+    }
+    if (!isSessionClientMutationAllowed(sessionId)) {
+      throw new Error("Session transcript mutation is in progress");
     }
     const authorization = authorizeProjectAction({
       cwd: row.cwd,

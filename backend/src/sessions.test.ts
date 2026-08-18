@@ -30,6 +30,7 @@ import {
   getSessionById,
   isLegacyPrivateSessionQuarantined,
   listSessions,
+  markSessionTranscriptMutated,
   normalizeSessionCwd,
   persistManualSessionTitle,
   reconcileSessionTitleFromCatalog,
@@ -40,6 +41,7 @@ import {
   syncPiSessionFiles,
   updatePiSessionFile,
   updateSessionAgentProfile,
+  updateSessionError,
   updateSessionModel,
 } from "./sessions.js";
 
@@ -318,6 +320,39 @@ test("sync restores archived file-linked session after post-archive TUI activity
     } else {
       process.env.WAYANG_DATA_DIR = previousDataDir;
     }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("transcript mutation invalidation clears derived title/error without retaining old text", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-session-transcript-metadata-invalidation-"));
+  const projectDir = path.join(dir, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = dir;
+  try {
+    init();
+    const session = createSession(projectDir);
+    setProvisionalSessionTitle(session.id, "removed synthetic transcript canary");
+    updateSessionError(session.id, "removed synthetic assistant error");
+    updateSessionModel(session.id, "removed-model", "removed-provider");
+    const beforeVersion = getSessionById(session.id)?.catalog_mutation_version ?? 0;
+
+    markSessionTranscriptMutated(session.id);
+
+    const invalidated = getSessionById(session.id)!;
+    assert.equal(invalidated.title, "");
+    assert.equal(invalidated.title_source, "provisional");
+    assert.equal(invalidated.error, null);
+    assert.equal(invalidated.provider, null);
+    assert.equal(invalidated.model, null);
+    assert.equal(invalidated.catalog_fingerprint, null);
+    assert.equal(invalidated.catalog_mutation_version, beforeVersion + 1);
+    assert.equal(JSON.stringify(invalidated).includes("removed synthetic"), false);
+  } finally {
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

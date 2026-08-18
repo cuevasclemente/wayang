@@ -135,6 +135,11 @@ import {
   type FileAudioExperimentRuntime,
 } from "./audio-experiment/types.js";
 import { createFileAudioExperimentRuntime } from "./audio-experiment/tools.js";
+import {
+  acquireSessionRuntimeMutationLock,
+  isSessionRuntimeMutationLocked,
+  releaseSessionRuntimeMutationLock,
+} from "./session-runtime-mutation-lock.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -282,7 +287,6 @@ const sessionBrowserTeardownIntents = new Map<string, SessionBrowserTeardownInte
 const agentSwitches = new Map<string, Promise<AgentSwitchResult>>();
 const runtimeEvents = new EventEmitter();
 const runtimeUnavailableNotifiedHandles = new WeakSet<object>();
-const runtimeMutationLocks = new Set<string>();
 const PROCESS_BOOT_NONCE = randomUUID();
 let idleCleanupTimer: NodeJS.Timeout | null = null;
 
@@ -880,22 +884,20 @@ export function getRuntimeMutationSessionState(id: string): RuntimeMutationSessi
     runtime_status: handle ? "active" : sessionCreations.has(id) ? "starting" : "stopped",
     streaming: Boolean(handle?.session.isStreaming),
     queued: Boolean((handle?.session.pendingMessageCount ?? 0) > 0),
-    mutation_locked: runtimeMutationLocks.has(id),
+    mutation_locked: isSessionRuntimeMutationLocked(id),
   };
 }
 
 export function lockRuntimeMutationSession(id: string): boolean {
-  if (runtimeMutationLocks.has(id)) return false;
-  runtimeMutationLocks.add(id);
-  return true;
+  return acquireSessionRuntimeMutationLock(id);
 }
 
 export function unlockRuntimeMutationSession(id: string): void {
-  runtimeMutationLocks.delete(id);
+  releaseSessionRuntimeMutationLock(id);
 }
 
 function assertRuntimeMutationUnlocked(id: string): void {
-  if (runtimeMutationLocks.has(id)) {
+  if (isSessionRuntimeMutationLocked(id)) {
     throw new WorkspaceStoreError("Session runtime is rebuilding after a settings change", 409);
   }
 }
@@ -2821,7 +2823,12 @@ export async function createPiSession(
   return creation;
 }
 
+export function isPiSessionAgentSwitchInProgress(id: string): boolean {
+  return agentSwitches.has(id);
+}
+
 export async function switchSessionAgent(id: string, targetProfileId: string): Promise<AgentSwitchResult> {
+  assertRuntimeMutationUnlocked(id);
   const inFlight = agentSwitches.get(id);
   if (inFlight) return inFlight;
 
@@ -2838,6 +2845,7 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
     }
 
     const target = await resolveAgentSwitchTarget(row, targetProfileId);
+    assertRuntimeMutationUnlocked(id);
     const from = row.agent_profile_id ? getAgentProfile(row.agent_profile_id) : undefined;
     const preview: AgentSwitchPreview = {
       session_id: id,

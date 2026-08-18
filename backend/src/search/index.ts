@@ -12,6 +12,8 @@ export {
   indexSession,
   reindexAll,
   removeSession,
+  beginTranscriptMutationSearchFence,
+  endTranscriptMutationSearchFence,
   purgePolicyDeniedSessions,
   setIncludeThinking,
   getIncludeThinking,

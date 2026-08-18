@@ -7,6 +7,7 @@ import { removeSession as removeSearchSession } from "../search/indexer.js";
 import { recordLatencyMetric } from "../latency-metrics.js";
 import { listHumanAttentionForSession, type HumanAttentionSummary } from "../human-attention.js";
 import type { Session as ProtocolSession } from "@wayang/protocol";
+import { isSessionRuntimeMutationLocked } from "../session-runtime-mutation-lock.js";
 
 export const router = Router();
 
@@ -170,6 +171,11 @@ router.get("/sessions/:id", (req: Request, res: Response) => {
 // Update session title
 // ---------------------------------------------------------------------------
 
+/** @internal Shared lock projection for focused route race tests. */
+export function isSessionTitleWriteAllowed(sessionId: string): boolean {
+  return !isSessionRuntimeMutationLocked(sessionId);
+}
+
 export function writeStoppedPiSessionName(session: SessionRow, name: string): void {
   if (!session.pi_session_file) return;
   SessionManager.open(session.pi_session_file, undefined, session.cwd).appendSessionInfo(name);
@@ -181,6 +187,10 @@ router.put("/sessions/:id/title", (req: Request, res: Response) => {
     const session = getSessionById(req.params.id);
     if (!session) {
       res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    if (!isSessionTitleWriteAllowed(session.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
       return;
     }
     const live = getPiSession(session.id);
@@ -207,6 +217,10 @@ router.delete("/sessions/:id", async (req: Request, res: Response) => {
       res.status(404).json({ error: "Session not found" });
       return;
     }
+    if (!isSessionTitleWriteAllowed(session.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
+      return;
+    }
     archiveSession(req.params.id);
     await stopPiSession(req.params.id, { kind: "close_session", reason: "archive" });
     res.status(204).end();
@@ -227,6 +241,11 @@ router.post("/sessions/:id/delete", async (req: Request, res: Response) => {
       return;
     }
 
+    if (!isSessionTitleWriteAllowed(session.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
+      return;
+    }
+
     const validation = validateCommandGuardIdentityPin(req.body?.pin);
     if (!validation.ok) {
       res.status(403).json({
@@ -238,6 +257,10 @@ router.post("/sessions/:id/delete", async (req: Request, res: Response) => {
     }
 
     await stopPiSession(req.params.id, { kind: "close_session", reason: "session_delete" });
+    if (!isSessionTitleWriteAllowed(session.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
+      return;
+    }
     await removeSearchSession(req.params.id);
     const deleted = deleteSession(req.params.id);
     if (!deleted) {
@@ -260,6 +283,10 @@ router.post("/sessions/:id/stop", async (req: Request, res: Response) => {
     const session = getSessionById(req.params.id);
     if (!session) {
       res.status(404).json({ error: "Session not found" });
+      return;
+    }
+    if (!isSessionTitleWriteAllowed(session.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
       return;
     }
     await stopPiSession(req.params.id);
@@ -292,6 +319,10 @@ router.put("/sessions/:id/agent", async (req: Request, res: Response) => {
     const agentProfileId = req.body?.agent_profile_id;
     if (typeof agentProfileId !== "string" || !agentProfileId) {
       res.status(400).json({ error: "agent_profile_id is required" });
+      return;
+    }
+    if (!isSessionTitleWriteAllowed(req.params.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
       return;
     }
     const result = await switchSessionAgent(req.params.id, agentProfileId);
@@ -327,6 +358,10 @@ router.put("/sessions/:id/model", async (req: Request, res: Response) => {
       return;
     }
 
+    if (!isSessionTitleWriteAllowed(session.id)) {
+      res.status(409).json({ error: "Session transcript mutation is in progress" });
+      return;
+    }
     if (wantsDefault) {
       await setSessionDefaultModel(req.params.id);
     } else {

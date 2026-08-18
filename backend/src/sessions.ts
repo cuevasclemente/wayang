@@ -1011,6 +1011,32 @@ export function touchSession(id: string): void {
   }
 }
 
+/**
+ * Fence catalog workers after a canonical transcript rewrite. The next scan
+ * must re-read the file and reconcile title/model/activity metadata instead of
+ * committing a pre-mutation fingerprint.
+ */
+export function markSessionTranscriptMutated(id: string): void {
+  const committed = commitStoreMutation((draft) => {
+    const row = draft.sessions.find((candidate) => candidate.id === id);
+    if (!row) throw new WorkspaceStoreError("Session not found", 404);
+    row.catalog_fingerprint = null;
+    // Non-explicit titles and terminal errors are transcript projections. Clear
+    // them before reparsing so removed event text cannot survive in Wayang
+    // metadata or its meta search chunk if reconciliation later fails.
+    if (row.title_source !== "explicit") {
+      row.title = "";
+      row.title_source = "provisional";
+    }
+    row.error = null;
+    row.provider = null;
+    row.model = null;
+    incrementDirectMutation(row);
+    return true;
+  });
+  if (committed) publishDirectMutation(true);
+}
+
 export function updateSessionError(id: string, error: string | null): void {
   const store = getStore();
   for (const row of store.sessions) {

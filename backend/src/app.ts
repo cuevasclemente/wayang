@@ -12,6 +12,8 @@ import { createAuthRouter } from "./auth/routes.js";
 import { init } from "./db.js";
 import { isLoopbackHost } from "./loopback.js";
 import { router as sessionsRouter } from "./routes/sessions.js";
+import { router as transcriptMutationsRouter } from "./routes/transcript-mutations.js";
+import { installTranscriptMutationPinAttempts } from "./transcript-mutations.js";
 import { router as projectsRouter } from "./routes/projects.js";
 import { router as agentProfilesRouter } from "./routes/agent-profiles.js";
 import { router as fsRouter } from "./routes/fs.js";
@@ -256,6 +258,7 @@ export function createApp(options: CreateAppOptions = {}) {
   // `/api/sessions/search` is matched before sessionsRouter's catch-all
   // `/sessions/:id` handler treats "search" as a session id.
   app.use("/api", searchRouter);
+  app.use("/api", transcriptMutationsRouter);
   app.use("/api", sessionsRouter);
   app.use("/api", projectsRouter);
   app.use("/api", agentProfilesRouter);
@@ -378,6 +381,7 @@ export function start() {
   console.log(`[db] Store at ${config.dbPath}`);
   const workspaceCapabilities = createProductionWorkspaceCapabilityBootstrap(authService, config);
   installActionApprovalPinAttempts(workspaceCapabilities.pinAttempts);
+  installTranscriptMutationPinAttempts(workspaceCapabilities.pinAttempts);
   const protectedAutomation = bootstrapProtectedAutomationProduction({
     dataDir: config.dataDir,
     credentialBroker,

@@ -27,6 +27,7 @@ export interface IndexResult {
   chunkCount: number;
   skipped: boolean;
   policySkipped?: boolean;
+  mutationFenced?: boolean;
   error?: string;
 }
 
@@ -44,6 +45,7 @@ export interface IndexerOptions {
 }
 
 let _includeThinking = false;
+const transcriptMutationFences = new Set<string>();
 
 export function setIncludeThinking(v: boolean): void {
   _includeThinking = v;
@@ -72,6 +74,10 @@ export async function indexSession(
   sessionId: string,
   options: IndexerOptions = {},
 ): Promise<IndexResult> {
+  if (transcriptMutationFences.has(sessionId)) {
+    purgeSessionIndex(sessionId);
+    return { sessionId, chunkCount: 0, skipped: true, mutationFenced: true };
+  }
   const row = await loadSessionRow(sessionId);
   if (!row) {
     return { sessionId, chunkCount: 0, skipped: true, error: "session not found" };
@@ -102,6 +108,10 @@ export async function indexSession(
 
   // Recheck after stat and before the unchanged shortcut so a policy change
   // cannot preserve stale searchable content merely because bytes are stable.
+  if (transcriptMutationFences.has(sessionId)) {
+    purgeSessionIndex(sessionId);
+    return { sessionId, chunkCount: 0, skipped: true, mutationFenced: true };
+  }
   const postStatDenial = policyDenial(row);
   if (postStatDenial) return purgePolicyDeniedSession(sessionId, postStatDenial);
 
@@ -176,6 +186,10 @@ export async function indexSession(
 
   // chunkJsonlFile yields while streaming. Reauthorize after all transcript
   // bytes have been processed and before any derived text is committed.
+  if (transcriptMutationFences.has(sessionId)) {
+    purgeSessionIndex(sessionId);
+    return { sessionId, chunkCount: 0, skipped: true, mutationFenced: true };
+  }
   const preCommitDenial = policyDenial(row);
   if (preCommitDenial) return purgePolicyDeniedSession(sessionId, preCommitDenial);
 
@@ -246,6 +260,24 @@ export async function indexSession(
 
 export async function removeSession(sessionId: string): Promise<void> {
   purgeSessionIndex(sessionId);
+}
+
+/** Prevent watcher/manual indexing from republishing stale text during rewrite. */
+export function beginTranscriptMutationSearchFence(sessionId: string): void {
+  if (transcriptMutationFences.has(sessionId)) {
+    throw new Error("A transcript mutation search fence is already active");
+  }
+  transcriptMutationFences.add(sessionId);
+  try {
+    purgeSessionIndex(sessionId);
+  } catch (error) {
+    transcriptMutationFences.delete(sessionId);
+    throw error;
+  }
+}
+
+export function endTranscriptMutationSearchFence(sessionId: string): void {
+  transcriptMutationFences.delete(sessionId);
 }
 
 export function purgePolicyDeniedSessions(): { purged: number; errors: number } {
