@@ -3,30 +3,43 @@ import assert from "node:assert/strict";
 import type { PiSessionHandle } from "../pi-bridge.js";
 import { resolveWebSocketRuntimeHandle } from "./ws.js";
 
-function handle(denied = false): PiSessionHandle {
-  return { capabilityAuthorityDenied: denied } as PiSessionHandle;
+function handle(denied?: true): PiSessionHandle {
+  return (denied ? { capabilityAuthorityDenied: true } : {}) as PiSessionHandle;
 }
 
-test("passive reconnect rebuilds a denied live runtime", async () => {
+test("passive reconnect rebuilds denied and revoked live runtimes", async () => {
   const denied = handle(true);
-  const replacement = handle(false);
-  let creates = 0;
+  const revoked = {
+    protectedBrowserRuntime: {
+      preflight: () => ({ allowed: false, reason: "synthetic revoked runtime" }),
+    },
+  } as unknown as PiSessionHandle;
+  const deniedReplacement = handle();
+  const revokedReplacement = handle();
+  let deniedCreates = 0;
+  let revokedCreates = 0;
 
-  const resolved = await resolveWebSocketRuntimeHandle(denied, false, async () => {
-    creates += 1;
-    return replacement;
+  const deniedResolved = await resolveWebSocketRuntimeHandle(denied, false, async () => {
+    deniedCreates += 1;
+    return deniedReplacement;
+  });
+  const revokedResolved = await resolveWebSocketRuntimeHandle(revoked, false, async () => {
+    revokedCreates += 1;
+    return revokedReplacement;
   });
 
-  assert.equal(creates, 1);
-  assert.equal(resolved, replacement);
+  assert.equal(deniedCreates, 1);
+  assert.equal(revokedCreates, 1);
+  assert.equal(deniedResolved, deniedReplacement);
+  assert.equal(revokedResolved, revokedReplacement);
 });
 
 test("passive selection preserves healthy or stopped runtime state", async () => {
-  const healthy = handle(false);
+  const healthy = handle();
   let creates = 0;
   const create = async () => {
     creates += 1;
-    return handle(false);
+    return handle();
   };
 
   assert.equal(await resolveWebSocketRuntimeHandle(healthy, false, create), healthy);
@@ -35,8 +48,8 @@ test("passive selection preserves healthy or stopped runtime state", async () =>
 });
 
 test("pre-message ensure delegates healthy runtime revalidation to creation", async () => {
-  const healthy = handle(false);
-  const replacement = handle(false);
+  const healthy = handle();
+  const replacement = handle();
   let creates = 0;
 
   const resolved = await resolveWebSocketRuntimeHandle(healthy, true, async () => {
@@ -50,10 +63,11 @@ test("pre-message ensure delegates healthy runtime revalidation to creation", as
 
 test("failed stale-runtime replacement never falls back to the denied handle", async () => {
   const denied = handle(true);
+  const creationError = new Error("fresh authority unavailable");
   await assert.rejects(
     resolveWebSocketRuntimeHandle(denied, false, async () => {
-      throw new Error("fresh authority unavailable");
+      throw creationError;
     }),
-    /fresh authority unavailable/,
+    (error) => error === creationError,
   );
 });
