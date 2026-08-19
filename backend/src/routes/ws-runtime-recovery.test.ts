@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { PiSessionHandle } from "../pi-bridge.js";
-import { resolveWebSocketRuntimeHandle } from "./ws.js";
+import { requireWebSocketRuntimeAttachment, resolveWebSocketRuntimeHandle } from "./ws.js";
 
 function handle(denied?: true): PiSessionHandle {
   return (denied ? { capabilityAuthorityDenied: true } : {}) as PiSessionHandle;
@@ -70,4 +70,21 @@ test("failed stale-runtime replacement never falls back to the denied handle", a
     }),
     (error) => error === creationError,
   );
+});
+
+test("runtime attachment gates dispatch on a successful attach result", async () => {
+  let dispatches = 0;
+
+  await assert.rejects(
+    requireWebSocketRuntimeAttachment(async () => false).then(() => {
+      dispatches += 1;
+    }),
+    {
+      name: "Error",
+      message: "Session selection changed before runtime attachment completed",
+    },
+  );
+  assert.equal(dispatches, 0);
+
+  await assert.doesNotReject(requireWebSocketRuntimeAttachment(async () => true));
 });

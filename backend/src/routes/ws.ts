@@ -158,6 +158,15 @@ export async function resolveWebSocketRuntimeHandle(
   return create();
 }
 
+/** @internal Exported for runtime-attachment regression tests. */
+export async function requireWebSocketRuntimeAttachment(
+  attach: () => Promise<boolean>,
+): Promise<void> {
+  if (!await attach()) {
+    throw new Error("Session selection changed before runtime attachment completed");
+  }
+}
+
 /** @internal Exported for focused wire-contract tests. */
 export function serializeSessionRuntimeState(sessionId: string, selectionId: string | null): SessionRuntimeStateMessage {
   return {
@@ -989,9 +998,13 @@ function handleConnection(
       return;
     }
 
-    handleClientMessage(ws, currentSessionId, currentSelectionId, msg, async () => {
-      await attachLiveSession(currentSessionId, setupVersion, true, currentSelectionId, false);
-    });
+    handleClientMessage(
+      ws,
+      currentSessionId,
+      currentSelectionId,
+      msg,
+      () => attachLiveSession(currentSessionId, setupVersion, true, currentSelectionId, false),
+    );
   };
 
   runtimeEventUnsub = onPiSessionRuntimeEvent((event) => {
@@ -1263,7 +1276,7 @@ async function handleClientMessage(
   sessionId: string,
   selectionId: string | null,
   msg: any,
-  ensureLiveSession: () => Promise<void>,
+  ensureLiveSession: () => Promise<boolean>,
 ): Promise<void> {
   try {
     const row = getSessionById(sessionId);
@@ -1294,7 +1307,7 @@ async function handleClientMessage(
         touchSession(sessionId);
 
         try {
-          await ensureLiveSession();
+          await requireWebSocketRuntimeAttachment(ensureLiveSession);
           updateSessionError(sessionId, null);
         } catch (err: any) {
           throw new Error(safeSessionError(sessionId, err, "Failed to start pi session: "));
@@ -1395,7 +1408,7 @@ async function handleClientMessage(
         if (!messageId) throw new Error("resend requires message_id");
 
         try {
-          await ensureLiveSession();
+          await requireWebSocketRuntimeAttachment(ensureLiveSession);
           updateSessionError(sessionId, null);
         } catch (err: any) {
           throw new Error(safeSessionError(sessionId, err, "Failed to start pi session: "));
@@ -1451,7 +1464,7 @@ async function handleClientMessage(
       }
 
       case "command_guard": {
-        await ensureLiveSession();
+        await requireWebSocketRuntimeAttachment(ensureLiveSession);
         const mode = normalizeCommandGuardMode(msg.mode);
         const state = mode
           ? setCommandGuardMode(sessionId, mode, { announce: msg.announce !== false, pin: typeof msg.pin === "string" ? msg.pin : undefined })
