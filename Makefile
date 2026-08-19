@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help doctor bootstrap install configure local-https-check local-https setup-capability-approval pi-login browser-credentials-unlock build start dev test test-scripts test-e2e install-e2e-browser check smoke
+.PHONY: help doctor bootstrap install configure local-https-check local-https setup-capability-approval setup-historical-agent-activation setup-historical-agent-activation-status pi-login browser-credentials-unlock build start dev test test-scripts test-e2e install-e2e-browser check smoke
 
 help: ## Show this help (the safe, non-mutating default)
 	@printf '%s\n' 'Wayang v0.1 source-checkout commands:'
@@ -31,6 +31,12 @@ local-https: ## Run the optional Caddy HTTPS reverse proxy in the foreground
 
 setup-capability-approval: ## Optional manual preflight; service startup initializes missing cooldown state automatically
 	@node scripts/run-with-env.mjs -- node scripts/setup-capability-approval.mjs
+
+setup-historical-agent-activation: ## Explicitly activate the one historical agent home; never normal/secondary-host setup
+	@node scripts/setup-historical-agent-activation.mjs
+
+setup-historical-agent-activation-status: ## Check deployment-local historical activation metadata without reading the PIN
+	@node scripts/setup-historical-agent-activation.mjs --status
 
 pi-login: ## Start the checkout's pi CLI for an interactive /login
 	@test -x backend/node_modules/.bin/pi || { printf '%s\n' 'Local pi is missing; run make install first.' >&2; exit 1; }

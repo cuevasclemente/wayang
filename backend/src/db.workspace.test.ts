@@ -8,7 +8,7 @@ import { close, flush, getStore, getWorkspaceCapabilityStoreProjectionPath, init
 import { createProject } from "./projects.js";
 import { createSession } from "./sessions.js";
 import { commitWorkspaceCapabilityActivation } from "./workspace-capabilities.js";
-import { NEUTRAL_AGENT_PROFILE_ID, STORE_SCHEMA_VERSION, WREN_AGENT_PROFILE_ID } from "./workspace-types.js";
+import { STORE_SCHEMA_VERSION, WREN_AGENT_PROFILE_ID } from "./workspace-types.js";
 
 function legacySession(id: string, cwd: string) {
   return {
@@ -58,7 +58,7 @@ function backups(dir: string): string[] {
   return fs.readdirSync(dir).filter((name) => name.startsWith("store.json.backup-v"));
 }
 
-test("legacy migration is private, canonical, seeded, and idempotent", () => withDataDir((dir) => {
+test("legacy migration is private, canonical, identity-neutral, and idempotent", () => withDataDir((dir) => {
   const project = path.join(dir, "project");
   const alias = path.join(dir, "project-alias");
   fs.mkdirSync(project);
@@ -72,9 +72,17 @@ test("legacy migration is private, canonical, seeded, and idempotent", () => wit
   init();
   const migrated = getStore();
   assert.equal(migrated.schema_version, STORE_SCHEMA_VERSION);
-  assert.deepEqual(migrated.agentProfiles.map((profile) => profile.id).sort(), [NEUTRAL_AGENT_PROFILE_ID, WREN_AGENT_PROFILE_ID].sort());
+  assert.equal(migrated.agentProfiles.length, 1);
+  const defaultProfile = migrated.agentProfiles[0]!;
+  assert.equal(defaultProfile.id, migrated.workspaceSettings.default_agent_profile_id);
+  assert.notEqual(defaultProfile.id, WREN_AGENT_PROFILE_ID);
+  assert.equal(defaultProfile.name, "Default");
+  assert.equal(defaultProfile.builtin_kind, null);
+  assert.equal(defaultProfile.resource_mode, "project_only");
+  assert.equal(defaultProfile.memory_access, "none");
   assert.equal(migrated.projects.length, 1);
   assert.equal(migrated.projects[0]?.cwd, fs.realpathSync.native(project));
+  assert.equal(migrated.projects[0]?.default_agent_profile_id, defaultProfile.id);
   assert.deepEqual(migrated.sessions.map((session) => session.agent_profile_id), [null, null]);
   assert.deepEqual(migrated.sessions.map((session) => session.pending_agent_switch), [null, null]);
   const firstProjectId = migrated.projects[0]?.id;
@@ -97,6 +105,7 @@ test("schema 3 migrates through current schema with no messaging or browser auth
   close();
   const schemaThree = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, unknown>;
   schemaThree.schema_version = 3;
+  delete schemaThree.historicalAgentCutovers;
   delete schemaThree.transcriptRecoveryJournal;
   delete schemaThree.messagingEndpoints;
   delete schemaThree.messagingEvents;
@@ -120,6 +129,21 @@ test("schema 3 migrates through current schema with no messaging or browser auth
   assert.deepEqual(migrated.sessionBrowserStates, []);
   assert.deepEqual(migrated.browserCleanups, []);
   assert.equal(backups(dir).filter((name) => name.includes("backup-v3-")).length, 1);
+}));
+
+test("schema 7 migrates backup-first to schema 8 with no historical cutover authority", () => withDataDir((dir) => {
+  init();
+  const storePath = path.join(dir, "store.json");
+  const schemaSeven = JSON.parse(fs.readFileSync(storePath, "utf8")) as Record<string, unknown>;
+  close();
+  schemaSeven.schema_version = 7;
+  delete schemaSeven.historicalAgentCutovers;
+  fs.writeFileSync(storePath, JSON.stringify(schemaSeven));
+
+  init();
+  assert.equal(getStore().schema_version, STORE_SCHEMA_VERSION);
+  assert.deepEqual(getStore().historicalAgentCutovers, []);
+  assert.equal(backups(dir).filter((name) => name.includes("backup-v7-")).length, 1);
 }));
 
 test("legacy migration defaults omitted nullable session provider", () => withDataDir((dir) => {
@@ -198,7 +222,7 @@ test("current-schema structural corruption aborts without normalization", () => 
   assert.equal(fs.readFileSync(storePath, "utf-8"), malformedCurrent);
 }));
 
-test("gate-off new stores use schema 7 with one generic restricted workspace default and empty Browser catalog", () => withDataDir((dir) => {
+test("gate-off new stores use schema 8 with one generic restricted workspace default and empty Browser catalog", () => withDataDir((dir) => {
   init();
   const store = getStore();
   assert.equal(store.agentProfiles.length, 1);
@@ -210,7 +234,7 @@ test("gate-off new stores use schema 7 with one generic restricted workspace def
   assert.deepEqual(store.workspaceCapabilityAssociations, []);
   assert.deepEqual(store.workspaceCapabilityApprovalEvents, []);
   const persisted = JSON.parse(fs.readFileSync(path.join(dir, "store.json"), "utf-8"));
-  assert.equal(persisted.schema_version, 7);
+  assert.equal(persisted.schema_version, STORE_SCHEMA_VERSION);
   assert.deepEqual(persisted.browserProfiles, []);
   assert.deepEqual(persisted.projectBrowserDefaults, []);
   assert.deepEqual(persisted.sessionBrowserStates, []);
@@ -219,6 +243,7 @@ test("gate-off new stores use schema 7 with one generic restricted workspace def
   assert.equal(persisted.agentProfiles.length, 1);
   assert.deepEqual(persisted.workspaceCapabilityAssociations, []);
   assert.deepEqual(persisted.workspaceCapabilityApprovalEvents, []);
+  assert.deepEqual(persisted.historicalAgentCutovers, []);
 }));
 
 test("exact capability projection contains only its model-independent project/profile pair and no approval or instruction evidence", () => withDataDir((dir) => {

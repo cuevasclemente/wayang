@@ -22,6 +22,7 @@ import {
   revokeWorkspaceCapabilityAssociation,
 } from "./workspace-capabilities.js";
 import { capabilityPairRuntimeSessionIds } from "./runtime-impact.js";
+import { STORE_SCHEMA_VERSION } from "./workspace-types.js";
 
 let dataDir = "";
 let projectRoot = "";
@@ -340,6 +341,7 @@ test("schema-1 migration creates zero positive authority and removes subject aut
   delete initial.workspaceSettings;
   delete initial.workspaceCapabilityAssociations;
   delete initial.workspaceCapabilityApprovalEvents;
+  delete initial.historicalAgentCutovers;
   delete initial.transcriptRecoveryJournal;
   delete initial.protectedAutomationJobs;
   delete initial.protectedAutomationRuns;
@@ -375,9 +377,10 @@ test("schema-1 migration creates zero positive authority and removes subject aut
 
   init();
   const migrated = getStore();
-  assert.equal(migrated.schema_version, 7);
+  assert.equal(migrated.schema_version, STORE_SCHEMA_VERSION);
   assert.deepEqual(migrated.workspaceCapabilityAssociations, []);
   assert.deepEqual(migrated.workspaceCapabilityApprovalEvents, []);
+  assert.deepEqual(migrated.historicalAgentCutovers, []);
   assert.deepEqual(migrated.protectedAutomationJobs, []);
   assert.deepEqual(migrated.protectedAutomationRuns, []);
   assert.deepEqual(migrated.messagingEndpoints, []);

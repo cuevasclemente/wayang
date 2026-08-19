@@ -31,6 +31,7 @@ import {
   getWayangCheckoutSecretPaths,
   LEGACY_ATTACHMENT_ROOT,
 } from "./protected-artifacts.js";
+import { installSyntheticLegacyAgentActivation } from "./legacy-agent-activation.test-helper.js";
 import { WREN_AGENT_PROFILE_ID, type AgentProfileRow } from "./workspace-types.js";
 import { WAYANG_RUNTIME_CONTEXT_TOOL_NAME } from "./wayang-runtime-context.js";
 import { RESTRICTED_MCP_TOOL_NAME, type RestrictedMcpRuntime } from "./restricted-mcp/index.js";
@@ -54,6 +55,7 @@ function fixture(name: string): {
   process.env.WAYANG_DATA_DIR = path.join(dir, "data");
   process.env.PI_CODING_AGENT_DIR = agentDir;
   process.env.PI_CODING_AGENT_SESSION_DIR = path.join(agentDir, "sessions");
+  const restoreActivation = installSyntheticLegacyAgentActivation(path.join(dir, "config"));
   init();
   return {
     dir,
@@ -61,6 +63,7 @@ function fixture(name: string): {
     agentDir,
     cleanup() {
       close();
+      restoreActivation();
       if (previousData === undefined) delete process.env.WAYANG_DATA_DIR;
       else process.env.WAYANG_DATA_DIR = previousData;
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

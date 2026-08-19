@@ -15,7 +15,7 @@ export {
 // ---------------------------------------------------------------------------
 
 export type SessionRuntimeStatus = "active" | "starting" | "stopped";
-export type BashMode = "host" | "sandboxed" | "sandboxed-wren" | "unavailable";
+export type BashMode = "host" | "sandboxed" | "masked-host-workspace" | "unavailable";
 export type BrowserSurfaceMode = "standard" | "protected" | "unavailable";
 export type BrowserAgentReasonCode =
   | "approval_required"
@@ -748,6 +748,7 @@ export function fetchCapabilities(cwd?: string | null): Promise<{ cwd: string | 
 
 export const WORKSPACE_CAPABILITY_IDS = [
   "wayang.standard-resources.v1",
+  "wayang.masked-host-workspace.v1",
   "wayang.standard-browser.v1",
   "wayang.host-execution.v1",
   "wayang.protected-browser.v1",

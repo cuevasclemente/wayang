@@ -15,7 +15,8 @@ import {
   getBashSandboxAvailability,
   selectWayangBashMode,
 } from "./sandbox-bash.js";
-import { isLegacyWrenStandardRuntime } from "./legacy-wren.js";
+import { installSyntheticLegacyAgentActivation } from "./legacy-agent-activation.test-helper.js";
+import { isLegacyWrenStandardRuntime, isLegacyWrenStandardRuntimeIdentity } from "./legacy-wren.js";
 import { createSession, updatePiSessionFile } from "./sessions.js";
 import { getPiAgentRoot, getSessionAttachmentRoot, LEGACY_ATTACHMENT_ROOT } from "./protected-artifacts.js";
 import type { SandboxNetworkMode } from "./sandbox-exec-protocol.js";
@@ -466,6 +467,48 @@ test("sandbox global Pi visibility requires the live standard-resources pair ass
   assert.equal(revoked.config.filesystem.allowRead?.includes(exactProjection), false);
 });
 
+test("generic masked-host capability pair receives broad sandbox policy without identity predicates", () => {
+  close();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-generic-masked-workspace-"));
+  const cwd = path.join(root, "project");
+  fs.mkdirSync(cwd);
+  const previousData = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = path.join(root, "data");
+  try {
+    init();
+    const profile = createAgentProfile({ name: "Generic maintenance profile" });
+    const project = createProject({
+      cwd,
+      default_agent_profile_id: profile.id,
+      access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [profile.id] },
+    });
+    const session = createSession(cwd, { agentProfileId: profile.id });
+    commitWorkspaceCapabilityActivation({
+      capability_id: "wayang.standard-resources.v1",
+      project_id: project.id,
+      agent_profile_id: profile.id,
+      operation_digest: "c".repeat(64),
+    });
+    assert.equal(buildBashSandboxPolicy(session.id).config.network.allowAllUnixSockets, false);
+    commitWorkspaceCapabilityActivation({
+      capability_id: "wayang.masked-host-workspace.v1",
+      project_id: project.id,
+      agent_profile_id: profile.id,
+      operation_digest: "d".repeat(64),
+    });
+    const policy = buildBashSandboxPolicy(session.id);
+    assert.equal(policy.config.network.allowAllUnixSockets, true);
+    assert.equal(policy.config.filesystem.allowGitConfig, true);
+    assert.deepEqual(policy.config.filesystem.allowWrite, [path.parse(fs.realpathSync(cwd)).root]);
+    assert.equal(policy.deniedWriteRoots.includes(path.join(fs.realpathSync(cwd), ".pi")), false);
+  } finally {
+    close();
+    if (previousData === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousData;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("only exact seeded Wren receives broad Standard compatibility, including scheduled runs", () => {
   const session = {
     agent_profile_id: WREN_AGENT_PROFILE_ID,
@@ -477,18 +520,20 @@ test("only exact seeded Wren receives broad Standard compatibility, including sc
   };
   const profile = { id: WREN_AGENT_PROFILE_ID, builtin_kind: "wren" as const, enabled: true };
   const project = { access_policy: { privacy_mode: "standard" as const, allowed_agent_profile_ids: null } };
-  const allowed = () => isLegacyWrenStandardRuntime({ session, profile, project });
+  const allowed = () => isLegacyWrenStandardRuntimeIdentity({ session, profile, project });
 
   assert.equal(allowed(), true);
-  assert.equal(isLegacyWrenStandardRuntime({
+  assert.equal(isLegacyWrenStandardRuntime({ session, profile, project }, { active: false }), false);
+  assert.equal(isLegacyWrenStandardRuntime({ session, profile, project }, { active: true }), true);
+  assert.equal(isLegacyWrenStandardRuntimeIdentity({
     session: { ...session, scheduled_job_id: "scheduled-job", scheduled_run_id: "scheduled-run" },
     profile,
     project,
   }), true);
-  assert.equal(isLegacyWrenStandardRuntime({ session, profile: { ...profile, id: "lookalike" }, project }), false);
-  assert.equal(isLegacyWrenStandardRuntime({ session, profile: { ...profile, builtin_kind: null }, project }), false);
-  assert.equal(isLegacyWrenStandardRuntime({ session: { ...session, pending_agent_switch: {} as never }, profile, project }), false);
-  assert.equal(isLegacyWrenStandardRuntime({
+  assert.equal(isLegacyWrenStandardRuntimeIdentity({ session, profile: { ...profile, id: "lookalike" }, project }), false);
+  assert.equal(isLegacyWrenStandardRuntimeIdentity({ session, profile: { ...profile, builtin_kind: null }, project }), false);
+  assert.equal(isLegacyWrenStandardRuntimeIdentity({ session: { ...session, pending_agent_switch: {} as never }, profile, project }), false);
+  assert.equal(isLegacyWrenStandardRuntimeIdentity({
     session,
     profile,
     project: { access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [profile.id] } },
@@ -508,6 +553,7 @@ test("exact Wren sandbox spans ordinary host paths while masking every Protected
   fs.mkdirSync(standardRoot);
   fs.mkdirSync(protectedRoot);
   const previousData = process.env.WAYANG_DATA_DIR;
+  const restoreActivation = installSyntheticLegacyAgentActivation(path.join(root, "config"));
   process.env.WAYANG_DATA_DIR = path.join(root, "data");
   init();
   const now = Date.now();
@@ -543,6 +589,7 @@ test("exact Wren sandbox spans ordinary host paths while masking every Protected
   const session = createSession(standardRoot, { agentProfileId: WREN_AGENT_PROFILE_ID });
   t.after(() => {
     close();
+    restoreActivation();
     if (previousData === undefined) delete process.env.WAYANG_DATA_DIR;
     else process.env.WAYANG_DATA_DIR = previousData;
     fs.rmSync(root, { recursive: true, force: true });

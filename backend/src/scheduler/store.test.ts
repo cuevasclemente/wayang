@@ -51,11 +51,20 @@ test("legacy scheduled jobs migrate with a null agent profile", () => {
   try {
     init();
     assert.equal(getScheduledJob(legacyJob.id)?.agent_profile_id, null);
+    assert.equal(getStore().agentProfiles.length, 1);
+    assert.equal(getStore().agentProfiles[0]?.builtin_kind, null);
+    assert.equal(getStore().agentProfiles[0]?.resource_mode, "project_only");
+    assert.equal(getStore().agentProfiles[0]?.memory_access, "none");
     close();
     const persisted = JSON.parse(fs.readFileSync(path.join(dir, "store.json"), "utf-8")) as {
       scheduledJobs: Array<{ agent_profile_id?: string | null }>;
+      workspaceSettings: { default_agent_profile_id: string };
+      agentProfiles: Array<{ id: string; builtin_kind: string | null }>;
     };
     assert.equal(persisted.scheduledJobs[0]?.agent_profile_id, null);
+    assert.equal(persisted.agentProfiles.length, 1);
+    assert.equal(persisted.agentProfiles[0]?.id, persisted.workspaceSettings.default_agent_profile_id);
+    assert.equal(persisted.agentProfiles[0]?.builtin_kind, null);
   } finally {
     close();
     if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;

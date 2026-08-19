@@ -61,6 +61,8 @@ The human types `/login`, selects the provider, completes browser/device authori
 
 If the human uses reviewed privileged workspace capabilities, Wayang reuses the command guard's existing identity PIN; normal PIN entry in the approval UI is the human authorization action. The deployed service automatically creates missing non-secret attempt/cooldown state under `WAYANG_DATA_DIR` with owner-only permissions on startup and preserves it across reboots. Capability associations, deterministic jobs, and schedules persist in the service store; restart is needed only when deploying new code. `make setup-capability-approval` is an optional human-run preflight/migration, not installation or activation setup. The agent must not create a PIN, inspect either file, or substitute ad-hoc shell redirection for the supported command.
 
+Normal installation must **not** run `make setup-historical-agent-activation`. That command exists only for an explicit continuity decision on the one designated historical-agent home and requires hidden local PIN entry. Fresh and secondary deployments remain identity-neutral with no activation witness; copying a store, profile name, or project configuration does not authorize activation.
+
 After handoff, the agent may check only metadata with `make doctor`. A successful configuration file should exist with mode `0600`. Doctor may report PIN and cooldown metadata readiness, but missing or unsafe PIN metadata and unsafe or malformed existing cooldown state must remain fail-closed and must not be replaced. Their contents remain off limits.
 
 ### 4. Validate

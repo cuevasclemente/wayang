@@ -15,7 +15,7 @@
 // ---------------------------------------------------------------------------
 
 /** Live runtime execution mode for the session's bash tool. */
-export type BashMode = "host" | "sandboxed" | "sandboxed-wren" | "unavailable";
+export type BashMode = "host" | "sandboxed" | "masked-host-workspace" | "unavailable";
 
 /** Whether the session's project exposes the embedded browser workbench. */
 export type BrowserSurfaceMode = "standard" | "protected" | "unavailable";

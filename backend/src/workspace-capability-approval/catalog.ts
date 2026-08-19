@@ -21,6 +21,19 @@ const CAPABILITIES: Readonly<Record<WorkspaceCapabilityId, CompiledWorkspaceCapa
       "The association applies across runtime implementation changes and only to fresh authorized runtime handles.",
     ]),
   }),
+  "wayang.masked-host-workspace.v1": Object.freeze({
+    id: "wayang.masked-host-workspace.v1",
+    compatiblePrivacyMode: "standard",
+    activationAvailable: true,
+    title: "Masked host workspace",
+    riskSummary: "Allows broad ordinary-host filesystem and Unix-IPC access through the sandbox when Standard resources is also active for this exact pair.",
+    consequences: Object.freeze([
+      "The pair may read and write ordinary same-user host paths, update Git/Pi project configuration, and use visible Unix-domain services.",
+      "Registered Protected projects and protected backing/control-plane artifacts remain masked, but this is cooperative same-user policy rather than containment.",
+      "The capability is ineffective without a simultaneous active Standard resources association for the same Project-Agent pair.",
+      "Eligible scheduled sessions receive the same masked-host workspace authority.",
+    ]),
+  }),
   "wayang.standard-browser.v1": Object.freeze({
     id: "wayang.standard-browser.v1",
     compatiblePrivacyMode: "standard",

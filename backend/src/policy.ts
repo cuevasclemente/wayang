@@ -8,6 +8,8 @@ import {
   type AgentProfileRow,
   type ProjectRow,
 } from "./workspace-types.js";
+import { getLegacyAgentActivationStatus } from "./legacy-agent-activation.js";
+import { isExactLegacyWrenProfile } from "./legacy-wren.js";
 import { getPolicyGeneration } from "./policy-generation.js";
 export { getPolicyGeneration, notifyPolicyChanged, onPolicyChanged } from "./policy-generation.js";
 
@@ -17,7 +19,7 @@ export type SessionConfigPurpose = "create" | "switch" | "resume" | "scheduled";
 export interface ProjectAuthorizationDecision {
   allowed: boolean;
   reason?: string;
-  code?: "project_not_registered" | "profile_not_found" | "profile_disabled" | "agent_not_allowed" | "protected_actor_denied";
+  code?: "project_not_registered" | "profile_not_found" | "profile_disabled" | "profile_activation_missing" | "agent_not_allowed" | "protected_actor_denied";
   project?: ProjectRow;
   agentProfile?: AgentProfileRow;
 }
@@ -48,6 +50,15 @@ export function authorizeProjectAction(options: {
   }
   if (!agentProfile.enabled) {
     return { allowed: false, code: "profile_disabled", reason: "Agent profile is disabled", project, agentProfile };
+  }
+  if (isExactLegacyWrenProfile(agentProfile) && !getLegacyAgentActivationStatus().active) {
+    return {
+      allowed: false,
+      code: "profile_activation_missing",
+      reason: "This historical agent profile is inactive on this Wayang deployment",
+      project,
+      agentProfile,
+    };
   }
 
   if (!projectAllowsAgentProfile(project, agentProfile.id)) {

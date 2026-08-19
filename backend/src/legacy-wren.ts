@@ -1,4 +1,5 @@
 import type { SessionRow } from "./sessions.js";
+import { getLegacyAgentActivationStatus, type LegacyAgentActivationStatus } from "./legacy-agent-activation.js";
 import { WREN_AGENT_PROFILE_ID, type AgentProfileRow, type ProjectRow } from "./workspace-types.js";
 
 export function isExactLegacyWrenProfile(
@@ -12,12 +13,7 @@ export function isExactLegacyWrenProfile(
   );
 }
 
-/**
- * Preserve pre-policy Wren behavior only for the immutable migration-seeded
- * profile in a Standard project. Scheduled runs are eligible. A durable agent
- * switch must finish before the target receives this compatibility authority.
- */
-export function isLegacyWrenStandardRuntime(input: {
+export interface LegacyWrenStandardRuntimeInput {
   session: Pick<
     SessionRow,
     | "agent_profile_id"
@@ -29,7 +25,10 @@ export function isLegacyWrenStandardRuntime(input: {
   >;
   profile: Pick<AgentProfileRow, "id" | "builtin_kind" | "enabled">;
   project: Pick<ProjectRow, "access_policy">;
-}): boolean {
+}
+
+/** Historical row/session classifier only. It never authorizes a runtime. */
+export function isLegacyWrenStandardRuntimeIdentity(input: LegacyWrenStandardRuntimeInput): boolean {
   const { session, profile, project } = input;
   return isExactLegacyWrenProfile(profile)
     && session.agent_profile_id === profile.id
@@ -37,4 +36,16 @@ export function isLegacyWrenStandardRuntime(input: {
     && session.legacy_private_session_quarantine === false
     && session.legacy_capability_ineligible === false
     && project.access_policy.privacy_mode === "standard";
+}
+
+/**
+ * Preserve pre-policy compatibility only on an explicitly activated deployment.
+ * Scheduled runs remain eligible so provisioning cannot silently narrow the
+ * active home's historical behavior. Store/profile rows alone are insufficient.
+ */
+export function isLegacyWrenStandardRuntime(
+  input: LegacyWrenStandardRuntimeInput,
+  activation: Pick<LegacyAgentActivationStatus, "active"> = getLegacyAgentActivationStatus(),
+): boolean {
+  return activation.active && isLegacyWrenStandardRuntimeIdentity(input);
 }

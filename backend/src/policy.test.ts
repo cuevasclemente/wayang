@@ -4,7 +4,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createAgentProfile } from "./agent-profiles.js";
-import { close, init } from "./db.js";
+import { close, commitStoreMutation, getStore, init } from "./db.js";
+import { installSyntheticLegacyAgentActivation } from "./legacy-agent-activation.test-helper.js";
 import { createProject, updateProject } from "./projects.js";
 import {
   authorizeProjectAction,
@@ -16,6 +17,8 @@ import {
   projectAllowsAgentProfile,
   resolveEffectiveSessionConfig,
 } from "./policy.js";
+import { resolveWorkspaceCapability } from "./workspace-capabilities.js";
+import { WREN_AGENT_PROFILE_ID } from "./workspace-types.js";
 
 function withStore(name: string, run: (fixture: { dir: string; cwd: string }) => void): void {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), name));
@@ -68,6 +71,67 @@ test("central policy applies allowlists in standard mode and protected actor inv
       { dream: entry?.dream, scheduled: entry?.scheduled, subagents: entry?.subagents, global_index: entry?.global_index },
       { dream: false, scheduled: false, subagents: false, global_index: false },
     );
+  });
+});
+
+test("historical agent profile requires deployment-local activation for every project action", () => {
+  withStore("wayang-policy-historical-activation-", ({ dir, cwd }) => {
+    const now = Date.now();
+    commitStoreMutation((draft) => {
+      draft.agentProfiles.push({
+        id: WREN_AGENT_PROFILE_ID,
+        name: "Historical profile",
+        description: null,
+        builtin_kind: "wren",
+        deletable: false,
+        enabled: true,
+        resource_mode: "standard",
+        instructions: null,
+        memory_access: "read_write",
+        default_provider: null,
+        default_model: null,
+        allowed_tools: null,
+        allowed_extensions: null,
+        created_at: now,
+        updated_at: now,
+      });
+    });
+    createProject({
+      cwd,
+      default_agent_profile_id: WREN_AGENT_PROFILE_ID,
+      access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [WREN_AGENT_PROFILE_ID] },
+    });
+
+    const inactive = authorizeProjectAction({ cwd, actor: "interactive", agentProfileId: WREN_AGENT_PROFILE_ID });
+    assert.equal(inactive.allowed, false);
+    assert.equal(inactive.code, "profile_activation_missing");
+    commitStoreMutation((draft) => {
+      for (const capability_id of ["wayang.standard-resources.v1", "wayang.masked-host-workspace.v1"] as const) {
+        draft.workspaceCapabilityAssociations.push({
+          capability_id,
+          project_id: draft.projects[0]!.id,
+          agent_profile_id: WREN_AGENT_PROFILE_ID,
+          revision: 1,
+          active: true,
+          approved_at: now,
+          revoked_at: null,
+          updated_at: now,
+        });
+      }
+    });
+    assert.equal(resolveWorkspaceCapability({
+      capability_id: "wayang.standard-resources.v1",
+      project_id: getStore().projects[0]!.id,
+      agent_profile_id: WREN_AGENT_PROFILE_ID,
+    }).authorized, false, "copied active associations must remain inert without local activation");
+
+    const restoreActivation = installSyntheticLegacyAgentActivation(path.join(dir, "config"));
+    try {
+      assert.equal(authorizeProjectAction({ cwd, actor: "interactive", agentProfileId: WREN_AGENT_PROFILE_ID }).allowed, true);
+      assert.equal(authorizeProjectAction({ cwd, actor: "scheduled", agentProfileId: WREN_AGENT_PROFILE_ID }).allowed, true);
+    } finally {
+      restoreActivation();
+    }
   });
 });
 

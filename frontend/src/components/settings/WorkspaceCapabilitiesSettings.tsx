@@ -28,6 +28,8 @@ interface WorkspaceCapabilitiesSettingsProps {
 const CAPABILITY_RISK_DETAILS: Record<WorkspaceCapabilityId, string> = {
   "wayang.standard-resources.v1":
     "Reviewed global resources may reach data and authority outside the project-only resource set. Labels do not grant this access.",
+  "wayang.masked-host-workspace.v1":
+    "Together with Standard resources for the same pair, this grants broad ordinary-host filesystem writes, Git/Pi project maintenance, and visible Unix IPC through the sandbox, including eligible scheduled sessions. Registered Protected projects and protected control-plane artifacts remain masked, but this is cooperative same-user policy rather than containment.",
   "wayang.standard-browser.v1":
     "The agent may navigate, inspect pages, click, type non-secret text, download bounded files, and cause remote mutations through a managed browser. Existing authenticated cookies may permit purchases, deletion, exports, account-setting changes, logout, or browser-mediated passkey flows; human login handoff does not make later actions read-only.",
   "wayang.host-execution.v1":
