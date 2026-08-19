@@ -36,15 +36,16 @@ test("passive selection preserves healthy or stopped runtime state", async () =>
 
 test("pre-message ensure delegates healthy runtime revalidation to creation", async () => {
   const healthy = handle(false);
+  const replacement = handle(false);
   let creates = 0;
 
   const resolved = await resolveWebSocketRuntimeHandle(healthy, true, async () => {
     creates += 1;
-    return healthy;
+    return replacement;
   });
 
   assert.equal(creates, 1);
-  assert.equal(resolved, healthy);
+  assert.equal(resolved, replacement);
 });
 
 test("failed stale-runtime replacement never falls back to the denied handle", async () => {
