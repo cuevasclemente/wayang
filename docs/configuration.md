@@ -194,7 +194,7 @@ Provisioning is **not** normal installation. Run it only on the explicitly selec
 
 ```sh
 make setup-historical-agent-activation
-make setup-historical-agent-activation -- --status
+make setup-historical-agent-activation-status
 ```
 
 The first command accepts the existing command-guard identity PIN only through hidden local-terminal input and never stores or prints it. It creates missing records with owner-only permissions and refuses malformed, linked, non-private, mismatched, or concurrently created state. It is idempotent. Do not run it on Tribe-Mac or another secondary deployment. A host transfer requires an explicit continuity decision plus new local provisioning; copying the witness itself is not the supported transfer procedure.

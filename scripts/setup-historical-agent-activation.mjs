@@ -7,7 +7,9 @@ import {
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
-  console.log(`Usage: make setup-historical-agent-activation [-- --status]
+  console.log(`Usage:
+  make setup-historical-agent-activation
+  make setup-historical-agent-activation-status
 
 Provision the deployment-local compatibility witness for the one explicitly
 active historical agent home. This is not normal Wayang setup and must not be
