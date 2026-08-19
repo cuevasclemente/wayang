@@ -62,7 +62,9 @@ import {
   type HostExecutionMode,
 } from "./host-execution.js";
 import { isSessionCapabilityEligible, resolveWorkspaceCapability } from "./workspace-capabilities.js";
+import type { LegacyAgentActivationStatus } from "./legacy-agent-activation.js";
 import { isLegacyWrenStandardRuntime } from "./legacy-wren.js";
+import { resolveMaskedHostWorkspaceWitness } from "./masked-host-workspace.js";
 import { WorkspaceStoreError, type AgentProfileRow, type PendingAgentSwitch, type ProjectRow } from "./workspace-types.js";
 import { REVIEWED_PROVIDER_EXTENSION_PATHS } from "./reviewed-provider-extensions.js";
 import { getSudoBridge } from "./sudo-bridge.js";
@@ -1877,11 +1879,13 @@ export function fileAudioExperimentRuntimeIsEligible(input: {
   session: SessionRow;
   profile: AgentProfileRow;
   project: ProjectRow;
+  /** Synthetic test seam; production uses the startup-captured local witness. */
+  activation?: Pick<LegacyAgentActivationStatus, "active">;
 }): boolean {
   return input.enabled
     && input.session.scheduled_job_id === null
     && input.session.scheduled_run_id === null
-    && isLegacyWrenStandardRuntime(input);
+    && isLegacyWrenStandardRuntime(input, input.activation);
 }
 
 export type PiSessionCreationPrivilegedEffect =
@@ -2480,12 +2484,12 @@ export async function createPiSession(
     const bashSandbox = getBashSandboxAvailability();
     const selectedBashMode = selectWayangBashMode(hostCreationDecision, bashSandbox);
     const bashMode: HostExecutionMode = selectedBashMode === "sandboxed"
-      && isLegacyWrenStandardRuntime({
+      && resolveMaskedHostWorkspaceWitness({
         session: runtimeIdentity.row,
         profile: runtimeIdentity.agentProfile,
         project: runtimeIdentity.project,
       })
-      ? "sandboxed-wren"
+      ? "masked-host-workspace"
       : selectedBashMode;
     const excludeTools = [
       ...(runtimeResources.excludeTools ?? []),
@@ -2599,7 +2603,7 @@ export async function createPiSession(
         ...(pendingProtectedAutomationRuntime ? [pendingProtectedAutomationRuntime.tool] : []),
         ...(pendingFileAudioExperimentRuntime ? [pendingFileAudioExperimentRuntime.tool] : []),
         ...(hostBashTool ? [hostBashTool] : []),
-        ...(bashMode === "sandboxed" || bashMode === "sandboxed-wren"
+        ...(bashMode === "sandboxed" || bashMode === "masked-host-workspace"
           ? [createPolicySandboxedBashToolDefinition(cwd, id, bashMode)]
           : []),
       ]),

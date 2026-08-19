@@ -86,6 +86,7 @@ test("runtime companion tools preserve unrestricted policy and only widen explic
 
 test("file-audio experiment eligibility is disabled-by-default and exact Wren Standard interactive only", () => {
   const eligible = {
+    activation: { active: true },
     session: {
       agent_profile_id: "00000000-0000-4000-8000-000000000001",
       pending_agent_switch: null,

@@ -7,22 +7,23 @@ import type {
 
 export type { BrowserCleanupRow, BrowserProfileRow, ProjectBrowserDefaultRow, SessionBrowserStateRow };
 
-export const STORE_SCHEMA_VERSION = 7;
+export const STORE_SCHEMA_VERSION = 8;
 
 export const SESSION_TITLE_SOURCES = ["provisional", "explicit", "pi", "legacy_unknown"] as const;
 export type SessionTitleSource = typeof SESSION_TITLE_SOURCES[number];
 
 /**
  * Legacy stable IDs retained so schema-1 stores keep their references. Names
- * never confer authority. The exact Wren ID plus its non-user-settable
- * historical kind is also the Standard-project global workspace compatibility
- * identity; it never grants a PIN-backed capability or direct host mode.
+ * never confer authority. The exact historical row is inert without a matching
+ * deployment-local activation witness and loses fallback permanently per pair
+ * after a monotonic generic-capability cutover.
  */
 export const WREN_AGENT_PROFILE_ID = "00000000-0000-4000-8000-000000000001";
 export const NEUTRAL_AGENT_PROFILE_ID = "00000000-0000-4000-8000-000000000002";
 
 export const WORKSPACE_CAPABILITY_IDS = [
   "wayang.standard-resources.v1",
+  "wayang.masked-host-workspace.v1",
   "wayang.standard-browser.v1",
   "wayang.host-execution.v1",
   "wayang.protected-browser.v1",
@@ -34,8 +35,8 @@ export type WorkspacePrivacyMode = "standard" | "protected";
 export type MemoryAccess = "none" | "read" | "read_write";
 export type ResourceMode = "standard" | "project_only" | "custom";
 
-/** Historical migration metadata. Only the exact seeded Wren ID+kind pair may
- * participate in Standard-project global workspace compatibility. */
+/** Historical migration metadata. It classifies retained rows but is never
+ * sufficient authority without deployment activation and live pair policy. */
 export type BuiltinAgentKind = "wren" | "neutral" | null;
 
 export interface WorkspaceSettingsRow {
@@ -96,6 +97,14 @@ export interface ProjectRow {
  * Sole live durable workspace-capability authority and monotonic ABA clock.
  * Inactive rows are retained tombstones during ordinary operation.
  */
+/** Monotonic tombstone: once present, this exact pair can never use historical fallback again. */
+export interface HistoricalAgentCutoverRow {
+  project_id: string;
+  agent_profile_id: string;
+  revision: number;
+  cut_over_at: number;
+}
+
 export interface WorkspaceCapabilityAssociationRow {
   project_id: string;
   agent_profile_id: string;

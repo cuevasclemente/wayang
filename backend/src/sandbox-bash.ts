@@ -27,7 +27,7 @@ import {
 } from "./protected-artifacts.js";
 import type { SandboxExecRequest, SandboxNetworkMode } from "./sandbox-exec-protocol.js";
 import type { HostExecutionAuthorizationDecision, HostExecutionMode } from "./host-execution.js";
-import { isLegacyWrenStandardRuntime } from "./legacy-wren.js";
+import { resolveMaskedHostWorkspaceWitness } from "./masked-host-workspace.js";
 import type { WayangBashMode as LegacyWayangBashMode } from "./wren-host-bash.js";
 
 export interface BashSandboxAvailability {
@@ -144,9 +144,10 @@ export function buildBashSandboxPolicy(
   if (!sourceAuthorization.allowed) throw new Error(sourceAuthorization.reason ?? "Session is no longer authorized");
 
   const projects = listProjects();
-  const legacyWrenStandard = sourceAuthorization.project
-    ? isLegacyWrenStandardRuntime({ session, profile, project: sourceAuthorization.project })
-    : false;
+  const maskedHostWorkspaceWitness = sourceAuthorization.project
+    ? resolveMaskedHostWorkspaceWitness({ session, profile, project: sourceAuthorization.project })
+    : null;
+  const maskedHostWorkspace = maskedHostWorkspaceWitness !== null;
   const deniedRead = new Set<string>();
   const deniedWrite = new Set<string>();
   const sourceProtected = sourceAuthorization.project?.access_policy.privacy_mode === "protected";
@@ -172,7 +173,8 @@ export function buildBashSandboxPolicy(
         agent_profile_id: profile.id,
       })
     : null;
-  const standardResourcesAuthorized = standardResources?.authorized === true || legacyWrenStandard;
+  const standardResourcesAuthorized = standardResources?.authorized === true
+    || maskedHostWorkspaceWitness?.authoritySource === "legacy-activated-home";
   if (!standardResourcesAuthorized) {
     for (const root of getRestrictedAgentArtifactRoots()) {
       deniedRead.add(root);
@@ -208,9 +210,9 @@ export function buildBashSandboxPolicy(
   }
 
   // Restricted runtimes may not replace project-local Pi extension/config code
-  // and then ask the host process to reload it outside the sandbox. Exact Wren
-  // intentionally retains its pre-policy ability to maintain Pi projects.
-  if (!legacyWrenStandard) deniedWrite.add(path.join(session.cwd, ".pi"));
+  // and then ask the host process to reload it outside the sandbox. The generic
+  // masked-host workspace intentionally retains the historical maintenance path.
+  if (!maskedHostWorkspace) deniedWrite.add(path.join(session.cwd, ".pi"));
 
   // Snapshot only currently existing genuine read-deny targets. SRT evaluates
   // this policy in a forked helper and temporarily creates missing denyWrite
@@ -242,7 +244,7 @@ export function buildBashSandboxPolicy(
         deniedDomains: networkMode === "allow_all_proxy" ? [] : ["*"],
         strictAllowlist: networkMode !== "allow_all_proxy",
         allowUnixSockets: [],
-        allowAllUnixSockets: legacyWrenStandard,
+        allowAllUnixSockets: maskedHostWorkspace,
         allowLocalBinding: false,
       },
       filesystem: {
@@ -255,13 +257,13 @@ export function buildBashSandboxPolicy(
         // host backing remains hidden and unmodifiable: on Linux, a directory
         // that is both read-denied and beneath writable /tmp appears as an empty
         // disposable tmpfs, so writes there never reach the protected host path.
-        allowWrite: legacyWrenStandard
+        allowWrite: maskedHostWorkspace
           ? [path.parse(canonicalCwd).root]
           : sourceAuthorization.project?.access_policy.privacy_mode === "protected"
             ? [canonicalCwd]
             : uniqueCanonicalPaths([canonicalCwd, os.tmpdir()]),
         denyWrite: deniedWriteRoots,
-        allowGitConfig: legacyWrenStandard,
+        allowGitConfig: maskedHostWorkspace,
       },
       enableWeakerNestedSandbox: false,
       enableWeakerNetworkIsolation: false,
@@ -355,14 +357,14 @@ export function createPolicySandboxedBashOperations(
 export function createPolicySandboxedBashToolDefinition(
   cwd: string,
   sessionId: string,
-  mode: "sandboxed" | "sandboxed-wren" = "sandboxed",
+  mode: "sandboxed" | "masked-host-workspace" = "sandboxed",
 ): any {
   const tool = createBashToolDefinition(cwd, { operations: createPolicySandboxedBashOperations(sessionId) });
-  if (mode === "sandboxed-wren") {
+  if (mode === "masked-host-workspace") {
     return {
       ...tool,
-      label: "bash (Wren host workspace)",
-      description: `${tool.description} Exact seeded Wren may read and write ordinary host paths and use visible Unix IPC services. Every registered Protected project and protected control-plane artifact remains masked. Commands run as the Wayang OS user; this is broad same-user authority, not containment.`,
+      label: "bash (masked host workspace)",
+      description: `${tool.description} This exact Project-Agent pair may read and write ordinary host paths and use visible Unix IPC services. Every registered Protected project and protected control-plane artifact remains masked. Commands run as the Wayang OS user; this is broad same-user authority, not containment.`,
     };
   }
   return {

@@ -40,7 +40,7 @@ export function BashModeStatus({ mode }: { mode: BashMode }) {
   }
 
   const sandboxed = mode === "sandboxed";
-  const wrenWorkspace = mode === "sandboxed-wren";
+  const maskedWorkspace = mode === "masked-host-workspace";
   return (
     <div
       role="status"
@@ -49,18 +49,18 @@ export function BashModeStatus({ mode }: { mode: BashMode }) {
       data-bash-mode={mode}
       title={sandboxed
         ? "Bash runs in Wayang's per-command filesystem and control-socket sandbox."
-        : wrenWorkspace
-          ? "Exact Wren may read and write ordinary host paths and use Unix IPC; registered Protected projects and protected backing artifacts remain masked."
+        : maskedWorkspace
+          ? "This Project-Agent pair may read and write ordinary host paths and use Unix IPC; registered Protected projects and protected backing artifacts remain masked."
           : "No active runtime currently provides bash authority."}
       className={`w-fit max-w-full rounded border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
         sandboxed
           ? "border-blue-900/70 bg-blue-950/30 text-blue-300"
-          : wrenWorkspace
+          : maskedWorkspace
             ? "border-violet-800/70 bg-violet-950/30 text-violet-300"
             : "border-neutral-800 bg-neutral-900 text-neutral-500"
       }`}
     >
-      {sandboxed ? "Sandboxed bash" : wrenWorkspace ? "Wren workspace access" : "Bash unavailable"}
+      {sandboxed ? "Sandboxed bash" : maskedWorkspace ? "Masked host workspace" : "Bash unavailable"}
     </div>
   );
 }

@@ -55,11 +55,11 @@ import {
   type InterviewSubmissionChannel,
 } from "./interview-provenance.js";
 import {
-  NEUTRAL_AGENT_PROFILE_ID,
   STORE_SCHEMA_VERSION,
   WREN_AGENT_PROFILE_ID,
   WORKSPACE_CAPABILITY_IDS,
   type AgentProfileRow,
+  type HistoricalAgentCutoverRow,
   type PendingAgentSwitch,
   type ProjectRow,
   type SessionTitleSource,
@@ -207,6 +207,7 @@ export interface StoreData {
   workspaceSettings: WorkspaceSettingsRow;
   workspaceCapabilityAssociations: WorkspaceCapabilityAssociationRow[];
   workspaceCapabilityApprovalEvents: WorkspaceCapabilityApprovalEventRow[];
+  historicalAgentCutovers: HistoricalAgentCutoverRow[];
   browserProfiles: BrowserProfileRow[];
   projectBrowserDefaults: ProjectBrowserDefaultRow[];
   sessionBrowserStates: SessionBrowserStateRow[];
@@ -233,7 +234,7 @@ export interface StoreData {
 }
 
 const ARRAY_KEYS = [
-  "workspaceCapabilityAssociations", "workspaceCapabilityApprovalEvents", "browserProfiles", "projectBrowserDefaults",
+  "workspaceCapabilityAssociations", "workspaceCapabilityApprovalEvents", "historicalAgentCutovers", "browserProfiles", "projectBrowserDefaults",
   "sessionBrowserStates", "browserCleanups", "sessions", "transcriptRecoveryJournal", "projects", "agentProfiles",
   "agentTeams", "teamMembers", "goals", "apps", "appStates", "appEvents", "scheduledJobs", "scheduledRuns",
   "protectedAutomationJobs", "protectedAutomationRuns", "messagingEndpoints", "messagingEvents",
@@ -505,45 +506,6 @@ function backfillLegacySessionProjectIds(sessions: SessionRow[], projects: Proje
   }
 }
 
-function legacySeededProfiles(now: number): AgentProfileRow[] {
-  return [
-    {
-      id: WREN_AGENT_PROFILE_ID,
-      name: "Wren",
-      description: "Wayang's default agent using standard Pi resources.",
-      builtin_kind: "wren",
-      deletable: false,
-      enabled: true,
-      resource_mode: "standard",
-      instructions: null,
-      memory_access: "read_write",
-      default_provider: null,
-      default_model: null,
-      allowed_tools: null,
-      allowed_extensions: null,
-      created_at: now,
-      updated_at: now,
-    },
-    {
-      id: NEUTRAL_AGENT_PROFILE_ID,
-      name: "Neutral",
-      description: "Project-only agent without Wren's global personal overlay.",
-      builtin_kind: "neutral",
-      deletable: false,
-      enabled: true,
-      resource_mode: "project_only",
-      instructions: null,
-      memory_access: "none",
-      default_provider: null,
-      default_model: null,
-      allowed_tools: [],
-      allowed_extensions: [],
-      created_at: now,
-      updated_at: now,
-    },
-  ];
-}
-
 function freshDefaultProfile(now: number): AgentProfileRow {
   return {
     id: randomUUID(),
@@ -571,6 +533,7 @@ function emptyStore(now = Date.now()): StoreData {
     workspaceSettings: { default_agent_profile_id: defaultProfile.id },
     workspaceCapabilityAssociations: [],
     workspaceCapabilityApprovalEvents: [],
+    historicalAgentCutovers: [],
     browserProfiles: [],
     projectBrowserDefaults: [],
     sessionBrowserStates: [],
@@ -934,6 +897,20 @@ function validateCurrentStore(raw: Record<string, unknown>): StoreData {
     throw new Error("Wayang workspace default agent profile must be enabled");
   }
 
+  const historicalCutoverKeys = new Set<string>();
+  for (const [index, candidate] of (raw.historicalAgentCutovers as unknown[]).entries()) {
+    const value = candidate as Partial<HistoricalAgentCutoverRow> | null;
+    if (!value || typeof value !== "object"
+      || !exactObjectKeys(value, ["project_id", "agent_profile_id", "revision", "cut_over_at"])
+      || !validStableId(value.project_id) || value.agent_profile_id !== WREN_AGENT_PROFILE_ID
+      || !validPositiveRevision(value.revision) || !finiteTimestamp(value.cut_over_at)) {
+      throw new Error(`Wayang store contains a malformed historical agent cutover at index ${index}`);
+    }
+    const key = `${value.project_id}\u0000${value.agent_profile_id}`;
+    if (historicalCutoverKeys.has(key)) throw new Error("Wayang store contains duplicate historical agent cutovers");
+    historicalCutoverKeys.add(key);
+  }
+
   const projectIds = new Set<string>();
   const projectsById = new Map<string, ProjectRow>();
   const projectCwds = new Set<string>();
@@ -1113,13 +1090,12 @@ function browserCatalogMigrationFields(
 function normalizeLegacyStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
   const now = Date.now();
   const data = emptyStore(now);
-  // Schema-0 had no profile control plane. Preserve its former default as
-  // stable migration rows. Migration creates no capability grant; the exact
-  // Wren row retains only the documented Standard-project global workspace compatibility.
-  data.agentProfiles = legacySeededProfiles(now);
-  data.workspaceSettings = { default_agent_profile_id: WREN_AGENT_PROFILE_ID };
+  // Schema-0 had no profile control plane and therefore cannot prove any
+  // historical agent identity. Keep emptyStore()'s generated restricted
+  // Default profile rather than manufacturing a portable built-in identity.
   const legacyKeys = new Set<string>(ARRAY_KEYS.filter((key) =>
     key !== "workspaceCapabilityAssociations" && key !== "workspaceCapabilityApprovalEvents"
+    && key !== "historicalAgentCutovers"
     && key !== "projects" && key !== "agentProfiles"
     && key !== "protectedAutomationJobs" && key !== "protectedAutomationRuns"
     && key !== "messagingEndpoints" && key !== "messagingEvents"
@@ -1213,7 +1189,7 @@ function normalizeLegacyStore(raw: Record<string, unknown>, browserProfilesEnabl
       name: projectName(cwd),
       description: null,
       color: null,
-      default_agent_profile_id: WREN_AGENT_PROFILE_ID,
+      default_agent_profile_id: data.workspaceSettings.default_agent_profile_id,
       default_provider: null,
       default_model: null,
       access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: null },
@@ -1282,6 +1258,7 @@ function normalizeSchemaOneStore(raw: Record<string, unknown>, browserProfilesEn
     workspaceSettings: { default_agent_profile_id: compatibilityDefault },
     workspaceCapabilityAssociations: [],
     workspaceCapabilityApprovalEvents: [],
+    historicalAgentCutovers: [],
     browserProfiles: [],
     projectBrowserDefaults: [],
     sessionBrowserStates: [],
@@ -1316,6 +1293,7 @@ function normalizeSchemaOneStore(raw: Record<string, unknown>, browserProfilesEn
 
 function normalizeSchemaTwoStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
   const schemaTwoArrayKeys = ARRAY_KEYS.filter((key) => key !== "transcriptRecoveryJournal"
+    && key !== "historicalAgentCutovers"
     && key !== "protectedAutomationJobs" && key !== "protectedAutomationRuns"
     && key !== "messagingEndpoints" && key !== "messagingEvents"
     && key !== "messagingTransactions" && key !== "messagingDeliveries"
@@ -1338,6 +1316,7 @@ function normalizeSchemaTwoStore(raw: Record<string, unknown>, browserProfilesEn
   const migrated = {
     ...structuredClone(raw),
     schema_version: STORE_SCHEMA_VERSION,
+    historicalAgentCutovers: [],
     protectedAutomationJobs: [],
     protectedAutomationRuns: [],
     messagingEndpoints: [],
@@ -1359,6 +1338,7 @@ function normalizeSchemaTwoStore(raw: Record<string, unknown>, browserProfilesEn
 function normalizeSchemaThreeStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
   const messagingKeys = new Set(["messagingEndpoints", "messagingEvents", "messagingTransactions", "messagingDeliveries"]);
   const schemaThreeArrayKeys = ARRAY_KEYS.filter((key) => key !== "transcriptRecoveryJournal"
+    && key !== "historicalAgentCutovers"
     && !messagingKeys.has(key)
     && !BROWSER_CATALOG_ARRAY_KEYS.includes(key as typeof BROWSER_CATALOG_ARRAY_KEYS[number]));
   const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaThreeArrayKeys]);
@@ -1373,6 +1353,7 @@ function normalizeSchemaThreeStore(raw: Record<string, unknown>, browserProfiles
   const migrated = {
     ...structuredClone(raw),
     schema_version: STORE_SCHEMA_VERSION,
+    historicalAgentCutovers: [],
     messagingEndpoints: [],
     messagingEvents: [],
     messagingTransactions: [],
@@ -1391,6 +1372,7 @@ function normalizeSchemaThreeStore(raw: Record<string, unknown>, browserProfiles
 
 function normalizeSchemaFourStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
   const schemaFourArrayKeys = ARRAY_KEYS.filter((key) => key !== "transcriptRecoveryJournal"
+    && key !== "historicalAgentCutovers"
     && !BROWSER_CATALOG_ARRAY_KEYS.includes(key as typeof BROWSER_CATALOG_ARRAY_KEYS[number]));
   const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaFourArrayKeys]);
   for (const key of Object.keys(raw)) {
@@ -1405,6 +1387,7 @@ function normalizeSchemaFourStore(raw: Record<string, unknown>, browserProfilesE
   const migrated = {
     ...structuredClone(raw),
     schema_version: STORE_SCHEMA_VERSION,
+    historicalAgentCutovers: [],
     browserProfiles: [],
     projectBrowserDefaults: [],
     sessionBrowserStates: [],
@@ -1420,6 +1403,7 @@ function normalizeSchemaFourStore(raw: Record<string, unknown>, browserProfilesE
 
 function normalizeSchemaFiveStore(raw: Record<string, unknown>, browserProfilesEnabled = true): StoreData {
   const schemaFiveArrayKeys = ARRAY_KEYS.filter((key) => key !== "transcriptRecoveryJournal"
+    && key !== "historicalAgentCutovers"
     && !BROWSER_CATALOG_ARRAY_KEYS.includes(key as typeof BROWSER_CATALOG_ARRAY_KEYS[number]));
   const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaFiveArrayKeys]);
   for (const key of Object.keys(raw)) {
@@ -1428,12 +1412,13 @@ function normalizeSchemaFiveStore(raw: Record<string, unknown>, browserProfilesE
   for (const key of schemaFiveArrayKeys) {
     if (!Array.isArray(raw[key])) throw new Error(`Schema-5 Wayang store field ${key} must be an array`);
   }
-  // Schema 5 owns canonical title provenance. Current schema 7 preserves every
+  // Schema 5 owns canonical title provenance. The current schema preserves every
   // byte of those rows, inventories only expected profile-root metadata when
   // enabled, and adds an empty content-free recovery journal.
   const migrated = {
     ...structuredClone(raw),
     schema_version: STORE_SCHEMA_VERSION,
+    historicalAgentCutovers: [],
     browserProfiles: [],
     projectBrowserDefaults: [],
     sessionBrowserStates: [],
@@ -1445,7 +1430,7 @@ function normalizeSchemaFiveStore(raw: Record<string, unknown>, browserProfilesE
 }
 
 function normalizeSchemaSixStore(raw: Record<string, unknown>): StoreData {
-  const schemaSixArrayKeys = ARRAY_KEYS.filter((key) => key !== "transcriptRecoveryJournal");
+  const schemaSixArrayKeys = ARRAY_KEYS.filter((key) => key !== "transcriptRecoveryJournal" && key !== "historicalAgentCutovers");
   const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaSixArrayKeys]);
   for (const key of Object.keys(raw)) {
     if (!allowedKeys.has(key)) throw new Error(`Schema-6 Wayang store contains unsupported field ${key}`);
@@ -1456,7 +1441,24 @@ function normalizeSchemaSixStore(raw: Record<string, unknown>): StoreData {
   return validateCurrentStore({
     ...structuredClone(raw),
     schema_version: STORE_SCHEMA_VERSION,
+    historicalAgentCutovers: [],
     transcriptRecoveryJournal: [],
+  });
+}
+
+function normalizeSchemaSevenStore(raw: Record<string, unknown>): StoreData {
+  const schemaSevenArrayKeys = ARRAY_KEYS.filter((key) => key !== "historicalAgentCutovers");
+  const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...schemaSevenArrayKeys]);
+  for (const key of Object.keys(raw)) {
+    if (!allowedKeys.has(key)) throw new Error(`Schema-7 Wayang store contains unsupported field ${key}`);
+  }
+  for (const key of schemaSevenArrayKeys) {
+    if (!Array.isArray(raw[key])) throw new Error(`Schema-7 Wayang store field ${key} must be an array`);
+  }
+  return validateCurrentStore({
+    ...structuredClone(raw),
+    schema_version: STORE_SCHEMA_VERSION,
+    historicalAgentCutovers: [],
   });
 }
 
@@ -1733,10 +1735,17 @@ function loadStore(storePath: string, browserProfilesEnabled = _browserProfilesE
   if (!browserProfilesEnabled && version === 6) {
     throw new Error("Wayang store schema 6 requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1");
   }
+  if (!browserProfilesEnabled && version === 7) {
+    for (const key of BROWSER_CATALOG_ARRAY_KEYS) {
+      if (Array.isArray(raw[key]) && (raw[key] as unknown[]).length !== 0) {
+        throw new Error("Wayang schema 7 browser persistence requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1");
+      }
+    }
+  }
   if (!browserProfilesEnabled && version === STORE_SCHEMA_VERSION) {
     for (const key of BROWSER_CATALOG_ARRAY_KEYS) {
       if (!Array.isArray(raw[key]) || (raw[key] as unknown[]).length !== 0) {
-        throw new Error("Wayang schema 7 browser persistence requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1");
+        throw new Error(`Wayang schema ${STORE_SCHEMA_VERSION} browser persistence requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1`);
       }
     }
   }
@@ -1748,7 +1757,8 @@ function loadStore(storePath: string, browserProfilesEnabled = _browserProfilesE
   // durable private backup. Any backup error aborts startup.
   createPrivateBackup(storePath, contents, version);
   let migrated: StoreData;
-  if (version === 6) migrated = normalizeSchemaSixStore(raw);
+  if (version === 7) migrated = normalizeSchemaSevenStore(raw);
+  else if (version === 6) migrated = normalizeSchemaSixStore(raw);
   else if (version === 5) migrated = normalizeSchemaFiveStore(raw, browserProfilesEnabled);
   else if (version === 4) migrated = normalizeSchemaFourStore(raw, browserProfilesEnabled);
   else if (version === 3) migrated = normalizeSchemaThreeStore(raw, browserProfilesEnabled);

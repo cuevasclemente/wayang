@@ -8,6 +8,7 @@ import { close, commitStoreMutation, getStore, init } from "../db.js";
 import { createProject } from "../projects.js";
 import { createSession } from "../sessions.js";
 import { commitWorkspaceCapabilityActivation } from "../workspace-capabilities.js";
+import { STORE_SCHEMA_VERSION } from "../workspace-types.js";
 import {
   createManagedBrowserProfile,
   getProjectBrowserDefault,
@@ -133,6 +134,7 @@ test("schema 5 to 7 migration preserves title provenance and inventories only ex
   const storePath = path.join(dataDir, "store.json");
   const schemaFive = JSON.parse(fs.readFileSync(storePath, "utf8"));
   schemaFive.schema_version = 5;
+  delete schemaFive.historicalAgentCutovers;
   delete schemaFive.transcriptRecoveryJournal;
   delete schemaFive.browserProfiles;
   delete schemaFive.projectBrowserDefaults;
@@ -142,7 +144,7 @@ test("schema 5 to 7 migration preserves title provenance and inventories only ex
 
   init({ browserProfilesEnabled: true });
   const store = getStore();
-  assert.equal(store.schema_version, 7);
+  assert.equal(store.schema_version, STORE_SCHEMA_VERSION);
   assert.deepEqual(store.browserProfiles.map((row) => row.storage_source.kind).sort(), ["legacy_shared", "standard_pair_v1"]);
   assert.deepEqual(store.projectBrowserDefaults, []);
   assert.deepEqual(store.sessionBrowserStates, []);

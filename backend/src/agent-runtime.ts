@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { getSessionById } from "./sessions.js";
 import { isLegacyWrenStandardRuntime } from "./legacy-wren.js";
+import { historicalAgentPairIsCutOver } from "./masked-host-workspace.js";
 import {
   getProtectedArtifactReadRoots,
   getProtectedArtifactWriteRoots,
@@ -98,6 +99,7 @@ function resolveCurrentStandardResourcesWitness(options: {
     agent_profile_id: options.agentProfile.id,
   }));
   if (associated) return associated;
+  if (historicalAgentPairIsCutOver(options.project.id, options.agentProfile.id)) return null;
   return isLegacyWrenStandardRuntime({
     session: row,
     profile: options.agentProfile,

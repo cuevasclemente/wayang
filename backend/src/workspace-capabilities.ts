@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { commitStoreMutation, getStore, type SessionRow, type StoreData, type StoredScheduledJobRow } from "./db.js";
+import { getLegacyAgentActivationStatus } from "./legacy-agent-activation.js";
+import { isExactLegacyWrenProfile } from "./legacy-wren.js";
 import { notifyPolicyChanged } from "./policy-generation.js";
 import { blockProtectedAutomationJobsDraft } from "./protected-automation/draft-lifecycle.js";
 import { PROTECTED_AUTOMATION_CAPABILITY_ID } from "./protected-automation/types.js";
@@ -19,7 +21,7 @@ export const MAX_WORKSPACE_CAPABILITY_APPROVAL_EVENTS = 4_096;
 export interface WorkspaceCapabilityDefinition {
   id: WorkspaceCapabilityId;
   privacy_mode: WorkspacePrivacyMode;
-  risk: "global-resources" | "host-execution" | "authenticated-browser" | "protected-automation";
+  risk: "global-resources" | "masked-host-workspace" | "host-execution" | "authenticated-browser" | "protected-automation";
 }
 
 export const WORKSPACE_CAPABILITY_REGISTRY: Readonly<Record<WorkspaceCapabilityId, WorkspaceCapabilityDefinition>> = Object.freeze({
@@ -27,6 +29,11 @@ export const WORKSPACE_CAPABILITY_REGISTRY: Readonly<Record<WorkspaceCapabilityI
     id: "wayang.standard-resources.v1",
     privacy_mode: "standard",
     risk: "global-resources",
+  }),
+  "wayang.masked-host-workspace.v1": Object.freeze({
+    id: "wayang.masked-host-workspace.v1",
+    privacy_mode: "standard",
+    risk: "masked-host-workspace",
   }),
   "wayang.standard-browser.v1": Object.freeze({
     id: "wayang.standard-browser.v1",
@@ -69,6 +76,7 @@ export type WorkspaceCapabilityDenialReason =
   | "profile_not_found"
   | "incompatible_privacy_mode"
   | "profile_disabled"
+  | "profile_activation_missing"
   | "profile_not_allowed"
   | "association_missing"
   | "association_inactive"
@@ -177,6 +185,9 @@ export function resolveWorkspaceCapability(input: WorkspaceCapabilityResolutionI
     return { authorized: false, reason: "incompatible_privacy_mode" };
   }
   if (!profile.enabled) return { authorized: false, reason: "profile_disabled" };
+  if (isExactLegacyWrenProfile(profile) && !getLegacyAgentActivationStatus().active) {
+    return { authorized: false, reason: "profile_activation_missing" };
+  }
   if (!projectAllowsAgentProfile(project, profile.id)) return { authorized: false, reason: "profile_not_allowed" };
   const association = findWorkspaceCapabilityAssociation(store, input);
   if (!association) return { authorized: false, reason: "association_missing" };
@@ -276,6 +287,9 @@ export function commitWorkspaceCapabilityActivation(input: WorkspaceCapabilityRe
       throw new WorkspaceStoreError("Capability is incompatible with project privacy mode", 409);
     }
     if (!profile.enabled) throw new WorkspaceStoreError("Agent profile must be enabled", 409);
+    if (isExactLegacyWrenProfile(profile) && !getLegacyAgentActivationStatus().active) {
+      throw new WorkspaceStoreError("Historical agent profile is inactive on this Wayang deployment", 409);
+    }
     if (!projectAllowsAgentProfile(project, profile.id)) {
       throw new WorkspaceStoreError("Agent profile is not allowed for this project", 403);
     }

@@ -5,6 +5,7 @@ import { delimiter, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { diagnoseCapabilityApprovalMetadata } from "./lib/capability-approval.mjs";
+import { historicalAgentActivationStatus } from "./lib/historical-agent-activation.mjs";
 import { diagnoseLinuxUserBus } from "./lib/doctor.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -114,6 +115,15 @@ if (capabilityApproval.state.ok) {
   ok("workspace capability approval cooldown metadata is owner-only and safe (contents not inspected)");
 } else {
   warn(`workspace capability approval cooldown metadata is unavailable or unsafe (${capabilityApproval.state.reason}); deployed service startup initializes missing state automatically when PIN metadata is safe (make setup-capability-approval is an optional preflight)`);
+}
+
+const historicalActivation = historicalAgentActivationStatus();
+if (historicalActivation.active) {
+  ok(`deployment-local historical agent compatibility is active (revision ${historicalActivation.activationRevision}; no identity content inspected)`);
+} else if (/\bis absent$/u.test(historicalActivation.reason)) {
+  ok("deployment-local historical agent compatibility is inactive (normal for fresh and secondary deployments)");
+} else {
+  warn(`deployment-local historical agent compatibility is inactive because its metadata is unsafe (${historicalActivation.reason})`);
 }
 
 const providerVariables = [

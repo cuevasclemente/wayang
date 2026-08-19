@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { close, init } from "../db.js";
+import { STORE_SCHEMA_VERSION } from "../workspace-types.js";
 
 async function freePort(): Promise<number> {
   const server = net.createServer();
@@ -33,7 +34,7 @@ async function stopChild(child: ChildProcess): Promise<void> {
   }
 }
 
-test("production gate-on startup accepts gate-off schema 7 only after complete browser composition", { timeout: 60_000 }, async () => {
+test("production gate-on startup accepts the current gate-off schema only after complete browser composition", { timeout: 60_000 }, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-browser-production-activation-"));
   const dataDir = path.join(root, "data");
   const home = path.join(root, "home");
@@ -51,7 +52,7 @@ test("production gate-on startup accepts gate-off schema 7 only after complete b
   }
   const storePath = path.join(dataDir, "store.json");
   const gateOffStore = JSON.parse(fs.readFileSync(storePath, "utf8"));
-  assert.equal(gateOffStore.schema_version, 7);
+  assert.equal(gateOffStore.schema_version, STORE_SCHEMA_VERSION);
   assert.deepEqual(gateOffStore.browserProfiles, []);
   assert.deepEqual(gateOffStore.projectBrowserDefaults, []);
   assert.deepEqual(gateOffStore.sessionBrowserStates, []);
@@ -108,10 +109,10 @@ test("production gate-on startup accepts gate-off schema 7 only after complete b
   }
 
   const migrated = JSON.parse(fs.readFileSync(storePath, "utf8"));
-  assert.equal(migrated.schema_version, 7);
+  assert.equal(migrated.schema_version, STORE_SCHEMA_VERSION);
   assert.ok(Array.isArray(migrated.browserProfiles));
   assert.deepEqual(migrated.transcriptRecoveryJournal, []);
   const backups = fs.readdirSync(dataDir).filter((name) => name.startsWith("store.json.backup-v"));
-  assert.equal(backups.length, 0, "current schema 7 requires no migration rewrite");
+  assert.equal(backups.length, 0, "current schema requires no migration rewrite");
   fs.rmSync(root, { recursive: true, force: true });
 });

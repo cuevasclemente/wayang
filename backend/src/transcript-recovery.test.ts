@@ -23,6 +23,7 @@ import {
 } from "./transcript-recovery-journal.js";
 import { recoverTranscriptRecoveryJournal } from "./transcript-recovery.js";
 import { closeSearchDb, getSearchDb } from "./search/db.js";
+import { STORE_SCHEMA_VERSION } from "./workspace-types.js";
 import { removeSession as removeSearchSession } from "./search/indexer.js";
 
 function environment(name: string) {
@@ -68,7 +69,7 @@ function materializedSession(project: string, sessionDir: string, id: string) {
   return manager;
 }
 
-test("schema 6 migrates to strict content-free schema 7 recovery journal", () => {
+test("schema 6 migrates to the current strict content-free recovery journal", () => {
   const f = environment("wayang-recovery-schema-");
   try {
     init({ browserProfilesEnabled: true });
@@ -76,10 +77,11 @@ test("schema 6 migrates to strict content-free schema 7 recovery journal", () =>
     const storePath = path.join(process.env.WAYANG_DATA_DIR!, "store.json");
     const raw = JSON.parse(fs.readFileSync(storePath, "utf8"));
     raw.schema_version = 6;
+    delete raw.historicalAgentCutovers;
     delete raw.transcriptRecoveryJournal;
     fs.writeFileSync(storePath, JSON.stringify(raw), { mode: 0o600 });
     init({ browserProfilesEnabled: true });
-    assert.equal(getStore().schema_version, 7);
+    assert.equal(getStore().schema_version, STORE_SCHEMA_VERSION);
     assert.deepEqual(getStore().transcriptRecoveryJournal, []);
     close();
 
