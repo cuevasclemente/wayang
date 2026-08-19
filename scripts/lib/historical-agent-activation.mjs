@@ -54,9 +54,19 @@ function readPrivate(filePath, label) {
   return readFileSync(filePath, "utf8");
 }
 
+function ensurePrivateDirectory(directory) {
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(directory);
+  const uid = process.getuid?.();
+  if (!stat.isDirectory() || stat.isSymbolicLink()
+    || (uid !== undefined && stat.uid !== uid) || (stat.mode & 0o7777) !== 0o700
+    || realpathSync.native(directory) !== resolve(directory)) {
+    throw new Error("Wayang activation directory must be one canonical owner-private mode-0700 directory");
+  }
+}
+
 function writePrivateCreateOrReplace(filePath, contents, replace) {
-  mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
-  chmodSync(dirname(filePath), 0o700);
+  ensurePrivateDirectory(dirname(filePath));
   if (!replace) {
     const fd = openSync(filePath, "wx", 0o600);
     try {

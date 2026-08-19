@@ -7,6 +7,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -55,6 +56,17 @@ test("provisioning creates one owner-private deployment-bound record and is idem
   const repeated = provisionHistoricalAgentActivation({ configHome, pin: PIN, now: 2_000 });
   assert.equal(repeated.created, false);
   assert.equal(readFileSync(paths.activationPath, "utf8"), before);
+}));
+
+test("symlinked activation directories are refused before publication", () => fixture(({ root, configHome, paths }) => {
+  const target = join(root, "elsewhere");
+  mkdirSync(target, { mode: 0o700 });
+  symlinkSync(target, paths.wayangConfigDir, "dir");
+  assert.throws(
+    () => provisionHistoricalAgentActivation({ configHome, pin: PIN, deploymentId: DEPLOYMENT_ID, now: 1_000 }),
+    /activation directory/,
+  );
+  assert.throws(() => readFileSync(join(target, "deployment-id")), /ENOENT/);
 }));
 
 test("unsafe or deployment-mismatched existing records are never replaced", () => fixture(({ configHome, paths }) => {
