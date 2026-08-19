@@ -1970,21 +1970,81 @@ function makeLocalPendingUserMessage(
   };
 }
 
+function userMessageId(message: ChatMessage): string | null {
+  return typeof message.id === "string"
+    ? message.id
+    : typeof message.message?.id === "string"
+      ? message.message.id
+      : null;
+}
+
+function userMessageIdsMatch(a: ChatMessage, b: ChatMessage): boolean {
+  const aId = userMessageId(a);
+  const bId = userMessageId(b);
+  return aId !== null && bId !== null && aId === bId;
+}
+
+function hasKnownDurableUserMessage(messages: ChatMessage[], userMessage: ChatMessage): boolean {
+  return messages.some((existing) => (
+    !isLocalPendingUserMessage(existing) && userMessageIdsMatch(existing, userMessage)
+  ));
+}
+
 function upsertUserMessage(messages: ChatMessage[], userMessage: ChatMessage): ChatMessage[] {
+  // Check durable identity before content: replaying an older "done" event
+  // must not consume a newer optimistic "done" turn.
+  if (hasKnownDurableUserMessage(messages, userMessage)) {
+    return messages;
+  }
+  // Content similarity is only safe for replacing this browser's optimistic
+  // echo. A later real turn may intentionally repeat an earlier short reply
+  // such as "done" and must remain a distinct transcript event.
   const pendingIndex = messages.findIndex((existing) => isLocalPendingUserMessage(existing) && userMessagesMatch(existing, userMessage));
   if (pendingIndex !== -1) {
     return messages.map((existing, index) => index === pendingIndex ? userMessage : existing);
   }
-  if (messages.some((existing) => !isLocalPendingUserMessage(existing) && userMessagesMatch(existing, userMessage))) {
-    return messages;
-  }
   return [...messages, userMessage];
 }
 
-function mergeHistoryWithLocalPending(historyMessages: ChatMessage[], currentMessages: ChatMessage[]): ChatMessage[] {
-  const localPending = currentMessages.filter(
-    (message) => isLocalPendingUserMessage(message) && !historyMessages.some((historyMessage) => userMessagesMatch(message, historyMessage)),
+function unmatchedHistoryUserOccurrences(
+  historyMessages: ChatMessage[],
+  currentMessages: ChatMessage[],
+): ChatMessage[] {
+  const unmatchedHistoryUsers = historyMessages.filter((message) => message.type === "user");
+  const currentDurableUsers = currentMessages.filter(
+    (message) => message.type === "user" && !isLocalPendingUserMessage(message),
   );
+  const matchedCurrentUsers = new Set<ChatMessage>();
+
+  // Reserve every exact durable identity globally before any content fallback.
+  // A durable ID absent from authoritative history represents a removed row
+  // and never falls back by content; only ID-less live echoes need that bridge.
+  for (const currentMessage of currentDurableUsers) {
+    const historyIndex = unmatchedHistoryUsers.findIndex((historyMessage) => userMessageIdsMatch(currentMessage, historyMessage));
+    if (historyIndex === -1) continue;
+    matchedCurrentUsers.add(currentMessage);
+    unmatchedHistoryUsers.splice(historyIndex, 1);
+  }
+  for (const currentMessage of currentDurableUsers) {
+    if (matchedCurrentUsers.has(currentMessage) || userMessageId(currentMessage) !== null) continue;
+    const historyIndex = unmatchedHistoryUsers.findIndex((historyMessage) => userMessagesMatch(currentMessage, historyMessage));
+    if (historyIndex !== -1) unmatchedHistoryUsers.splice(historyIndex, 1);
+  }
+  return unmatchedHistoryUsers;
+}
+
+function mergeHistoryWithLocalPending(historyMessages: ChatMessage[], currentMessages: ChatMessage[]): ChatMessage[] {
+  // Reconcile user-message occurrences rather than asking whether the content
+  // appeared anywhere in history. Pair already-rendered durable turns first;
+  // only a remaining new history occurrence can consume a local pending echo.
+  const unmatchedHistoryUsers = unmatchedHistoryUserOccurrences(historyMessages, currentMessages);
+  const localPending = currentMessages.filter((message) => {
+    if (!isLocalPendingUserMessage(message)) return false;
+    const historyIndex = unmatchedHistoryUsers.findIndex((historyMessage) => userMessagesMatch(message, historyMessage));
+    if (historyIndex === -1) return true;
+    unmatchedHistoryUsers.splice(historyIndex, 1);
+    return false;
+  });
   return localPending.length > 0 ? [...historyMessages, ...localPending] : historyMessages;
 }
 
@@ -3174,6 +3234,8 @@ export function ChatPanel({
   const submittedUserMessagesRef = useRef(new Map<string, SubmittedUserMessage>());
   const attachmentDraftsBySessionRef = useRef(new Map<string, PendingAttachment[]>());
   const deferredUserMessagesRef = useRef<ChatMessage[]>([]);
+  const messagesRef = useRef<ChatMessage[]>(messages);
+  const messagesOwnerSessionIdRef = useRef<string | null>(messagesOwnerSessionId);
   const streamingBlocksRef = useRef<StreamingBlocks>({ content: [] });
   const streamingHistoryPrefixRef = useRef<StreamingBlocks>({ content: [] });
   const interviewQueueRef = useRef<QueuedInterview[]>([]);
@@ -3187,6 +3249,8 @@ export function ChatPanel({
   const identityPinReturnFocusRef = useRef<HTMLButtonElement | null>(null);
   const isRestoringDraftRef = useRef(false);
   const suppressedDraftPersistenceRef = useRef<{ sessionId: string; value: string } | null>(null);
+  messagesRef.current = messages;
+  messagesOwnerSessionIdRef.current = messagesOwnerSessionId;
   activeSessionErrorRef.current = activeSession?.error ?? null;
   activeSessionRuntimeStreamingRef.current = Boolean(activeSession?.runtime_is_streaming);
   activeSessionRuntimeCompactingRef.current = Boolean(activeSession?.runtime_is_compacting);
@@ -4281,9 +4345,15 @@ export function ChatPanel({
           if (hasActiveAssistantOutput() && queuedUserMessagesRef.current.length > 0) {
             const remainingQueued = [...queuedUserMessagesRef.current];
             const acceptedNextTurnMessages: ChatMessage[] = [];
+            const currentSessionMessages = messagesOwnerSessionIdRef.current === activeSessionIdRef.current
+              ? messagesRef.current
+              : [];
+            const newHistoryUserOccurrences = new Set(
+              unmatchedHistoryUserOccurrences(historyMessages, currentSessionMessages),
+            );
             const visibleHistoryMessages = historyMessages.filter((historyMessage) => {
               const message = historyMessage?.message;
-              if (historyMessage?.type !== "user" || !message) return true;
+              if (historyMessage?.type !== "user" || !message || !newHistoryUserOccurrences.has(historyMessage)) return true;
               const content = getUserMessageText(message);
               const queuedIndex = remainingQueued.findIndex((queued) => queuedMessageMatchesContent(queued, content));
               if (queuedIndex === -1) return true;
@@ -4973,6 +5043,10 @@ export function ChatPanel({
                   ? { id: typeof msg.id === "string" ? msg.id : message.id }
                   : {}),
               };
+              const currentSessionMessages = messagesOwnerSessionIdRef.current === activeSessionIdRef.current
+                ? messagesRef.current
+                : [];
+              if (hasKnownDurableUserMessage(currentSessionMessages, userMessage)) return;
               const wasQueuedForNextTurn = takeMatchingQueuedMessage(getUserMessageText(message));
               if (hasActiveAssistantOutput() && wasQueuedForNextTurn) {
                 insertAcceptedUsersAfterActiveStreaming([userMessage]);
@@ -5035,6 +5109,10 @@ export function ChatPanel({
           msg.type === "custom"
         ) {
           if (msg.type === "user") {
+            const currentSessionMessages = messagesOwnerSessionIdRef.current === activeSessionIdRef.current
+              ? messagesRef.current
+              : [];
+            if (hasKnownDurableUserMessage(currentSessionMessages, msg)) return;
             const wasQueuedForNextTurn = takeMatchingQueuedMessage(getUserMessageText(msg.message));
             if (hasActiveAssistantOutput() && wasQueuedForNextTurn) {
               insertAcceptedUsersAfterActiveStreaming([msg]);
