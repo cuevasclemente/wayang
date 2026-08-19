@@ -206,6 +206,38 @@ test("pointer, keyboard, and wheel dispatch stay responsive while every navigati
   await viewer.close();
 });
 
+test("authenticated viewer paste inserts bounded text without exposing its value to telemetry", async () => {
+  const cdp = new InteractiveCdp();
+  const observations: StandardViewerObservation[] = [];
+  const viewer = await interactiveViewer(cdp, { observe: (event) => observations.push({ ...event }) });
+  const text = "synthetic-paste-canary";
+
+  await viewer.dispatch(Buffer.from(JSON.stringify({ type: "paste", text })), false);
+  assert.ok(cdp.calls.some((call) => call.method === "Input.insertText" && call.params?.text === text));
+  await waitUntil(() => observations.some((event) => (
+    event.event === "attestation" && event.category === "paste" && event.outcome === "accepted"
+  )));
+  assert.ok(observations.some((event) => event.event === "input_received" && event.category === "paste"));
+  assert.doesNotMatch(JSON.stringify(observations), /synthetic-paste-canary/, "paste text is excluded from telemetry");
+  await viewer.close();
+
+  const invalidMessages = [
+    { type: "paste", text: "" },
+    { type: "paste", text: "synthetic", extra: true },
+    { type: "paste", text: "x".repeat(4_097) },
+    { type: "paste", text: "nul\0text" },
+    { type: "paste", text: "unpaired-\ud800" },
+  ];
+  for (const message of invalidMessages) {
+    const invalidViewer = await interactiveViewer(new InteractiveCdp());
+    await assert.rejects(
+      Promise.resolve(invalidViewer.dispatch(Buffer.from(JSON.stringify(message)), false)),
+      (error: unknown) => error instanceof StandardViewerInputError && error.reason === "input_invalid",
+    );
+    await invalidViewer.close();
+  }
+});
+
 test("input authorization, CDP dispatch, and attestation failures seal with stable bounded reasons", async () => {
   for (const scenario of ["authorization", "dispatch", "attestation"] as const) {
     const cdp = new InteractiveCdp();

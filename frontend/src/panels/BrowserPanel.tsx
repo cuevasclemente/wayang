@@ -562,6 +562,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
             onStatus={refresh}
             onPageChange={handlePageChange}
             onPasteText={pasteSupported ? (text) => void handleViewerPasteText(text) : undefined}
+            pasteThroughViewer={namedRuntime && viewerTransport === "cdp-screencast"}
           />
         ) : (
           <div className="flex h-full items-center justify-center p-6 text-center text-sm text-neutral-500">
