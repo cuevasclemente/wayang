@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createAgentProfile } from "./agent-profiles.js";
-import { close, commitStoreMutation, init } from "./db.js";
+import { close, commitStoreMutation, getStore, init } from "./db.js";
 import { installSyntheticLegacyAgentActivation } from "./legacy-agent-activation.test-helper.js";
 import { createProject, updateProject } from "./projects.js";
 import {
@@ -17,6 +17,7 @@ import {
   projectAllowsAgentProfile,
   resolveEffectiveSessionConfig,
 } from "./policy.js";
+import { resolveWorkspaceCapability } from "./workspace-capabilities.js";
 import { WREN_AGENT_PROFILE_ID } from "./workspace-types.js";
 
 function withStore(name: string, run: (fixture: { dir: string; cwd: string }) => void): void {
@@ -104,6 +105,25 @@ test("historical agent profile requires deployment-local activation for every pr
     const inactive = authorizeProjectAction({ cwd, actor: "interactive", agentProfileId: WREN_AGENT_PROFILE_ID });
     assert.equal(inactive.allowed, false);
     assert.equal(inactive.code, "profile_activation_missing");
+    commitStoreMutation((draft) => {
+      for (const capability_id of ["wayang.standard-resources.v1", "wayang.masked-host-workspace.v1"] as const) {
+        draft.workspaceCapabilityAssociations.push({
+          capability_id,
+          project_id: draft.projects[0]!.id,
+          agent_profile_id: WREN_AGENT_PROFILE_ID,
+          revision: 1,
+          active: true,
+          approved_at: now,
+          revoked_at: null,
+          updated_at: now,
+        });
+      }
+    });
+    assert.equal(resolveWorkspaceCapability({
+      capability_id: "wayang.standard-resources.v1",
+      project_id: getStore().projects[0]!.id,
+      agent_profile_id: WREN_AGENT_PROFILE_ID,
+    }).authorized, false, "copied active associations must remain inert without local activation");
 
     const restoreActivation = installSyntheticLegacyAgentActivation(path.join(dir, "config"));
     try {
