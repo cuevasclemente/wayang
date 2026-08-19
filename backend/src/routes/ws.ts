@@ -53,6 +53,7 @@ import {
   createPiSession,
   getPiSession,
   getPiSessionBashMode,
+  piSessionHandleRequiresFreshRuntime,
   getRuntimeMutationSessionState,
   sendMessage,
   resendMessage,
@@ -144,6 +145,17 @@ function wsProfile(sessionId: string | null | undefined, event: string, details 
   console.log(
     `[ws-profile] ${new Date().toISOString()} sid=${shortSessionId(sessionId)} event=${event}${details ? ` ${details}` : ""}`,
   );
+}
+
+/** @internal Exported for stale-runtime WebSocket regression tests. */
+export async function resolveWebSocketRuntimeHandle(
+  existing: PiSessionHandle | undefined,
+  createIfMissing: boolean,
+  create: () => Promise<PiSessionHandle>,
+): Promise<PiSessionHandle | undefined> {
+  if (!existing) return createIfMissing ? create() : undefined;
+  if (!createIfMissing && !piSessionHandleRequiresFreshRuntime(existing)) return existing;
+  return create();
 }
 
 /** @internal Exported for focused wire-contract tests. */
@@ -457,20 +469,19 @@ function handleConnection(
       return false;
     }
     const attachStart = nowMs();
-    wsProfile(nextSessionId, "attach_live_start", `createIfMissing=${createIfMissing} hasLive=${Boolean(getPiSession(nextSessionId))}`);
-    if (!getPiSession(nextSessionId)) {
-      if (!createIfMissing) {
-        wsProfile(nextSessionId, "attach_live_skip", `duration=${elapsedMs(attachStart)} reason=not_live`);
-        return false;
-      }
-      const createStart = nowMs();
-      await getOrCreatePiSession(nextSessionId);
-      wsProfile(nextSessionId, "attach_live_created", `duration=${elapsedMs(createStart)}`);
+    const existingHandle = getPiSession(nextSessionId);
+    wsProfile(nextSessionId, "attach_live_start", `createIfMissing=${createIfMissing} hasLive=${Boolean(existingHandle)}`);
+    const liveHandle = await resolveWebSocketRuntimeHandle(
+      existingHandle,
+      createIfMissing,
+      () => getOrCreatePiSession(nextSessionId),
+    );
+    if (!liveHandle) {
+      wsProfile(nextSessionId, "attach_live_skip", `duration=${elapsedMs(attachStart)} reason=not_live`);
+      return false;
     }
 
     if (!alive || version !== setupVersion) return false;
-    const liveHandle = getPiSession(nextSessionId);
-    if (!liveHandle) return false;
 
     if (!liveHandle.session.isStreaming) {
       ensureInteractiveCommandGuardEnabled(nextSessionId, "websocket live-session attach");
@@ -1032,15 +1043,12 @@ function handleConnection(
   });
 }
 
-async function getOrCreatePiSession(id: string): Promise<void> {
+async function getOrCreatePiSession(id: string): Promise<PiSessionHandle> {
   const session = getSessionById(id);
   if (!session) throw new Error("Session not found in DB");
   if (isLegacyPrivateSessionQuarantined(session)) {
     throw new Error("Quarantined legacy sessions cannot start a runtime");
   }
-
-  const existing = getPiSession(id);
-  if (existing) return;
 
   let handle: PiSessionHandle;
   try {
@@ -1057,6 +1065,7 @@ async function getOrCreatePiSession(id: string): Promise<void> {
   }
   ensureInteractiveCommandGuardEnabled(id, "websocket-created pi session");
   if (handle.sessionFile && !session.pi_session_file) updatePiSessionFile(id, handle.sessionFile);
+  return handle;
 }
 
 function parseSlashCommand(content: string): { name: string; args: string } | null {
