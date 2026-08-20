@@ -8,6 +8,7 @@ interface BrowserMockState {
   credentialAvailability: CredentialAvailability;
   matchesAvailability?: CredentialAvailability;
   credentialInspection?: "blocked" | "text-allowed";
+  profilePersistence?: "shared" | "named";
 }
 
 interface CapturedRequest {
@@ -31,7 +32,9 @@ function publicBrowserState(sessionId: string, projectCwd: string, state: Browse
     cdpReady: true,
     viewerTransport: "cdp-screencast",
     vncReady: true,
-    profile: { persistence: "shared" },
+    profile: state.profilePersistence === "named"
+      ? { persistence: "named", name: "Legacy shared" }
+      : { persistence: "shared" },
     updatedAt: Date.now(),
     credentialInspection: state.credentialInspection,
   };
@@ -353,6 +356,35 @@ test("credential drawer preserves matches 409 handling after an unlocked status"
   await expect(drawer).not.toContainText("not connected");
   expect(mock.requests.some((entry) => entry.path === "/api/browser/credentials/status" && entry.method === "POST")).toBe(true);
   expect(mock.requests.some((entry) => entry.path === "/api/browser/credentials/matches" && entry.method === "POST")).toBe(true);
+});
+
+test("named Standard Fast page sends human paste only through its authenticated viewer", async ({ page, request }) => {
+  const session = await createE2eSession(request, "e2e named browser paste");
+  const mock = await openMockBrowser(page, session.id, session.cwd);
+  mock.state.profilePersistence = "named";
+  mock.state.controlMode = "user";
+  await openSessionInUi(page, session);
+  await page.getByRole("button", { name: "Browser", exact: true }).click();
+
+  await expect(page.getByText("Fast page connected")).toBeVisible();
+  await page.getByRole("button", { name: "Paste text" }).click();
+  const target = page.getByLabel("Direct paste target");
+  await target.evaluate((element) => {
+    const clipboard = new DataTransfer();
+    clipboard.setData("text/plain", "synthetic-human-paste");
+    element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: clipboard }));
+  });
+  await expect(page.getByText("Clipboard text was sent to the focused browser field.")).toBeVisible();
+  await expect.poll(() => mock.viewerMessages.flatMap((raw) => {
+    const message = JSON.parse(raw) as { type?: string; text?: string };
+    return message.type === "paste" ? [message] : [];
+  })).toEqual([{ type: "paste", text: "synthetic-human-paste" }]);
+  expect(mock.requests.some((entry) => entry.path === "/api/browser/paste-text")).toBe(false);
+  const storage = await page.evaluate(() => ({
+    local: Object.values(localStorage),
+    session: Object.values(sessionStorage),
+  }));
+  expect([...storage.local, ...storage.session].join("\n")).not.toContain("synthetic-human-paste");
 });
 
 test("direct paste forwards an uncontrolled DOM value without retaining it in browser storage", async ({ page, request }) => {

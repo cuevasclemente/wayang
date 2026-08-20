@@ -15,6 +15,8 @@ interface BrowserViewerProps {
   onStatus?: () => void;
   onPageChange?: (page: { url?: string; title?: string }) => void;
   onPasteText?: (text: string) => void;
+  /** Send human clipboard text through the authenticated CDP viewer transport. */
+  pasteThroughViewer?: boolean;
   vncTakeoverRequest?: number;
   vncTakeoverConsumed?: number;
   onVncTakeoverConsumed?: (request: number) => void;
@@ -48,6 +50,7 @@ export function BrowserViewer(props: BrowserViewerProps) {
       onStatus={props.onStatus}
       onPageChange={props.onPageChange}
       onPasteText={props.onPasteText}
+      pasteThroughViewer={props.pasteThroughViewer}
     />
   );
 }
@@ -229,12 +232,12 @@ export function CdpScreencastViewer({
     if (!text) return;
     setPasteCaptureOpen(false);
     if (text.length > 4_096 || new TextEncoder().encode(text).byteLength > 16_384 || text.includes("\0")) {
-      setPasteNotice("Clipboard text exceeds the protected preparation paste limit.");
+      setPasteNotice("Clipboard text exceeds the direct paste limit.");
       return;
     }
     setPasteNotice(sendInput({ type: "paste", text })
       ? "Clipboard text was sent to the focused browser field."
-      : "The preparation viewer is not connected.");
+      : "The browser viewer is not connected.");
   }, [sendInput]);
 
   const readSystemClipboard = useCallback(async () => {
@@ -554,6 +557,7 @@ export function CdpScreencastViewer({
           <label className="mb-2 block font-medium text-neutral-200">Direct paste target</label>
           <textarea
             ref={pasteCaptureRef}
+            aria-label="Direct paste target"
             data-testid={testId ? `${testId}-paste-capture` : undefined}
             defaultValue=""
             onPaste={(event) => {

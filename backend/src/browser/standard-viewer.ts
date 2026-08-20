@@ -5,6 +5,8 @@ import type { ProtectedBrowserViewerTransport } from "../routes/protected-browse
 
 const SETTLE_TIMEOUT_MS = 10_000;
 const SETTLE_INTERVAL_MS = 50;
+const STANDARD_VIEWER_PASTE_MAX_CHARS = 4_096;
+const STANDARD_VIEWER_PASTE_MAX_BYTES = 16_384;
 
 export type StandardViewerFailureReason =
   | "viewer_closed"
@@ -23,7 +25,8 @@ export type StandardViewerInputCategory =
   | "mouse_move"
   | "wheel"
   | "key_down"
-  | "key_up";
+  | "key_up"
+  | "paste";
 
 export interface StandardViewerObservation {
   event: "input_received" | "authority" | "cdp_dispatch" | "attestation" | "viewer_close";
@@ -61,7 +64,24 @@ function inputCategory(message: any): StandardViewerInputCategory | null {
     if (message.event === "down") return "key_down";
     if (message.event === "up") return "key_up";
   }
+  if (message?.type === "paste") return "paste";
   return null;
+}
+
+function exactPasteText(value: unknown): string | null {
+  if (typeof value !== "string" || !value || value.length > STANDARD_VIEWER_PASTE_MAX_CHARS
+    || Buffer.byteLength(value, "utf8") > STANDARD_VIEWER_PASTE_MAX_BYTES || value.includes("\0")) return null;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return null;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return null;
+    }
+  }
+  return value;
 }
 
 function keyCodeFor(key: string): number | undefined {
@@ -313,6 +333,16 @@ export async function openStandardCdpViewer(options: {
           const sessionId = Number(message.sessionId);
           if (!Number.isSafeInteger(sessionId) || sessionId < 0) fail("input_invalid");
           await dispatchCdp(category, "Page.screencastFrameAck", { sessionId });
+          return;
+        }
+        if (message.type === "paste") {
+          if (Object.keys(message).sort().join("\0") !== "text\0type") fail("input_invalid");
+          const text = exactPasteText(message.text);
+          if (text === null) fail("input_invalid");
+          await dispatchCdp(category, "Input.insertText", { text });
+          // Input handlers may navigate synchronously, just like ordinary key
+          // input, so paste joins the same coalesced document-attestation lane.
+          scheduleAttestation(category);
           return;
         }
         if (message.type === "mouse") {
