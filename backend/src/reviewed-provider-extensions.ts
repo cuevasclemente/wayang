@@ -15,7 +15,7 @@
  *
  * "narwhal-horn/index.ts" was source-reviewed as the identity-neutral,
  * Ruminant-capable Narwhal-Horn Qwen3.8 provider artifact (reviewed SHA-256
- * db51a20aa989c06315b1e058cfe431027c3961eee3748516c99fc02b6b01242a at
+ * 67bf45debd9d019da672770164b28832aa9e7a660db6ba16d1d7c0b4eb4c936f at
  * integration time, 2026-08-20). It preserves the explicitly experimental
  * 512K YaRN tier (`qwen3.8-27b`), adds fail-closed shared-gateway routing and
  * session-affinity headers, and retains explicit direct routing for rollback.
