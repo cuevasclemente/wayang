@@ -18,6 +18,7 @@ import {
   getPiSessionBrowserAgentDiagnostic,
 } from "./pi-bridge.js";
 import { createProject } from "./projects.js";
+import { getBashSandboxAvailability } from "./sandbox-bash.js";
 import { createSession } from "./sessions.js";
 import {
   commitWorkspaceCapabilityActivation,
@@ -179,10 +180,12 @@ test("approved Standard interactive sessions receive exact explicit browser tool
     INTERACTIVE_BROWSER_TOOL_NAMES.filter((name) => approvedHandle.session.getActiveToolNames().includes(name)),
     [...INTERACTIVE_BROWSER_TOOL_NAMES],
   );
+  const expectedRestrictedTools = ["read", "edit", "write", ...INTERACTIVE_BROWSER_TOOL_NAMES];
+  if (getBashSandboxAvailability().available) expectedRestrictedTools.push("bash");
   assert.deepEqual(
     new Set(approvedHandle.session.getActiveToolNames()),
-    new Set(["read", "edit", "write", "bash", ...INTERACTIVE_BROWSER_TOOL_NAMES]),
-    "restricted Browser runtime receives only reviewed built-ins plus exact companion tools",
+    new Set(expectedRestrictedTools),
+    "restricted Browser runtime receives only reviewed built-ins, available sandboxed bash, and exact companion tools",
   );
   const live = getLiveInteractiveBrowserRuntime(approved.id);
   assert.ok(live);
