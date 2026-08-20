@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { PiSessionHandle } from "../pi-bridge.js";
-import { requireWebSocketRuntimeAttachment, resolveWebSocketRuntimeHandle } from "./ws.js";
+import {
+  isStaleWebSocketRuntimeAttachmentError,
+  requireWebSocketRuntimeAttachment,
+  resolveWebSocketRuntimeHandle,
+} from "./ws.js";
 
 function handle(denied?: true): PiSessionHandle {
   return (denied ? { capabilityAuthorityDenied: true } : {}) as PiSessionHandle;
@@ -72,19 +76,76 @@ test("failed stale-runtime replacement never falls back to the denied handle", a
   );
 });
 
-test("runtime attachment gates dispatch on a successful attach result", async () => {
+test("runtime attachment retries once when the exact selection remains current", async () => {
+  let attempts = 0;
+  await assert.doesNotReject(requireWebSocketRuntimeAttachment(
+    async () => {
+      attempts += 1;
+      return attempts === 2;
+    },
+    () => true,
+  ));
+  assert.equal(attempts, 2);
+});
+
+test("runtime attachment stays fail-closed after a genuine selection change", async () => {
+  let attempts = 0;
   let dispatches = 0;
 
   await assert.rejects(
-    requireWebSocketRuntimeAttachment(async () => false).then(() => {
+    requireWebSocketRuntimeAttachment(
+      async () => {
+        attempts += 1;
+        return false;
+      },
+      () => false,
+    ).then(() => {
       dispatches += 1;
     }),
-    {
-      name: "Error",
-      message: "Session selection changed before runtime attachment completed",
+    (error) => {
+      assert.equal(isStaleWebSocketRuntimeAttachmentError(error), true);
+      assert.equal((error as { code?: unknown }).code, "selection_changed");
+      assert.equal(
+        (error as Error).message,
+        "Session action was not sent because the selection changed during runtime attachment",
+      );
+      return true;
     },
   );
+  assert.equal(attempts, 1);
   assert.equal(dispatches, 0);
+});
 
-  await assert.doesNotReject(requireWebSocketRuntimeAttachment(async () => true));
+test("a superseded same-selection retry remains a nonpersistent cancellation", async () => {
+  let attempts = 0;
+  let cancellation: unknown;
+  try {
+    await requireWebSocketRuntimeAttachment(
+      async () => {
+        attempts += 1;
+        return false;
+      },
+      () => true,
+    );
+  } catch (error) {
+    cancellation = error;
+  }
+
+  assert.equal(attempts, 2);
+  assert.equal(isStaleWebSocketRuntimeAttachmentError(cancellation), true);
+});
+
+test("successful and failed runtime creation do not receive a stale-selection retry", async () => {
+  await assert.doesNotReject(requireWebSocketRuntimeAttachment(async () => true, () => true));
+
+  const creationError = new Error("runtime creation failed");
+  let attempts = 0;
+  await assert.rejects(
+    requireWebSocketRuntimeAttachment(async () => {
+      attempts += 1;
+      throw creationError;
+    }, () => true),
+    (error) => error === creationError,
+  );
+  assert.equal(attempts, 1);
 });

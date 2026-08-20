@@ -158,13 +158,32 @@ export async function resolveWebSocketRuntimeHandle(
   return create();
 }
 
+export class StaleWebSocketRuntimeAttachmentError extends Error {
+  readonly code = "selection_changed";
+
+  constructor() {
+    super("Session action was not sent because the selection changed during runtime attachment");
+    this.name = "StaleWebSocketRuntimeAttachmentError";
+  }
+}
+
+export function isStaleWebSocketRuntimeAttachmentError(
+  error: unknown,
+): error is StaleWebSocketRuntimeAttachmentError {
+  return error instanceof StaleWebSocketRuntimeAttachmentError;
+}
+
 /** @internal Exported for runtime-attachment regression tests. */
 export async function requireWebSocketRuntimeAttachment(
   attach: () => Promise<boolean>,
+  isSelectionCurrent: () => boolean = () => false,
 ): Promise<void> {
-  if (!await attach()) {
-    throw new Error("Session selection changed before runtime attachment completed");
-  }
+  if (await attach()) return;
+  // An internal setup refresh can supersede an attachment without changing the
+  // browser's exact selected session/generation. Retry once against the latest
+  // setup version; genuine selection changes remain fail-closed.
+  if (isSelectionCurrent() && await attach()) return;
+  throw new StaleWebSocketRuntimeAttachmentError();
 }
 
 /** @internal Exported for focused wire-contract tests. */
@@ -998,12 +1017,17 @@ function handleConnection(
       return;
     }
 
+    const actionSessionId = currentSessionId;
+    const actionSelectionId = currentSelectionId;
     handleClientMessage(
       ws,
-      currentSessionId,
-      currentSelectionId,
+      actionSessionId,
+      actionSelectionId,
       msg,
-      () => attachLiveSession(currentSessionId, setupVersion, true, currentSelectionId, false),
+      () => attachLiveSession(actionSessionId, setupVersion, true, actionSelectionId, false),
+      () => alive
+        && currentSessionId === actionSessionId
+        && currentSelectionId === actionSelectionId,
     );
   };
 
@@ -1239,6 +1263,58 @@ function queuedAttachmentNames(value: unknown): string[] {
   ));
 }
 
+/** @internal Applies the client-failure wire and persistence policy in one testable boundary. */
+export function applyWebSocketClientFailure(input: {
+  sessionId: string;
+  selectionId: string | null;
+  message: any;
+  cause: unknown;
+  send: (frame: Record<string, unknown>) => void;
+  persist: (error: string) => void;
+}): void {
+  const { sessionId, selectionId, message, cause, send, persist } = input;
+  const staleAttachment = isStaleWebSocketRuntimeAttachmentError(cause);
+  const error = safeSessionError(sessionId, cause);
+  let cancellationId: string | undefined;
+  if (message?.type === "cancel_queued_message") {
+    try { cancellationId = optionalClientMessageId(message.client_message_id); }
+    catch { /* malformed IDs cannot receive a correlated acknowledgement */ }
+  }
+  if (cancellationId) {
+    send({
+      type: "queued_message_cancel_ack",
+      session_id: sessionId,
+      client_message_id: cancellationId,
+      status: "error",
+      error: `Could not cancel queued message: ${error}`,
+    });
+    return;
+  }
+  let messageId: string | undefined;
+  if (message?.type === "message") {
+    try { messageId = optionalClientMessageId(message.client_message_id); }
+    catch { /* malformed IDs receive only the generic protocol error */ }
+  }
+  if (messageId) {
+    send({
+      type: "queued_message_ack",
+      session_id: sessionId,
+      client_message_id: messageId,
+      status: "rejected",
+      ...(staleAttachment ? { error_code: cause.code } : {}),
+      error,
+    });
+  }
+  if (!staleAttachment) persist(error);
+  send({
+    type: "error",
+    session_id: sessionId,
+    ...(selectionId ? { selection_id: selectionId } : {}),
+    ...(staleAttachment ? { code: cause.code } : {}),
+    error,
+  });
+}
+
 /** @internal Machine-coded lock rejection; callers must not persist it as a session error. */
 export function serializeMutationLockedRejection(
   sessionId: string,
@@ -1277,6 +1353,7 @@ async function handleClientMessage(
   selectionId: string | null,
   msg: any,
   ensureLiveSession: () => Promise<boolean>,
+  isSelectionCurrent: () => boolean,
 ): Promise<void> {
   try {
     const row = getSessionById(sessionId);
@@ -1300,18 +1377,24 @@ async function handleClientMessage(
         const rawContent = typeof msg.content === "string" ? msg.content : "";
         const trimmedContent = rawContent.trim();
         const clientMessageId = optionalClientMessageId(msg.client_message_id);
-        const preparedAttachments = prepareAttachments(sessionId, msg.attachments);
+        const hasAttachmentInput = Array.isArray(msg.attachments) && msg.attachments.length > 0;
         const acceptedAt = Date.now();
-        if (!trimmedContent && preparedAttachments.count === 0) return;
+        if (!trimmedContent && !hasAttachmentInput) return;
 
         touchSession(sessionId);
 
         try {
-          await requireWebSocketRuntimeAttachment(ensureLiveSession);
+          await requireWebSocketRuntimeAttachment(ensureLiveSession, isSelectionCurrent);
           updateSessionError(sessionId, null);
         } catch (err: any) {
+          if (isStaleWebSocketRuntimeAttachmentError(err)) throw err;
           throw new Error(safeSessionError(sessionId, err, "Failed to start pi session: "));
         }
+
+        // Attachment preparation writes private files. Keep it after the exact
+        // selection attachment succeeds so a stale, rejected send leaves no
+        // orphaned upload artifacts behind.
+        const preparedAttachments = prepareAttachments(sessionId, msg.attachments);
 
         if (trimmedContent && await handleBuiltinSlashCommand(ws, sessionId, trimmedContent)) {
           if (clientMessageId) {
@@ -1408,9 +1491,10 @@ async function handleClientMessage(
         if (!messageId) throw new Error("resend requires message_id");
 
         try {
-          await requireWebSocketRuntimeAttachment(ensureLiveSession);
+          await requireWebSocketRuntimeAttachment(ensureLiveSession, isSelectionCurrent);
           updateSessionError(sessionId, null);
         } catch (err: any) {
+          if (isStaleWebSocketRuntimeAttachmentError(err)) throw err;
           throw new Error(safeSessionError(sessionId, err, "Failed to start pi session: "));
         }
 
@@ -1464,7 +1548,7 @@ async function handleClientMessage(
       }
 
       case "command_guard": {
-        await requireWebSocketRuntimeAttachment(ensureLiveSession);
+        await requireWebSocketRuntimeAttachment(ensureLiveSession, isSelectionCurrent);
         const mode = normalizeCommandGuardMode(msg.mode);
         const state = mode
           ? setCommandGuardMode(sessionId, mode, { announce: msg.announce !== false, pin: typeof msg.pin === "string" ? msg.pin : undefined })
@@ -1484,38 +1568,14 @@ async function handleClientMessage(
         break;
     }
   } catch (err: any) {
-    const error = safeSessionError(sessionId, err);
-    let cancellationId: string | undefined;
-    if (msg?.type === "cancel_queued_message") {
-      try { cancellationId = optionalClientMessageId(msg.client_message_id); }
-      catch { /* malformed IDs cannot receive a correlated acknowledgement */ }
-    }
-    if (cancellationId) {
-      sendSafe(ws, {
-        type: "queued_message_cancel_ack",
-        session_id: sessionId,
-        client_message_id: cancellationId,
-        status: "error",
-        error: `Could not cancel queued message: ${error}`,
-      });
-      return;
-    }
-    let messageId: string | undefined;
-    if (msg?.type === "message") {
-      try { messageId = optionalClientMessageId(msg.client_message_id); }
-      catch { /* malformed IDs receive only the generic protocol error */ }
-    }
-    if (messageId) {
-      sendSafe(ws, {
-        type: "queued_message_ack",
-        session_id: sessionId,
-        client_message_id: messageId,
-        status: "rejected",
-        error,
-      });
-    }
-    updateSessionError(sessionId, error);
-    sendSafe(ws, { type: "error", session_id: sessionId, ...(selectionId ? { selection_id: selectionId } : {}), error });
+    applyWebSocketClientFailure({
+      sessionId,
+      selectionId,
+      message: msg,
+      cause: err,
+      send: (frame) => sendSafe(ws, frame),
+      persist: (error) => updateSessionError(sessionId, error),
+    });
   }
 }
 

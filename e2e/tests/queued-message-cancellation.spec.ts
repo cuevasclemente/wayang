@@ -5,8 +5,9 @@ async function installQueuedMessageSocket(
   page: Page,
   initialQueued: Array<{ client_message_id: string; content: string; attachment_names: string[] }> = [],
   deferFirstAgentStart = false,
+  rejectQueuedSend = false,
 ): Promise<void> {
-  await page.addInitScript(({ queuedSnapshot, deferFirstStart }) => {
+  await page.addInitScript(({ queuedSnapshot, deferFirstStart, rejectQueued }) => {
     type Handler<T> = ((event: T) => void) | null;
 
     class QueuedMessageWebSocket {
@@ -19,8 +20,8 @@ async function installQueuedMessageSocket(
       onclose: Handler<CloseEvent> = null;
       onerror: Handler<Event> = null;
       onmessage: Handler<MessageEvent> = null;
-      private readonly sessionId: string;
-      private readonly selectionId: string | null;
+      private sessionId: string;
+      private selectionId: string | null;
       private messageCount = 0;
       private interruptCount = 0;
 
@@ -31,6 +32,9 @@ async function installQueuedMessageSocket(
         (window as unknown as { queuedCancellationState: () => { interruptCount: number } }).queuedCancellationState = () => ({
           interruptCount: this.interruptCount,
         });
+        (window as unknown as { forceQueuedSocketClosing: () => void }).forceQueuedSocketClosing = () => {
+          this.readyState = QueuedMessageWebSocket.CLOSING;
+        };
         (window as unknown as { startDeferredQueuedTurn: () => void }).startDeferredQueuedTurn = () => {
           this.emit({ type: "agent_start" });
           this.emit({ type: "text_delta", delta: "Synthetic deferred active response." });
@@ -59,7 +63,23 @@ async function installQueuedMessageSocket(
           type?: string;
           content?: string;
           client_message_id?: string;
+          session_id?: string;
+          selection_id?: string;
         };
+        if (message.type === "switch_session" && message.session_id) {
+          this.sessionId = message.session_id;
+          this.selectionId = message.selection_id ?? null;
+          this.emit({ type: "session_loading", session_id: this.sessionId, selection_id: this.selectionId });
+          this.emit({ type: "session_ready", session_id: this.sessionId, selection_id: this.selectionId });
+          this.emit({ type: "history", session_id: this.sessionId, selection_id: this.selectionId, messages: [] });
+          this.emit({
+            type: "queued_message_snapshot",
+            session_id: this.sessionId,
+            selection_id: this.selectionId,
+            messages: [],
+          });
+          return;
+        }
         if (message.type === "interrupt") {
           this.interruptCount++;
           return;
@@ -85,13 +105,18 @@ async function installQueuedMessageSocket(
           return;
         }
         if (message.client_message_id) {
-          this.emit({
+          const acknowledgement = {
             type: "queued_message_ack",
             session_id: this.sessionId,
             client_message_id: message.client_message_id,
-            status: "queued",
-            cancellable: true,
-          });
+            status: rejectQueued ? "rejected" : "queued",
+            ...(rejectQueued ? {
+              error_code: "synthetic_rejection",
+              error: "Synthetic queued send rejection",
+            } : { cancellable: true }),
+          };
+          if (rejectQueued) window.setTimeout(() => this.emit(acknowledgement), 0);
+          else this.emit(acknowledgement);
         }
       }
 
@@ -105,7 +130,111 @@ async function installQueuedMessageSocket(
     }
 
     (window as unknown as { WebSocket: typeof QueuedMessageWebSocket }).WebSocket = QueuedMessageWebSocket;
-  }, { queuedSnapshot: initialQueued, deferFirstStart: deferFirstAgentStart });
+  }, {
+    queuedSnapshot: initialQueued,
+    deferFirstStart: deferFirstAgentStart,
+    rejectQueued: rejectQueuedSend,
+  });
+}
+
+async function installStaleSelectionSocket(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    type Handler<T> = ((event: T) => void) | null;
+    type PendingSend = { sessionId: string; clientMessageId: string };
+
+    class StaleSelectionWebSocket {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static readonly CLOSED = 3;
+      readyState = StaleSelectionWebSocket.CONNECTING;
+      onopen: Handler<Event> = null;
+      onclose: Handler<CloseEvent> = null;
+      onerror: Handler<Event> = null;
+      onmessage: Handler<MessageEvent> = null;
+      private sessionId: string;
+      private selectionId: string | null;
+      private pendingSend: PendingSend | null = null;
+
+      constructor(url: string) {
+        const parsed = new URL(url, window.location.href);
+        this.sessionId = parsed.searchParams.get("session_id") ?? "";
+        this.selectionId = parsed.searchParams.get("selection_id");
+        window.setTimeout(() => {
+          this.readyState = StaleSelectionWebSocket.OPEN;
+          this.onopen?.(new Event("open"));
+          this.publishSelection();
+        }, 0);
+      }
+
+      send(raw: string): void {
+        const message = JSON.parse(raw) as {
+          type?: string;
+          session_id?: string;
+          selection_id?: string;
+          client_message_id?: string;
+        };
+        if (message.type === "message" && message.client_message_id) {
+          this.pendingSend = { sessionId: this.sessionId, clientMessageId: message.client_message_id };
+          return;
+        }
+        if (message.type !== "switch_session" || !message.session_id) return;
+
+        const rejected = this.pendingSend;
+        this.pendingSend = null;
+        this.sessionId = message.session_id;
+        this.selectionId = message.selection_id ?? null;
+        this.publishSelection(rejected ? [{
+          client_message_id: rejected.clientMessageId,
+          content: "Synthetic queue entry owned by the newly selected session.",
+          attachment_names: [],
+        }] : []);
+        if (rejected) {
+          this.emit({
+            type: "queued_message_ack",
+            session_id: rejected.sessionId,
+            client_message_id: rejected.clientMessageId,
+            status: "rejected",
+            error_code: "selection_changed",
+            error: "Session action was not sent because the selection changed during runtime attachment",
+          });
+        }
+      }
+
+      close(): void {
+        this.readyState = StaleSelectionWebSocket.CLOSED;
+      }
+
+      private publishSelection(
+        queuedMessages: Array<{ client_message_id: string; content: string; attachment_names: string[] }> = [],
+      ): void {
+        this.emit({ type: "session_loading", session_id: this.sessionId, selection_id: this.selectionId });
+        this.emit({ type: "session_ready", session_id: this.sessionId, selection_id: this.selectionId });
+        this.emit({ type: "history", session_id: this.sessionId, selection_id: this.selectionId, messages: [] });
+        this.emit({
+          type: "queued_message_snapshot",
+          session_id: this.sessionId,
+          selection_id: this.selectionId,
+          messages: queuedMessages,
+        });
+      }
+
+      private emit(payload: Record<string, unknown>): void {
+        this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(payload) }));
+      }
+    }
+
+    (window as unknown as { WebSocket: typeof StaleSelectionWebSocket }).WebSocket = StaleSelectionWebSocket;
+  });
+}
+
+async function installDelayedFileReader(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const originalReadAsDataUrl = FileReader.prototype.readAsDataURL;
+    FileReader.prototype.readAsDataURL = function delayedReadAsDataURL(blob: Blob): void {
+      window.setTimeout(() => originalReadAsDataUrl.call(this, blob), 150);
+    };
+  });
 }
 
 async function sendPrompt(page: Page, content: string): Promise<void> {
@@ -154,6 +283,133 @@ test("restores cancellation controls from the backend queue snapshot after reatt
   await queued.getByTestId("chat-cancel-queued-message").click();
   await expect(queued).toHaveCount(0);
   await expect(page.getByTestId("chat-streaming")).toContainText("reattached response remains active");
+});
+
+test("keeps an asynchronously prepared attachment bound to its source session", async ({ page, request }) => {
+  await installStaleSelectionSocket(page);
+  await installDelayedFileReader(page);
+  const first = await createE2eSession(request, "e2e delayed attachment first session");
+  const second = await createE2eSession(request, "e2e delayed attachment second session");
+  await openSessionInUi(page, first);
+
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "source-session-only.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("synthetic delayed attachment bytes"),
+  });
+  await page.getByText(second.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${second.id}$`));
+  await page.waitForTimeout(250);
+  await expect(page.getByText("source-session-only.txt", { exact: true })).not.toBeVisible();
+
+  await page.getByText(first.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${first.id}$`));
+  await expect(page.getByText("source-session-only.txt", { exact: true })).toBeVisible();
+});
+
+test("restores text and attachments when a send is rejected after switching sessions", async ({ page, request }) => {
+  await installStaleSelectionSocket(page);
+  const first = await createE2eSession(request, "e2e stale send first session");
+  const second = await createE2eSession(request, "e2e stale send second session");
+  await openSessionInUi(page, first);
+
+  const rejectedText = "Restore this draft after the selection changes.";
+  await page.getByTestId("chat-input").fill(rejectedText);
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "stale-selection-note.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("synthetic attachment bytes"),
+  });
+  await expect(page.getByText("stale-selection-note.txt", { exact: true })).toBeVisible();
+  await page.getByTestId("chat-send-button").click();
+
+  await page.getByText(second.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${second.id}$`));
+  const secondSessionQueue = page.getByTestId("chat-queued-user-message");
+  await expect(secondSessionQueue).toContainText("Synthetic queue entry owned by the newly selected session.");
+  await expect(secondSessionQueue).not.toContainText(rejectedText);
+  await expect(secondSessionQueue).not.toContainText("stale-selection-note.txt");
+  await page.getByText(first.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${first.id}$`));
+
+  await expect(page.getByTestId("chat-input")).toHaveValue(rejectedText);
+  await expect(page.getByText("stale-selection-note.txt", { exact: true })).toBeVisible();
+});
+
+test("removes a rejected queue item after restoring its text and attachment", async ({ page, request }) => {
+  await installQueuedMessageSocket(page, [], false, true);
+  const session = await createE2eSession(request, "e2e rejected queued attachment");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Start the synthetic turn before queue rejection.");
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  const rejectedText = "Restore this rejected queued draft exactly once.";
+  await page.getByTestId("chat-input").fill(rejectedText);
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "rejected-queue-note.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("synthetic rejected queue attachment"),
+  });
+  await page.getByTestId("chat-send-button").click();
+
+  await expect(page.getByTestId("chat-queued-user-message")).toHaveCount(0);
+  await expect(page.getByTestId("chat-input")).toHaveValue(rejectedText);
+  await expect(page.getByText("rejected-queue-note.txt", { exact: true })).toBeVisible();
+});
+
+test("keeps the composer intact when the socket closes before send", async ({ page, request }) => {
+  await installQueuedMessageSocket(page);
+  const session = await createE2eSession(request, "e2e closing socket send");
+  await openSessionInUi(page, session);
+
+  const unsentText = "Keep this unsent draft during the closing-socket race.";
+  await page.getByTestId("chat-input").fill(unsentText);
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "unsent-closing-socket.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("synthetic unsent attachment"),
+  });
+  await expect(page.getByText("unsent-closing-socket.txt", { exact: true })).toBeVisible();
+  await page.evaluate(() => (
+    window as unknown as { forceQueuedSocketClosing: () => void }
+  ).forceQueuedSocketClosing());
+  await page.getByTestId("chat-send-button").click();
+
+  await expect(page.getByTestId("chat-input")).toHaveValue(unsentText);
+  await expect(page.getByText("unsent-closing-socket.txt", { exact: true })).toBeVisible();
+  await expect(page.locator('[data-testid="chat-message"][data-role="user"]')).toHaveCount(0);
+});
+
+test("keeps interrupted queued attachments in the source-session draft across switches", async ({ page, request }) => {
+  await installQueuedMessageSocket(page);
+  const first = await createE2eSession(request, "e2e interrupted attachment first session");
+  const second = await createE2eSession(request, "e2e interrupted attachment second session");
+  await openSessionInUi(page, first);
+
+  await sendPrompt(page, "Start the synthetic turn before interruption.");
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  const restoredText = "Restore this queued attachment on interrupt.";
+  await page.getByTestId("chat-input").fill(restoredText);
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "interrupted-queue-note.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("synthetic interrupted queue attachment"),
+  });
+  await expect(page.getByText("interrupted-queue-note.txt", { exact: true })).toBeVisible();
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-queued-user-message")).toHaveCount(1);
+
+  await page.getByTestId("chat-composer-interrupt-button").click();
+  await expect(page.getByTestId("chat-input")).toHaveValue(restoredText);
+  await expect(page.getByText("interrupted-queue-note.txt", { exact: true })).toBeVisible();
+
+  await page.getByText(second.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${second.id}$`));
+  await expect(page.getByText("interrupted-queue-note.txt", { exact: true })).not.toBeVisible();
+  await page.getByText(first.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${first.id}$`));
+  await expect(page.getByTestId("chat-input")).toHaveValue(restoredText);
+  await expect(page.getByText("interrupted-queue-note.txt", { exact: true })).toBeVisible();
 });
 
 test("cancels one queued message without interrupting the active turn or removing its neighbor", async ({ page, request }) => {
