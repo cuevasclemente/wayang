@@ -28,6 +28,7 @@ import {
   type Session,
   type WorkspaceProject,
 } from "../api/client";
+import { formatContextWindow } from "../utils/context-window";
 
 interface NewSessionPanelProps {
   onCreated: (session: Session) => void;
@@ -208,7 +209,7 @@ export function NewSessionPanel({ onCreated, onCancel }: NewSessionPanelProps) {
                 <span className="block">Provider/model</span>
                 <select value={modelSelection} onChange={(event) => setModelSelection(event.target.value)} className="w-full rounded border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 focus:border-blue-600 focus:outline-none">
                   <option value="">Project / agent default</option>
-                  {models.map((model) => <option key={`${model.provider}:${model.id}`} value={JSON.stringify([model.provider, model.id])}>{model.name || model.id} — {model.provider}</option>)}
+                  {models.map((model) => <option key={`${model.provider}:${model.id}`} value={JSON.stringify([model.provider, model.id])}>{model.name || model.id} — {model.provider}{formatContextWindow(model.contextWindow) ? ` · ${formatContextWindow(model.contextWindow)}` : ""}</option>)}
                 </select>
               </label>
             </div>

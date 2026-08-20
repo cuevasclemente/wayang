@@ -1196,6 +1196,37 @@ async function ensureExtensionProvidersLoaded(cwd = process.cwd()): Promise<void
   await _extensionProviderLoadPromise;
 }
 
+/**
+ * Resolve the compile-time reviewed provider extension entries against the
+ * agent directory's extensions root. Missing entries are skipped (the
+ * provider is not deployed on this host); symlinked or non-regular entries
+ * are refused fail-closed with a non-secret error. Returns absolute paths
+ * that are safe to hand to the resource loader.
+ */
+function resolveReviewedProviderExtensionPaths(
+  agentDir: string,
+): { paths: string[]; errors: string[] } {
+  const paths: string[] = [];
+  const errors: string[] = [];
+  for (const entry of REVIEWED_PROVIDER_EXTENSION_PATHS) {
+    const resolved = path.join(agentDir, "extensions", entry);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(resolved);
+    } catch {
+      continue;
+    }
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      errors.push(
+        `Reviewed provider extension "${entry}" is missing or unsafe; refusing to load it`,
+      );
+      continue;
+    }
+    paths.push(resolved);
+  }
+  return { paths, errors };
+}
+
 async function createReviewedModelListingRegistry(options: {
   cwd: string;
   agentDir: string;
@@ -1203,7 +1234,12 @@ async function createReviewedModelListingRegistry(options: {
   const { runtime, registry } = await createModelContext({ agentDir: options.agentDir });
   if (REVIEWED_PROVIDER_EXTENSION_PATHS.length === 0) return { runtime, registry };
 
-  const errors: string[] = [];
+  const resolved = resolveReviewedProviderExtensionPaths(options.agentDir);
+  if (resolved.paths.length === 0) {
+    return { runtime, registry, error: formatLoadErrors(resolved.errors) };
+  }
+
+  const errors = [...resolved.errors];
   const loader = new DefaultResourceLoader({
     cwd: options.cwd,
     agentDir: options.agentDir,
@@ -1213,7 +1249,7 @@ async function createReviewedModelListingRegistry(options: {
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    additionalExtensionPaths: [...REVIEWED_PROVIDER_EXTENSION_PATHS],
+    additionalExtensionPaths: resolved.paths,
   });
   try {
     await loader.reload();
