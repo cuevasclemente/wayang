@@ -64,7 +64,10 @@ import {
 import { isSessionCapabilityEligible, resolveWorkspaceCapability } from "./workspace-capabilities.js";
 import { isLegacyWrenStandardRuntime } from "./legacy-wren.js";
 import { WorkspaceStoreError, type AgentProfileRow, type PendingAgentSwitch, type ProjectRow } from "./workspace-types.js";
-import { REVIEWED_PROVIDER_EXTENSION_PATHS } from "./reviewed-provider-extensions.js";
+import {
+  REVIEWED_EXTERNAL_MODELS,
+  type ReviewedExternalModelEntry,
+} from "./reviewed-provider-extensions.js";
 import { getSudoBridge } from "./sudo-bridge.js";
 import { getCommandGuardIdentityBridge } from "./command-guard-bridge.js";
 import { scheduleWayangAutoTitle, type AutoTitleActivationSnapshot } from "./session-title-service.js";
@@ -1196,91 +1199,82 @@ async function ensureExtensionProvidersLoaded(cwd = process.cwd()): Promise<void
   await _extensionProviderLoadPromise;
 }
 
-/**
- * Resolve the compile-time reviewed provider extension entries against the
- * agent directory's extensions root. Missing entries are skipped (the
- * provider is not deployed on this host); symlinked or non-regular entries
- * are refused fail-closed with a non-secret error. Returns absolute paths
- * that are safe to hand to the resource loader.
- */
-function resolveReviewedProviderExtensionPaths(
+export function resolveReviewedExternalModels(
   agentDir: string,
-): { paths: string[]; errors: string[] } {
-  const paths: string[] = [];
+  entries: readonly ReviewedExternalModelEntry[] = REVIEWED_EXTERNAL_MODELS,
+): { models: WebModelInfo[]; errors: string[] } {
+  const models: WebModelInfo[] = [];
   const errors: string[] = [];
-  for (const entry of REVIEWED_PROVIDER_EXTENSION_PATHS) {
-    const resolved = path.join(agentDir, "extensions", entry);
-    let stat: fs.Stats;
+  const homeDir = path.resolve(agentDir, "..", "..");
+
+  for (const entry of entries) {
+    const extensionPath = path.join(agentDir, "extensions", entry.extensionPath);
+    let digest: string;
+    let artifactFd: number | undefined;
     try {
-      stat = fs.lstatSync(resolved);
-    } catch {
-      continue;
-    }
-    if (stat.isSymbolicLink() || !stat.isFile()) {
-      errors.push(
-        `Reviewed provider extension "${entry}" is missing or unsafe; refusing to load it`,
+      artifactFd = fs.openSync(
+        extensionPath,
+        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
       );
+      const stat = fs.fstatSync(artifactFd);
+      if (!stat.isFile()) {
+        errors.push(`Reviewed provider artifact "${entry.extensionPath}" is unsafe; refusing to list it`);
+        continue;
+      }
+      // Hash bytes from the same no-follow descriptor that was fstat-verified.
+      digest = createHash("sha256").update(fs.readFileSync(artifactFd)).digest("hex");
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error
+        ? String((error as { code?: unknown }).code)
+        : undefined;
+      if (code === "ELOOP") {
+        errors.push(`Reviewed provider artifact "${entry.extensionPath}" is unsafe; refusing to list it`);
+      } else if (code !== "ENOENT") {
+        errors.push(`Reviewed provider artifact "${entry.extensionPath}" could not be verified`);
+      }
+      continue;
+    } finally {
+      if (artifactFd !== undefined) fs.closeSync(artifactFd);
+    }
+    if (digest !== entry.sha256) {
+      errors.push(`Reviewed provider artifact "${entry.extensionPath}" hash mismatch; refusing to list it`);
       continue;
     }
-    paths.push(resolved);
+
+    let available = true;
+    if (entry.credentialRelativeToHome) {
+      const credentialPath = path.join(homeDir, entry.credentialRelativeToHome);
+      let credentialFd: number | undefined;
+      try {
+        credentialFd = fs.openSync(
+          credentialPath,
+          fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+        );
+        available = fs.fstatSync(credentialFd).isFile();
+      } catch {
+        available = false;
+      } finally {
+        if (credentialFd !== undefined) fs.closeSync(credentialFd);
+      }
+    }
+    models.push({
+      provider: entry.model.provider,
+      id: entry.model.id,
+      name: entry.model.name,
+      api: entry.model.api,
+      reasoning: entry.model.reasoning,
+      input: [...entry.model.input],
+      contextWindow: entry.model.contextWindow,
+      available,
+    });
   }
-  return { paths, errors };
+  return { models, errors };
 }
 
-async function createReviewedModelListingRegistry(options: {
-  cwd: string;
-  agentDir: string;
-}): Promise<{ runtime: ModelRuntime; registry: ModelRegistry; error?: string }> {
-  const { runtime, registry } = await createModelContext({ agentDir: options.agentDir });
-  if (REVIEWED_PROVIDER_EXTENSION_PATHS.length === 0) return { runtime, registry };
-
-  const resolved = resolveReviewedProviderExtensionPaths(options.agentDir);
-  if (resolved.paths.length === 0) {
-    return { runtime, registry, error: formatLoadErrors(resolved.errors) };
-  }
-
-  const errors = [...resolved.errors];
-  const loader = new DefaultResourceLoader({
-    cwd: options.cwd,
-    agentDir: options.agentDir,
-    settingsManager: SettingsManager.inMemory(),
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
-    additionalExtensionPaths: resolved.paths,
-  });
-  try {
-    await loader.reload();
-    const result = loader.getExtensions();
-    for (const error of result.errors) {
-      errors.push(`Reviewed provider extension "${error.path}" failed to load: ${error.error}`);
-    }
-    for (const { name, config, extensionPath } of result.runtime.pendingProviderRegistrations) {
-      try {
-        registry.registerProvider(name, config);
-      } catch (error) {
-        errors.push(
-          `Reviewed provider extension "${extensionPath}" failed to register provider "${name}": ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }
-    result.runtime.pendingProviderRegistrations = [];
-    for (const { provider, extensionPath } of result.runtime.pendingNativeProviderRegistrations) {
-      try {
-        runtime.registerNativeProvider(provider);
-      } catch (error) {
-        errors.push(
-          `Reviewed provider extension "${extensionPath}" failed to register native provider "${provider.id}": ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }
-    result.runtime.pendingNativeProviderRegistrations = [];
-  } catch (error) {
-    errors.push(`Reviewed provider extensions failed to load: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  return { runtime, registry, error: formatLoadErrors(errors) };
+async function createStaticModelListingRegistry(
+  agentDir: string,
+): Promise<{ runtime: ModelRuntime; registry: ModelRegistry; error?: string }> {
+  return createModelContext({ agentDir });
 }
 
 async function getModelListingRegistry(options?: {
@@ -1288,19 +1282,12 @@ async function getModelListingRegistry(options?: {
   agentDir?: string;
 }): Promise<{ runtime: ModelRuntime; registry: ModelRegistry; error?: string }> {
   if (options?.cwd || options?.agentDir) {
-    const agentDir = options.agentDir ?? getAgentDirPath();
-    return createReviewedModelListingRegistry({
-      cwd: options.cwd ?? process.cwd(),
-      agentDir,
-    });
+    return createStaticModelListingRegistry(options.agentDir ?? getAgentDirPath());
   }
   if (_modelListingRuntime && _modelListingRegistry) {
     return { runtime: _modelListingRuntime, registry: _modelListingRegistry, error: _modelListingRegistryError };
   }
-  _modelListingRegistryPromise ??= createReviewedModelListingRegistry({
-    cwd: process.cwd(),
-    agentDir: getAgentDirPath(),
-  }).then((result) => {
+  _modelListingRegistryPromise ??= createStaticModelListingRegistry(getAgentDirPath()).then((result) => {
     _modelListingRuntime = result.runtime;
     _modelListingRegistry = result.registry;
     _modelListingRegistryError = result.error;
@@ -1599,13 +1586,26 @@ export async function listModels(options: {
   cwd?: string;
   agentDir?: string;
   includeDynamicModels?: boolean;
+  reviewedExternalModels?: readonly ReviewedExternalModelEntry[];
 } = {}): Promise<{ models: WebModelInfo[]; defaultModel: WebDefaultModelInfo | null; error?: string }> {
   const listing = await getModelListingRegistry(options);
   const registry = listing.registry;
   const dynamicModels = options.includeDynamicModels === false
     ? { fetchedAt: Date.now(), models: [] as Model<Api>[], error: undefined }
     : await refreshDynamicModels(registry, options.refresh ?? false);
+  const reviewed = resolveReviewedExternalModels(
+    options.agentDir ?? getAgentDirPath(),
+    options.reviewedExternalModels ?? REVIEWED_EXTERNAL_MODELS,
+  );
   const models = uniqueModels([...registry.getAll(), ...dynamicModels.models]).map((model) => modelToWebInfo(registry, model));
+  const seenModelKeys = new Set(models.map((model) => dynamicModelKey(model.provider, model.id)));
+  for (const model of reviewed.models) {
+    const key = dynamicModelKey(model.provider, model.id);
+    if (!seenModelKeys.has(key)) {
+      models.push(model);
+      seenModelKeys.add(key);
+    }
+  }
   const providerSelectable = new Map<string, boolean>();
   for (const model of models) {
     providerSelectable.set(
@@ -1634,7 +1634,12 @@ export async function listModels(options: {
     defaultModel: defaultModel
       ? { provider: String(defaultModel.provider), id: defaultModel.id, name: defaultModel.name }
       : null,
-    error: combineModelErrors(registry.getError(), listing.error, dynamicModels.error),
+    error: combineModelErrors(
+      registry.getError(),
+      listing.error,
+      dynamicModels.error,
+      formatLoadErrors(reviewed.errors),
+    ),
   };
 }
 
@@ -1653,6 +1658,9 @@ async function getSessionModelSelectionRegistry(id: string): Promise<ModelRegist
         agent_profile_id: profile.id,
       })
     : { authorized: false as const };
+  // Model selection never triggers extension discovery. It may consult providers
+  // only after an authorized Standard runtime has already loaded them through the
+  // normal session-construction path and its current policy checks.
   if (standard.authorized && _extensionProvidersLoaded) return getModelRegistry();
   return (await getModelListingRegistry()).registry;
 }
