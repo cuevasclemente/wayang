@@ -121,6 +121,26 @@ interface PendingAttachment extends QueuedAttachment {
   data: string;
 }
 
+interface SubmittedUserMessage {
+  sessionId: string;
+  content: string;
+  draft: string;
+  attachments: PendingAttachment[];
+  transportGeneration: number;
+}
+
+function mergePendingAttachments(
+  restored: PendingAttachment[],
+  current: PendingAttachment[],
+): PendingAttachment[] {
+  const seen = new Set<string>();
+  return [...restored, ...current].filter((attachment) => {
+    if (seen.has(attachment.id)) return false;
+    seen.add(attachment.id);
+    return true;
+  });
+}
+
 interface TodoItem {
   id: number;
   text: string;
@@ -722,6 +742,10 @@ function persistChatDraft(sessionId: string | null, draft: string) {
   } catch {
     // Ignore unavailable storage (private mode, quota, etc.).
   }
+}
+
+function clearChatDraftIfUnchanged(sessionId: string, submittedDraft: string) {
+  if (loadChatDraft(sessionId) === submittedDraft) persistChatDraft(sessionId, "");
 }
 
 function chatWsProfile(event: string, details: Record<string, unknown> = {}) {
@@ -3058,11 +3082,8 @@ export function ChatPanel({
   const pinActiveTurnScrollRef = useRef(false);
   const lastProgrammaticScrollAtRef = useRef(0);
   const queuedUserMessagesRef = useRef<QueuedUserMessage[]>([]);
-  const submittedUserMessagesRef = useRef(new Map<string, {
-    content: string;
-    attachments: PendingAttachment[];
-    transportGeneration: number;
-  }>());
+  const submittedUserMessagesRef = useRef(new Map<string, SubmittedUserMessage>());
+  const attachmentDraftsBySessionRef = useRef(new Map<string, PendingAttachment[]>());
   const deferredUserMessagesRef = useRef<ChatMessage[]>([]);
   const streamingBlocksRef = useRef<StreamingBlocks>({ content: [] });
   const streamingHistoryPrefixRef = useRef<StreamingBlocks>({ content: [] });
@@ -3076,6 +3097,7 @@ export function ChatPanel({
   const isSessionHistoryLoadingRef = useRef(isSessionHistoryLoading);
   const identityPinReturnFocusRef = useRef<HTMLButtonElement | null>(null);
   const isRestoringDraftRef = useRef(false);
+  const suppressedDraftPersistenceRef = useRef<{ sessionId: string; value: string } | null>(null);
   activeSessionErrorRef.current = activeSession?.error ?? null;
   activeSessionRuntimeStreamingRef.current = Boolean(activeSession?.runtime_is_streaming);
   activeSessionRuntimeCompactingRef.current = Boolean(activeSession?.runtime_is_compacting);
@@ -3147,6 +3169,12 @@ export function ChatPanel({
       isRestoringDraftRef.current = false;
       return;
     }
+    const suppressed = suppressedDraftPersistenceRef.current;
+    if (suppressed && suppressed.sessionId === activeSessionId && suppressed.value === inputText) {
+      suppressedDraftPersistenceRef.current = null;
+      return;
+    }
+    suppressedDraftPersistenceRef.current = null;
     persistChatDraft(activeSessionId, inputText);
   }, [activeSessionId, inputText]);
 
@@ -3290,6 +3318,30 @@ export function ChatPanel({
     setDeferredUserMessages([]);
   }, []);
 
+  const restoreRejectedSubmission = useCallback((submitted: SubmittedUserMessage) => {
+    const existingAttachments = attachmentDraftsBySessionRef.current.get(submitted.sessionId) ?? [];
+    const restoredAttachments = mergePendingAttachments(submitted.attachments, existingAttachments);
+    if (restoredAttachments.length > 0) {
+      attachmentDraftsBySessionRef.current.set(submitted.sessionId, restoredAttachments);
+    }
+
+    if (activeSessionIdRef.current !== submitted.sessionId) return;
+    setInputText((current) => {
+      const next = current === submitted.draft
+        ? current
+        : [submitted.draft, current].filter((text) => text.trim().length > 0).join("\n\n");
+      persistChatDraft(submitted.sessionId, next);
+      return next;
+    });
+    if (restoredAttachments.length > 0) {
+      setPendingAttachments((current) => {
+        const next = mergePendingAttachments(restoredAttachments, current);
+        attachmentDraftsBySessionRef.current.set(submitted.sessionId, next);
+        return next;
+      });
+    }
+  }, []);
+
   const queuedMessageMatchesContent = useCallback((message: QueuedUserMessage, content: string) => (
     message.content === content ||
     (message.content.trim() !== "" && content.startsWith(message.content.trim())) ||
@@ -3325,7 +3377,12 @@ export function ChatPanel({
       setInputText((prev) => [queuedText, prev].filter((text) => text.trim().length > 0).join("\n\n"));
     }
     if (queuedAttachments.length > 0) {
-      setPendingAttachments((prev) => [...queuedAttachments, ...prev]);
+      const sessionId = activeSessionIdRef.current;
+      setPendingAttachments((prev) => {
+        const next = mergePendingAttachments(queuedAttachments, prev);
+        if (sessionId) attachmentDraftsBySessionRef.current.set(sessionId, next);
+        return next;
+      });
     }
 
     setQueuedMessagesSynced(() => []);
@@ -3647,13 +3704,17 @@ export function ChatPanel({
           setQueuedMessagesSynced((current) => {
             const existing = new Map(current.map((message) => [message.id, message]));
             return [
-              ...snapshot.map((message) => ({
-                ...message,
-                ...submittedUserMessagesRef.current.get(message.id),
-                ...existing.get(message.id),
-                cancelStatus: "ready" as const,
-                cancelError: undefined,
-              })),
+              ...snapshot.map((message) => {
+                const submitted = submittedUserMessagesRef.current.get(message.id);
+                const correlatedSubmitted = submitted?.sessionId === msg.session_id ? submitted : undefined;
+                return {
+                  ...message,
+                  ...correlatedSubmitted,
+                  ...existing.get(message.id),
+                  cancelStatus: "ready" as const,
+                  cancelError: undefined,
+                };
+              }),
               ...current.filter((message) => (
                 !snapshotIds.has(message.id)
                 && message.cancelStatus === "registering"
@@ -3665,14 +3726,22 @@ export function ChatPanel({
         }
 
         if (msg.type === "queued_message_ack") {
-          if (msg.session_id !== activeSessionIdRef.current || typeof msg.client_message_id !== "string") return;
+          if (typeof msg.session_id !== "string" || typeof msg.client_message_id !== "string") return;
+          const submitted = submittedUserMessagesRef.current.get(msg.client_message_id);
+          if (submitted && submitted.sessionId !== msg.session_id) return;
+          const isSelectedSession = msg.session_id === activeSessionIdRef.current;
+
           if (msg.status === "accepted") {
+            if (submitted) clearChatDraftIfUnchanged(submitted.sessionId, submitted.draft);
             submittedUserMessagesRef.current.delete(msg.client_message_id);
-            setQueuedMessagesSynced((current) => current.filter((message) => message.id !== msg.client_message_id));
+            if (isSelectedSession) {
+              setQueuedMessagesSynced((current) => current.filter((message) => message.id !== msg.client_message_id));
+            }
             return;
           }
-          const submitted = submittedUserMessagesRef.current.get(msg.client_message_id);
           if (msg.status === "queued") {
+            if (submitted) clearChatDraftIfUnchanged(submitted.sessionId, submitted.draft);
+            if (!isSelectedSession) return;
             setMessages((current) => current.filter((message) => !(
               message.__localPending === true && message.__localId === msg.client_message_id
             )));
@@ -3696,17 +3765,13 @@ export function ChatPanel({
             return;
           }
           submittedUserMessagesRef.current.delete(msg.client_message_id);
+          if (submitted) restoreRejectedSubmission(submitted);
+          if (!isSelectedSession) return;
           setMessages((current) => current.filter((message) => !(
             message.__localPending === true && message.__localId === msg.client_message_id
           )));
-          setQueuedMessagesSynced((current) => current.map((message) => (
-            message.id === msg.client_message_id
-              ? {
-                  ...message,
-                  cancelStatus: "unavailable",
-                  cancelError: typeof msg.error === "string" ? msg.error : "The queued message was rejected.",
-                }
-              : message
+          setQueuedMessagesSynced((current) => current.filter((message) => (
+            message.id !== msg.client_message_id
           )));
           return;
         }
@@ -4673,7 +4738,6 @@ export function ChatPanel({
       setMessagesOwnerSessionId(null);
       setMessages([]);
       clearQueuedAndDeferredUserMessages();
-      submittedUserMessagesRef.current.clear();
       setIsSessionHistoryLoading(false);
       return;
     }
@@ -4690,8 +4754,7 @@ export function ChatPanel({
     setVisibleMessageStart(0);
     setMessages([]);
     clearQueuedAndDeferredUserMessages();
-    submittedUserMessagesRef.current.clear();
-    setPendingAttachments([]);
+    setPendingAttachments(attachmentDraftsBySessionRef.current.get(activeSessionId) ?? []);
     setAttachmentError("");
     const sessionError = activeSessionErrorRef.current;
     const sessionErrorKind = activeSession?.error_kind ?? null;
@@ -4954,10 +5017,15 @@ export function ChatPanel({
   }, [agentSwitchDialog, isAgentSwitching, onSessionChange, onSessionUpdate]);
 
   const addAttachmentFiles = useCallback(async (files: File[] | FileList) => {
+    const sourceSessionId = activeSessionIdRef.current;
     const incomingFiles = Array.from(files);
-    if (incomingFiles.length === 0) return;
+    if (!sourceSessionId || incomingFiles.length === 0) return;
 
-    const remainingSlots = MAX_ATTACHMENTS - pendingAttachments.length;
+    if (pendingAttachments.length > 0 && !attachmentDraftsBySessionRef.current.has(sourceSessionId)) {
+      attachmentDraftsBySessionRef.current.set(sourceSessionId, pendingAttachments);
+    }
+    const sourceAttachments = attachmentDraftsBySessionRef.current.get(sourceSessionId) ?? [];
+    const remainingSlots = MAX_ATTACHMENTS - sourceAttachments.length;
     if (remainingSlots <= 0) {
       setAttachmentError(`You can attach up to ${MAX_ATTACHMENTS} files per message.`);
       return;
@@ -4988,7 +5056,7 @@ export function ChatPanel({
     });
 
     const attachments: PendingAttachment[] = [];
-    let totalAcceptedBytes = pendingAttachments.reduce((total, attachment) => total + attachment.size, 0);
+    let totalAcceptedBytes = sourceAttachments.reduce((total, attachment) => total + attachment.size, 0);
     for (const file of validFiles) {
       try {
         const attachment = await fileToPendingAttachment(file);
@@ -5004,13 +5072,24 @@ export function ChatPanel({
     }
 
     if (attachments.length > 0) {
-      setPendingAttachments((prev) => [...prev, ...attachments]);
+      const currentSourceAttachments = attachmentDraftsBySessionRef.current.get(sourceSessionId) ?? [];
+      const next = mergePendingAttachments(currentSourceAttachments, attachments);
+      attachmentDraftsBySessionRef.current.set(sourceSessionId, next);
+      if (activeSessionIdRef.current === sourceSessionId) setPendingAttachments(next);
     }
-    setAttachmentError(errors.join(" "));
+    if (activeSessionIdRef.current === sourceSessionId) setAttachmentError(errors.join(" "));
   }, [pendingAttachments]);
 
   const removePendingAttachment = useCallback((id: string) => {
-    setPendingAttachments((prev) => prev.filter((attachment) => attachment.id !== id));
+    const sessionId = activeSessionIdRef.current;
+    setPendingAttachments((prev) => {
+      const next = prev.filter((attachment) => attachment.id !== id);
+      if (sessionId) {
+        if (next.length > 0) attachmentDraftsBySessionRef.current.set(sessionId, next);
+        else attachmentDraftsBySessionRef.current.delete(sessionId);
+      }
+      return next;
+    });
   }, []);
 
   const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -5032,7 +5111,9 @@ export function ChatPanel({
     const queuedAttachments: PendingAttachment[] = attachments;
     const turnAnchorText = trimmed || (attachments.length > 0 ? "File attachment" : "");
     submittedUserMessagesRef.current.set(queuedMessageId, {
+      sessionId: activeSessionId,
       content: trimmed,
+      draft: inputText,
       attachments: queuedAttachments,
       transportGeneration: transportGenerationRef.current,
     });
@@ -5063,7 +5144,7 @@ export function ChatPanel({
       }
     }
 
-    sendWs({
+    const sent = sendWs({
       type: "message",
       content: trimmed,
       client_message_id: queuedMessageId,
@@ -5074,10 +5155,22 @@ export function ChatPanel({
         size: attachment.size,
       })),
     });
+    if (!sent) {
+      submittedUserMessagesRef.current.delete(queuedMessageId);
+      setMessages((current) => current.filter((message) => !(
+        message.__localPending === true && message.__localId === queuedMessageId
+      )));
+      setQueuedMessagesSynced((current) => current.filter((message) => message.id !== queuedMessageId));
+      appendRuntimeError("Message was not sent because the connection changed. Retry when the session reconnects.");
+      return;
+    }
     onSessionChange?.();
     window.setTimeout(() => onSessionChange?.(), 500);
-    persistChatDraft(activeSessionId, "");
+    if (inputText !== "") {
+      suppressedDraftPersistenceRef.current = { sessionId: activeSessionId, value: "" };
+    }
     setInputText("");
+    attachmentDraftsBySessionRef.current.delete(activeSessionId);
     setPendingAttachments([]);
     setAttachmentError("");
 
@@ -5095,6 +5188,7 @@ export function ChatPanel({
     hasActiveAssistantOutput,
     setQueuedMessagesSynced,
     clearRuntimeError,
+    appendRuntimeError,
   ]);
 
   const handleCompactAfterOverflow = useCallback(() => {
