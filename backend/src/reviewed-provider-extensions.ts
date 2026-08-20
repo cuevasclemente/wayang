@@ -13,12 +13,13 @@
  * host), while a symlinked or non-regular-file entry is refused and reported
  * without loading any code.
  *
- * "narwhal-horn/index.ts" was source-reviewed as the identity-neutral
- * Narwhal-Horn Qwen3.8 provider artifact (installed SHA-256
- * 77ab52f4e8156fcd784c6e097f1433733c102c77e3297727659f22cfecf6393e at
- * integration time, 2026-08-19). It registers only the explicitly
- * experimental 512K YaRN tier (`qwen3.8-27b`); keep it in lockstep with the
- * reviewed source artifact distributed through the pi extension pipeline.
+ * "narwhal-horn/index.ts" was source-reviewed as the identity-neutral,
+ * Ruminant-capable Narwhal-Horn Qwen3.8 provider artifact (reviewed SHA-256
+ * db51a20aa989c06315b1e058cfe431027c3961eee3748516c99fc02b6b01242a at
+ * integration time, 2026-08-20). It preserves the explicitly experimental
+ * 512K YaRN tier (`qwen3.8-27b`), adds fail-closed shared-gateway routing and
+ * session-affinity headers, and retains explicit direct routing for rollback.
+ * Keep it in lockstep with the reviewed mypi source and installed artifact.
  */
 export const REVIEWED_PROVIDER_EXTENSION_PATHS: readonly string[] = Object.freeze([
   "narwhal-horn/index.ts",
