@@ -43,6 +43,7 @@ import {
   type TranscriptEventRowSummary,
 } from "../components/transcript/TranscriptMutations";
 import { transcriptMutationMarker } from "../components/transcript/transcriptMutationHelpers";
+import { formatContextWindow } from "../utils/context-window";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -6017,6 +6018,9 @@ export function ChatPanel({
                                     </span>
                                     <span className="block truncate font-mono text-[10px] text-neutral-500">
                                       {model.provider}/{model.id}
+                                      {formatContextWindow(model.contextWindow)
+                                        ? ` · ${formatContextWindow(model.contextWindow)} ctx`
+                                        : ""}
                                     </span>
                                   </button>
                                 );

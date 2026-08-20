@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import { Type } from "@earendil-works/pi-ai";
 import { SessionManager, defineTool } from "@earendil-works/pi-coding-agent";
 import {
@@ -1531,6 +1532,180 @@ test("listModels does not execute an unrelated installed extension factory", asy
     assert.ok(result.models.length > 0, "built-in models remain discoverable");
     assert.equal(fs.existsSync(moduleMarker), false, "unreviewed extension module must not execute");
     assert.equal(fs.existsSync(factoryMarker), false, "unreviewed extension factory must not execute");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function writeSyntheticNarwhalReviewedExtension(agentDir: string, moduleMarker: string): string {
+  const extensionDir = path.join(agentDir, "extensions", "narwhal-horn");
+  fs.mkdirSync(extensionDir, { recursive: true });
+  const extensionPath = path.join(extensionDir, "index.ts");
+  fs.writeFileSync(extensionPath, [
+    'import * as fs from "node:fs";',
+    `fs.writeFileSync(${JSON.stringify(moduleMarker)}, "executed");`,
+    'export default function narwhalHornSynthetic(pi: any) {',
+    '  pi.registerProvider("narwhal-horn", {',
+    '    name: "Narwhal Horn (LAN)",',
+    '    baseUrl: "http://127.0.0.1:9/v1",',
+    '    apiKey: "synthetic-key",',
+    '    api: "openai-completions",',
+    '    models: [{',
+    '      id: "qwen3.8-27b",',
+    '      name: "Qwen 3.8 27B (UD-Q8_K_XL, Vulkan, experimental 512K)",',
+    '      reasoning: true,',
+    '      input: ["text", "image"],',
+    '      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },',
+    '      contextWindow: 524288,',
+    '      maxTokens: 32768,',
+    '    }],',
+    '  });',
+    '}',
+  ].join("\n"));
+  return extensionPath;
+}
+
+function syntheticReviewedModel(extensionPath?: string) {
+  return [{
+    extensionPath: "narwhal-horn/index.ts",
+    sha256: extensionPath
+      ? createHash("sha256").update(fs.readFileSync(extensionPath)).digest("hex")
+      : "0".repeat(64),
+    credentialRelativeToHome: "src/mypi/secure_data/ruminant_key",
+    model: {
+      provider: "narwhal-horn",
+      id: "qwen3.8-27b",
+      name: "Qwen 3.8 27B (UD-Q8_K_XL, Vulkan, experimental 512K)",
+      api: "openai-completions",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 524288,
+    },
+  }];
+}
+
+test("listModels statically projects the reviewed Narwhal model without executing its extension", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-provider-"));
+  const cwd = path.join(dir, "project");
+  const homeDir = path.join(dir, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const moduleMarker = path.join(dir, "reviewed-extension-executed");
+  const credential = path.join(homeDir, "src", "mypi", "secure_data", "ruminant_key");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(path.dirname(credential), { recursive: true });
+  fs.writeFileSync(credential, "synthetic-key");
+  const extensionPath = writeSyntheticNarwhalReviewedExtension(agentDir, moduleMarker);
+
+  try {
+    const result = await listModels({
+      cwd,
+      agentDir,
+      includeDynamicModels: false,
+      reviewedExternalModels: syntheticReviewedModel(extensionPath),
+    });
+    const narwhal = result.models.find(
+      (model) => model.provider === "narwhal-horn" && model.id === "qwen3.8-27b",
+    );
+    assert.ok(narwhal, "reviewed Narwhal model descriptor must be listed");
+    assert.equal(narwhal?.contextWindow, 524288, "512K experimental tier window must be preserved");
+    assert.equal(narwhal?.available, true, "configured synthetic key must mark the model available");
+    assert.ok(
+      !result.error?.includes("Reviewed provider artifact"),
+      `healthy reviewed projection must not report an integrity error, got: ${result.error ?? "<none>"}`,
+    );
+    assert.equal(fs.existsSync(moduleMarker), false, "model listing must not execute provider code");
+    assert.ok(
+      result.models.every((model) => !model.id.includes("heretic")),
+      "no stale qwen3.6-35b-a3b-heretic entry may appear in the catalog",
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("listModels skips a missing reviewed provider extension without loading other extensions", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-provider-missing-"));
+  const cwd = path.join(dir, "project");
+  const agentDir = path.join(dir, "agent");
+  const extensionDir = path.join(agentDir, "extensions");
+  const moduleMarker = path.join(dir, "unrelated-extension-module-executed");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(extensionDir, { recursive: true });
+  fs.writeFileSync(path.join(extensionDir, "unrelated.ts"), [
+    'import * as fs from "node:fs";',
+    `fs.writeFileSync(${JSON.stringify(moduleMarker)}, "executed");`,
+    "export default function unrelated() {}",
+  ].join("\n"));
+
+  try {
+    const result = await listModels({
+      cwd,
+      agentDir,
+      includeDynamicModels: false,
+      reviewedExternalModels: syntheticReviewedModel(),
+    });
+    assert.ok(result.models.length > 0, "built-in models remain discoverable");
+    assert.ok(
+      !result.models.some((model) => model.provider === "narwhal-horn"),
+      "absent reviewed artifact must not produce a Narwhal entry",
+    );
+    assert.ok(!result.error?.includes("Reviewed provider artifact"), "missing entry is a skip, not an error");
+    assert.equal(fs.existsSync(moduleMarker), false, "unreviewed extension module must not execute");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("listModels refuses a symlinked reviewed provider extension fail-closed", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-provider-unsafe-"));
+  const cwd = path.join(dir, "project");
+  const agentDir = path.join(dir, "agent");
+  const extensionDir = path.join(agentDir, "extensions", "narwhal-horn");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(extensionDir, { recursive: true });
+  const realFile = path.join(dir, "real-extension.ts");
+  fs.writeFileSync(realFile, "export default function evil() {}");
+  fs.symlinkSync(realFile, path.join(extensionDir, "index.ts"));
+
+  try {
+    const result = await listModels({
+      cwd,
+      agentDir,
+      includeDynamicModels: false,
+      reviewedExternalModels: syntheticReviewedModel(realFile),
+    });
+    assert.ok(
+      !result.models.some((model) => model.provider === "narwhal-horn"),
+      "unsafe reviewed artifact must not be listed",
+    );
+    assert.ok(result.error?.includes("refusing to list"), "integrity refusal must be reported");
+    assert.ok(
+      !result.error?.includes("evil"),
+      "error must not leak reviewed artifact contents",
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("listModels refuses a reviewed provider artifact hash mismatch without execution", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-provider-hash-"));
+  const cwd = path.join(dir, "project");
+  const agentDir = path.join(dir, "agent");
+  const moduleMarker = path.join(dir, "hash-mismatch-executed");
+  fs.mkdirSync(cwd, { recursive: true });
+  writeSyntheticNarwhalReviewedExtension(agentDir, moduleMarker);
+
+  try {
+    const result = await listModels({
+      cwd,
+      agentDir,
+      includeDynamicModels: false,
+      reviewedExternalModels: syntheticReviewedModel(),
+    });
+    assert.ok(!result.models.some((model) => model.provider === "narwhal-horn"));
+    assert.ok(result.error?.includes("hash mismatch; refusing to list"));
+    assert.equal(fs.existsSync(moduleMarker), false, "hash mismatch must not execute provider code");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
