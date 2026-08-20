@@ -206,6 +206,167 @@ test("pointer, keyboard, and wheel dispatch stay responsive while every navigati
   await viewer.close();
 });
 
+test("stalled hundreds-of-moves input remains open and delivers the final coordinates", async () => {
+  const cdp = new InteractiveCdp();
+  let releaseDispatch!: () => void;
+  cdp.inputDispatchGate = new Promise<void>((resolve) => { releaseDispatch = resolve; });
+  const viewer = await interactiveViewer(cdp);
+  const reasons: Array<string | undefined> = [];
+  viewer.onClose?.((reason) => reasons.push(reason));
+
+  const dispatches: Promise<void>[] = [];
+  for (let index = 0; index < 300; index += 1) {
+    dispatches.push(Promise.resolve(viewer.dispatch(Buffer.from(JSON.stringify({
+      type: "mouse", event: "move", x: index, y: index + 1,
+    })), false)));
+  }
+  await waitUntil(() => cdp.calls.some((call) => call.method === "Input.dispatchMouseEvent"));
+  assert.deepEqual(reasons, [], "coalescible movement does not trip the discrete abuse bound");
+  cdp.inputDispatchGate = null;
+  releaseDispatch();
+  await Promise.all(dispatches);
+
+  const moves = cdp.calls.filter((call) => call.method === "Input.dispatchMouseEvent" && call.params?.type === "mouseMoved");
+  assert.equal(moves.length, 2, "one active and one newest pending movement are dispatched");
+  assert.equal(moves.at(-1)?.params?.x, 299);
+  assert.equal(moves.at(-1)?.params?.y, 300);
+  assert.deepEqual(reasons, [], "the viewer remains open after the movement burst");
+  await viewer.close();
+});
+
+test("stalled wheel bursts aggregate into one finite pending dispatch", async () => {
+  const cdp = new InteractiveCdp();
+  let releaseDispatch!: () => void;
+  cdp.inputDispatchGate = new Promise<void>((resolve) => { releaseDispatch = resolve; });
+  const viewer = await interactiveViewer(cdp);
+
+  const dispatches: Promise<void>[] = [];
+  for (let index = 0; index < 200; index += 1) {
+    dispatches.push(Promise.resolve(viewer.dispatch(Buffer.from(JSON.stringify({
+      type: "mouse", event: "wheel", x: index, y: index + 1, deltaX: 1, deltaY: -2,
+    })), false)));
+  }
+  await waitUntil(() => cdp.calls.some((call) => call.method === "Input.dispatchMouseEvent"));
+  cdp.inputDispatchGate = null;
+  releaseDispatch();
+  await Promise.all(dispatches);
+
+  const wheels = cdp.calls.filter((call) => call.method === "Input.dispatchMouseEvent" && call.params?.type === "mouseWheel");
+  assert.equal(wheels.length, 2, "one active and one aggregated pending wheel event are dispatched");
+  assert.equal(wheels[0]!.params.deltaX + wheels[1]!.params.deltaX, 200);
+  assert.equal(wheels[0]!.params.deltaY + wheels[1]!.params.deltaY, -400);
+  assert.equal(wheels.at(-1)?.params?.x, 199, "the aggregate uses the newest burst coordinates");
+  assert.equal(Number.isFinite(wheels.at(-1)?.params?.deltaX), true);
+  assert.equal(Number.isFinite(wheels.at(-1)?.params?.deltaY), true);
+  await viewer.close();
+});
+
+test("mouse moves around down and up remain separated by click-order barriers", async () => {
+  const cdp = new InteractiveCdp();
+  let releaseDispatch!: () => void;
+  cdp.inputDispatchGate = new Promise<void>((resolve) => { releaseDispatch = resolve; });
+  const viewer = await interactiveViewer(cdp);
+  const dispatches: Promise<void>[] = [];
+  const dispatchMouse = (event: "move" | "down" | "up", x: number) => {
+    dispatches.push(Promise.resolve(viewer.dispatch(Buffer.from(JSON.stringify({
+      type: "mouse", event, x, y: x + 1, button: "left",
+    })), false)));
+  };
+
+  for (let index = 0; index <= 100; index += 1) dispatchMouse("move", index);
+  dispatchMouse("down", 101);
+  for (let index = 102; index <= 201; index += 1) dispatchMouse("move", index);
+  dispatchMouse("up", 202);
+  for (let index = 203; index <= 302; index += 1) dispatchMouse("move", index);
+  await waitUntil(() => cdp.calls.some((call) => call.method === "Input.dispatchMouseEvent"));
+  cdp.inputDispatchGate = null;
+  releaseDispatch();
+  await Promise.all(dispatches);
+
+  const pointerCalls = cdp.calls.filter((call) => call.method === "Input.dispatchMouseEvent");
+  assert.deepEqual(pointerCalls.map((call) => [call.params.type, call.params.x]), [
+    ["mouseMoved", 0],
+    ["mouseMoved", 100],
+    ["mousePressed", 101],
+    ["mouseMoved", 201],
+    ["mouseReleased", 202],
+    ["mouseMoved", 302],
+  ]);
+  assert.equal(cdp.clicks, 1);
+  assert.equal(cdp.pointerPressed, false);
+  await viewer.close();
+});
+
+test("closing during stalled input rejects the active, coalesced, and discrete callers promptly", async () => {
+  const cdp = new InteractiveCdp();
+  let releaseDispatch!: () => void;
+  cdp.inputDispatchGate = new Promise<void>((resolve) => { releaseDispatch = resolve; });
+  const observations: StandardViewerObservation[] = [];
+  const viewer = await interactiveViewer(cdp, { observe: (event) => observations.push({ ...event }) });
+
+  const active = Promise.resolve(viewer.dispatch(Buffer.from(JSON.stringify({
+    type: "mouse", event: "move", x: 1, y: 2,
+  })), false));
+  await waitUntil(() => cdp.calls.some((call) => call.method === "Input.dispatchMouseEvent"));
+  const coalescedA = Promise.resolve(viewer.dispatch(Buffer.from(JSON.stringify({
+    type: "mouse", event: "move", x: 3, y: 4,
+  })), false));
+  const coalescedB = Promise.resolve(viewer.dispatch(Buffer.from(JSON.stringify({
+    type: "mouse", event: "move", x: 5, y: 6,
+  })), false));
+  const discrete = Promise.resolve(viewer.dispatch(Buffer.from(JSON.stringify({
+    type: "mouse", event: "down", x: 7, y: 8, button: "left",
+  })), false));
+
+  await viewer.close();
+  for (const pending of [active, coalescedA, coalescedB, discrete]) {
+    await assert.rejects(pending, (error: unknown) => (
+      error instanceof StandardViewerInputError && error.reason === "viewer_closed"
+    ));
+  }
+  const closeIndex = observations.findIndex((event) => event.event === "viewer_close");
+  assert.notEqual(closeIndex, -1);
+
+  cdp.inputDispatchGate = null;
+  releaseDispatch();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(observations.slice(closeIndex + 1).some((event) => event.outcome === "accepted"), false,
+    "no input reports accepted after viewer_close");
+});
+
+test("more than 64 blocked discrete inputs still close with input_queue_full", async () => {
+  const cdp = new InteractiveCdp();
+  let releaseDispatch!: () => void;
+  cdp.inputDispatchGate = new Promise<void>((resolve) => { releaseDispatch = resolve; });
+  const viewer = await interactiveViewer(cdp);
+  const reasons: Array<string | undefined> = [];
+  viewer.onClose?.((reason) => reasons.push(reason));
+  const blocked: Array<Promise<unknown>> = [];
+
+  for (let index = 0; index < 64; index += 1) {
+    blocked.push(Promise.resolve(viewer.dispatch(Buffer.from(JSON.stringify({
+      type: "mouse", event: "down", x: index, y: index, button: "left",
+    })), false)).catch((error) => error));
+  }
+  await assert.rejects(
+    Promise.resolve(viewer.dispatch(Buffer.from(JSON.stringify({
+      type: "mouse", event: "up", x: 64, y: 64, button: "left",
+    })), false)),
+    (error: unknown) => error instanceof StandardViewerInputError && error.reason === "input_queue_full",
+  );
+  assert.deepEqual(reasons, ["input_queue_full"]);
+
+  cdp.inputDispatchGate = null;
+  releaseDispatch();
+  const outcomes = await Promise.all(blocked);
+  assert.equal(outcomes.filter((outcome) => (
+    outcome instanceof StandardViewerInputError && outcome.reason === "input_queue_full"
+  )).length, 64, "the active and queued discrete dispatches all reject when the viewer seals");
+  assert.ok(cdp.calls.filter((call) => call.method === "Input.dispatchMouseEvent").length <= 1,
+    "at most the already-active discrete dispatch can reach CDP before sealing");
+  await viewer.close();
+});
+
 test("authenticated viewer paste inserts bounded text without exposing its value to telemetry", async () => {
   const cdp = new InteractiveCdp();
   const observations: StandardViewerObservation[] = [];
