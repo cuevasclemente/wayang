@@ -77,6 +77,7 @@ import { getCommandGuardIdentityBridge } from "./command-guard-bridge.js";
 import { scheduleWayangAutoTitle, type AutoTitleActivationSnapshot } from "./session-title-service.js";
 import { extractCompletedTitleExchanges, titleTextBlocks } from "./session-title-policy.js";
 import { createWayangSessionCustomTools } from "./wayang-runtime-context.js";
+import { createSessionInteropToolDefinitions } from "./session-interop.js";
 import { createWorkspaceToolDefinitions, workspaceToolsAllowedForRuntime } from "./workspace-tools.js";
 import { AgentSwitchAuthorityLifecycle } from "./agent-switch-authority-lifecycle.js";
 import {
@@ -2638,6 +2639,9 @@ export async function createPiSession(
         scheduledRunId: runtimeIdentity.row.scheduled_run_id,
         agentProfileId: runtimeIdentity.agentProfile.id,
       }, [
+        ...(runtimeIdentity.row.scheduled_job_id === null && runtimeIdentity.row.scheduled_run_id === null
+          ? createSessionInteropToolDefinitions(id)
+          : []),
         ...(workspaceToolsAllowedForRuntime({
           restricted: runtimeResources.restricted,
           scheduledJobId: runtimeIdentity.row.scheduled_job_id,

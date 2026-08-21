@@ -11,7 +11,8 @@ Wayang is an early-stage, single-user web workbench for the pi coding-agent harn
 
 ## Secret safety
 
-- Never read, print, copy, or commit `.env`, pi's `auth.json`, provider credentials, cookies, private keys, browser profiles, or user transcripts.
+- Never read, print, copy, or commit `.env`, pi's `auth.json`, provider credentials, cookies, private keys, or browser profiles.
+- Protected-project and unclassified/quarantined session transcripts and attachments are private and must never be inspected outside their owning backend/UI flow. Standard-project transcripts and attachments are intentionally cross-session readable through Wayang's bounded session tools or exact-file `read`; keep that access read-only, avoid broad storage scans, and never reproduce credentials or sensitive personal data unnecessarily.
 - Never ask a human to paste credentials into chat or place secrets in command arguments, logs, fixtures, screenshots, or tool calls.
 - Hand OAuth, API-key, password, MFA, and account steps to the human in their local terminal. `make configure` and `make pi-login` provide the supported flows.
 - Use synthetic homes, pi directories, data directories, and credentials in tests.

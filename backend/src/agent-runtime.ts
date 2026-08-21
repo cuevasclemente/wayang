@@ -33,6 +33,7 @@ import {
 import { isInteractiveBrowserToolName } from "./browser/protected-tools.js";
 import { PROTECTED_AUTOMATION_TOOL_NAME, type ProtectedAutomationToolRuntime } from "./protected-automation/tool.js";
 import { FILE_AUDIO_EXPERIMENT_TOOL_NAME, type FileAudioExperimentRuntime } from "./audio-experiment/types.js";
+import { classifyReadableStandardArtifact, SESSION_INTEROP_TOOL_NAMES } from "./session-interop.js";
 import {
   isSessionCapabilityEligible,
   resolveWorkspaceCapability,
@@ -232,10 +233,13 @@ export function authorizeAgentToolCall(options: {
     return { allowed: false, reason: "The file-audio experiment requires its exact source-bound runtime object" };
   }
 
-  // This SDK-injected tool is immutable, read-only, and session-bound. It is
-  // intentionally available even when restricted profiles reject all other
-  // unknown/custom tools.
-  if (toolName === WAYANG_RUNTIME_CONTEXT_TOOL_NAME) return { allowed: true };
+  // These SDK-injected tools are immutable, read-only, and source-session-bound.
+  // They are intentionally available even when restricted profiles reject all
+  // other unknown/custom tools; each interop execution revalidates its source
+  // and the target's current Standard privacy classification.
+  if (toolName === WAYANG_RUNTIME_CONTEXT_TOOL_NAME || SESSION_INTEROP_TOOL_NAMES.has(toolName)) {
+    return { allowed: true };
+  }
 
   // These immutable SDK-owned control-plane tools are Standard-only. They are
   // excluded before restricted runtime construction and denied again here if a
@@ -276,21 +280,27 @@ export function authorizeAgentToolCall(options: {
     pathIsWithin(canonicalPath, root) || (traverses && pathIsWithin(root, canonicalPath))
   );
 
-  // Wayang state and Pi transcripts are backend-owned. The sole direct-tool
-  // exception is read access to this exact source session's upload subtree.
+  // Wayang state and Pi transcripts are backend-owned. Source-session uploads
+  // retain their existing read exception. In addition, only the non-recursive
+  // read tool may open an exact artifact whose current durable source session is
+  // Standard; recursive scans could intersect Protected or unclassified bytes.
   const ownAttachmentRoot = options.sourceSessionId
     ? getSessionAttachmentRoot(options.sourceSessionId)
     : undefined;
   const inOwnAttachments = Boolean(ownAttachmentRoot && pathIsWithin(canonicalPath, ownAttachmentRoot));
+  const sharedStandardArtifact = !isMutation && toolName === "read"
+    ? classifyReadableStandardArtifact(canonicalPath)
+    : null;
+  const inReadableSessionArtifact = inOwnAttachments || Boolean(sharedStandardArtifact);
   if (isMutation) {
     if (getProtectedArtifactWriteRoots().some((root) => pathIsWithin(canonicalPath, root))) {
       return { allowed: false, reason: "Agent writes to protected transcript/Wayang/attachment storage are denied", canonicalPath };
     }
-  } else if (!inOwnAttachments && getProtectedArtifactReadRoots().some(intersects)) {
-    return { allowed: false, reason: "Agent access to protected transcript/Wayang/attachment storage is denied", canonicalPath };
+  } else if (!inReadableSessionArtifact && getProtectedArtifactReadRoots().some(intersects)) {
+    return { allowed: false, reason: "Agent access to Protected or unclassified transcript/Wayang/attachment storage is denied", canonicalPath };
   }
 
-  if (restricted && !(inOwnAttachments && !isMutation) && getRestrictedAgentArtifactRoots().some(intersects)) {
+  if (restricted && !(inReadableSessionArtifact && !isMutation) && getRestrictedAgentArtifactRoots().some(intersects)) {
     return { allowed: false, reason: "Restricted agents cannot access global Pi or control-plane storage", canonicalPath };
   }
 
@@ -315,7 +325,7 @@ export function authorizeAgentToolCall(options: {
     const canonicalProjectRoot = canonicalMemoryRoot(project.cwd);
     const inProject = pathIsWithin(canonicalPath, canonicalProjectRoot);
     const inPermittedMemory = Boolean(memoryRoot && pathIsWithin(canonicalPath, memoryRoot));
-    const inPermittedAttachments = !isMutation && inOwnAttachments;
+    const inPermittedAttachments = !isMutation && inReadableSessionArtifact;
     if (!inProject && !inPermittedMemory && !inPermittedAttachments) {
       return {
         allowed: false,
@@ -556,7 +566,9 @@ function wrapToolExecute(
   if (!tool || (typeof tool !== "object" && typeof tool !== "function") || typeof tool.name !== "string"
     || typeof tool.execute !== "function") return;
   const policyToolName = tool.name;
-  const interactiveBrowserReleaseFence = isInteractiveBrowserToolName(normalizeToolName(policyToolName));
+  const normalizedPolicyToolName = normalizeToolName(policyToolName);
+  const interactiveBrowserReleaseFence = isInteractiveBrowserToolName(normalizedPolicyToolName);
+  const pathReadReleaseFence = READ_PATH_TOOLS.has(normalizedPolicyToolName);
   if (interactiveBrowserReleaseFence) {
     const priorOwner = interactiveBrowserToolWrapperOwners.get(tool);
     if (priorOwner && priorOwner !== sessionId) {
@@ -567,8 +579,8 @@ function wrapToolExecute(
   }
   if (policyWrappedToolExecutes.has(tool)) return;
   const previousExecute = tool.execute.bind(tool);
-  const protectedAutomationReleaseFence = normalizeToolName(policyToolName) === PROTECTED_AUTOMATION_TOOL_NAME;
-  const fileAudioExperimentReleaseFence = normalizeToolName(policyToolName) === FILE_AUDIO_EXPERIMENT_TOOL_NAME;
+  const protectedAutomationReleaseFence = normalizedPolicyToolName === PROTECTED_AUTOMATION_TOOL_NAME;
+  const fileAudioExperimentReleaseFence = normalizedPolicyToolName === FILE_AUDIO_EXPERIMENT_TOOL_NAME;
   let standardRuntimeRevoked = false;
   const decideWrappedCall = (params: unknown): ToolAuthorizationDecision => {
     if (standardResourcesWitness && standardRuntimeRevoked) {
@@ -596,7 +608,7 @@ function wrapToolExecute(
     const decision = decideWrappedCall(params);
     if (!decision.allowed) throw new Error(`Wayang policy blocked ${policyToolName}: ${decision.reason ?? "denied"}`);
     const guardedRest = [...rest];
-    if ((standardResourcesWitness || interactiveBrowserReleaseFence || protectedAutomationReleaseFence || fileAudioExperimentReleaseFence) && typeof guardedRest[1] === "function") {
+    if ((standardResourcesWitness || pathReadReleaseFence || interactiveBrowserReleaseFence || protectedAutomationReleaseFence || fileAudioExperimentReleaseFence) && typeof guardedRest[1] === "function") {
       const previousUpdate = guardedRest[1] as (...args: unknown[]) => unknown;
       guardedRest[1] = (...args: unknown[]) => {
         const release = decideWrappedCall(params);
@@ -605,7 +617,7 @@ function wrapToolExecute(
       };
     }
     const result = await previousExecute(toolCallId, params, ...guardedRest);
-    if (standardResourcesWitness || interactiveBrowserReleaseFence || protectedAutomationReleaseFence || fileAudioExperimentReleaseFence) {
+    if (standardResourcesWitness || pathReadReleaseFence || interactiveBrowserReleaseFence || protectedAutomationReleaseFence || fileAudioExperimentReleaseFence) {
       const release = decideWrappedCall(params);
       if (!release.allowed) throw new Error(`Wayang policy suppressed ${policyToolName} result: ${release.reason ?? "denied"}`);
     }

@@ -639,7 +639,7 @@ test("memory capability registry and filesystem policy implement none/read/read_
   }
 });
 
-test("restricted direct paths allow only the project, permitted memory, and own attachments while universal secrets stay denied", () => {
+test("restricted direct paths allow the project, permitted memory, and Standard session artifacts while universal secrets stay denied", () => {
   const f = fixture("wayang-runtime-direct-boundary-");
   const memoryRoot = path.join(f.dir, "memoriki");
   try {
@@ -690,7 +690,8 @@ test("restricted direct paths allow only the project, permitted memory, and own 
     assert.equal(decide(profile, "read", memoryFile).allowed, true);
     assert.equal(decide(profile, "edit", memoryFile).allowed, false, "Memoriki is read-only for this profile");
     assert.equal(decide(profile, "read", ownAttachment).allowed, true);
-    assert.equal(decide(profile, "read", crossAttachment).allowed, false);
+    assert.equal(decide(profile, "read", crossAttachment).allowed, true,
+      "privacy mode, not source-session ownership or target allowlists, controls Standard attachment reads");
     for (const denied of [projectEnv, authFile, globalAgents, globalSystem, "/proc/self/environ", browserProfile]) {
       assert.equal(decide(profile, "read", denied).allowed, false, denied);
     }
@@ -768,19 +769,31 @@ test("Protected restricted agents read ordinary and Standard paths but write onl
   }
 });
 
-test("direct read, grep, and find deny backend artifacts while the source session reads only its own attachment", async () => {
+test("direct read exposes exact Standard session artifacts while recursive and Protected access stays denied", async () => {
   const f = fixture("wayang-runtime-artifacts-");
   try {
     const profile = createAgentProfile({ name: "Artifact guard", memory_access: "read_write" });
     const project = createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
     const row = createSession(f.cwd, { agentProfileId: profile.id });
     const other = createSession(f.cwd, { agentProfileId: profile.id });
+    const protectedCwd = path.join(f.dir, "protected-project");
+    fs.mkdirSync(protectedCwd);
+    const protectedProfile = createAgentProfile({ name: "Protected artifact owner" });
+    createProject({
+      cwd: protectedCwd,
+      default_agent_profile_id: protectedProfile.id,
+      access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [protectedProfile.id] },
+    });
+    const protectedSession = createSession(protectedCwd, { agentProfileId: protectedProfile.id });
 
     const transcriptDir = path.join(f.agentDir, "sessions", "synthetic-project");
     fs.mkdirSync(transcriptDir, { recursive: true });
-    const transcript = path.join(transcriptDir, "protected.jsonl");
-    fs.writeFileSync(transcript, "PROTECTED_TRANSCRIPT_CANARY\n");
+    const transcript = path.join(transcriptDir, "standard.jsonl");
+    const protectedTranscript = path.join(transcriptDir, "protected.jsonl");
+    fs.writeFileSync(transcript, "STANDARD_TRANSCRIPT_CANARY\n");
+    fs.writeFileSync(protectedTranscript, "PROTECTED_TRANSCRIPT_CANARY\n");
     updatePiSessionFile(row.id, transcript);
+    updatePiSessionFile(protectedSession.id, protectedTranscript);
 
     const dataDir = process.env.WAYANG_DATA_DIR!;
     const store = path.join(dataDir, "store.json");
@@ -791,12 +804,16 @@ test("direct read, grep, and find deny backend artifacts while the source sessio
 
     const ownRoot = getSessionAttachmentRoot(row.id);
     const otherRoot = getSessionAttachmentRoot(other.id);
+    const protectedAttachmentRoot = getSessionAttachmentRoot(protectedSession.id);
     fs.mkdirSync(ownRoot, { recursive: true, mode: 0o700 });
     fs.mkdirSync(otherRoot, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(protectedAttachmentRoot, { recursive: true, mode: 0o700 });
     const ownAttachment = path.join(ownRoot, "own.txt");
     const otherAttachment = path.join(otherRoot, "other.txt");
+    const protectedAttachment = path.join(protectedAttachmentRoot, "protected.txt");
     fs.writeFileSync(ownAttachment, "OWN_ATTACHMENT_CANARY\n", { mode: 0o600 });
     fs.writeFileSync(otherAttachment, "OTHER_ATTACHMENT_CANARY\n", { mode: 0o600 });
+    fs.writeFileSync(protectedAttachment, "PROTECTED_ATTACHMENT_CANARY\n", { mode: 0o600 });
 
     const read = createReadTool(f.cwd);
     const grep = createGrepTool(f.cwd);
@@ -809,14 +826,20 @@ test("direct read, grep, and find deny backend artifacts while the source sessio
     };
     installAgentToolPolicyGuard(fakeSession, row.id);
 
-    for (const denied of [transcript, store, search, projection, otherAttachment]) {
+    for (const allowed of [transcript, ownAttachment, otherAttachment]) {
+      const result = await (read.execute as any)("read", { path: allowed });
+      assert.match(result.content[0].text, /CANARY/);
+    }
+    for (const denied of [store, search, projection, protectedTranscript, protectedAttachment]) {
       await assert.rejects(() => (read.execute as any)("read", { path: denied }), /Wayang policy blocked read/);
+    }
+    for (const nonRecursiveOnly of [transcript, otherAttachment, protectedTranscript, protectedAttachment]) {
       await assert.rejects(
-        () => (grep.execute as any)("grep", { pattern: "CANARY", path: denied }),
+        () => (grep.execute as any)("grep", { pattern: "CANARY", path: nonRecursiveOnly }),
         /Wayang policy blocked grep/,
       );
       await assert.rejects(
-        () => (find.execute as any)("find", { pattern: "*", path: denied }),
+        () => (find.execute as any)("find", { pattern: "*", path: nonRecursiveOnly }),
         /Wayang policy blocked find/,
       );
     }
@@ -829,8 +852,6 @@ test("direct read, grep, and find deny backend artifacts while the source sessio
       /Wayang policy blocked find/,
     );
 
-    const own = await (read.execute as any)("read", { path: ownAttachment });
-    assert.match(own.content[0].text, /OWN_ATTACHMENT_CANARY/);
     const ownGrep = await (grep.execute as any)("grep", { pattern: "OWN_ATTACHMENT_CANARY", path: ownRoot });
     assert.match(ownGrep.content[0].text, /own\.txt/);
 

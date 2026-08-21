@@ -24,6 +24,7 @@ Wayang:
 - deliberately allows every outbound TCP destination from sandboxed bash through HTTP/SOCKS proxies, including Internet, loopback, LAN, and VPN services; this is not a network isolation or data-loss-prevention boundary;
 - removes bash when the required OS sandbox cannot prove its configured filesystem restrictions and, for socket-blocked profiles, Unix control-socket restrictions;
 - does not make unreviewed pi extensions/packages safe;
+- treats Project privacy mode as the cross-session transcript boundary: exact catalogued Standard-session transcripts and attachments are readable by other eligible interactive sessions through bounded tools or exact-file reads, regardless of target Project agent allowlists; Protected, quarantined, and unclassified session artifacts remain unreadable, all cross-session writes remain denied, and sandboxed bash retains no Pi/Wayang storage access;
 - does not provide TLS or certificate management;
 - cannot make public exposure safe solely by requiring a shared password.
 
@@ -76,10 +77,10 @@ When built-in authentication is enabled, `/healthz`, login/static assets, `GET /
 Protect at least:
 
 - root `.env` and `.env.backup`;
-- `~/.pi/agent/auth.json`, settings, extensions, and session JSONL;
+- `~/.pi/agent/auth.json`, settings, extensions, and session JSONL; exact catalogued Standard JSONL is intentionally cross-session readable inside Wayang, while Protected, quarantined, unknown, auth, and configuration artifacts remain denied;
 - the command-guard identity PIN under the XDG config root (normally `~/.config/pi/command-guard-identity-pin`);
 - `WAYANG_DATA_DIR/workspace-capability-approval/pin-attempt-state.json`, the private non-secret capability-approval attempt/cooldown record, created automatically with owner-only permissions when missing and preserved across reboots;
-- `~/.wayang/store.json`, `search.db`, `auth-sessions.json`, private policy projections, and session-scoped `attachments/`;
+- `~/.wayang/store.json`, `search.db`, `auth-sessions.json`, private policy projections, and session-scoped `attachments/`; Standard-session attachments are intentionally readable by other eligible Wayang sessions but remain private at the OS/storage boundary, while Protected/unclassified attachment subtrees remain cross-session private;
 - configured file-audio Wren capsule, shared task, neutral adapter, response schema, Sol synthesis prompt, and disposable `WAYANG_DATA_DIR/audio-experiment/` workspaces;
 - Protected-automation job/run metadata, immutable snapshots, bounded state/diagnostics/download staging, and persistent job browser realms under `WAYANG_DATA_DIR/protected-automation/`;
 - projects and files Wayang can access;
