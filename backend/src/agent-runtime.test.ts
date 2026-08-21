@@ -18,6 +18,7 @@ import {
   classifyMemoryTool,
   installAgentToolPolicyGuard,
   RESTRICTED_BUILTIN_TOOLS,
+  resolveCurrentStandardResourcesWitness,
   WAYANG_INTERACTIVE_COMMUNICATION_APPENDIX,
 } from "./agent-runtime.js";
 import { commandGuardIdentityPinPath } from "./command-guard-pin.js";
@@ -284,6 +285,13 @@ test("exact Wren loads standard resources for interactive and scheduled Standard
     });
 
     for (const sourceSessionId of [interactive.id, scheduled.id]) {
+      const witness = resolveCurrentStandardResourcesWitness({
+        sourceSessionId,
+        project,
+        agentProfile: profile,
+      });
+      assert.equal(witness?.authoritySource, "legacy-wren",
+        "model/provider selection must recognize the same legacy Wren resource authority as runtime loading");
       const loaded = await buildAgentResourceLoader({
         cwd: f.cwd,
         agentDir: f.agentDir,

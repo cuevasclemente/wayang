@@ -45,7 +45,11 @@ import {
 import { getAgentProfile } from "./agent-profiles.js";
 import { getProjectByCwd } from "./projects.js";
 import { authorizeProjectAction, resolveEffectiveSessionConfig } from "./policy.js";
-import { buildAgentResourceLoader, installAgentToolPolicyGuard } from "./agent-runtime.js";
+import {
+  buildAgentResourceLoader,
+  installAgentToolPolicyGuard,
+  resolveCurrentStandardResourcesWitness,
+} from "./agent-runtime.js";
 import {
   createPolicySandboxedBashToolDefinition,
   getBashSandboxAvailability,
@@ -1651,17 +1655,22 @@ async function getSessionModelSelectionRegistry(id: string): Promise<ModelRegist
   // Provider/model selection may use standard resource providers only when the
   // durable Project-Agent pair has that association. The selected model is not
   // an authority input.
-  const standard = project && profile && isSessionCapabilityEligible(row)
-    ? resolveWorkspaceCapability({
-        capability_id: "wayang.standard-resources.v1",
-        project_id: project.id,
-        agent_profile_id: profile.id,
+  const standardResourcesWitness = project && profile
+    ? resolveCurrentStandardResourcesWitness({
+        sourceSessionId: row.id,
+        project,
+        agentProfile: profile,
       })
-    : { authorized: false as const };
-  // Model selection never triggers extension discovery. It may consult providers
-  // only after an authorized Standard runtime has already loaded them through the
-  // normal session-construction path and its current policy checks.
-  if (standard.authorized && _extensionProvidersLoaded) return getModelRegistry();
+    : null;
+  // The read-only model catalog can advertise statically reviewed external
+  // providers without executing them. Selecting one is a deliberate mutation:
+  // after reauthorizing the exact session, load the same provider extensions the
+  // subsequent runtime will use. This also covers legacy Wren Standard access,
+  // whose witness is intentionally equivalent to standard-resources authority.
+  if (standardResourcesWitness) {
+    await ensureExtensionProvidersLoaded(row.cwd);
+    return getModelRegistry();
+  }
   return (await getModelListingRegistry()).registry;
 }
 
@@ -2158,21 +2167,17 @@ export async function createPiSession(
     assertCreationCurrent();
 
     const extensionsStartedAt = performance.now();
-    const standardResolution = isSessionCapabilityEligible(runtimeIdentity.row)
-      && runtimeIdentity.row.pending_agent_switch === null
-      && runtimeIdentity.row.agent_profile_id === runtimeIdentity.agentProfile.id
-      ? resolveWorkspaceCapability({
-          capability_id: "wayang.standard-resources.v1",
-          project_id: runtimeIdentity.project.id,
-          agent_profile_id: runtimeIdentity.agentProfile.id,
-        })
-      : { authorized: false as const, reason: "association_missing" as const };
+    const standardResourcesWitness = resolveCurrentStandardResourcesWitness({
+      sourceSessionId: runtimeIdentity.row.id,
+      project: runtimeIdentity.project,
+      agentProfile: runtimeIdentity.agentProfile,
+    });
     assertCreationCurrent();
     if (runtimeOptions.testHooks?.afterStandardResourcesResolution) {
-      await runtimeOptions.testHooks.afterStandardResourcesResolution(standardResolution.authorized);
+      await runtimeOptions.testHooks.afterStandardResourcesResolution(Boolean(standardResourcesWitness));
       assertCreationCurrent();
     }
-    if (standardResolution.authorized) {
+    if (standardResourcesWitness) {
       assertCreationCurrent();
       runtimeOptions.testHooks?.onPrivilegedEffect?.("extension_provider_load");
       assertCreationCurrent();

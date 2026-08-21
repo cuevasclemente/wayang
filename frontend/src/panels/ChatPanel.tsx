@@ -2887,6 +2887,7 @@ export function ChatPanel({
   const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
   const [defaultModel, setDefaultModel] = useState<DefaultModelOption | null>(null);
   const [modelError, setModelError] = useState("");
+  const [modelSelectionError, setModelSelectionError] = useState("");
   const [selectedModelValue, setSelectedModelValue] = useState("");
   const [isModelSaving, setIsModelSaving] = useState(false);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
@@ -2994,6 +2995,7 @@ export function ChatPanel({
 
   useEffect(() => {
     setSelectedModelValue(sessionModelSelectValue(activeSession));
+    setModelSelectionError("");
   }, [activeSession]);
 
   useEffect(() => {
@@ -4938,6 +4940,7 @@ export function ChatPanel({
       setIsModelSaving(true);
       setIsModelPickerOpen(false);
       setModelError("");
+      setModelSelectionError("");
       try {
         const updated = await updateSessionModelRequest(
           activeSessionId,
@@ -4948,8 +4951,10 @@ export function ChatPanel({
         onSessionChange?.();
         if (wsConnectedRef.current) sendWs({ type: "command_guard" });
       } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
         setSelectedModelValue(previousValue);
-        setModelError(err instanceof Error ? err.message : String(err));
+        setModelError(message);
+        setModelSelectionError(message);
       } finally {
         setIsModelSaving(false);
       }
@@ -6101,6 +6106,26 @@ export function ChatPanel({
           </div>
         )}
       </header>
+
+      {modelSelectionError && (
+        <div
+          data-testid="chat-model-selection-error"
+          role="alert"
+          className="flex items-start justify-between gap-3 border-b border-red-900/70 bg-red-950/40 px-4 py-2 text-xs text-red-100"
+        >
+          <div className="min-w-0">
+            <span className="font-semibold text-red-300">Model change failed: </span>
+            <span className="break-words">{modelSelectionError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setModelSelectionError("")}
+            className="shrink-0 text-red-300 hover:text-red-100"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {runtimeError && (
         <div

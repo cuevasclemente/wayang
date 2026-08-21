@@ -84,7 +84,7 @@ function exactStandardResourcesWitnessEqual(left: ExactStandardResourcesWitness,
     && left.authoritySource === right.authoritySource;
 }
 
-function resolveCurrentStandardResourcesWitness(options: {
+export function resolveCurrentStandardResourcesWitness(options: {
   sourceSessionId: string;
   project: ProjectRow;
   agentProfile: AgentProfileRow;
