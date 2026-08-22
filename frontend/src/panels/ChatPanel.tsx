@@ -11,6 +11,7 @@ import {
   previewSessionAgentSwitch,
   recordSessionOpenLatency,
   switchSessionAgent,
+  transcriptSwitchEnvelope,
   synthesizeTts,
   updateSessionGoal,
   updateSessionModel as updateSessionModelRequest,
@@ -44,6 +45,15 @@ import {
 } from "../components/transcript/TranscriptMutations";
 import { transcriptMutationMarker } from "../components/transcript/transcriptMutationHelpers";
 import { formatContextWindow } from "../utils/context-window";
+import {
+  createTranscriptWindowState,
+  isTranscriptWindowEnvelope,
+  transcriptWindowReducer,
+  type TranscriptOpenIntent,
+  type TranscriptWindowAction,
+  type TranscriptWindowEnvelope,
+  type TranscriptWindowState,
+} from "../transcript/windowController";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -54,6 +64,7 @@ interface ChatPanelProps {
   sessionSelectionStartedAt?: number | null;
   onSessionChange?: () => void;
   onSessionUpdate?: (session: Session) => void;
+  transcriptOpenIntent?: TranscriptOpenIntent;
   /**
    * When set, ChatPanel scrolls the transcript to the message with this pi
    * message id and briefly highlights it. Cleared by calling
@@ -273,6 +284,20 @@ const TRANSCRIPT_HYDRATION_CHUNK_ROWS = 200;
 // Browser WebSocket clients may initiate close only with 1000 or 3000–4999.
 // 4001 is Wayang's application-level request for authoritative transcript reconnect.
 const TRANSCRIPT_MUTATION_RECONNECT_CLOSE_CODE = 4001;
+const DEFAULT_TRANSCRIPT_OPEN_INTENT: TranscriptOpenIntent = {
+  kind: "latest",
+  requestKey: "chat-panel-default-latest",
+};
+
+function createTranscriptIntent(kind: "latest" | "around", anchorId?: string): TranscriptOpenIntent {
+  return {
+    kind,
+    ...(kind === "around" && anchorId ? { anchorId } : {}),
+    requestKey: typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `transcript-intent-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  };
+}
 
 function createSelectionId(): string {
   return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
@@ -2862,11 +2887,33 @@ export function ChatPanel({
   sessionSelectionStartedAt,
   onSessionChange,
   onSessionUpdate,
+  transcriptOpenIntent,
   scrollToMessageId,
   onScrollToMessageHandled,
 }: ChatPanelProps) {
   const activeSessionId = activeSession?.id ?? null;
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const requestedTranscriptOpenIntent = transcriptOpenIntent ?? DEFAULT_TRANSCRIPT_OPEN_INTENT;
+  const [transcriptNavigationOverride, setTranscriptNavigationOverride] = useState<{
+    baseRequestKey: string;
+    intent: TranscriptOpenIntent;
+  } | null>(null);
+  const effectiveTranscriptOpenIntent = transcriptNavigationOverride?.baseRequestKey === requestedTranscriptOpenIntent.requestKey
+    ? transcriptNavigationOverride.intent
+    : requestedTranscriptOpenIntent;
+  const [transcriptState, setTranscriptState] = useState<TranscriptWindowState<ChatMessage>>(
+    () => createTranscriptWindowState<ChatMessage>(requestedTranscriptOpenIntent),
+  );
+  const transcriptStateRef = useRef(transcriptState);
+  const applyTranscriptAction = useCallback((action: TranscriptWindowAction<ChatMessage>) => {
+    const next = transcriptWindowReducer(transcriptStateRef.current, action);
+    transcriptStateRef.current = next;
+    setTranscriptState(next);
+    return next;
+  }, []);
+  const messages = transcriptState.messages;
+  const setMessages = useCallback((updater: ChatMessage[] | ((messages: ChatMessage[]) => ChatMessage[])) => {
+    applyTranscriptAction({ type: "local_update", updater });
+  }, [applyTranscriptAction]);
   const [messagesOwnerSessionId, setMessagesOwnerSessionId] = useState<string | null>(null);
   const [visibleMessageStart, setVisibleMessageStart] = useState(0);
   const [deferredUserMessages, setDeferredUserMessages] = useState<ChatMessage[]>([]);
@@ -3061,14 +3108,23 @@ export function ChatPanel({
   const activeSessionIdRef = useRef<string | null>(null);
   const selectedSessionIdRef = useRef<string | null>(activeSessionId);
   const selectionIdRef = useRef<string | null>(null);
+  const transcriptOpenIntentRef = useRef<TranscriptOpenIntent>(effectiveTranscriptOpenIntent);
+  const requestedTranscriptIntentKeyRef = useRef(requestedTranscriptOpenIntent.requestKey);
+  requestedTranscriptIntentKeyRef.current = requestedTranscriptOpenIntent.requestKey;
   const selectionGenerationRef = useRef(0);
   const selectionStartedAtRef = useRef(0);
   const sessionSelectionStartedAtInputRef = useRef(sessionSelectionStartedAt);
   sessionSelectionStartedAtInputRef.current = sessionSelectionStartedAt;
   const reportedSessionOpenSelectionIdRef = useRef<string | null>(null);
+  const scrollToMessageIdRef = useRef(scrollToMessageId);
+  scrollToMessageIdRef.current = scrollToMessageId;
   const scrollAnchorRef = useRef<HTMLDivElement | null>(null);
   const activeTurnUserMessageRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const matchIntentRef = useRef<TranscriptOpenIntent | null>(null);
+  const savedMatchViewportRef = useRef<{ eventId: string; offset: number } | null>(null);
+  const prependAnchorsRef = useRef(new Map<string, { eventId: string; offset: number }>());
+  const pendingViewportRestoreRef = useRef<{ eventId: string; offset: number; requestId?: string } | null>(null);
   const chatPanelRootRef = useRef<HTMLElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -3112,7 +3168,9 @@ export function ChatPanel({
   useLayoutEffect(() => {
     selectedSessionIdRef.current = activeSessionId;
     selectionGenerationRef.current += 1;
-    selectionStartedAtRef.current = sessionSelectionStartedAtInputRef.current ?? performance.now();
+    selectionStartedAtRef.current = effectiveTranscriptOpenIntent.requestKey === requestedTranscriptOpenIntent.requestKey
+      ? sessionSelectionStartedAtInputRef.current ?? performance.now()
+      : performance.now();
     const selectionId = activeSessionId ? createSelectionId() : null;
     const previousPrompt = activeCommandGuardPinPromptRef.current;
     if (
@@ -3136,10 +3194,25 @@ export function ChatPanel({
       setActiveCommandGuardPinPrompt(null);
     }
     selectionIdRef.current = selectionId;
+    transcriptOpenIntentRef.current = effectiveTranscriptOpenIntent;
+    if (effectiveTranscriptOpenIntent.requestKey === requestedTranscriptOpenIntent.requestKey) {
+      matchIntentRef.current = effectiveTranscriptOpenIntent.kind === "around"
+        ? effectiveTranscriptOpenIntent
+        : null;
+      savedMatchViewportRef.current = null;
+      pendingViewportRestoreRef.current = null;
+    }
+    prependAnchorsRef.current.clear();
+    applyTranscriptAction({
+      type: "selection",
+      sessionId: activeSessionId,
+      selectionId,
+      intent: effectiveTranscriptOpenIntent,
+    });
     setTranscriptSelectionKey(selectionId ? `${activeSessionId}:${selectionId}:${selectionGenerationRef.current}` : "");
     poisonedExternalActionKeysRef.current.clear();
     externalActionTerminalTombstonesRef.current.clear();
-  }, [activeSessionId]);
+  }, [activeSessionId, effectiveTranscriptOpenIntent, applyTranscriptAction, requestedTranscriptOpenIntent]);
 
   useEffect(() => {
     const root = chatPanelRootRef.current;
@@ -3292,7 +3365,7 @@ export function ChatPanel({
     // live presentation before inserting the accepted user.
     setStreamingHistoryPrefixSynced({ content: [] });
     setStreamingBlocksSynced({ content: [] });
-  }, [setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
+  }, [setMessages, setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
 
   const appendRuntimeError = useCallback((message: string, recovery: "context_overflow" | null = null) => {
     const trimmed = message.trim() || "Unknown error";
@@ -3308,7 +3381,7 @@ export function ChatPanel({
       return [...prev, { type: "error", error: trimmed }];
     });
     onSessionChange?.();
-  }, [onSessionChange, setStreamingHistoryPrefixSynced]);
+  }, [onSessionChange, setMessages, setStreamingHistoryPrefixSynced]);
 
   const clearRuntimeError = useCallback(() => {
     setRuntimeError(null);
@@ -3418,10 +3491,29 @@ export function ChatPanel({
     return () => { cancelled = true; };
   }, [scrollToMessageId, onScrollToMessageHandled, activeSessionId, transcriptOwnedBySelection, visibleMessageStart]);
 
-  // Tail-first progressive hydration. Prepend bounded chunks during idle time
-  // while preserving the viewport's visual anchor.
+  useLayoutEffect(() => {
+    const pending = pendingViewportRestoreRef.current;
+    if (!pending || !transcriptOwnedBySelection) return;
+    if (pending.requestId && transcriptState.lastAppliedRequestId !== pending.requestId) return;
+    const container = scrollContainerRef.current;
+    const target = container?.querySelector<HTMLElement>(
+      `[data-message-id="${CSS.escape(pending.eventId)}"]`,
+    );
+    if (!container || !target) return;
+    const currentOffset = target.getBoundingClientRect().top - container.getBoundingClientRect().top;
+    container.scrollTop += currentOffset - pending.offset;
+    pendingViewportRestoreRef.current = null;
+  }, [messages, transcriptOwnedBySelection, transcriptState.lastAppliedRequestId]);
+
+  // Legacy full-history snapshots keep their existing progressive hydration.
+  // Negotiated windows never schedule automatic complete hydration.
   useEffect(() => {
-    if (!transcriptOwnedBySelection || visibleMessageStart <= 0 || scrollToMessageId) return;
+    if (
+      transcriptState.mode === "window-v1"
+      || !transcriptOwnedBySelection
+      || visibleMessageStart <= 0
+      || scrollToMessageId
+    ) return;
     let cancelled = false;
     const hydrate = () => {
       if (cancelled) return;
@@ -3442,7 +3534,7 @@ export function ChatPanel({
       if (idleWindow.cancelIdleCallback) idleWindow.cancelIdleCallback(id);
       else window.clearTimeout(id);
     };
-  }, [transcriptOwnedBySelection, visibleMessageStart, scrollToMessageId]);
+  }, [transcriptState.mode, transcriptOwnedBySelection, visibleMessageStart, scrollToMessageId]);
 
   // Auto-scroll. During a freshly submitted turn, pin the accepted user prompt
   // to the top of the transcript while the assistant response grows below it.
@@ -3458,10 +3550,16 @@ export function ChatPanel({
       return;
     }
 
-    if (isScrolledToBottom(container)) {
+    if (!(transcriptState.mode === "window-v1" && transcriptState.hasNewer) && isScrolledToBottom(container)) {
       scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [messages, deferredUserMessages, streamingBlocks, streamingHistoryPrefix, interviewQueue, externalActionApprovals, activeSudoPrompt, activeCommandGuardPinPrompt, activeTurnScrollAnchorText]);
+  }, [messages, deferredUserMessages, streamingBlocks, streamingHistoryPrefix, interviewQueue, externalActionApprovals, activeSudoPrompt, activeCommandGuardPinPrompt, activeTurnScrollAnchorText, transcriptState.mode, transcriptState.hasNewer]);
+
+  useEffect(() => {
+    if (transcriptState.mode === "window-v1" && transcriptState.hasNewer && transcriptState.pendingTailEvents) {
+      setShowScrollToBottom(true);
+    }
+  }, [transcriptState.hasNewer, transcriptState.mode, transcriptState.pendingTailEvents]);
 
   // ------------------------------------------------------------------
   // WS connection
@@ -3560,7 +3658,7 @@ export function ChatPanel({
         reconnectTimerRef.current = null;
       }
 
-      const url = chatWsUrl(sessionId, selectionIdRef.current);
+      const url = chatWsUrl(sessionId, selectionIdRef.current, transcriptOpenIntentRef.current);
       const ws = new WebSocket(url);
       chatWsProfile("socket_constructed", {
         sessionId,
@@ -3597,6 +3695,7 @@ export function ChatPanel({
               type: "switch_session",
               session_id: current,
               selection_id: selectionIdRef.current,
+              ...transcriptSwitchEnvelope(transcriptOpenIntentRef.current),
             }),
           );
           connectingSessionIdRef.current = current;
@@ -3804,6 +3903,73 @@ export function ChatPanel({
           return;
         }
 
+        if (msg.type === "transcript_protocol") {
+          if (
+            msg.session_id !== activeSessionIdRef.current
+            || msg.selection_id !== selectionIdRef.current
+            || ws !== wsRef.current
+            || transportGeneration !== transportGenerationRef.current
+          ) return;
+          chatWsProfile("message_transcript_protocol", {
+            sessionId: msg.session_id,
+            selectionId: msg.selection_id,
+            protocol: msg.protocol,
+          });
+          return;
+        }
+
+        if (msg.type === "transcript_page_error") {
+          if (
+            msg.session_id !== activeSessionIdRef.current
+            || msg.selection_id !== selectionIdRef.current
+            || ws !== wsRef.current
+            || transportGeneration !== transportGenerationRef.current
+            || typeof msg.request_id !== "string"
+            || (msg.direction !== "before" && msg.direction !== "after")
+          ) return;
+          if (msg.direction === "before") prependAnchorsRef.current.delete(msg.request_id);
+          applyTranscriptAction({
+            type: "page_failed",
+            direction: msg.direction,
+            requestId: msg.request_id,
+            error: typeof msg.error === "string"
+              ? msg.error
+              : typeof msg.message === "string"
+                ? msg.message
+                : "The server could not load this transcript page.",
+          });
+          return;
+        }
+
+        if (msg.type === "transcript_invalidated") {
+          if (
+            msg.session_id !== activeSessionIdRef.current
+            || msg.selection_id !== selectionIdRef.current
+            || ws !== wsRef.current
+            || transportGeneration !== transportGenerationRef.current
+          ) return;
+          prependAnchorsRef.current.clear();
+          pendingViewportRestoreRef.current = null;
+          savedMatchViewportRef.current = null;
+          applyTranscriptAction({
+            type: "invalidate",
+            error: typeof msg.reason === "string" && msg.reason
+              ? `Transcript changed (${msg.reason}); waiting for a fresh bounded window.`
+              : "Transcript changed; waiting for a fresh bounded window.",
+          });
+          setMessagesOwnerSessionId(null);
+          setVisibleMessageStart(0);
+          setShowScrollToBottom(false);
+          pinActiveTurnScrollRef.current = false;
+          setActiveTurnScrollAnchorText(null);
+          setResendingMessageId(null);
+          setIsSessionHistoryLoading(true);
+          setStreamingHistoryPrefixSynced({ content: [] });
+          setStreamingBlocksSynced({ content: [] });
+          clearExternalActionAuthority();
+          return;
+        }
+
         // Every live event emitted by the current backend is correlated to the
         // session selection that subscribed to it. Ignore an A event already
         // queued in the browser when React has switched the durable socket to B.
@@ -3812,7 +3978,147 @@ export function ChatPanel({
           || (typeof msg.selection_id === "string" && msg.selection_id !== selectionIdRef.current)
         ) return;
 
-        // Handle history (replace, don't append)
+        // Negotiated bounded transcript projection. A frozen window is accepted
+        // only from the current socket/transport and current session selection;
+        // request/epoch/edge correlation is enforced again by the reducer.
+        if (msg.type === "transcript_window") {
+          if (
+            msg.session_id !== activeSessionIdRef.current
+            || msg.selection_id !== selectionIdRef.current
+            || ws !== wsRef.current
+            || transportGeneration !== transportGenerationRef.current
+          ) return;
+          if (!isTranscriptWindowEnvelope<ChatMessage>(msg)) {
+            applyTranscriptAction({ type: "invalidate", error: "The server returned an invalid bounded transcript window." });
+            setMessagesOwnerSessionId(null);
+            setIsSessionHistoryLoading(false);
+            return;
+          }
+          if (msg.messages.some((message) => typeof message?.id !== "string" || message.id.length === 0)) {
+            applyTranscriptAction({ type: "invalidate", error: "The bounded transcript contained an event without a stable id." });
+            setMessagesOwnerSessionId(null);
+            setIsSessionHistoryLoading(false);
+            return;
+          }
+
+          const rawWindowMessages = msg.streaming_at_snapshot === true
+            ? suppressActiveRecoveryErrors(msg.messages)
+            : msg.messages;
+          let windowMessages = rawWindowMessages;
+          let remainingQueued = queuedUserMessagesRef.current;
+          const acceptedNextTurnMessages: ChatMessage[] = [];
+          if (hasActiveAssistantOutput() && remainingQueued.length > 0) {
+            remainingQueued = [...remainingQueued];
+            windowMessages = rawWindowMessages.filter((historyMessage) => {
+              if (historyMessage?.type !== "user" || !historyMessage.message) return true;
+              const content = getUserMessageText(historyMessage.message);
+              const queuedIndex = remainingQueued.findIndex((queued) => queuedMessageMatchesContent(queued, content));
+              if (queuedIndex === -1) return true;
+              remainingQueued.splice(queuedIndex, 1);
+              acceptedNextTurnMessages.push(historyMessage);
+              return false;
+            });
+          }
+          if (msg.reason === "initial" || msg.reason === "reset" || transcriptStateRef.current.mode !== "window-v1") {
+            windowMessages = mergeHistoryWithLocalPending(windowMessages, transcriptStateRef.current.messages);
+          }
+
+          if (msg.reason === "prepend" && msg.request_id) {
+            const anchor = prependAnchorsRef.current.get(msg.request_id);
+            if (anchor) pendingViewportRestoreRef.current = { ...anchor, requestId: msg.request_id };
+            prependAnchorsRef.current.delete(msg.request_id);
+          }
+          if (
+            (msg.reason === "append" || msg.reason === "tail_reconcile")
+            && !transcriptStateRef.current.hasNewer
+          ) {
+            const durableUsers = windowMessages.filter((message) => message.type === "user");
+            if (durableUsers.length > 0 || msg.reason === "tail_reconcile") {
+              setMessages((current) => current.filter((message) => {
+                if (
+                  isLocalPendingUserMessage(message)
+                  && durableUsers.some((durable) => userMessagesMatch(message, durable))
+                ) return false;
+                return !(
+                  msg.reason === "tail_reconcile"
+                  && typeof message.id !== "string"
+                  && ["assistant", "toolResult", "tool_result"].includes(message.type)
+                );
+              }));
+            }
+          }
+          const acceptedWindow: TranscriptWindowEnvelope<ChatMessage> = { ...msg, messages: windowMessages };
+          const nextTranscript = applyTranscriptAction({ type: "window", window: acceptedWindow });
+          if (nextTranscript.invalidated) {
+            setMessagesOwnerSessionId(null);
+            setIsSessionHistoryLoading(true);
+            setTranscriptNavigationOverride({
+              baseRequestKey: requestedTranscriptIntentKeyRef.current,
+              intent: createTranscriptIntent(
+                transcriptOpenIntentRef.current.kind,
+                transcriptOpenIntentRef.current.anchorId,
+              ),
+            });
+            return;
+          }
+
+          if (typeof msg.streaming_at_snapshot === "boolean") {
+            setStreamingBlocksSynced({ content: [] });
+            setStreamingHistoryPrefixSynced(
+              msg.streaming_at_snapshot ? trailingActiveStreamPrefix(rawWindowMessages) : { content: [] },
+            );
+            isStreamingRef.current = msg.streaming_at_snapshot;
+            setIsStreaming(msg.streaming_at_snapshot);
+          }
+          if (typeof msg.compacting_at_snapshot === "boolean") setIsCompacting(msg.compacting_at_snapshot);
+          if (acceptedNextTurnMessages.length > 0) {
+            setQueuedMessagesSynced(() => remainingQueued);
+            insertAcceptedUsersAfterActiveStreaming(acceptedNextTurnMessages);
+          } else if (msg.reason === "initial" || msg.reason === "reset") {
+            clearQueuedAndDeferredUserMessages();
+          }
+          setMessagesOwnerSessionId(activeSessionIdRef.current);
+          setVisibleMessageStart(0);
+          setResendingMessageId(null);
+          const historyGuardState = commandGuardStateFromMessages(rawWindowMessages);
+          if (historyGuardState) setCommandGuardState(historyGuardState);
+
+          chatWsProfile("message_transcript_window", {
+            sessionId: msg.session_id,
+            selectionId: msg.selection_id,
+            reason: msg.reason,
+            requestId: msg.request_id,
+            count: msg.messages.length,
+            payloadBytes: msg.payload_bytes,
+            epoch: msg.transcript_epoch,
+            attemptId,
+            elapsedMs: Math.round(performance.now() - connectStart),
+          });
+          const acceptedSelectionId = selectionIdRef.current;
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (selectionIdRef.current !== acceptedSelectionId) return;
+            setIsSessionHistoryLoading(false);
+            setTranscriptHistoryTransportGeneration(transportGeneration);
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+              if (
+                selectionIdRef.current !== acceptedSelectionId
+                || reportedSessionOpenSelectionIdRef.current === acceptedSelectionId
+              ) return;
+              reportedSessionOpenSelectionIdRef.current = acceptedSelectionId;
+              const durationMs = performance.now() - selectionStartedAtRef.current;
+              void recordSessionOpenLatency(durationMs).catch(() => {});
+            }));
+            if (
+              transcriptOpenIntentRef.current.kind === "latest"
+              && !nextTranscript.hasNewer
+              && msg.reason !== "prepend"
+            ) scrollAnchorRef.current?.scrollIntoView();
+          }));
+          return;
+        }
+
+        // A complete history frame means this server/selection did not
+        // negotiate window-v1. Preserve the prior full-history behavior.
         if (msg.type === "history") {
           if (msg.session_id !== activeSessionIdRef.current || msg.selection_id !== selectionIdRef.current) {
             chatWsProfile("stale_history_ignored", { sessionId: msg.session_id, selectionId: msg.selection_id });
@@ -3876,10 +4182,15 @@ export function ChatPanel({
             setMessages((prev) => mergeHistoryWithLocalPending(historyMessages, prev));
             clearQueuedAndDeferredUserMessages();
           }
+          applyTranscriptAction({
+            type: "legacy_history",
+            messages: transcriptStateRef.current.messages,
+          });
           setMessagesOwnerSessionId(activeSessionIdRef.current);
           const normalizedHistory = normalizeMessagesForDisplay(historyMessages);
-          const anchorIndex = scrollToMessageId
-            ? normalizedHistory.findIndex((message) => message.id === scrollToMessageId)
+          const requestedScrollMessageId = scrollToMessageIdRef.current;
+          const anchorIndex = requestedScrollMessageId
+            ? normalizedHistory.findIndex((message) => message.id === requestedScrollMessageId)
             : -1;
           const desiredStart = anchorIndex >= 0
             ? Math.max(0, anchorIndex - Math.floor(INITIAL_TRANSCRIPT_TAIL_ROWS / 2))
@@ -3912,10 +4223,30 @@ export function ChatPanel({
               });
               void recordSessionOpenLatency(durationMs).catch(() => {});
             }));
-            if (!scrollToMessageId) scrollAnchorRef.current?.scrollIntoView();
+            if (!requestedScrollMessageId) scrollAnchorRef.current?.scrollIntoView();
           }));
           return;
         }
+
+        if (
+          transcriptStateRef.current.mode === "window-v1"
+          && transcriptStateRef.current.hasNewer
+          && [
+            "text_delta",
+            "thinking_delta",
+            "tool_execution_start",
+            "tool_execution_end",
+            "agent_start",
+            "agent_end",
+            "agent_settled",
+            "message_start",
+            "message_end",
+            "assistant",
+            "user",
+            "toolResult",
+            "custom",
+          ].includes(msg.type)
+        ) applyTranscriptAction({ type: "tail_activity" });
 
         // Handle streaming deltas
         if (msg.type === "text_delta") {
@@ -4755,6 +5086,7 @@ export function ChatPanel({
     setIsSessionHistoryLoading(true);
     setMessagesOwnerSessionId(null);
     setVisibleMessageStart(0);
+    setShowScrollToBottom(false);
     setMessages([]);
     clearQueuedAndDeferredUserMessages();
     setPendingAttachments(attachmentDraftsBySessionRef.current.get(activeSessionId) ?? []);
@@ -4800,7 +5132,12 @@ export function ChatPanel({
         selectionId,
         elapsedMs: Math.round(performance.now() - selectionStartedAtRef.current),
       });
-      sendWs({ type: "switch_session", session_id: activeSessionId, selection_id: selectionId });
+      sendWs({
+        type: "switch_session",
+        session_id: activeSessionId,
+        selection_id: selectionId,
+        ...transcriptSwitchEnvelope(transcriptOpenIntentRef.current),
+      });
       return;
     }
 
@@ -4808,7 +5145,7 @@ export function ChatPanel({
       chatWsProfile("invoke_connect", { activeSessionId });
       connectRef.current();
     }
-  }, [activeSessionId, activeSession?.error_kind, sendWs, clearExternalActionAuthority, clearQueuedAndDeferredUserMessages, setExternalActionApprovalsSynced, setInterviewQueueSynced, setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
+  }, [activeSessionId, activeSession?.error_kind, effectiveTranscriptOpenIntent.requestKey, sendWs, setMessages, clearExternalActionAuthority, clearQueuedAndDeferredUserMessages, setExternalActionApprovalsSynced, setInterviewQueueSynced, setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
 
   // Mark a sent response retryable when a connected socket never returns the
   // required durable acknowledgement. This does not resend in a loop; the
@@ -5004,6 +5341,11 @@ export function ChatPanel({
     try {
       const result = await switchSessionAgent(pending.sessionId, pending.targetProfileId);
       if (activeSessionIdRef.current === pending.sessionId) {
+        if (transcriptStateRef.current.mode === "window-v1") {
+          applyTranscriptAction({ type: "invalidate", error: "Agent changed; waiting for the active-branch transcript reset." });
+          setMessagesOwnerSessionId(null);
+          setIsSessionHistoryLoading(true);
+        }
         // The backend's agent_switched runtime event reattaches this durable
         // WebSocket and sends fresh history with the same selection id. Keep
         // composer, attachment, and browser draft state untouched here.
@@ -5020,7 +5362,7 @@ export function ChatPanel({
     } finally {
       setIsAgentSwitching(false);
     }
-  }, [agentSwitchDialog, isAgentSwitching, onSessionChange, onSessionUpdate]);
+  }, [agentSwitchDialog, applyTranscriptAction, isAgentSwitching, onSessionChange, onSessionUpdate]);
 
   const addAttachmentFiles = useCallback(async (files: File[] | FileList) => {
     const sourceSessionId = activeSessionIdRef.current;
@@ -5195,6 +5537,7 @@ export function ChatPanel({
     setQueuedMessagesSynced,
     clearRuntimeError,
     appendRuntimeError,
+    setMessages,
   ]);
 
   const handleCompactAfterOverflow = useCallback(() => {
@@ -5233,13 +5576,19 @@ export function ChatPanel({
     pinActiveTurnScrollRef.current = false;
     setActiveTurnScrollAnchorText(null);
     setResendingMessageId(messageId);
-    sendWs({ type: "resend", message_id: messageId });
+    const sent = sendWs({ type: "resend", message_id: messageId });
+    if (sent && transcriptStateRef.current.mode === "window-v1") {
+      applyTranscriptAction({ type: "invalidate", error: "Branch is changing; waiting for a fresh bounded transcript." });
+      setMessagesOwnerSessionId(null);
+      setIsSessionHistoryLoading(true);
+    }
     onSessionChange?.();
     window.setTimeout(() => {
       setResendingMessageId((current) => current === messageId ? null : current);
     }, 1500);
   }, [
     activeSessionId,
+    applyTranscriptAction,
     clearQueuedAndDeferredUserMessages,
     clearRuntimeError,
     hasActiveAssistantOutput,
@@ -5252,10 +5601,11 @@ export function ChatPanel({
   const handleAwaitAuthoritativeMutationHistory = useCallback(() => {
     if (!activeSessionIdRef.current || !selectionIdRef.current) return;
     // Hide the stale projection before retiring the initiating transport.
+    applyTranscriptAction({ type: "invalidate", error: "Transcript mutation committed; waiting for a fresh bounded revision." });
     setMessagesOwnerSessionId(null);
     setIsSessionHistoryLoading(true);
     onSessionChange?.();
-  }, [onSessionChange]);
+  }, [applyTranscriptAction, onSessionChange]);
 
   const handleTranscriptMutationControlledReconnect = useCallback(() => {
     if (!activeSessionIdRef.current || !selectionIdRef.current) return;
@@ -5687,12 +6037,105 @@ export function ChatPanel({
     [activeSessionId],
   );
 
+  const captureViewportEventAnchor = useCallback((): { eventId: string; offset: number } | null => {
+    const container = scrollContainerRef.current;
+    if (!container) return null;
+    const containerRect = container.getBoundingClientRect();
+    const anchors = container.querySelectorAll<HTMLElement>("[data-message-id]");
+    for (const anchor of anchors) {
+      const eventId = anchor.dataset.messageId;
+      if (!eventId) continue;
+      const rect = anchor.getBoundingClientRect();
+      if (rect.top >= containerRect.top - 1 && rect.bottom <= containerRect.bottom + 1) {
+        return { eventId, offset: rect.top - containerRect.top };
+      }
+    }
+    return null;
+  }, []);
+
+  const requestTranscriptPage = useCallback((direction: "before" | "after") => {
+    const state = transcriptStateRef.current;
+    if (
+      state.mode !== "window-v1"
+      || state.invalidated
+      || wsStatusRef.current !== "connected"
+      || isSessionHistoryLoadingRef.current
+    ) return;
+    const cursor = direction === "before" ? state.beforeCursor : state.afterCursor;
+    const hasPage = direction === "before" ? state.hasOlder : state.hasNewer;
+    const inFlight = direction === "before" ? state.inFlightBefore : state.inFlightAfter;
+    if (!cursor || !hasPage || inFlight) return;
+
+    const requestId = createSelectionId();
+    if (direction === "before") {
+      const anchor = captureViewportEventAnchor();
+      if (anchor) prependAnchorsRef.current.set(requestId, anchor);
+    }
+    applyTranscriptAction({
+      type: "page_requested",
+      direction,
+      flight: { requestId, cursor },
+    });
+    const sent = sendWs({
+      type: "transcript_page_request",
+      request_id: requestId,
+      direction,
+      cursor,
+    });
+    if (!sent) {
+      prependAnchorsRef.current.delete(requestId);
+      applyTranscriptAction({
+        type: "page_failed",
+        direction,
+        requestId,
+        error: "The transcript page request was not sent. Reconnect and retry.",
+      });
+    }
+  }, [applyTranscriptAction, captureViewportEventAnchor, sendWs]);
+
+  const handleJumpToLatest = useCallback(() => {
+    if (effectiveTranscriptOpenIntent.kind === "around") {
+      savedMatchViewportRef.current = captureViewportEventAnchor();
+      matchIntentRef.current = effectiveTranscriptOpenIntent;
+    }
+    setTranscriptNavigationOverride({
+      baseRequestKey: requestedTranscriptOpenIntent.requestKey,
+      intent: createTranscriptIntent("latest"),
+    });
+  }, [captureViewportEventAnchor, effectiveTranscriptOpenIntent, requestedTranscriptOpenIntent.requestKey]);
+
+  const handleRetryTranscriptWindow = useCallback(() => {
+    setTranscriptNavigationOverride({
+      baseRequestKey: requestedTranscriptOpenIntent.requestKey,
+      intent: createTranscriptIntent(effectiveTranscriptOpenIntent.kind, effectiveTranscriptOpenIntent.anchorId),
+    });
+  }, [effectiveTranscriptOpenIntent, requestedTranscriptOpenIntent.requestKey]);
+
+  const handleBackToMatch = useCallback(() => {
+    const matchIntent = matchIntentRef.current;
+    if (!matchIntent?.anchorId) return;
+    pendingViewportRestoreRef.current = savedMatchViewportRef.current
+      ? { ...savedMatchViewportRef.current }
+      : {
+          eventId: matchIntent.anchorId,
+          offset: Math.max(0, (scrollContainerRef.current?.clientHeight ?? 0) / 2),
+        };
+    setTranscriptNavigationOverride({
+      baseRequestKey: requestedTranscriptOpenIntent.requestKey,
+      intent: createTranscriptIntent("around", matchIntent.anchorId),
+    });
+  }, [requestedTranscriptOpenIntent.requestKey]);
+
   const handleMessagesScroll = useCallback(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
 
     const distance = getScrollDistanceFromBottom(container);
     setShowScrollToBottom(distance > BOTTOM_SCROLL_TOLERANCE_PX);
+    if (transcriptStateRef.current.mode === "window-v1" && !isSessionHistoryLoadingRef.current) {
+      if (container.scrollTop <= 240) requestTranscriptPage("before");
+      if (distance <= 240) requestTranscriptPage("after");
+    }
 
     // Let a deliberate user scroll opt out of prompt-top pinning.
     if (pinActiveTurnScrollRef.current && Date.now() - lastProgrammaticScrollAtRef.current > 200) {
@@ -5705,7 +6148,7 @@ export function ChatPanel({
         }
       }
     }
-  }, []);
+  }, [requestTranscriptPage]);
 
   // ------------------------------------------------------------------
   // Status
@@ -6203,11 +6646,69 @@ export function ChatPanel({
       <div
         ref={scrollContainerRef}
         data-testid="chat-message-list"
-        data-transcript-state={isTranscriptLoading ? "loading" : visibleMessageStart > 0 ? "hydrating" : "ready"}
+        data-transcript-mode={transcriptState.mode}
+        data-transcript-epoch={transcriptState.transcriptEpoch ?? undefined}
+        data-transcript-state={isTranscriptLoading ? "loading" : transcriptState.invalidated ? "invalidated" : visibleMessageStart > 0 ? "hydrating" : "ready"}
         data-visible-message-start={visibleMessageStart}
         className="flex-1 overflow-y-auto px-3 py-3 space-y-3"
         onScroll={handleMessagesScroll}
       >
+        {transcriptState.mode === "window-v1" && (
+          <div className="sticky top-0 z-20 flex flex-wrap items-center justify-center gap-2 rounded border border-neutral-800 bg-neutral-950/95 px-3 py-1.5 text-[11px] text-neutral-400 shadow-sm">
+            <span>Bounded transcript window</span>
+            {effectiveTranscriptOpenIntent.kind === "around" && (
+              <button
+                type="button"
+                data-testid="transcript-jump-latest"
+                onClick={handleJumpToLatest}
+                className="rounded border border-blue-800/70 bg-blue-950/40 px-2 py-1 font-semibold text-blue-200 hover:bg-blue-900/50"
+              >
+                Jump to latest
+              </button>
+            )}
+            {effectiveTranscriptOpenIntent.kind === "latest" && matchIntentRef.current && (
+              <button
+                type="button"
+                data-testid="transcript-back-to-match"
+                onClick={handleBackToMatch}
+                className="rounded border border-amber-800/70 bg-amber-950/30 px-2 py-1 font-semibold text-amber-200 hover:bg-amber-900/40"
+              >
+                Back to match
+              </button>
+            )}
+          </div>
+        )}
+        {transcriptState.mode === "window-v1" && transcriptState.anchor && transcriptState.anchor.status !== "found" && (
+          <div data-testid="transcript-anchor-unavailable" role="status" className="rounded border border-amber-800/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-100">
+            {transcriptState.anchor.status === "off_branch"
+              ? "This search match is no longer on the active branch."
+              : transcriptState.anchor.status === "pending"
+                ? "The exact search match is still being resolved."
+                : "This search match is no longer available in the transcript."}
+            <button type="button" onClick={handleJumpToLatest} className="ml-2 underline decoration-dotted">Open latest</button>
+          </div>
+        )}
+        {transcriptState.error && (
+          <div data-testid="transcript-window-error" role="alert" className="rounded border border-red-900/60 bg-red-950/30 px-3 py-2 text-xs text-red-200">
+            {transcriptState.error}
+            {transcriptState.invalidated && (
+              <button type="button" onClick={handleRetryTranscriptWindow} className="ml-2 underline decoration-dotted">Reload bounded window</button>
+            )}
+          </div>
+        )}
+        {transcriptState.mode === "window-v1" && transcriptState.hasOlder && (
+          <div data-testid="transcript-gap-before" className="flex items-center justify-center gap-2 rounded border border-dashed border-neutral-700 bg-neutral-900/40 px-3 py-2 text-xs text-neutral-400">
+            <span>Earlier messages are not loaded.</span>
+            <button
+              type="button"
+              onClick={() => requestTranscriptPage("before")}
+              disabled={Boolean(transcriptState.inFlightBefore)}
+              className="rounded border border-neutral-700 px-2 py-1 text-neutral-200 hover:bg-neutral-800 disabled:opacity-50"
+            >
+              {transcriptState.inFlightBefore ? "Loading…" : "Load older"}
+            </button>
+          </div>
+        )}
         {displayMessages.length === 0 && deferredUserMessages.length === 0 && !hasStreamingContent && visibleExternalActionApprovals.length === 0 && !activeInterview && !activeSudoPrompt && !activeCommandGuardPinPrompt && (
           <div data-testid={isTranscriptLoading ? "chat-loading-shell" : undefined} className="flex items-center justify-center h-full text-neutral-600 text-sm font-mono">
             {isTranscriptLoading ? "Loading session…" : "No messages yet"}
@@ -6256,6 +6757,23 @@ export function ChatPanel({
           );
         })}
 
+        {transcriptState.mode === "window-v1" && transcriptState.hasNewer && (
+          <div data-testid="transcript-gap-after" className="flex flex-wrap items-center justify-center gap-2 rounded border border-dashed border-blue-900/70 bg-blue-950/20 px-3 py-2 text-xs text-blue-200">
+            <span>{transcriptState.pendingTailEvents ? "New transcript activity is available beyond this gap." : "Newer messages are not loaded."}</span>
+            <button
+              type="button"
+              onClick={() => requestTranscriptPage("after")}
+              disabled={Boolean(transcriptState.inFlightAfter)}
+              className="rounded border border-blue-900/80 px-2 py-1 hover:bg-blue-900/40 disabled:opacity-50"
+            >
+              {transcriptState.inFlightAfter ? "Loading…" : "Load newer"}
+            </button>
+            <button type="button" onClick={handleJumpToLatest} className="rounded bg-blue-700 px-2 py-1 font-semibold text-white hover:bg-blue-600">
+              Jump to latest
+            </button>
+          </div>
+        )}
+
         {/* Live streaming content */}
         {hasStreamingContent && (
           <div data-testid="chat-streaming" data-role="assistant" className="px-4 py-3 bg-neutral-900 rounded-lg border border-blue-900/30">
@@ -6292,14 +6810,18 @@ export function ChatPanel({
             <button
               type="button"
               onClick={() => {
-                scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" });
-                setShowScrollToBottom(false);
+                if (transcriptState.mode === "window-v1" && transcriptState.hasNewer) {
+                  handleJumpToLatest();
+                } else {
+                  scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" });
+                  setShowScrollToBottom(false);
+                }
               }}
               className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400
                 rounded-full w-9 h-9 flex items-center justify-center shadow-lg
                 border border-neutral-700 transition-all hover:text-neutral-200
                 hover:border-neutral-600"
-              aria-label="Scroll to bottom"
+              aria-label={transcriptState.mode === "window-v1" && transcriptState.hasNewer ? "Jump to latest" : "Scroll to bottom"}
             >
               <svg
                 xmlns="http://www.w3.org/2000/svg"

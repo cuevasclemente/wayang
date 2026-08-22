@@ -31,6 +31,7 @@ import { ScheduledJobsPanel } from "./panels/ScheduledJobsPanel";
 import { ProtectedAutomationsPanel } from "./panels/ProtectedAutomationsPanel";
 import { isCurrentSessionPath, parseSessionPath, sessionPath } from "./routing/sessionRoute";
 import { SettingsDialog, type SettingsTab } from "./components/settings/SettingsDialog";
+import type { TranscriptOpenIntent } from "./transcript/windowController";
 
 type MobileTab = "sessions" | "chat" | "tools";
 
@@ -40,6 +41,15 @@ type RouteResolution =
   | { kind: "ready"; requestedId: string }
   | { kind: "not_found"; requestedId: string }
   | { kind: "error"; requestedId: string };
+
+function createTranscriptOpenIntent(anchorId?: string | null): TranscriptOpenIntent {
+  const requestKey = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `transcript-intent-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return anchorId
+    ? { kind: "around", anchorId, requestKey }
+    : { kind: "latest", requestKey };
+}
 
 function initialRouteResolution(): RouteResolution {
   const route = parseSessionPath(window.location.pathname);
@@ -99,6 +109,9 @@ function App({ authEnabled, onLogout }: AppProps) {
   const [activeProjectCwd, setActiveProjectCwd] = useState<string | null>(null);
   const activeSessionId = activeSession?.id ?? null;
   const [scrollToMessageId, setScrollToMessageId] = useState<string | null>(null);
+  const [transcriptOpenIntent, setTranscriptOpenIntent] = useState<TranscriptOpenIntent>(
+    () => createTranscriptOpenIntent(),
+  );
   const [sessionChangeTrigger, setSessionChangeTrigger] = useState(0);
   const [humanAttentionCount, setHumanAttentionCount] = useState(0);
   const [showNewSession, setShowNewSession] = useState(false);
@@ -131,6 +144,7 @@ function App({ authEnabled, onLogout }: AppProps) {
       setShowScheduledJobs(false);
       setShowProtectedAutomations(false);
       setScrollToMessageId(messageId);
+      setTranscriptOpenIntent(createTranscriptOpenIntent(messageId));
       if (!isCurrentSessionPath(session.id)) {
         window.history.pushState(window.history.state, "", sessionPath(session.id));
       }
@@ -189,6 +203,7 @@ function App({ authEnabled, onLogout }: AppProps) {
     routeRequestGenerationRef.current += 1;
     setActiveSession(null);
     setScrollToMessageId(null);
+    setTranscriptOpenIntent(createTranscriptOpenIntent());
     setRouteResolution({ kind: "idle" });
     if (window.location.pathname !== "/") {
       window.history.replaceState(window.history.state, "", "/");
@@ -203,6 +218,7 @@ function App({ authEnabled, onLogout }: AppProps) {
     setShowScheduledJobs(false);
     setShowProtectedAutomations(false);
     setScrollToMessageId(null);
+    setTranscriptOpenIntent(createTranscriptOpenIntent());
 
     if (route.kind === "root") {
       setActiveSession(null);
@@ -385,6 +401,7 @@ function App({ authEnabled, onLogout }: AppProps) {
           sessionSelectionStartedAt={sessionSelectionStartedAtRef.current}
           onSessionChange={handleSessionChange}
           onSessionUpdate={setActiveSession}
+          transcriptOpenIntent={transcriptOpenIntent}
           scrollToMessageId={scrollToMessageId}
           onScrollToMessageHandled={() => setScrollToMessageId(null)}
         />
