@@ -4130,7 +4130,7 @@ function extractReplayPayloadFromUserContent(content: unknown): { text: string; 
   return { text: textParts.join(""), images };
 }
 
-export async function resendMessage(id: string, messageId: string): Promise<ResendMessageResult> {
+export async function resendMessage(id: string, messageId: string, includeHistory = true): Promise<ResendMessageResult> {
   assertRuntimeMutationUnlocked(id);
   const handle = sessions.get(id);
   if (!handle) throw new Error(`Session ${id} not found`);
@@ -4162,7 +4162,7 @@ export async function resendMessage(id: string, messageId: string): Promise<Rese
   });
 
   return {
-    messages: getMessageHistory(id),
+    messages: includeHistory ? getMessageHistory(id) : [],
     turn,
   };
 }
@@ -4977,6 +4977,48 @@ export function getTodoState(id: string): SerializedTodoState {
   if (!handle) return { type: "todo_state", todos: [], source: "none" };
   const manager = handle.session.sessionManager;
   return extractTodoStateFromEntries(manager.getBranch().length > 0 ? manager.getBranch() : manager.getEntries());
+}
+
+export interface SessionFileDerivedProjection {
+  fingerprint: FileFingerprint;
+  autoTitle: AutoTitleActivationSnapshot;
+  todoState: SerializedTodoState;
+}
+
+/**
+ * Complete stopped-session derived state, intentionally separate from the
+ * bounded transcript pager. Modern attaches schedule this only after the first
+ * window has been sent; it never serializes or transfers the complete branch.
+ */
+export function getSessionFileDerivedProjection(
+  sessionFile: string | null | undefined,
+  cwd?: string | null,
+): SessionFileDerivedProjection | null {
+  if (!sessionFile) return null;
+  try {
+    const fingerprint = sessionFileFingerprint(sessionFile);
+    const manager = SessionManager.open(sessionFile, undefined, cwd || undefined);
+    const branch = manager.getBranch();
+    const activeEntries = branch.length > 0 ? branch : manager.getEntries();
+    const firstUser = activeEntries.find((entry: any) => entry?.type === "message" && entry.message?.role === "user");
+    const projection: SessionFileDerivedProjection = {
+      fingerprint,
+      autoTitle: {
+        sessionId: manager.getSessionId(),
+        cwd: manager.getHeader()?.cwd ?? "",
+        sessionFile,
+        fingerprint,
+        nameState: manager.getSessionNameState(),
+        markedProjection: extractCompletedTitleExchanges(activeEntries),
+        legacyProjection: extractCompletedTitleExchanges(activeEntries, { allowSafeLegacyUserText: true }),
+        normalizedFirstUserFallback: normalizeProvisionalSessionTitle(titleTextBlocks((firstUser as any)?.message?.content)),
+      },
+      todoState: extractTodoStateFromEntries(activeEntries),
+    };
+    return fingerprintsEqual(fingerprint, sessionFileFingerprint(sessionFile)) ? projection : null;
+  } catch {
+    return null;
+  }
 }
 
 export interface SessionFileSnapshot {

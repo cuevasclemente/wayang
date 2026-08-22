@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getConfig } from "../config.js";
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 let _db: DatabaseType | null = null;
 
@@ -119,7 +119,9 @@ function applySchemaV1(db: DatabaseType): void {
       role          TEXT NOT NULL,
       text          TEXT NOT NULL,
       message_id    TEXT,
-      source_offset INTEGER
+      source_offset INTEGER,
+      transcript_epoch TEXT,
+      active_branch INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS chunks_session ON chunks(session_id);
     CREATE INDEX IF NOT EXISTS chunks_cwd_active ON chunks(cwd, last_active);

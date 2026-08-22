@@ -21,6 +21,8 @@ import { getSearchDb, SCHEMA_VERSION } from "./db.js";
 import { isSessionIndexable } from "./policy-filter.js";
 import { chunkJsonlFile, type MetaForChunker } from "./chunker.js";
 import { writeDreamPolicyProjection } from "./policy-projection.js";
+import { invalidateTranscriptPaginationSession } from "../transcript-pagination/service.js";
+import { getStructuralTranscriptIndex } from "../transcript-pagination/structural-index.js";
 
 export interface IndexResult {
   sessionId: string;
@@ -233,6 +235,7 @@ async function indexSessionAttempt(
 
   let chunks: Awaited<ReturnType<typeof chunkJsonlFile>>["chunks"] = [];
   let chunkerError: string | undefined;
+  let structuralEpoch: string | null = null;
 
   const meta = makeMeta(row);
   if (filePath && fileMtime != null) {
@@ -274,9 +277,26 @@ async function indexSessionAttempt(
     ];
   }
 
+  if (filePath && fileMtime != null && !chunkerError) {
+    try {
+      const active = await getStructuralTranscriptIndex().activeProjection(sessionId, filePath);
+      structuralEpoch = active.revision.transcriptEpoch;
+      chunks = chunks.filter((chunk) => chunk.role === "meta" || Boolean(chunk.messageId && active.eventIds.has(chunk.messageId)));
+    } catch (error) {
+      purgeSessionIndex(sessionId);
+      return {
+        sessionId,
+        chunkCount: 0,
+        skipped: true,
+        retryable: true,
+        error: `Active-branch transcript structure is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
   await options.afterChunkingForTests?.();
 
-  // chunkJsonlFile and test seams yield while streaming. Reauthorize and
+  // chunkJsonlFile, structural indexing, and test seams yield. Reauthorize and
   // compare the complete index projection before preparing a commit.
   if (transcriptMutationFences.has(sessionId)) {
     purgeSessionIndex(sessionId);
@@ -293,11 +313,11 @@ async function indexSessionAttempt(
     `INSERT INTO chunks (
       session_id, cwd, title, goal, model, provider,
       created_at, last_active, archived, has_error,
-      chunk_index, role, text, message_id, source_offset
+      chunk_index, role, text, message_id, source_offset, transcript_epoch, active_branch
     ) VALUES (
       @session_id, @cwd, @title, @goal, @model, @provider,
       @created_at, @last_active, @archived, @has_error,
-      @chunk_index, @role, @text, @message_id, @source_offset
+      @chunk_index, @role, @text, @message_id, @source_offset, @transcript_epoch, @active_branch
     )`,
   );
 
@@ -343,6 +363,8 @@ async function indexSessionAttempt(
         text: c.text,
         message_id: c.messageId ?? null,
         source_offset: c.sourceOffset ?? null,
+        transcript_epoch: structuralEpoch,
+        active_branch: c.messageId && structuralEpoch ? 1 : 0,
       });
     }
     stateStmt.run(
@@ -363,6 +385,7 @@ async function indexSessionAttempt(
 
 export async function removeSession(sessionId: string): Promise<void> {
   purgeSessionIndex(sessionId);
+  invalidateTranscriptPaginationSession(sessionId);
 }
 
 /** Prevent watcher/manual indexing from republishing stale text during rewrite. */
@@ -373,6 +396,7 @@ export function beginTranscriptMutationSearchFence(sessionId: string): void {
   transcriptMutationFences.add(sessionId);
   try {
     purgeSessionIndex(sessionId);
+    invalidateTranscriptPaginationSession(sessionId);
   } catch (error) {
     transcriptMutationFences.delete(sessionId);
     throw error;
@@ -390,6 +414,7 @@ export function purgePolicyDeniedSessions(): { purged: number; errors: number } 
     if (!policyDenial(row)) continue;
     try {
       purgeSessionIndex(row.id);
+      invalidateTranscriptPaginationSession(row.id);
       purged++;
     } catch (error) {
       errors++;
@@ -445,6 +470,7 @@ function purgeSessionIndex(sessionId: string): void {
 function purgePolicyDeniedSession(sessionId: string, reason: string): IndexResult {
   try {
     purgeSessionIndex(sessionId);
+    invalidateTranscriptPaginationSession(sessionId);
     return { sessionId, chunkCount: 0, skipped: true, policySkipped: true };
   } catch (error) {
     return {

@@ -25,6 +25,7 @@ const indexerMod = await import("./indexer.js");
 const policyFilterMod = await import("./policy-filter.js");
 const searchMod = await import("./search.js");
 const watcherMod = await import("./watcher.js");
+const transcriptIndexMod = await import("../transcript-pagination/structural-index.js");
 
 dbMod.init();
 
@@ -34,18 +35,22 @@ function writeFixture(sessionId: string, cwd: string, transcript: Array<{ role: 
   const file = path.join(dir, "session.jsonl");
   const lines: string[] = [];
   lines.push(JSON.stringify({ type: "session", version: 3, id: sessionId, cwd }));
+  let parentId: string | null = null;
   for (let i = 0; i < transcript.length; i++) {
     const t = transcript[i];
+    const messageId = t.id ?? `m${i}`;
     lines.push(
       JSON.stringify({
         type: "message",
-        id: t.id ?? `m${i}`,
+        id: messageId,
+        parentId,
         message: {
           role: t.role,
           content: [{ type: "text", text: t.text }],
         },
       }),
     );
+    parentId = messageId;
   }
   fs.writeFileSync(file, lines.join("\n") + "\n", "utf-8");
   return file;
@@ -398,12 +403,35 @@ test("protected policy live-filters stale results and indexing denial purges chu
   assert.equal((db.prepare("SELECT COUNT(*) AS n FROM session_index_state WHERE session_id = ?").get(id) as { n: number }).n, 0);
 });
 
+test("search publishes exact active-branch message anchors and excludes sibling content", async () => {
+  const id = seedSession({
+    title: "Branch-aware exact anchors",
+    transcript: [{ role: "user", text: "placeholder" }],
+  });
+  const row = dbMod.getStore().sessions.find((session) => session.id === id)!;
+  const lines = [
+    { type: "session", version: 3, id, cwd: row.cwd },
+    { type: "message", id: "root", parentId: null, message: { role: "user", content: [{ type: "text", text: "shared root" }] } },
+    { type: "message", id: "off-branch", parentId: "root", message: { role: "assistant", content: [{ type: "text", text: "sibling marmot canary" }] } },
+    { type: "message", id: "active-exact", parentId: "root", message: { role: "assistant", content: [{ type: "text", text: "active exact capybara" }] } },
+  ];
+  fs.writeFileSync(row.pi_session_file!, lines.map((line) => JSON.stringify(line)).join("\n") + "\n");
+  await indexerMod.indexSession(id, { force: true });
+  assert.equal(searchMod.runSearch("sibling marmot", { archived: "any" }).results.some((result) => result.session_id === id), false);
+  const active = searchMod.runSearch("exact capybara", { archived: "any" }).results.find((result) => result.session_id === id);
+  assert.equal(active?.best_message_id, "active-exact");
+  assert.equal(active?.best_message_active, true);
+  assert.equal(active?.best_anchor_status, "active");
+  assert.ok(active?.best_transcript_epoch);
+});
+
 test("search returns empty for short queries without throwing", () => {
   const out = searchMod.runSearch("a");
   assert.deepEqual(out.results, []);
 });
 
 // Cleanup hook — done via process exit; we leave the temp dir for inspection if needed.
-test("close db handles", () => {
+test("close db handles", async () => {
   searchDbMod.closeSearchDb();
+  await transcriptIndexMod.closeStructuralTranscriptIndex();
 });

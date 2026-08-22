@@ -5,11 +5,10 @@
  *   1. Stream JSONL line by line; skip non-`message` types.
  *   2. Keep only items where message.role ∈ {user, assistant} and each
  *      content item has type="text".
- *   3. Concatenate consecutive same-role text into one role-prefixed
- *      utterance: `User: …\n\nAssistant: …`.
- *   4. Greedy-pack utterances into ≤ MAX_CHUNK_CHARS chunks, breaking only
- *      on utterance boundaries; allow OVERLAP_CHARS overlap with the previous
- *      chunk for context.
+ *   3. Keep one exact message id per utterance (multiple text blocks from the
+ *      same message may coalesce; adjacent same-role messages may not).
+ *   4. Emit message-bound chunks of ≤ MAX_CHUNK_CHARS. Oversized messages are
+ *      split with bounded within-message overlap so every result anchor remains exact.
  *   5. One synthetic role='meta' chunk per session, so metadata-only sessions
  *      are still searchable.
  *
@@ -141,9 +140,8 @@ export async function chunkJsonlFile(
       const text = part.text.trim();
       if (!text) continue;
 
-      if (pending && pending.role === partRole) {
+      if (pending && pending.role === partRole && pending.messageId === messageId) {
         pending.text += `\n\n${text}`;
-        // Keep the original messageId/offset of the first contributor.
       } else {
         flushPending();
         pending = {
@@ -174,8 +172,8 @@ export async function chunkJsonlFile(
     sourceOffset: null,
   });
 
-  // Greedy-pack utterances into chunks ≤ MAX_CHUNK_CHARS, with OVERLAP_CHARS
-  // tail of the previous chunk prepended for context. We never split mid-utterance.
+  // Keep chunks message-bound so best_message_id identifies the exact
+  // searchable event rather than the first contributor to a coalesced chunk.
   const utteranceToText = (u: Utterance): string => {
     const prefix =
       u.role === "user" ? "User: " : u.role === "assistant" ? "Assistant: " : "Thinking: ";
@@ -197,71 +195,40 @@ export async function chunkJsonlFile(
     else transcriptStream.push(u);
   }
 
-  const packStream = (
-    stream: Utterance[],
-    fallbackRole: "user" | "assistant" | "thinking",
-  ): void => {
-    let localBuffer = "";
-    let localStart: { messageId: string | null; sourceOffset: number } | null = null;
-    let localLastRole: Utterance["role"] = fallbackRole;
-    let lastEmittedTail = "";
-
-    const localEmit = (): void => {
-      if (!localBuffer || !localStart) return;
-      chunks.push({
-        chunkIndex: chunkIndex++,
-        role: localLastRole,
-        text: localBuffer,
-        messageId: localStart.messageId,
-        sourceOffset: localStart.sourceOffset,
-      });
-      lastEmittedTail = overlapTail(localBuffer);
-      localBuffer = "";
-      localStart = null;
-    };
-
-    for (const u of stream) {
-      const utteranceText = utteranceToText(u);
-      const nextLenIfAdded = localBuffer
-        ? localBuffer.length + 2 + utteranceText.length
-        : utteranceText.length;
-
-      // If a single utterance is longer than MAX, hard-split it at MAX boundaries.
-      if (utteranceText.length > MAX_CHUNK_CHARS && !localBuffer) {
-        for (let i = 0; i < utteranceText.length; i += MAX_CHUNK_CHARS) {
-          const slice = utteranceText.slice(i, i + MAX_CHUNK_CHARS);
-          chunks.push({
-            chunkIndex: chunkIndex++,
-            role: u.role,
-            text: lastEmittedTail ? `${lastEmittedTail}\n\n${slice}` : slice,
-            messageId: u.messageId,
-            sourceOffset: u.sourceOffset,
-          });
-          lastEmittedTail = overlapTail(slice);
-        }
+  const packStream = (stream: Utterance[]): void => {
+    for (const utterance of stream) {
+      const text = utteranceToText(utterance);
+      if (text.length <= MAX_CHUNK_CHARS) {
+        chunks.push({
+          chunkIndex: chunkIndex++,
+          role: utterance.role,
+          text,
+          messageId: utterance.messageId,
+          sourceOffset: utterance.sourceOffset,
+        });
         continue;
       }
-
-      if (nextLenIfAdded > MAX_CHUNK_CHARS && localBuffer) {
-        localEmit();
+      let offset = 0;
+      let priorTail = "";
+      while (offset < text.length) {
+        const available = Math.max(1, MAX_CHUNK_CHARS - (priorTail ? priorTail.length + 2 : 0));
+        const slice = text.slice(offset, offset + available);
+        const projected = priorTail ? `${priorTail}\n\n${slice}` : slice;
+        chunks.push({
+          chunkIndex: chunkIndex++,
+          role: utterance.role,
+          text: projected,
+          messageId: utterance.messageId,
+          sourceOffset: utterance.sourceOffset,
+        });
+        offset += available;
+        priorTail = overlapTail(slice);
       }
-
-      if (!localBuffer) {
-        const prefix = lastEmittedTail ? `${lastEmittedTail}\n\n` : "";
-        localBuffer = prefix + utteranceText;
-        localStart = { messageId: u.messageId, sourceOffset: u.sourceOffset };
-      } else {
-        localBuffer += `\n\n${utteranceText}`;
-      }
-      localLastRole = u.role;
     }
-    localEmit();
   };
 
-  packStream(transcriptStream, "user");
-  if (options.includeThinking && thinkingStream.length > 0) {
-    packStream(thinkingStream, "thinking");
-  }
+  packStream(transcriptStream);
+  if (options.includeThinking && thinkingStream.length > 0) packStream(thinkingStream);
 
   return { chunks, stats };
 }

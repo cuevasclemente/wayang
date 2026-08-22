@@ -15,6 +15,7 @@ import {
   releaseSessionRuntimeMutationLock,
 } from "../session-runtime-mutation-lock.js";
 import { validateSessionDeletionPinAttempt } from "../transcript-mutations.js";
+import { invalidateTranscriptPaginationSession } from "../transcript-pagination/service.js";
 
 export const router = Router();
 
@@ -294,6 +295,7 @@ router.post("/sessions/:id/delete", async (req: Request, res: Response) => {
       await removeSearchSession(req.params.id);
       let deleted: ReturnType<typeof deleteSession>;
       try {
+        invalidateTranscriptPaginationSession(req.params.id);
         deleted = deleteSession(req.params.id, { searchPurged: true });
       } catch {
         const canonicalRetained = Boolean(getSessionById(req.params.id));

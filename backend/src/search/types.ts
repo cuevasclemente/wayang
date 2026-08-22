@@ -12,7 +12,7 @@ export interface Chunk {
   chunkIndex: number;
   role: ChunkRole;
   text: string;
-  /** First pi message id contributing to this chunk, if any. */
+  /** Exact pi message id contributing to this message-bound chunk, if any. */
   messageId?: string | null;
   /** Byte offset in the source JSONL for the first contributing line. */
   sourceOffset?: number | null;
@@ -29,6 +29,9 @@ export interface SearchResult {
   best_role: ChunkRole;
   snippet_html: string;
   best_message_id?: string | null;
+  best_message_active?: boolean;
+  best_transcript_epoch?: string | null;
+  best_anchor_status?: "active" | "unavailable";
 }
 
 export interface SearchFacets {

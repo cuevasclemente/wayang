@@ -86,6 +86,18 @@ test("skips non-message rows and tool/thinking content by default", async () => 
   assert.doesNotMatch(transcript, /tool_result/);
 });
 
+test("adjacent same-role messages retain distinct exact anchors", async () => {
+  const file = tempFile("same-role.jsonl", [
+    JSON.stringify({ type: "message", id: "first", message: { role: "user", content: "first exact canary" } }),
+    JSON.stringify({ type: "message", id: "second", message: { role: "user", content: "second exact platypus" } }),
+  ]);
+  const { chunks } = await chunkJsonlFile(file, baseMeta);
+  const transcript = chunks.filter((chunk) => chunk.role !== "meta");
+  assert.deepEqual(transcript.map((chunk) => chunk.messageId), ["first", "second"]);
+  assert.match(transcript[1].text, /platypus/);
+  assert.doesNotMatch(transcript[1].text, /canary/);
+});
+
 test("includes thinking when option is set", async () => {
   const lines = [
     JSON.stringify({
@@ -143,7 +155,7 @@ test("splits utterances longer than MAX_CHUNK_CHARS", async () => {
   }
 });
 
-test("packs many short utterances into multi-utterance chunks", async () => {
+test("keeps adjacent searchable messages on exact message-bound chunks", async () => {
   const lines: string[] = [];
   for (let i = 0; i < 40; i++) {
     lines.push(
@@ -161,11 +173,10 @@ test("packs many short utterances into multi-utterance chunks", async () => {
   const { chunks, stats } = await chunkJsonlFile(file, baseMeta);
   const transcriptChunks = chunks.filter((c) => c.role !== "meta");
   assert.equal(stats.messagesUsed, 40);
-  // Multi-utterance chunks should contain both User: and Assistant: prefixes.
-  const hasMixed = transcriptChunks.some(
-    (c) => c.text.includes("User:") && c.text.includes("Assistant:"),
-  );
-  assert.ok(hasMixed, "expected at least one chunk to contain both User: and Assistant:");
+  assert.equal(transcriptChunks.length, 40);
+  assert.deepEqual(transcriptChunks.map((chunk) => chunk.messageId),
+    Array.from({ length: 40 }, (_, index) => `m${index}`));
+  assert.ok(transcriptChunks.every((chunk) => !(chunk.text.includes("User:") && chunk.text.includes("Assistant:"))));
 });
 
 test("recovers from malformed lines without aborting", async () => {

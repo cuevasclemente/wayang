@@ -6,6 +6,7 @@
  *     { type: "message", content: string, client_message_id?: string, attachments?: {name?: string, mimeType?: string, data: string, size?: number}[] }
  *     { type: "cancel_queued_message", client_message_id: string }
  *     { type: "resend", message_id: string }
+ *     { type: "transcript_page_request", request_id, direction, cursor }
  *     { type: "interrupt", clear_queue?: boolean }
  *     { type: "set_permission", mode: string }
  *     { type: "set_goal", goal: string }
@@ -16,7 +17,9 @@
  *     { type: "command_guard_pin_response", requestId, sessionId, selection_id, pin? | cancelled }
  *
  *   Server → Client:
- *     { type: "history", messages: [...] }
+ *     { type: "history", messages: [...] } // legacy/unnegotiated only
+ *     { type: "transcript_protocol", protocol: "window-v1", intent }
+ *     { type: "transcript_window", transcript_epoch, messages, before_cursor, after_cursor, ... }
  *     { type: "session_runtime_state", session_id, selection_id, bash_mode }
  *     { type: "text_delta", delta: string }
  *     { type: "thinking_delta", delta: string }
@@ -65,6 +68,7 @@ import {
   getLiveMessageHistory,
   getSessionFileTodoState,
   getSessionFileSnapshot,
+  getSessionFileDerivedProjection,
   invalidateSessionFileSnapshot,
   getTodoState,
   getCommandGuardState,
@@ -110,6 +114,9 @@ import { scheduleWayangAutoTitle, scheduleWayangAutoTitleFromActivation } from "
 import type {
   ExternalActionTerminalMessage,
   SessionRuntimeStateMessage,
+  TranscriptProtocolMessage,
+  TranscriptIntent,
+  TranscriptWindowReason,
 } from "@wayang/protocol";
 import { authorizeProjectAction } from "../policy.js";
 import type { AuthService } from "../auth/service.js";
@@ -123,8 +130,49 @@ import {
   acquireSessionRuntimeMutationLock,
   releaseSessionRuntimeMutationLock,
 } from "../session-runtime-mutation-lock.js";
+import {
+  getTranscriptPaginationService,
+  invalidateTranscriptPaginationSession,
+} from "../transcript-pagination/service.js";
+import { TranscriptCursorError } from "../transcript-pagination/cursor-registry.js";
 
 export const router = Router();
+
+type WindowTranscriptNegotiation = {
+  protocol: "window-v1";
+  intent: TranscriptIntent;
+  anchorId?: string;
+};
+
+type TranscriptNegotiation =
+  | WindowTranscriptNegotiation
+  | { protocol: null; intent: "latest"; anchorId?: never };
+
+function validTranscriptAnchor(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 512
+    && !/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(value);
+}
+
+/** @internal Exported for additive negotiation regression tests. */
+export function parseTranscriptNegotiation(
+  source: URLSearchParams | Record<string, unknown>,
+  selectionId: string | null,
+): TranscriptNegotiation {
+  const nested = !(source instanceof URLSearchParams) && source.transcript
+    && typeof source.transcript === "object" && !Array.isArray(source.transcript)
+    ? source.transcript as Record<string, unknown>
+    : null;
+  const read = (queryName: string, envelopeName: string): unknown => source instanceof URLSearchParams
+    ? source.get(queryName)
+    : nested?.[envelopeName] ?? source[queryName];
+  if (read("transcript_protocol", "protocol") !== "window-v1" || !selectionId) return { protocol: null, intent: "latest" };
+  const requestedIntent = read("transcript_intent", "intent") === "around" ? "around" : "latest";
+  const anchor = read("transcript_anchor_id", "anchor_id");
+  if (requestedIntent === "around" && validTranscriptAnchor(anchor)) {
+    return { protocol: "window-v1", intent: "around", anchorId: anchor };
+  }
+  return { protocol: "window-v1", intent: "latest" };
+}
 
 const wsHandshakeStarts = new WeakMap<object, number>();
 
@@ -197,6 +245,22 @@ export function serializeSessionRuntimeState(sessionId: string, selectionId: str
   };
 }
 
+/** @internal Exported for negotiated protocol confirmation tests. */
+export function serializeTranscriptProtocolConfirmation(
+  sessionId: string,
+  selectionId: string,
+  negotiation: WindowTranscriptNegotiation,
+): TranscriptProtocolMessage {
+  return {
+    type: "transcript_protocol",
+    session_id: sessionId,
+    selection_id: selectionId,
+    protocol: "window-v1",
+    intent: negotiation.intent,
+    ...(negotiation.anchorId ? { anchor_id: negotiation.anchorId } : {}),
+  };
+}
+
 /** @internal Shared wire projection used by every selected client. */
 export function subscribeTranscriptInvalidationForSelection(input: {
   sessionId: string;
@@ -207,6 +271,7 @@ export function subscribeTranscriptInvalidationForSelection(input: {
 }): () => void {
   return onTranscriptInvalidation((event: TranscriptInvalidationEvent) => {
     if (event.sessionId !== input.sessionId || !input.isCurrent()) return;
+    invalidateTranscriptPaginationSession(input.sessionId);
     input.send({
       type: "transcript_invalidated",
       session_id: input.sessionId,
@@ -327,7 +392,13 @@ export function attachWs(httpServer: Server, auth: AuthService): void {
     }
 
     wsProfile(sessionId, "handle_connection_start", `connection_event_duration=${elapsedMs(connectionStart)}`);
-    handleConnection(ws, sessionId, selectionId, WAYANG_WEBSOCKET_SUBMISSION_CONTEXT);
+    handleConnection(
+      ws,
+      sessionId,
+      selectionId,
+      WAYANG_WEBSOCKET_SUBMISSION_CONTEXT,
+      parseTranscriptNegotiation(url.searchParams, selectionId),
+    );
   });
 }
 
@@ -345,12 +416,14 @@ function handleConnection(
   sessionId: string,
   initialSelectionId: string | null,
   submissionContext: InterviewSubmissionContext,
+  initialTranscriptNegotiation: TranscriptNegotiation,
 ): void {
   const connectionStart = nowMs();
   wsProfile(sessionId, "handle_connection_enter");
   let alive = true;
   let currentSessionId = sessionId;
   let currentSelectionId: string | null = initialSelectionId;
+  let currentTranscriptNegotiation = initialTranscriptNegotiation;
   let ready = false;
   let readyError: string | null = null;
   let setupVersion = 0;
@@ -440,15 +513,17 @@ function handleConnection(
     runtimeEligible: boolean,
   ) => {
     const pollStart = nowMs();
+    const pollTranscriptNegotiation = currentTranscriptNegotiation;
     stopFilePoll();
     if (!sessionFile) {
       wsProfile(nextSessionId, "file_poll_skip", "reason=no_session_file");
       return;
     }
 
-    let lastMtimeMs = 0;
+    let lastFileRevision = "";
     try {
-      lastMtimeMs = fs.statSync(sessionFile).mtimeMs;
+      const stat = fs.statSync(sessionFile);
+      lastFileRevision = `${Number(stat.dev)}:${Number(stat.ino)}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
     } catch (err: any) {
       wsProfile(nextSessionId, "file_poll_skip", `reason=stat_failed duration=${elapsedMs(pollStart)} error=${err?.message || String(err)}`);
       return;
@@ -460,23 +535,53 @@ function handleConnection(
       if (runtimeEligible && getPiSession(nextSessionId)) return;
 
       try {
-        const mtimeMs = fs.statSync(sessionFile).mtimeMs;
-        if (mtimeMs <= lastMtimeMs) return;
-        lastMtimeMs = mtimeMs;
+        const stat = fs.statSync(sessionFile);
+        const revision = `${Number(stat.dev)}:${Number(stat.ino)}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+        if (revision === lastFileRevision) return;
+        lastFileRevision = revision;
         const historyStart = nowMs();
-        const snapshot = getSessionFileSnapshot(sessionFile, cwd);
-        const messages = snapshot?.messages ?? [];
-        wsProfile(nextSessionId, "file_poll_history_loaded", `duration=${elapsedMs(historyStart)} messages=${messages.length}`);
-        sendSafe(ws, {
-          type: "history",
-          session_id: nextSessionId,
-          ...(selectionId ? { selection_id: selectionId } : {}),
-          reason: "external_file_change",
-          message_count: messages.length,
-          payload_bytes: snapshot?.payloadBytes ?? 0,
-          messages,
-        });
-        sendSafe(ws, { ...(snapshot?.todoState ?? getSessionFileTodoState(sessionFile, cwd)), session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
+        if (pollTranscriptNegotiation.protocol === "window-v1" && selectionId) {
+          void getTranscriptPaginationService().open({
+            sessionId: nextSessionId,
+            selectionId,
+            sessionFile,
+            intent: "latest",
+            reason: "reset",
+          }).then((window) => {
+            if (!alive || version !== setupVersion) return;
+            wsProfile(nextSessionId, "file_poll_window_loaded", `duration=${elapsedMs(historyStart)} messages=${window.message_count}`);
+            sendSafe(ws, window);
+            setImmediate(() => {
+              if (!alive || version !== setupVersion) return;
+              const derived = getSessionFileDerivedProjection(sessionFile, cwd);
+              if (!derived || !getTranscriptPaginationService().isDerivedProjectionCurrent(
+                nextSessionId, sessionFile, window.transcript_epoch, derived.fingerprint,
+              )) return;
+              sendSafe(ws, { ...derived.todoState, session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
+              scheduleWayangAutoTitleFromActivation(nextSessionId, derived.autoTitle, {
+                stillSelected: () => alive && version === setupVersion && currentSessionId === nextSessionId && currentSelectionId === selectionId,
+                onCommitted: invalidateSessionFileSnapshot,
+              });
+            });
+          }).catch(() => {
+            // A racing external rewrite is retried by the next poll; stale pages
+            // are never replaced by an unbounded fallback.
+          });
+        } else {
+          const snapshot = getSessionFileSnapshot(sessionFile, cwd);
+          const messages = snapshot?.messages ?? [];
+          wsProfile(nextSessionId, "file_poll_history_loaded", `duration=${elapsedMs(historyStart)} messages=${messages.length}`);
+          sendSafe(ws, {
+            type: "history",
+            session_id: nextSessionId,
+            ...(selectionId ? { selection_id: selectionId } : {}),
+            reason: "external_file_change",
+            message_count: messages.length,
+            payload_bytes: snapshot?.payloadBytes ?? 0,
+            messages,
+          });
+          sendSafe(ws, { ...(snapshot?.todoState ?? getSessionFileTodoState(sessionFile, cwd)), session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
+        }
       } catch {
         // Ignore transient file errors; the next sessions sync will reconcile
         // deleted/moved session files.
@@ -510,6 +615,33 @@ function handleConnection(
     }
 
     if (!alive || version !== setupVersion) return false;
+
+    const attachTranscriptNegotiation = currentTranscriptNegotiation;
+    const modernWindowNegotiation: WindowTranscriptNegotiation | null =
+      attachTranscriptNegotiation.protocol === "window-v1" && selectionId
+        ? attachTranscriptNegotiation
+        : null;
+    const sendBoundedLiveWindow = async (
+      reason: TranscriptWindowReason,
+      intent: TranscriptIntent = "latest",
+      anchorId?: string,
+      compactingOverride?: boolean,
+    ) => {
+      if (!selectionId) return;
+      const window = await getTranscriptPaginationService().open({
+        sessionId: nextSessionId,
+        selectionId,
+        sessionFile: liveHandle.sessionFile ?? durable?.pi_session_file,
+        intent,
+        anchorId,
+        reason,
+        streamingAtSnapshot: Boolean(liveHandle.session.isStreaming),
+        compactingAtSnapshot: compactingOverride ?? Boolean(liveHandle.session.isCompacting),
+        liveStreamingMessage: liveHandle.liveStreamingMessage ?? liveHandle.session.state.streamingMessage,
+        preserveCursors: reason === "tail_reconcile",
+      });
+      if (alive && version === setupVersion) sendSafe(ws, window);
+    };
 
     if (!liveHandle.session.isStreaming) {
       ensureInteractiveCommandGuardEnabled(nextSessionId, "websocket live-session attach");
@@ -551,18 +683,25 @@ function handleConnection(
         const compactingAtSnapshot = msg.type === "compaction_end"
           ? false
           : Boolean(liveHandle.session.isCompacting);
-        const reconciled = getLiveMessageHistory(nextSessionId);
-        sendSafe(ws, {
-          type: "history",
-          session_id: nextSessionId,
-          ...(selectionId ? { selection_id: selectionId } : {}),
-          reason: msg.type === "agent_settled" ? "agent_settled_reconciliation" : "compaction_end_reconciliation",
-          streaming_at_snapshot: streamingAtSnapshot,
-          compacting_at_snapshot: compactingAtSnapshot,
-          message_count: reconciled.length,
-          payload_bytes: Buffer.byteLength(JSON.stringify(reconciled)),
-          messages: reconciled,
-        });
+        if (modernWindowNegotiation) {
+          void sendBoundedLiveWindow("tail_reconcile", "latest", undefined, compactingAtSnapshot).catch(() => {
+            // A concurrent append/rewrite is retried by the next authoritative
+            // lifecycle event; never substitute legacy full history.
+          });
+        } else {
+          const reconciled = getLiveMessageHistory(nextSessionId);
+          sendSafe(ws, {
+            type: "history",
+            session_id: nextSessionId,
+            ...(selectionId ? { selection_id: selectionId } : {}),
+            reason: msg.type === "agent_settled" ? "agent_settled_reconciliation" : "compaction_end_reconciliation",
+            streaming_at_snapshot: streamingAtSnapshot,
+            compacting_at_snapshot: compactingAtSnapshot,
+            message_count: reconciled.length,
+            payload_bytes: Buffer.byteLength(JSON.stringify(reconciled)),
+            messages: reconciled,
+          });
+        }
         sendContextUsage(ws, nextSessionId);
       }
     };
@@ -591,21 +730,33 @@ function handleConnection(
       // after that drain would clear valid post-snapshot deltas in the client.
       const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
       const compactingAtSnapshot = Boolean(liveHandle.session.isCompacting);
-      const liveHistory = getLiveMessageHistory(nextSessionId);
-      bufferedEvents.length = 0;
-      wsProfile(nextSessionId, "attach_live_history", `duration=${elapsedMs(liveHistoryStart)} messages=${liveHistory.length}`);
-      sendSafe(ws, {
-        type: "history",
-        session_id: nextSessionId,
-        ...(selectionId ? { selection_id: selectionId } : {}),
-        reason: "initial",
-        streaming_at_snapshot: streamingAtSnapshot,
-        compacting_at_snapshot: compactingAtSnapshot,
-        message_count: liveHistory.length,
-        payload_bytes: Buffer.byteLength(JSON.stringify(liveHistory)),
-        messages: liveHistory,
-      });
-      sendSafe(ws, { ...getTodoState(nextSessionId), session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
+      if (modernWindowNegotiation) {
+        // Events observed after this boundary are drained below. The bounded
+        // disk/runtime overlay snapshot represents everything before it.
+        bufferedEvents.length = 0;
+        await sendBoundedLiveWindow(
+          "initial",
+          modernWindowNegotiation.intent,
+          modernWindowNegotiation.anchorId,
+        );
+        wsProfile(nextSessionId, "attach_live_window", `duration=${elapsedMs(liveHistoryStart)}`);
+      } else {
+        const liveHistory = getLiveMessageHistory(nextSessionId);
+        bufferedEvents.length = 0;
+        wsProfile(nextSessionId, "attach_live_history", `duration=${elapsedMs(liveHistoryStart)} messages=${liveHistory.length}`);
+        sendSafe(ws, {
+          type: "history",
+          session_id: nextSessionId,
+          ...(selectionId ? { selection_id: selectionId } : {}),
+          reason: "initial",
+          streaming_at_snapshot: streamingAtSnapshot,
+          compacting_at_snapshot: compactingAtSnapshot,
+          message_count: liveHistory.length,
+          payload_bytes: Buffer.byteLength(JSON.stringify(liveHistory)),
+          messages: liveHistory,
+        });
+        sendSafe(ws, { ...getTodoState(nextSessionId), session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
+      }
       sendSafe(ws, {
         type: "queued_message_snapshot",
         session_id: nextSessionId,
@@ -615,20 +766,24 @@ function handleConnection(
     }
     bufferLiveEvents = false;
     if (bufferOverflow) {
-      const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
-      const compactingAtSnapshot = Boolean(liveHandle.session.isCompacting);
-      const retryHistory = getLiveMessageHistory(nextSessionId);
-      sendSafe(ws, {
-        type: "history",
-        session_id: nextSessionId,
-        ...(selectionId ? { selection_id: selectionId } : {}),
-        reason: "event_buffer_overflow_resnapshot",
-        streaming_at_snapshot: streamingAtSnapshot,
-        compacting_at_snapshot: compactingAtSnapshot,
-        message_count: retryHistory.length,
-        payload_bytes: Buffer.byteLength(JSON.stringify(retryHistory)),
-        messages: retryHistory,
-      });
+      if (modernWindowNegotiation) {
+        await sendBoundedLiveWindow("reset");
+      } else {
+        const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
+        const compactingAtSnapshot = Boolean(liveHandle.session.isCompacting);
+        const retryHistory = getLiveMessageHistory(nextSessionId);
+        sendSafe(ws, {
+          type: "history",
+          session_id: nextSessionId,
+          ...(selectionId ? { selection_id: selectionId } : {}),
+          reason: "event_buffer_overflow_resnapshot",
+          streaming_at_snapshot: streamingAtSnapshot,
+          compacting_at_snapshot: compactingAtSnapshot,
+          message_count: retryHistory.length,
+          payload_bytes: Buffer.byteLength(JSON.stringify(retryHistory)),
+          messages: retryHistory,
+        });
+      }
     } else {
       for (const msg of bufferedEvents) deliverLiveEvent(msg);
     }
@@ -660,13 +815,17 @@ function handleConnection(
       wsProfile(nextSessionId, "setup_session_lookup", `duration=${elapsedMs(lookupStart)} found=${Boolean(sessionInfo)}`);
       if (!sessionInfo) throw new Error("Session not found");
       const quarantined = isLegacyPrivateSessionQuarantined(sessionInfo);
+      if (quarantined) currentTranscriptNegotiation = { protocol: null, intent: "latest" };
       if (!quarantined) {
         const authorization = authorizeProjectAction({
           cwd: sessionInfo.cwd,
           actor: "interactive",
           agentProfileId: sessionInfo.agent_profile_id,
         });
-        if (!authorization.allowed) throw new Error(authorization.reason ?? "Session is no longer authorized");
+        if (!authorization.allowed) {
+          invalidateTranscriptPaginationSession(nextSessionId);
+          throw new Error(authorization.reason ?? "Session is no longer authorized");
+        }
       }
 
       // Mark the selected session ready before loading/parsing transcript
@@ -678,6 +837,14 @@ function handleConnection(
       if (!quarantined) sendSafe(ws, serializeSessionRuntimeState(nextSessionId, selectionId));
       ready = true;
       sendSafe(ws, { type: "session_ready", session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
+      const confirmedTranscriptNegotiation = currentTranscriptNegotiation;
+      if (confirmedTranscriptNegotiation.protocol === "window-v1" && selectionId) {
+        sendSafe(ws, serializeTranscriptProtocolConfirmation(
+          nextSessionId,
+          selectionId,
+          confirmedTranscriptNegotiation,
+        ));
+      }
       wsProfile(nextSessionId, "sent_session_ready", `setup_elapsed=${elapsedMs(setupStart)}`);
       transcriptInvalidationUnsub = subscribeTranscriptInvalidationForSelection({
         sessionId: nextSessionId,
@@ -883,34 +1050,70 @@ function handleConnection(
           if (!alive || version !== setupVersion) return;
           if (!attachedLive) {
             const fileHistoryStart = nowMs();
-            const snapshot = getSessionFileSnapshot(sessionInfo.pi_session_file, sessionInfo.cwd);
-            const messages = snapshot?.messages ?? [];
-            wsProfile(nextSessionId, "file_history_loaded", `duration=${elapsedMs(fileHistoryStart)} messages=${messages.length} hasFile=${Boolean(sessionInfo.pi_session_file)}`);
-            const sendHistoryStart = nowMs();
-            sendSafe(ws, {
-              type: "history",
-              session_id: nextSessionId,
-              ...(selectionId ? { selection_id: selectionId } : {}),
-              reason: "initial",
-              message_count: messages.length,
-              payload_bytes: snapshot?.payloadBytes ?? 0,
-              messages,
-            });
-            sendSafe(ws, { ...(snapshot?.todoState ?? getSessionFileTodoState(sessionInfo.pi_session_file, sessionInfo.cwd)), session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
-            sendSafe(ws, {
-              type: "queued_message_snapshot",
-              session_id: nextSessionId,
-              ...(selectionId ? { selection_id: selectionId } : {}),
-              messages: [],
-            });
-            wsProfile(nextSessionId, "sent_history", `duration=${elapsedMs(sendHistoryStart)} messages=${messages.length}`);
-            // Catch-up is selected-session-only and starts after history is sent.
-            // It reuses this parse; a second full parse is reserved for commit.
-            if (!quarantined && snapshot?.autoTitle) {
-              scheduleWayangAutoTitleFromActivation(nextSessionId, snapshot.autoTitle, {
-                stillSelected: () => alive && version === setupVersion && currentSessionId === nextSessionId && currentSelectionId === selectionId,
-                onCommitted: invalidateSessionFileSnapshot,
+            const stoppedTranscriptNegotiation = currentTranscriptNegotiation;
+            if (stoppedTranscriptNegotiation.protocol === "window-v1" && selectionId) {
+              const window = await getTranscriptPaginationService().open({
+                sessionId: nextSessionId,
+                selectionId,
+                sessionFile: sessionInfo.pi_session_file,
+                intent: stoppedTranscriptNegotiation.intent,
+                anchorId: stoppedTranscriptNegotiation.anchorId,
+                reason: "initial",
               });
+              if (!alive || version !== setupVersion) return;
+              sendSafe(ws, window);
+              sendSafe(ws, {
+                type: "queued_message_snapshot",
+                session_id: nextSessionId,
+                selection_id: selectionId,
+                messages: [],
+              });
+              wsProfile(nextSessionId, "sent_transcript_window", `duration=${elapsedMs(fileHistoryStart)} messages=${window.message_count}`);
+              // Nonessential complete derived state starts only after the
+              // bounded transcript frame is queued. It never serializes or
+              // transfers the complete branch.
+              setImmediate(() => {
+                if (!alive || version !== setupVersion) return;
+                const derived = getSessionFileDerivedProjection(sessionInfo.pi_session_file, sessionInfo.cwd);
+                if (!derived || !alive || version !== setupVersion || !sessionInfo.pi_session_file
+                  || !getTranscriptPaginationService().isDerivedProjectionCurrent(
+                    nextSessionId, sessionInfo.pi_session_file, window.transcript_epoch, derived.fingerprint,
+                  )) return;
+                sendSafe(ws, { ...derived.todoState, session_id: nextSessionId, selection_id: selectionId });
+                scheduleWayangAutoTitleFromActivation(nextSessionId, derived.autoTitle, {
+                  stillSelected: () => alive && version === setupVersion && currentSessionId === nextSessionId && currentSelectionId === selectionId,
+                  onCommitted: invalidateSessionFileSnapshot,
+                });
+              });
+            } else {
+              const snapshot = getSessionFileSnapshot(sessionInfo.pi_session_file, sessionInfo.cwd);
+              const messages = snapshot?.messages ?? [];
+              wsProfile(nextSessionId, "file_history_loaded", `duration=${elapsedMs(fileHistoryStart)} messages=${messages.length} hasFile=${Boolean(sessionInfo.pi_session_file)}`);
+              const sendHistoryStart = nowMs();
+              sendSafe(ws, {
+                type: "history",
+                session_id: nextSessionId,
+                ...(selectionId ? { selection_id: selectionId } : {}),
+                reason: "initial",
+                message_count: messages.length,
+                payload_bytes: snapshot?.payloadBytes ?? 0,
+                messages,
+              });
+              sendSafe(ws, { ...(snapshot?.todoState ?? getSessionFileTodoState(sessionInfo.pi_session_file, sessionInfo.cwd)), session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
+              sendSafe(ws, {
+                type: "queued_message_snapshot",
+                session_id: nextSessionId,
+                ...(selectionId ? { selection_id: selectionId } : {}),
+                messages: [],
+              });
+              wsProfile(nextSessionId, "sent_history", `duration=${elapsedMs(sendHistoryStart)} messages=${messages.length}`);
+              // Legacy catch-up intentionally reuses the complete snapshot.
+              if (!quarantined && snapshot?.autoTitle) {
+                scheduleWayangAutoTitleFromActivation(nextSessionId, snapshot.autoTitle, {
+                  stillSelected: () => alive && version === setupVersion && currentSessionId === nextSessionId && currentSelectionId === selectionId,
+                  onCommitted: invalidateSessionFileSnapshot,
+                });
+              }
             }
             startFilePoll(nextSessionId, sessionInfo.pi_session_file, sessionInfo.cwd, version, selectionId, !quarantined);
           } else if (!quarantined) {
@@ -953,9 +1156,12 @@ function handleConnection(
     if (msg.type === "switch_session") {
       const nextSessionId = msg.session_id;
       const nextSelectionId = typeof msg.selection_id === "string" ? msg.selection_id : null;
+      const nextTranscriptNegotiation = parseTranscriptNegotiation(msg, nextSelectionId);
       if (!nextSessionId || typeof nextSessionId !== "string") return;
       wsProfile(nextSessionId, "switch_session_received", `from=${shortSessionId(currentSessionId)}`);
-      if (nextSessionId === currentSessionId && ready && nextSelectionId === currentSelectionId) {
+      if (nextSessionId === currentSessionId && ready && nextSelectionId === currentSelectionId
+        && nextTranscriptNegotiation.intent !== "around"
+        && JSON.stringify(nextTranscriptNegotiation) === JSON.stringify(currentTranscriptNegotiation)) {
         wsProfile(nextSessionId, "switch_session_noop", "reason=same_session_ready");
         return;
       }
@@ -963,6 +1169,7 @@ function handleConnection(
       // Drop any messages queued for the previous session; messages received
       // after this switch request will queue against the new session instead.
       pendingMessages.splice(0);
+      currentTranscriptNegotiation = nextTranscriptNegotiation;
       setupSession(nextSessionId, nextSelectionId).catch((err) => {
         sendSafe(ws, { type: "error", error: err.message || String(err) });
       });
@@ -988,6 +1195,47 @@ function handleConnection(
       if (msg.type === "message" && typeof msg.content === "string") touchSession(currentSessionId);
       pendingMessages.push(msg);
       wsProfile(currentSessionId, "client_message_queued", `type=${String(msg?.type || "unknown")} queueLength=${pendingMessages.length}`);
+      return;
+    }
+
+    if (msg.type === "transcript_page_request") {
+      const pageTranscriptNegotiation = currentTranscriptNegotiation;
+      const requestId = typeof msg.request_id === "string" && /^[A-Za-z0-9._:-]{1,128}$/u.test(msg.request_id)
+        ? msg.request_id : "";
+      const direction = msg.direction === "before" || msg.direction === "after" ? msg.direction : null;
+      const cursor = typeof msg.cursor === "string" && msg.cursor.length <= 256 ? msg.cursor : "";
+      if (!requestId || !direction || !cursor || pageTranscriptNegotiation.protocol !== "window-v1" || !currentSelectionId) {
+        sendSafe(ws, { type: "error", session_id: currentSessionId, ...(currentSelectionId ? { selection_id: currentSelectionId } : {}), code: "invalid_transcript_page_request", error: "Transcript page request is invalid" });
+        return;
+      }
+      const requestSessionId = currentSessionId;
+      const requestSelectionId = currentSelectionId;
+      const requestVersion = setupVersion;
+      if (getRuntimeMutationSessionState(requestSessionId).mutation_locked) {
+        sendSafe(ws, { type: "error", session_id: requestSessionId, selection_id: requestSelectionId, code: "mutation_locked", error: "Session transcript mutation is in progress" });
+        return;
+      }
+      const row = getSessionById(requestSessionId);
+      const authorization = row && authorizeProjectAction({ cwd: row.cwd, actor: "interactive", agentProfileId: row.agent_profile_id });
+      if (!row || !authorization || !authorization.allowed) {
+        invalidateTranscriptPaginationSession(requestSessionId);
+        sendSafe(ws, { type: "error", session_id: requestSessionId, selection_id: requestSelectionId, code: "transcript_page_denied", error: "Transcript page is no longer authorized" });
+        return;
+      }
+      void getTranscriptPaginationService().page({
+        sessionId: requestSessionId,
+        selectionId: requestSelectionId,
+        sessionFile: row.pi_session_file,
+        requestId,
+        direction,
+        cursor,
+      }).then((window) => {
+        if (alive && requestVersion === setupVersion && currentSessionId === requestSessionId && currentSelectionId === requestSelectionId) sendSafe(ws, window);
+      }).catch((error) => {
+        if (!alive || requestVersion !== setupVersion) return;
+        const code = error instanceof TranscriptCursorError ? error.code : "transcript_page_failed";
+        sendSafe(ws, { type: "error", session_id: requestSessionId, selection_id: requestSelectionId, code, error: "Transcript page could not be loaded; reopen the current transcript window" });
+      });
       return;
     }
 
@@ -1019,6 +1267,7 @@ function handleConnection(
 
     const actionSessionId = currentSessionId;
     const actionSelectionId = currentSelectionId;
+    const actionTranscriptNegotiation = currentTranscriptNegotiation;
     handleClientMessage(
       ws,
       actionSessionId,
@@ -1028,6 +1277,24 @@ function handleConnection(
       () => alive
         && currentSessionId === actionSessionId
         && currentSelectionId === actionSelectionId,
+      actionTranscriptNegotiation.protocol === "window-v1" && actionSelectionId ? {
+        reset: async () => {
+          const row = getSessionById(actionSessionId);
+          if (!row) throw new Error("Session not found");
+          const handle = getPiSession(actionSessionId);
+          const window = await getTranscriptPaginationService().open({
+            sessionId: actionSessionId,
+            selectionId: actionSelectionId,
+            sessionFile: handle?.sessionFile ?? row.pi_session_file,
+            intent: "latest",
+            reason: "reset",
+            streamingAtSnapshot: Boolean(handle?.session.isStreaming),
+            compactingAtSnapshot: Boolean(handle?.session.isCompacting),
+            liveStreamingMessage: handle?.liveStreamingMessage ?? handle?.session.state.streamingMessage,
+          });
+          sendSafe(ws, window);
+        },
+      } : undefined,
     );
   };
 
@@ -1040,6 +1307,7 @@ function handleConnection(
       return;
     }
     if (event.type === "agent_switched") {
+      invalidateTranscriptPaginationSession(currentSessionId);
       setupSession(currentSessionId, currentSelectionId).catch((err) => {
         sendSafe(ws, { type: "error", error: err.message || String(err) });
       });
@@ -1354,6 +1622,7 @@ async function handleClientMessage(
   msg: any,
   ensureLiveSession: () => Promise<boolean>,
   isSelectionCurrent: () => boolean,
+  transcriptWindow?: { reset: () => Promise<void> },
 ): Promise<void> {
   try {
     const row = getSessionById(sessionId);
@@ -1498,9 +1767,13 @@ async function handleClientMessage(
           throw new Error(safeSessionError(sessionId, err, "Failed to start pi session: "));
         }
 
-        const result = await resendMessage(sessionId, messageId);
+        const result = await resendMessage(sessionId, messageId, !transcriptWindow);
         touchSession(sessionId);
-        sendSafe(ws, {
+        if (transcriptWindow) {
+          invalidateTranscriptPaginationSession(sessionId);
+          await transcriptWindow.reset();
+        }
+        else sendSafe(ws, {
           type: "history",
           session_id: sessionId,
           ...(selectionId ? { selection_id: selectionId } : {}),
@@ -1513,7 +1786,9 @@ async function handleClientMessage(
           const error = safeSessionError(sessionId, err, "Agent turn failed: ");
           updateSessionError(sessionId, error);
           sendSafe(ws, { type: "error", session_id: sessionId, ...(selectionId ? { selection_id: selectionId } : {}), error });
-          sendSafe(ws, {
+          if (transcriptWindow) {
+            void transcriptWindow.reset().catch(() => undefined);
+          } else sendSafe(ws, {
             type: "history",
             session_id: sessionId,
             ...(selectionId ? { selection_id: selectionId } : {}),
@@ -1838,7 +2113,7 @@ function sendContextUsage(ws: WebSocket, sessionId: string, selectionId?: string
 function sendSafe(ws: WebSocket, msg: any): void {
   try {
     if (ws.readyState === WebSocket.OPEN) {
-      const startedAt = msg?.type === "history" ? performance.now() : 0;
+      const startedAt = msg?.type === "history" || msg?.type === "transcript_window" ? performance.now() : 0;
       const serialized = JSON.stringify(msg);
       if (startedAt) recordLatencyMetric("history_stringify_ms", performance.now() - startedAt);
       ws.send(serialized);

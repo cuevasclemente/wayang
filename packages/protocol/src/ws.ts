@@ -93,10 +93,29 @@ export interface SetCommandGuard {
  * sequence (`session_loading` → `session_ready` → `history` → snapshots) for
  * the new session on the same connection.
  */
+export type TranscriptProtocol = "window-v1";
+export type TranscriptIntent = "latest" | "around";
+
+/** Optional transcript projection requested for one exact session selection. */
+export interface TranscriptSelection {
+  protocol: TranscriptProtocol;
+  intent: TranscriptIntent;
+  anchor_id?: string;
+}
+
 export interface SwitchSession {
   type: "switch_session";
   session_id: string;
   selection_id?: string | null;
+  transcript?: TranscriptSelection;
+}
+
+/** Request one adjacent page using an opaque, selection-bound server token. */
+export interface TranscriptPageRequest {
+  type: "transcript_page_request";
+  request_id: string;
+  direction: "before" | "after";
+  cursor: string;
 }
 
 /**
@@ -166,6 +185,7 @@ export type ChatClientMessage =
   | SetGoal
   | SetCommandGuard
   | SwitchSession
+  | TranscriptPageRequest
   | SubagentSpawn
   | ExternalActionResponse
   | CommandGuardPinResponse
@@ -213,6 +233,44 @@ export interface HistoryMessage {
   message_count?: number;
   payload_bytes?: number;
   messages: HistoryEntry[];
+}
+
+export interface TranscriptProtocolMessage {
+  type: "transcript_protocol";
+  session_id: string;
+  selection_id?: string;
+  protocol: TranscriptProtocol;
+  intent: TranscriptIntent;
+  anchor_id?: string;
+}
+
+export type TranscriptWindowReason = "initial" | "prepend" | "append" | "tail_reconcile" | "reset";
+
+export interface TranscriptAnchorResolution {
+  requested_id: string;
+  resolved_id: string | null;
+  status: "found" | "missing" | "off_branch" | "pending";
+}
+
+/** A bounded active-branch projection. This never reuses the legacy `history` discriminator. */
+export interface TranscriptWindowMessage {
+  type: "transcript_window";
+  session_id: string;
+  selection_id?: string;
+  request_id?: string;
+  reason: TranscriptWindowReason;
+  transcript_epoch: string;
+  branch_tip_id: string | null;
+  messages: HistoryEntry[];
+  before_cursor: string | null;
+  after_cursor: string | null;
+  has_older: boolean;
+  has_newer: boolean;
+  anchor?: TranscriptAnchorResolution;
+  streaming_at_snapshot?: boolean;
+  compacting_at_snapshot?: boolean;
+  message_count: number;
+  payload_bytes: number;
 }
 
 export interface SessionLoadingMessage {
@@ -669,6 +727,8 @@ export interface CustomMessage {
 
 export type ChatServerMessage =
   | HistoryMessage
+  | TranscriptProtocolMessage
+  | TranscriptWindowMessage
   | SessionLoadingMessage
   | SessionReadyMessage
   | SessionErrorMessage
