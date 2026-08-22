@@ -7,8 +7,10 @@ declare module "@novnc/novnc" {
     background: string;
     qualityLevel: number;
     compressionLevel: number;
-    focus(): void;
+    focus(options?: FocusOptions): void;
     disconnect(): void;
     sendCredentials(credentials: Record<string, string>): void;
+    clipboardPasteFrom(text: string): void;
+    sendKey(keysym: number, code: string, down?: boolean): void;
   }
 }
