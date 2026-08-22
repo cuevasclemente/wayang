@@ -273,6 +273,17 @@ export interface TranscriptWindowMessage {
   payload_bytes: number;
 }
 
+/** Correlated terminal failure for one transcript edge request. */
+export interface TranscriptPageErrorMessage {
+  type: "transcript_page_error";
+  session_id: string;
+  selection_id: string;
+  request_id: string;
+  direction: "before" | "after";
+  code: string;
+  error: string;
+}
+
 export interface SessionLoadingMessage {
   type: "session_loading";
   session_id: string;
@@ -729,6 +740,7 @@ export type ChatServerMessage =
   | HistoryMessage
   | TranscriptProtocolMessage
   | TranscriptWindowMessage
+  | TranscriptPageErrorMessage
   | SessionLoadingMessage
   | SessionReadyMessage
   | SessionErrorMessage

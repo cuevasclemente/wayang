@@ -20,6 +20,7 @@
  *     { type: "history", messages: [...] } // legacy/unnegotiated only
  *     { type: "transcript_protocol", protocol: "window-v1", intent }
  *     { type: "transcript_window", transcript_epoch, messages, before_cursor, after_cursor, ... }
+ *     { type: "transcript_page_error", session_id, selection_id, request_id, direction, code, error }
  *     { type: "session_runtime_state", session_id, selection_id, bash_mode }
  *     { type: "text_delta", delta: string }
  *     { type: "thinking_delta", delta: string }
@@ -115,6 +116,7 @@ import type {
   ExternalActionTerminalMessage,
   SessionRuntimeStateMessage,
   TranscriptProtocolMessage,
+  TranscriptPageErrorMessage,
   TranscriptIntent,
   TranscriptWindowReason,
 } from "@wayang/protocol";
@@ -259,6 +261,105 @@ export function serializeTranscriptProtocolConfirmation(
     intent: negotiation.intent,
     ...(negotiation.anchorId ? { anchor_id: negotiation.anchorId } : {}),
   };
+}
+
+type TranscriptPageDirection = "before" | "after";
+
+interface TranscriptPageCorrelation {
+  requestId: string;
+  direction: TranscriptPageDirection;
+  selectionId: string;
+}
+
+function boundedTranscriptPageErrorText(value: string, maxBytes: number, fallback: string): string {
+  const safe = value.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, " ").trim() || fallback;
+  let bounded = "";
+  for (const character of safe) {
+    if (Buffer.byteLength(bounded + character, "utf8") > maxBytes) break;
+    bounded += character;
+  }
+  return bounded || fallback;
+}
+
+/** @internal Exact correlation gate for transcript edge failures. */
+export function transcriptPageRequestCorrelation(
+  message: unknown,
+  selectionId: string | null,
+): TranscriptPageCorrelation | null {
+  const value = message as { request_id?: unknown; direction?: unknown } | null;
+  const requestId = typeof value?.request_id === "string" && /^[A-Za-z0-9._:-]{1,128}$/u.test(value.request_id)
+    ? value.request_id
+    : null;
+  const direction = value?.direction === "before" || value?.direction === "after" ? value.direction : null;
+  return requestId && direction && selectionId
+    ? { requestId, direction, selectionId }
+    : null;
+}
+
+/** @internal Bounded correlated page-error serializer. */
+export function serializeTranscriptPageError(input: {
+  sessionId: string;
+  selectionId: string;
+  requestId: string;
+  direction: TranscriptPageDirection;
+  code: string;
+  error: string;
+}): TranscriptPageErrorMessage {
+  if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(input.requestId)) throw new Error("Transcript page request id is not correlatable");
+  return {
+    type: "transcript_page_error",
+    session_id: input.sessionId,
+    selection_id: input.selectionId,
+    request_id: input.requestId,
+    direction: input.direction,
+    code: /^[a-z0-9._:-]{1,64}$/u.test(input.code) ? input.code : "transcript_page_failed",
+    error: boundedTranscriptPageErrorText(input.error, 512, "Transcript page could not be loaded"),
+  };
+}
+
+/** @internal Chooses correlated versus generic invalid-request failure. */
+export function serializeInvalidTranscriptPageRequest(input: {
+  sessionId: string;
+  selectionId: string | null;
+  message: unknown;
+}): TranscriptPageErrorMessage | Record<string, unknown> {
+  const correlation = transcriptPageRequestCorrelation(input.message, input.selectionId);
+  if (correlation) return serializeTranscriptPageError({
+    sessionId: input.sessionId,
+    selectionId: correlation.selectionId,
+    requestId: correlation.requestId,
+    direction: correlation.direction,
+    code: "invalid_transcript_page_request",
+    error: "Transcript page request is invalid",
+  });
+  return {
+    type: "error",
+    session_id: input.sessionId,
+    ...(input.selectionId ? { selection_id: input.selectionId } : {}),
+    code: "invalid_transcript_page_request",
+    error: "Transcript page request is invalid",
+  };
+}
+
+/** @internal Gate-level serializer for correlated paging denials/not-ready states. */
+export function serializeTranscriptPageGateFailure(input: {
+  sessionId: string;
+  selectionId: string | null;
+  message: unknown;
+  code: string;
+  error: string;
+}): TranscriptPageErrorMessage | Record<string, unknown> {
+  const correlation = transcriptPageRequestCorrelation(input.message, input.selectionId);
+  return correlation
+    ? serializeTranscriptPageError({
+        sessionId: input.sessionId,
+        selectionId: correlation.selectionId,
+        requestId: correlation.requestId,
+        direction: correlation.direction,
+        code: input.code,
+        error: input.error,
+      })
+    : serializeInvalidTranscriptPageRequest(input);
 }
 
 /** @internal Shared wire projection used by every selected client. */
@@ -1179,19 +1280,49 @@ function handleConnection(
     const durable = getSessionById(currentSessionId);
     if (durable && isLegacyPrivateSessionQuarantined(durable)) {
       const error = "Quarantined legacy sessions are view-only";
-      sendCorrelatedClientFailure(currentSessionId, msg, error);
-      sendSafe(ws, { type: "error", error });
+      if (msg.type === "transcript_page_request") {
+        sendSafe(ws, serializeTranscriptPageGateFailure({
+          sessionId: currentSessionId,
+          selectionId: currentSelectionId,
+          message: msg,
+          code: "transcript_page_denied",
+          error,
+        }));
+      } else {
+        sendCorrelatedClientFailure(currentSessionId, msg, error);
+        sendSafe(ws, { type: "error", error });
+      }
       return;
     }
 
     if (readyError) {
       const error = `Session is not ready: ${readyError}`;
-      sendCorrelatedClientFailure(currentSessionId, msg, error);
-      sendSafe(ws, { type: "error", error });
+      if (msg.type === "transcript_page_request") {
+        sendSafe(ws, serializeTranscriptPageGateFailure({
+          sessionId: currentSessionId,
+          selectionId: currentSelectionId,
+          message: msg,
+          code: "transcript_page_not_ready",
+          error,
+        }));
+      } else {
+        sendCorrelatedClientFailure(currentSessionId, msg, error);
+        sendSafe(ws, { type: "error", error });
+      }
       return;
     }
 
     if (!ready) {
+      if (msg.type === "transcript_page_request") {
+        sendSafe(ws, serializeTranscriptPageGateFailure({
+          sessionId: currentSessionId,
+          selectionId: currentSelectionId,
+          message: msg,
+          code: "transcript_page_not_ready",
+          error: "Session is not ready for transcript paging",
+        }));
+        return;
+      }
       if (msg.type === "message" && typeof msg.content === "string") touchSession(currentSessionId);
       pendingMessages.push(msg);
       wsProfile(currentSessionId, "client_message_queued", `type=${String(msg?.type || "unknown")} queueLength=${pendingMessages.length}`);
@@ -1200,26 +1331,44 @@ function handleConnection(
 
     if (msg.type === "transcript_page_request") {
       const pageTranscriptNegotiation = currentTranscriptNegotiation;
-      const requestId = typeof msg.request_id === "string" && /^[A-Za-z0-9._:-]{1,128}$/u.test(msg.request_id)
-        ? msg.request_id : "";
-      const direction = msg.direction === "before" || msg.direction === "after" ? msg.direction : null;
+      const correlation = transcriptPageRequestCorrelation(msg, currentSelectionId);
       const cursor = typeof msg.cursor === "string" && msg.cursor.length <= 256 ? msg.cursor : "";
-      if (!requestId || !direction || !cursor || pageTranscriptNegotiation.protocol !== "window-v1" || !currentSelectionId) {
-        sendSafe(ws, { type: "error", session_id: currentSessionId, ...(currentSelectionId ? { selection_id: currentSelectionId } : {}), code: "invalid_transcript_page_request", error: "Transcript page request is invalid" });
+      if (!correlation || !cursor || pageTranscriptNegotiation.protocol !== "window-v1") {
+        sendSafe(ws, serializeInvalidTranscriptPageRequest({
+          sessionId: currentSessionId,
+          selectionId: currentSelectionId,
+          message: msg,
+        }));
         return;
       }
       const requestSessionId = currentSessionId;
-      const requestSelectionId = currentSelectionId;
+      const requestSelectionId = correlation.selectionId;
+      const requestId = correlation.requestId;
+      const direction = correlation.direction;
       const requestVersion = setupVersion;
       if (getRuntimeMutationSessionState(requestSessionId).mutation_locked) {
-        sendSafe(ws, { type: "error", session_id: requestSessionId, selection_id: requestSelectionId, code: "mutation_locked", error: "Session transcript mutation is in progress" });
+        sendSafe(ws, serializeTranscriptPageError({
+          sessionId: requestSessionId,
+          selectionId: requestSelectionId,
+          requestId,
+          direction,
+          code: "mutation_locked",
+          error: "Session transcript mutation is in progress",
+        }));
         return;
       }
       const row = getSessionById(requestSessionId);
       const authorization = row && authorizeProjectAction({ cwd: row.cwd, actor: "interactive", agentProfileId: row.agent_profile_id });
       if (!row || !authorization || !authorization.allowed) {
         invalidateTranscriptPaginationSession(requestSessionId);
-        sendSafe(ws, { type: "error", session_id: requestSessionId, selection_id: requestSelectionId, code: "transcript_page_denied", error: "Transcript page is no longer authorized" });
+        sendSafe(ws, serializeTranscriptPageError({
+          sessionId: requestSessionId,
+          selectionId: requestSelectionId,
+          requestId,
+          direction,
+          code: "transcript_page_denied",
+          error: "Transcript page is no longer authorized",
+        }));
         return;
       }
       void getTranscriptPaginationService().page({
@@ -1234,7 +1383,14 @@ function handleConnection(
       }).catch((error) => {
         if (!alive || requestVersion !== setupVersion) return;
         const code = error instanceof TranscriptCursorError ? error.code : "transcript_page_failed";
-        sendSafe(ws, { type: "error", session_id: requestSessionId, selection_id: requestSelectionId, code, error: "Transcript page could not be loaded; reopen the current transcript window" });
+        sendSafe(ws, serializeTranscriptPageError({
+          sessionId: requestSessionId,
+          selectionId: requestSelectionId,
+          requestId,
+          direction,
+          code,
+          error: "Transcript page could not be loaded; reopen the current transcript window",
+        }));
       });
       return;
     }
