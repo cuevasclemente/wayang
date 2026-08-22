@@ -39,7 +39,8 @@ export interface BrowserAgentDiagnostic {
   executable: {
     platform: string;
     transport: "cdp-screencast" | "vnc";
-    state: "resolved" | "missing" | "invalid_configured_path";
+    state: "resolved" | "missing" | "invalid_configured_path" | "unchecked";
+    vncAvailable?: boolean;
     reasonCode?: "browser_not_found" | "configured_path_invalid" | "transport_unavailable";
   };
   tool_state: "registered" | "withheld" | "stale_runtime";

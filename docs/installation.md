@@ -101,6 +101,23 @@ Open <http://127.0.0.1:5173>. Ctrl-C stops both child processes.
 
 No systemd or launchd unit is shipped. If you later add process supervision, keep `.env` private, preserve the working directory, run as an unprivileged user, and apply the full network/authentication requirements in [SECURITY.md](../SECURITY.md).
 
+### Normalize an existing supervised Browser deployment
+
+`auto` is the production-standard Browser transport. Existing service definitions should leave `WAYANG_BROWSER_TRANSPORT` unset or set it to `auto`; `cdp` is an explicit Fast-page override and rollback setting.
+
+Before changing an existing systemd or launchd deployment:
+
+1. preserve the current unit drop-in or launchd configuration as an owner-private, timestamped rollback copy without printing its contents;
+2. change only the Browser transport value to `auto`, preserving every unrelated environment and service setting;
+3. on an existing systemd deployment, the tracked transport-only `deploy/60-browser-transport.auto.conf` is the reference drop-in; install it through the host's normal reviewed administrator procedure, then daemon-reload and restart the existing unit. It deliberately does not enable or migrate the separate named-profile host gate;
+4. on an existing launchd deployment, update the equivalent `EnvironmentVariables` entry to `auto` through the host's established backup-first deployment procedure, then reload the existing job;
+5. verify the bounded startup line reports `requested=auto` and the expected `selected` value, without dumping the service environment;
+6. if the separate named-profile host gate was already reviewed and enabled, start a named Standard Browser Profile and verify Full browser is available on Linux with Xvfb/x11vnc. macOS and hosts without those dependencies should report the CDP fallback while retaining the same `auto` setting.
+
+After selecting Full browser, pause the agent, click the destination field, and use **Paste text**. Test only with a synthetic canary before using a credential. The canary should appear exactly once and must not appear in HTTP requests, browser storage, or operational logs.
+
+To roll back, restore the preserved supervisor configuration or set `WAYANG_BROWSER_TRANSPORT=cdp`, restart through the same reviewed procedure, and confirm startup reports `selected=cdp-screencast`. Do not delete browser profiles or Wayang data during transport rollback.
+
 For authenticated Settings/capability administration from another private-LAN device, follow [Local HTTPS remote administration](local-https.md). After human configuration and Caddy installation, `make local-https-check` validates the non-secret deployment shape and generated proxy configuration; `make local-https` runs Caddy in a separate foreground process. It does not weaken remote owner checks or treat the command-guard PIN as a network password.
 
 ## Validate the checkout

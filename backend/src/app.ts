@@ -49,7 +49,7 @@ import { attachWs } from "./routes/ws.js";
 import { installActionApprovalPinAttempts } from "./action-approval-bridge.js";
 import { attachBrowserWs } from "./browser/ws.js";
 import { stopAllApps } from "./apps/process-manager.js";
-import { registerBrowserStopHook, stopAllBrowsers } from "./browser/manager.js";
+import { getBrowserExecutableDiagnostic, registerBrowserStopHook, stopAllBrowsers } from "./browser/manager.js";
 import {
   clearBrowserAgentToken,
   createLegacyBrowserAgentAttributionRejection,
@@ -348,6 +348,13 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
 
 export function start() {
   const config = getConfig();
+  const browserDiagnostic = getBrowserExecutableDiagnostic({ requestedTransport: config.browser.transport });
+  if (config.browser.transport === "vnc" && browserDiagnostic.vncAvailable === false) {
+    throw new Error("WAYANG_BROWSER_TRANSPORT=vnc requires Linux with executable Xvfb and x11vnc dependencies");
+  }
+  console.log(
+    `[browser] transport requested=${config.browser.transport} selected=${browserDiagnostic.transport} full_browser_available=${browserDiagnostic.vncAvailable === true ? "yes" : "no"} chromium=${browserDiagnostic.state}`,
+  );
   // Compose the complete inert Standard/Protected browser process graph before
   // allowing schema 6 to migrate. Constructors install closures only: they do
   // not open profile storage or start Chromium until exact runtime use.
