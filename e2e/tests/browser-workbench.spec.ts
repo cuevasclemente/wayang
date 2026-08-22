@@ -9,6 +9,7 @@ interface BrowserMockState {
   matchesAvailability?: CredentialAvailability;
   credentialInspection?: "blocked" | "text-allowed";
   profilePersistence?: "shared" | "named";
+  viewerTransport?: "cdp-screencast" | "vnc";
 }
 
 interface CapturedRequest {
@@ -30,7 +31,7 @@ function publicBrowserState(sessionId: string, projectCwd: string, state: Browse
     activeUrl: "https://login.example.test/sign-in",
     activeTitle: "Synthetic sign in",
     cdpReady: true,
-    viewerTransport: "cdp-screencast",
+    viewerTransport: state.viewerTransport ?? "cdp-screencast",
     vncReady: true,
     profile: state.profilePersistence === "named"
       ? { persistence: "named", name: "Legacy shared" }
@@ -124,39 +125,132 @@ async function fulfillBrowserApi(
   return route.fulfill({ json: publicBrowserState(sessionId, projectCwd, state) });
 }
 
+async function installSyntheticVncSocket(page: Page) {
+  await page.addInitScript(() => {
+    const NativeWebSocket = window.WebSocket;
+    const frames: number[][] = [];
+    Object.defineProperty(window, "__wayangSyntheticVncFrames", {
+      configurable: true,
+      value: frames,
+    });
+
+    class SyntheticVncSocket {
+      binaryType: BinaryType = "arraybuffer";
+      onerror: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onopen: ((event: Event) => void) | null = null;
+      onclose: ((event: CloseEvent) => void) | null = null;
+      protocol = "";
+      readyState = NativeWebSocket.CONNECTING;
+      private stage = 0;
+
+      constructor() {
+        queueMicrotask(() => {
+          this.readyState = NativeWebSocket.OPEN;
+          this.onopen?.(new Event("open"));
+          this.deliver(new TextEncoder().encode("RFB 003.008\n"));
+        });
+      }
+
+      send = (data: string | ArrayBufferLike | Blob | ArrayBufferView) => {
+        let bytes: Uint8Array;
+        if (typeof data === "string") bytes = new TextEncoder().encode(data);
+        else if (data instanceof Blob) throw new Error("Synthetic VNC does not accept Blob client frames");
+        else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        else bytes = new Uint8Array(data);
+        frames.push(Array.from(bytes));
+        if (this.stage === 0) {
+          this.stage = 1;
+          queueMicrotask(() => this.deliver(new Uint8Array([1, 1])));
+        } else if (this.stage === 1) {
+          this.stage = 2;
+          queueMicrotask(() => this.deliver(new Uint8Array([0, 0, 0, 0])));
+        } else if (this.stage === 2) {
+          this.stage = 3;
+          const name = new TextEncoder().encode("Wayang synthetic VNC");
+          const serverInit = new Uint8Array(24 + name.length);
+          const view = new DataView(serverInit.buffer);
+          view.setUint16(0, 800);
+          view.setUint16(2, 600);
+          serverInit[4] = 32;
+          serverInit[5] = 24;
+          serverInit[6] = 0;
+          serverInit[7] = 1;
+          view.setUint16(8, 255);
+          view.setUint16(10, 255);
+          view.setUint16(12, 255);
+          serverInit[14] = 16;
+          serverInit[15] = 8;
+          serverInit[16] = 0;
+          view.setUint32(20, name.length);
+          serverInit.set(name, 24);
+          queueMicrotask(() => this.deliver(serverInit));
+        }
+      };
+
+      close = () => {
+        if (this.readyState === NativeWebSocket.CLOSED) return;
+        this.readyState = NativeWebSocket.CLOSED;
+        this.onclose?.(new CloseEvent("close", { code: 1000, reason: "", wasClean: true }));
+      };
+
+      private deliver(bytes: Uint8Array) {
+        if (this.readyState !== NativeWebSocket.OPEN) return;
+        const copy = bytes.slice();
+        this.onmessage?.(new MessageEvent("message", { data: copy.buffer }));
+      }
+    }
+
+    function RoutedWebSocket(this: WebSocket, url: string | URL, protocols?: string | string[]) {
+      if (String(url).includes("/ws/browser-vnc")) return new SyntheticVncSocket() as unknown as WebSocket;
+      return new NativeWebSocket(url, protocols);
+    }
+    RoutedWebSocket.prototype = NativeWebSocket.prototype;
+    Object.defineProperties(RoutedWebSocket, {
+      CONNECTING: { value: NativeWebSocket.CONNECTING },
+      OPEN: { value: NativeWebSocket.OPEN },
+      CLOSING: { value: NativeWebSocket.CLOSING },
+      CLOSED: { value: NativeWebSocket.CLOSED },
+    });
+    window.WebSocket = RoutedWebSocket as unknown as typeof WebSocket;
+  });
+}
+
 async function openMockBrowser(
   page: Page,
   sessionId: string,
   projectCwd: string,
   credentialAvailability: CredentialAvailability = "unlocked",
   matchesAvailability?: CredentialAvailability,
+  routeCdpViewer = true,
 ) {
   const state: BrowserMockState = { controlMode: "agent", credentialAvailability, matchesAvailability };
   const requests: CapturedRequest[] = [];
   const viewerMessages: string[] = [];
   const viewerSockets: WebSocketRoute[] = [];
   let sendViewerMessage: ((message: Record<string, unknown>) => void) | null = null;
-  await page.routeWebSocket(/\/ws\/browser(?:\?|$)/, (socket) => {
-    viewerSockets.push(socket);
-    sendViewerMessage = (message) => socket.send(JSON.stringify(message));
-    socket.onMessage((message) => {
-      if (typeof message === "string") viewerMessages.push(message);
+  if (routeCdpViewer) {
+    await page.routeWebSocket(/\/ws\/browser(?:\?|$)/, (socket) => {
+      viewerSockets.push(socket);
+      sendViewerMessage = (message) => socket.send(JSON.stringify(message));
+      socket.onMessage((message) => {
+        if (typeof message === "string") viewerMessages.push(message);
+      });
+      setTimeout(() => {
+        socket.send(JSON.stringify({
+          type: "frame-metadata",
+          sessionId: 41,
+          metadata: { deviceWidth: 1, deviceHeight: 1 },
+        }));
+        // Public 1×1 PNG bytes stand in for a binary screenshot. The test has no
+        // secret-bearing page content, screenshot, storage, or trace fixture.
+        socket.send(Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+          "base64",
+        ));
+      }, 50);
     });
-    setTimeout(() => {
-      socket.send(JSON.stringify({
-        type: "frame-metadata",
-        sessionId: 41,
-        metadata: { deviceWidth: 1, deviceHeight: 1 },
-      }));
-      // Public 1×1 PNG bytes stand in for a binary screenshot. The test has no
-      // secret-bearing page content, screenshot, storage, or trace fixture.
-      socket.send(Buffer.from(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-        "base64",
-      ));
-    }, 50);
-  });
-  await page.routeWebSocket(/\/ws\/browser-vnc(?:\?|$)/, () => {});
+  }
   await page.route("**/api/browser/**", (route) => fulfillBrowserApi(route, sessionId, projectCwd, state, requests));
   return {
     state,
@@ -385,6 +479,90 @@ test("named Standard Fast page sends human paste only through its authenticated 
     session: Object.values(sessionStorage),
   }));
   expect([...storage.local, ...storage.session].join("\n")).not.toContain("synthetic-human-paste");
+});
+
+test("named Standard Full browser paste is paused, focus-bound, exactly once, and RFB-only", async ({ page, request }) => {
+  const session = await createE2eSession(request, "e2e named full browser paste");
+  await installSyntheticVncSocket(page);
+  const mock = await openMockBrowser(page, session.id, session.cwd, "unlocked", undefined, false);
+  mock.state.profilePersistence = "named";
+  mock.state.viewerTransport = "vnc";
+  await openSessionInUi(page, session);
+  await page.getByRole("button", { name: "Browser", exact: true }).click();
+
+  await expect(page.getByText("Full browser connected")).toBeVisible();
+  const pasteButton = page.getByRole("button", { name: "Paste text" });
+  await pasteButton.click();
+  await expect(page.getByText("Pause the agent before using human-only Full browser paste.")).toBeVisible();
+
+  await page.getByRole("button", { name: "Pause agent" }).click();
+  await pasteButton.click();
+  await expect(page.getByText("Click the destination field in Full browser before pasting.")).toBeVisible();
+
+  await page.getByTestId("full-browser-viewer").click({ position: { x: 10, y: 10 } });
+  await pasteButton.click();
+  const target = page.getByLabel("Full browser paste target");
+  await expect(target).toBeVisible();
+
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { readText: async () => { throw new Error("synthetic permission denial"); } },
+    });
+  });
+  const readClipboardButton = page.getByRole("button", { name: "Read and paste system clipboard" });
+  await readClipboardButton.click();
+  await expect(page.getByText(/Clipboard access was denied.*Paste into the capture target instead/)).toBeVisible();
+
+  await page.evaluate(() => {
+    const pending: Array<(text: string) => void> = [];
+    Object.defineProperty(window, "__wayangPendingClipboardReads", { configurable: true, value: pending });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { readText: () => new Promise<string>((resolve) => pending.push(resolve)) },
+    });
+  });
+  await readClipboardButton.click();
+  await readClipboardButton.click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __wayangPendingClipboardReads: Array<(text: string) => void> }
+  ).__wayangPendingClipboardReads.length)).toBe(2);
+
+  const canary = "synthetic-full-browser-paste";
+  await target.evaluate((element, text) => {
+    const textarea = element as HTMLTextAreaElement;
+    const clipboard = new DataTransfer();
+    clipboard.setData("text/plain", text);
+    textarea.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: clipboard }));
+    // Model the native paste/input race. The component's content-free latch
+    // must suppress this second delivery even before React unmounts capture.
+    textarea.value = text;
+    textarea.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertFromPaste", data: text }));
+  }, canary);
+  await expect(page.getByText("Clipboard text was pasted once into the focused Full browser field.")).toBeVisible();
+  await page.evaluate((text) => {
+    const pending = (
+      window as unknown as { __wayangPendingClipboardReads: Array<(value: string) => void> }
+    ).__wayangPendingClipboardReads.splice(0);
+    pending.forEach((resolve) => resolve(text));
+  }, canary);
+
+  await expect.poll(async () => page.evaluate((text) => {
+    const frames = (window as unknown as { __wayangSyntheticVncFrames: number[][] }).__wayangSyntheticVncFrames;
+    const bytes = new Uint8Array(frames.flat());
+    const needle = new TextEncoder().encode(text);
+    let count = 0;
+    for (let offset = 0; offset <= bytes.length - needle.length; offset += 1) {
+      if (needle.every((value, index) => bytes[offset + index] === value)) count += 1;
+    }
+    return count;
+  }, canary)).toBe(1);
+  expect(mock.requests.some((entry) => entry.path === "/api/browser/paste-text")).toBe(false);
+  const storage = await page.evaluate(() => ({
+    local: Object.values(localStorage),
+    session: Object.values(sessionStorage),
+  }));
+  expect([...storage.local, ...storage.session].join("\n")).not.toContain(canary);
 });
 
 test("direct paste forwards an uncontrolled DOM value without retaining it in browser storage", async ({ page, request }) => {

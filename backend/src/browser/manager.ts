@@ -103,8 +103,10 @@ function canUseVncTransport(): boolean {
   return process.platform === "linux" && hasCommand("Xvfb") && hasCommand("x11vnc");
 }
 
-function selectedViewerTransport(vncAvailable: boolean): "vnc" | "cdp-screencast" {
-  const configured = process.env.WAYANG_BROWSER_TRANSPORT || "auto";
+function selectedViewerTransport(
+  vncAvailable: boolean,
+  configured = process.env.WAYANG_BROWSER_TRANSPORT || "auto",
+): "vnc" | "cdp-screencast" {
   if (configured === "vnc" && !vncAvailable) throw new Error("VNC transport requested but Xvfb/x11vnc are unavailable");
   return configured === "cdp" || !vncAvailable ? "cdp-screencast" : "vnc";
 }
@@ -266,6 +268,7 @@ export interface BrowserExecutableDiagnostic {
   platform: NodeJS.Platform;
   transport: "cdp-screencast" | "vnc";
   state: BrowserExecutableState;
+  vncAvailable?: boolean;
   reasonCode?: "browser_not_found" | "configured_path_invalid" | "transport_unavailable";
 }
 
@@ -284,18 +287,20 @@ export function getBrowserExecutableDiagnostic(options: {
   const requestedTransport = options.requestedTransport ?? process.env.WAYANG_BROWSER_TRANSPORT ?? "auto";
   const platform = options.platform ?? process.platform;
   const transportUnavailable = requestedTransport === "vnc" && !vncAvailable;
-  const transport: BrowserExecutableDiagnostic["transport"] = requestedTransport === "vnc" ? "vnc" : selectedViewerTransport(vncAvailable);
+  const transport: BrowserExecutableDiagnostic["transport"] = requestedTransport === "vnc"
+    ? "vnc"
+    : selectedViewerTransport(vncAvailable, requestedTransport);
   if (configured) {
     if (!path.isAbsolute(configured) || !resolveChromiumExecutableCandidate(configured)) {
-      return { platform, transport, state: "invalid_configured_path", reasonCode: "configured_path_invalid" };
+      return { platform, transport, state: "invalid_configured_path", vncAvailable, reasonCode: "configured_path_invalid" };
     }
-    return { platform, transport, state: "resolved", ...(transportUnavailable ? { reasonCode: "transport_unavailable" as const } : {}) };
+    return { platform, transport, state: "resolved", vncAvailable, ...(transportUnavailable ? { reasonCode: "transport_unavailable" as const } : {}) };
   }
   const resolved = getChromiumCandidates(undefined).some((candidate) => Boolean(resolveChromiumExecutableCandidate(candidate)))
     || ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"].some((name) => Boolean(executableOnPath(name)));
   return resolved
-    ? { platform, transport, state: "resolved", ...(transportUnavailable ? { reasonCode: "transport_unavailable" as const } : {}) }
-    : { platform, transport, state: "missing", reasonCode: "browser_not_found" };
+    ? { platform, transport, state: "resolved", vncAvailable, ...(transportUnavailable ? { reasonCode: "transport_unavailable" as const } : {}) }
+    : { platform, transport, state: "missing", vncAvailable, reasonCode: "browser_not_found" };
 }
 
 export function findChromiumExecutableCandidates(): string[] {
@@ -872,8 +877,8 @@ export async function startBrowser(lookup: BrowserSessionLookup, expectedControl
   runtime.stopping = false;
   const executable = findChromiumExecutable();
   const cdpPort = await allocatePort();
-  const useVnc = canUseVncTransport();
-  const viewerTransport = selectedViewerTransport(useVnc);
+  const viewerTransport = selectedViewerTransport(canUseVncTransport());
+  const useVnc = viewerTransport === "vnc";
   const display = useVnc ? await allocateDisplay() : undefined;
   const vncPort = useVnc ? await allocatePort() : undefined;
 
