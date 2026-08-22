@@ -55,6 +55,8 @@ interface BoundedSerialization {
   payloadBytes: number;
   firstId: string | null;
   lastId: string | null;
+  /** True only when byte bounding removed one or more earlier serialized rows. */
+  trimmedEarlier: boolean;
 }
 
 export interface OpenTranscriptWindowInput {
@@ -107,16 +109,21 @@ function boundedSerialization(
     return bytes > TRANSCRIPT_MESSAGE_BUDGET - 1024 ? rowPlaceholder(row, bytes) : row;
   });
   let anchorIndex = anchorId ? messages.findIndex((row) => row.id === anchorId) : -1;
+  let trimmedEarlier = false;
   if (anchorIndex < 0) anchorIndex = Math.floor(Math.max(0, messages.length - 1) / 2);
   const bytes = () => Buffer.byteLength(JSON.stringify(messages));
   while (messages.length > 1 && bytes() > TRANSCRIPT_MESSAGE_BUDGET) {
-    if (preference === "latest") messages.shift();
+    if (preference === "latest") {
+      messages.shift();
+      trimmedEarlier = true;
+    }
     else if (preference === "earliest") messages.pop();
     else {
       const leftDistance = anchorIndex;
       const rightDistance = messages.length - 1 - anchorIndex;
       if (leftDistance > rightDistance) {
         messages.shift();
+        trimmedEarlier = true;
         anchorIndex--;
       } else messages.pop();
     }
@@ -131,6 +138,7 @@ function boundedSerialization(
     payloadBytes: Buffer.byteLength(JSON.stringify(messages)),
     firstId: typeof firstRow?.id === "string" ? firstRow.id : null,
     lastId: typeof lastRow?.id === "string" ? lastRow.id : null,
+    trimmedEarlier,
   };
 }
 
@@ -138,6 +146,12 @@ function boundedReverseContinuation(
   reverse: ReturnType<typeof readReverseTranscriptPage>,
   bounded: BoundedSerialization,
 ): ReversePageContinuation | null {
+  // The reverse reader is authoritative about reaching the branch root. A
+  // hidden parent (for example session_info) of the first displayed row must
+  // not recreate an edge after that hidden entry was already scanned. Only
+  // reconstruct from the displayed boundary when byte bounding actually
+  // removed earlier serialized rows.
+  if (!bounded.trimmedEarlier) return reverse.continuation;
   if (!bounded.firstId) return reverse.continuation;
   const firstEntry = reverse.entries.find((entry) => entry?.id === bounded.firstId);
   const beforeOffset = reverse.entryOffsets[bounded.firstId];

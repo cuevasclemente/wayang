@@ -7,11 +7,24 @@ import { TranscriptPaginationService } from "./service.js";
 import { StructuralTranscriptIndex } from "./structural-index.js";
 import { TRANSCRIPT_PAGE_MAX_BYTES, TRANSCRIPT_PAGE_MAX_ROWS } from "./reverse-reader.js";
 
-function makeTranscript(count: number, options: { regularSize?: number; hugeLast?: boolean } = {}): { dir: string; file: string } {
+function makeTranscript(
+  count: number,
+  options: { regularSize?: number; hugeLast?: boolean; sessionInfoRoot?: boolean } = {},
+): { dir: string; file: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-window-service-"));
   const file = path.join(dir, "session.jsonl");
   const rows: any[] = [{ type: "session", version: 3, id: "s", cwd: "/synthetic" }];
   let parentId: string | null = null;
+  if (options.sessionInfoRoot) {
+    rows.push({
+      type: "session_info",
+      id: "session-info-root",
+      parentId: null,
+      timestamp: new Date(0).toISOString(),
+      name: "Synthetic session",
+    });
+    parentId = "session-info-root";
+  }
   for (let index = 0; index < count; index++) {
     const id = `m-${index}`;
     rows.push({
@@ -53,6 +66,40 @@ test("modern latest and before windows remain bounded and request-correlated", a
       sessionId: "s", selectionId: "selection-a", sessionFile: file,
       requestId: "stale", direction: "before", cursor: latest.before_cursor!,
     }));
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hidden session_info root does not create a fourth empty reverse page", async () => {
+  const { dir, file } = makeTranscript(450, { hugeLast: false, sessionInfoRoot: true });
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const latest = await service.open({
+      sessionId: "s", selectionId: "selection-session-info", sessionFile: file, intent: "latest",
+    });
+    assert.equal(latest.messages.length, 200);
+    assert.equal(latest.has_older, true);
+    assert.ok(latest.before_cursor);
+
+    const middle = await service.page({
+      sessionId: "s", selectionId: "selection-session-info", sessionFile: file,
+      requestId: "session-info-middle", direction: "before", cursor: latest.before_cursor!,
+    });
+    assert.equal(middle.messages.length, 200);
+    assert.equal(middle.has_older, true);
+    assert.ok(middle.before_cursor);
+
+    const earliest = await service.page({
+      sessionId: "s", selectionId: "selection-session-info", sessionFile: file,
+      requestId: "session-info-earliest", direction: "before", cursor: middle.before_cursor!,
+    });
+    assert.equal(earliest.messages.length, 50);
+    assert.deepEqual(earliest.messages.map((row) => row.id),
+      Array.from({ length: 50 }, (_, index) => `m-${index}`));
+    assert.equal(earliest.before_cursor, null);
+    assert.equal(earliest.has_older, false);
   } finally {
     await service.close();
     fs.rmSync(dir, { recursive: true, force: true });
