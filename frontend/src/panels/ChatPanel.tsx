@@ -3116,6 +3116,7 @@ export function ChatPanel({
   const sessionSelectionStartedAtInputRef = useRef(sessionSelectionStartedAt);
   sessionSelectionStartedAtInputRef.current = sessionSelectionStartedAt;
   const reportedSessionOpenSelectionIdRef = useRef<string | null>(null);
+  const paintedWindowSelectionIdRef = useRef<string | null>(null);
   const scrollToMessageIdRef = useRef(scrollToMessageId);
   scrollToMessageIdRef.current = scrollToMessageId;
   const scrollAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -4095,17 +4096,51 @@ export function ChatPanel({
             elapsedMs: Math.round(performance.now() - connectStart),
           });
           const acceptedSelectionId = selectionIdRef.current;
+          const completesSelectionOpen = msg.reason === "initial" || msg.reason === "reset";
           requestAnimationFrame(() => requestAnimationFrame(() => {
             if (selectionIdRef.current !== acceptedSelectionId) return;
             setIsSessionHistoryLoading(false);
             setTranscriptHistoryTransportGeneration(transportGeneration);
+            const domRows = scrollContainerRef.current?.querySelectorAll("[data-message-id]").length ?? 0;
+            if (
+              completesSelectionOpen
+              && paintedWindowSelectionIdRef.current !== acceptedSelectionId
+            ) {
+              paintedWindowSelectionIdRef.current = acceptedSelectionId;
+              chatWsProfile("history_painted", {
+                sessionId: activeSessionIdRef.current,
+                selectionId: acceptedSelectionId,
+                reason: msg.reason,
+                domRows,
+                count: msg.messages.length,
+                messageCount: msg.message_count,
+                payloadBytes: msg.payload_bytes,
+                hasOlder: msg.has_older,
+                hasNewer: msg.has_newer,
+                epoch: msg.transcript_epoch,
+              });
+            }
             requestAnimationFrame(() => requestAnimationFrame(() => {
               if (
-                selectionIdRef.current !== acceptedSelectionId
+                !completesSelectionOpen
+                || selectionIdRef.current !== acceptedSelectionId
                 || reportedSessionOpenSelectionIdRef.current === acceptedSelectionId
               ) return;
               reportedSessionOpenSelectionIdRef.current = acceptedSelectionId;
               const durationMs = performance.now() - selectionStartedAtRef.current;
+              chatWsProfile("transcript_usable", {
+                sessionId: activeSessionIdRef.current,
+                selectionId: acceptedSelectionId,
+                reason: msg.reason,
+                elapsedMs: Math.round(durationMs),
+                domRows,
+                count: msg.messages.length,
+                messageCount: msg.message_count,
+                payloadBytes: msg.payload_bytes,
+                hasOlder: msg.has_older,
+                hasNewer: msg.has_newer,
+                epoch: msg.transcript_epoch,
+              });
               void recordSessionOpenLatency(durationMs).catch(() => {});
             }));
             if (
