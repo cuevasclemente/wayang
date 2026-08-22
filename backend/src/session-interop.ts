@@ -8,6 +8,8 @@ import { getSessionAttachmentRoot } from "./protected-artifacts.js";
 import { authorizeProjectAction } from "./policy.js";
 import { getProjectByCwd } from "./projects.js";
 import { getSessionById, type SessionRow } from "./sessions.js";
+import { authorizeExactStandardTranscript } from "./standard-transcript-authorization.js";
+import { fingerprintsEqual } from "./session-metadata.js";
 
 export const SESSION_LIST_TOOL_NAME = "session_list";
 export const SESSION_READ_TOOL_NAME = "session_read";
@@ -20,14 +22,16 @@ export const SESSION_INTEROP_TOOL_NAMES = new Set([
 
 const MAX_LIST_LIMIT = 100;
 const MAX_READ_LINES = 200;
-const MAX_READ_BYTES = 48 * 1024;
+export const MAX_READ_BYTES = 48 * 1024;
+/** Includes every skipped prefix byte and every selected byte processed per call. */
+export const MAX_READ_SCAN_BYTES = 256 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
 const MAX_ATTACHMENT_RESULTS = 100;
 
 export type SessionPrivacyClass = "standard" | "protected" | "unknown";
 
 export function classifySessionPrivacy(row: SessionRow | undefined): SessionPrivacyClass {
-  if (!row || row.legacy_private_session_quarantine || !row.project_id) return "unknown";
+  if (!row || row.legacy_private_session_quarantine !== false || !row.project_id) return "unknown";
   const project = getProjectByCwd(row.cwd);
   if (!project || project.id !== row.project_id) return "unknown";
   return project.access_policy.privacy_mode;
@@ -39,7 +43,7 @@ function requireLiveSourceSession(sourceSessionId: string): SessionRow {
   const authorization = source && profile
     ? authorizeProjectAction({ cwd: source.cwd, actor: "interactive", agentProfileId: profile.id })
     : { allowed: false as const };
-  if (!source || source.legacy_private_session_quarantine || !authorization.allowed) {
+  if (!source || source.legacy_private_session_quarantine !== false || !authorization.allowed) {
     throw new Error("Source session is unavailable for session interop");
   }
   return source;
@@ -79,6 +83,8 @@ export function classifyReadableStandardArtifact(canonicalPath: string): {
   sessionId: string;
 } | null {
   const target = path.resolve(canonicalPath);
+  const transcript = authorizeExactStandardTranscript(target);
+  if (transcript) return { kind: "transcript", sessionId: transcript.row.id };
   try {
     const stat = fs.lstatSync(target);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || fs.realpathSync.native(target) !== target) return null;
@@ -87,9 +93,6 @@ export function classifyReadableStandardArtifact(canonicalPath: string): {
   }
   for (const row of getStore().sessions) {
     if (classifySessionPrivacy(row) !== "standard") continue;
-    if (row.pi_session_file && path.resolve(row.pi_session_file) === target) {
-      return { kind: "transcript", sessionId: row.id };
-    }
     const attachmentRoot = path.resolve(getSessionAttachmentRoot(row.id));
     const relative = path.relative(attachmentRoot, target);
     if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
@@ -149,24 +152,28 @@ export function readStandardSessionLines(targetSessionId: string, options: {
   const target = requireStandardTarget(targetSessionId);
   if (!target.pi_session_file) throw new Error("Target session has no materialized transcript");
   const expectedPath = target.pi_session_file;
-  const safe = canonicalExactRegularFile(expectedPath);
+  const authorized = authorizeExactStandardTranscript(expectedPath, { expectedSessionId: target.id });
+  if (!authorized) throw new Error("Target session transcript authorization failed");
   const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-  const descriptor = fs.openSync(safe.path, fs.constants.O_RDONLY | noFollow);
+  const descriptor = fs.openSync(authorized.path, fs.constants.O_RDONLY | noFollow);
   const lines: string[] = [];
   let currentLine = 1;
   let selectedBytes = 0;
   let selectedLine = Buffer.alloc(0);
   let position = 0;
+  let scannedBytes = 0;
   let reachedEof = false;
   let byteLimited = false;
+  let scanLimited = false;
   try {
     const opened = fs.fstatSync(descriptor);
-    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== safe.stat.dev || opened.ino !== safe.stat.ino) {
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== authorized.stat.dev || opened.ino !== authorized.stat.ino) {
       throw new Error("Session transcript changed before it could be read");
     }
     const chunk = Buffer.allocUnsafe(READ_CHUNK_BYTES);
-    while (lines.length < limit && selectedBytes < MAX_READ_BYTES) {
-      const count = fs.readSync(descriptor, chunk, 0, chunk.length, position);
+    while (lines.length < limit && selectedBytes < MAX_READ_BYTES && scannedBytes < MAX_READ_SCAN_BYTES) {
+      const remainingScanBytes = MAX_READ_SCAN_BYTES - scannedBytes;
+      const count = fs.readSync(descriptor, chunk, 0, Math.min(chunk.length, remainingScanBytes), position);
       if (count === 0) {
         reachedEof = true;
         if (currentLine >= offset && selectedLine.length > 0) {
@@ -176,6 +183,7 @@ export function readStandardSessionLines(targetSessionId: string, options: {
         break;
       }
       position += count;
+      scannedBytes += count;
       let start = 0;
       for (let index = 0; index < count && lines.length < limit; index++) {
         if (chunk[index] !== 0x0a) continue;
@@ -206,8 +214,18 @@ export function readStandardSessionLines(targetSessionId: string, options: {
     if (byteLimited && lines.length === 0) {
       throw new Error("A transcript line exceeds the session_read byte bound");
     }
+    if (!reachedEof && !byteLimited && lines.length < limit && scannedBytes >= MAX_READ_SCAN_BYTES) {
+      scanLimited = true;
+    }
     const after = fs.fstatSync(descriptor);
-    if (after.dev !== safe.stat.dev || after.ino !== safe.stat.ino || !targetStillStandard(target, expectedPath)) {
+    const reauthorized = authorizeExactStandardTranscript(expectedPath, { expectedSessionId: target.id });
+    if (!fingerprintsEqual({
+      mtimeMs: after.mtimeMs,
+      ctimeMs: after.ctimeMs,
+      size: after.size,
+      ino: Number(after.ino) || 0,
+    }, authorized.fingerprint)
+      || !reauthorized || !fingerprintsEqual(reauthorized.fingerprint, authorized.fingerprint)) {
       throw new Error("Session privacy or transcript identity changed during read");
     }
   } finally {
@@ -217,8 +235,11 @@ export function readStandardSessionLines(targetSessionId: string, options: {
     session: sessionMetadata(target),
     offset,
     lines,
-    next_offset: !reachedEof && lines.length > 0 ? offset + lines.length : null,
+    next_offset: !reachedEof && !scanLimited && lines.length > 0 ? offset + lines.length : null,
     byte_limited: byteLimited,
+    scanned_bytes: scannedBytes,
+    scan_byte_limit: MAX_READ_SCAN_BYTES,
+    scan_limited: scanLimited,
   };
 }
 
@@ -272,7 +293,7 @@ export function createSessionInteropToolDefinitions(sourceSessionId: string): To
     defineTool({
       name: SESSION_READ_TOOL_NAME,
       label: "Read Standard session",
-      description: "Read a bounded JSONL segment from one non-Protected Wayang session. Protected, quarantined, and unknown sessions are denied.",
+      description: "Read a bounded JSONL segment from one non-Protected Wayang session. Output is limited to 48 KiB/200 lines and total processing, including skipped prefix, is limited to 256 KiB. Protected, quarantined, and unknown sessions are denied.",
       promptSnippet: "Read bounded transcript lines from a non-Protected Wayang session",
       promptGuidelines: ["Treat readable Standard transcripts as entrusted context: do not unnecessarily reproduce credentials or sensitive personal data."],
       parameters: Type.Object({
