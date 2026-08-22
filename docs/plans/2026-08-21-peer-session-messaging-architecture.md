@@ -11,8 +11,8 @@ A running Wayang session may send a bounded request to another eligible session.
 
 Retained decisions:
 
-1. Standard-to-Standard is the only initial privacy class. Any Protected, quarantined, unresolved-legacy, or privacy-unknown source or target fails closed.
-2. Same-project delivery precedes cross-project delivery. Cross-project remains M5 and requires a separate rollout approval even if the privacy artifact permits it.
+1. Standard-to-Standard is the only initial rollout privacy class. The intended later Protected exception permits a peer send only when source and target have the exact same Protected Project and exact same Agent Profile; it is deferred to separately authorized M6. Every other Protected crossing, plus quarantined, unresolved-legacy, or privacy-unknown endpoints, fails closed.
+2. Same-project Standard delivery precedes cross-project Standard delivery. Cross-project Standard remains M5 and requires a separate rollout approval even if the privacy artifact permits it.
 3. Idle eligible targets may eventually auto-wake, but only after M2 proves the Pi append/dispatch boundary and the per-session arbiter. Archived targets are initially non-wakeable and denied with an inbox-visible terminal reason; unarchive is a separate human action.
 4. Target authority is always re-resolved at admission and immediately before projection, dispatch, reply, attachment open, and delivery.
 5. Peer attachments are read-only Standard objects, not paths. They remain M4 and unavailable until a durable attachment object catalog exists.
@@ -26,17 +26,18 @@ Two separate prerequisites block **every** implementation milestone, including M
 
 ### 2.1 Standard interop implementation dependency
 
-Peer work has a mandatory dependency on the unmerged Standard interop branch at commit `89f322a`. That commit is evidence of direction, not an approved or consumable final dependency. Peer scope must **not** reimplement, cherry-pick, copy, absorb, or independently patch any part of it. The Standard interop owner must fix and review the following durable audit findings on that branch:
+Peer work depends on the reviewed Standard interop lineage that began at `89f322a` and is now merged through successor fix `467c8ec` with main integration SHA `8e91da7`. Peer scope must **not** reimplement, cherry-pick, copy, absorb, or independently patch it. The successor addressed these durable audit findings:
 
 - **SI-1 — catalog classification before body parse:** catalog discovery must resolve and reconcile the durable catalog row, canonical path, and transcript header before parsing any transcript body. It must deny quarantined, unclassified/unknown, and project-conflicting sessions at that pre-parse boundary; quarantine eligibility is exact-false (`quarantined === false`), so missing, null, stale, malformed, or otherwise non-false values deny. Eligibility and the same durable row/path/header bindings must be rechecked immediately before committing a result. Regression tests must prove `parseBytes = 0` for every denied classification and for row/path/header conflict and race cases.
 - **SI-2 — bounded `session_read`:** `session_read` must enforce a total processed-byte bound across scanning, skipping, decoding, and returned content, with a cursor/resume contract that cannot require rescanning an unbounded prefix. Regression coverage must include a high-offset request against a transcript with a large prefix and prove the total bound, not merely the response-size bound.
 
 This dependency is satisfied only when a successor commit containing both fixes has independent review, the final integrated result is merged, and the exact final merged SHA is recorded here (replacing `PENDING`). The dependency record must include focused SI-1/SI-2 test evidence, the full repository test/check evidence, deployment evidence, and live verification of the deployed behavior using policy-safe/synthetic observations. Required record:
 
-- reviewed successor fix commit: `PENDING`
-- exact final merged SHA: `PENDING`
-- focused SI-1/SI-2 tests: `PENDING`
-- full test/check evidence: `PENDING`
+- reviewed successor fix commit: `467c8ec`
+- exact final merged SHA: `8e91da7`
+- focused SI-1/SI-2 tests: `37/37 passed`
+- backend TypeScript build: `passed`
+- full repository test/check evidence: `PENDING`
 - deployment and live verification: `PENDING`
 
 Until every field is complete and reviewed, no peer milestone may begin and peer code must not consume the branch.
@@ -48,13 +49,14 @@ Separately, a final, revisioned privacy decision artifact must define and approv
 - which Standard session prose, peer payloads, provenance fields, replies, and attachment bytes may cross session and project boundaries;
 - whether the target provider/model is allowed to receive each projected field and how provider retention is disclosed/handled;
 - retention, deletion, backup, search-index, transcript-compaction, and branch-abandonment treatment;
-- whether cross-project Standard delivery is approved or remains deferred to M5;
+- cross-project Standard delivery under M5;
+- the same-Protected-Project plus same-Agent-Profile send exception under M6, while all other Protected crossings and all Protected transcript/attachment cross-reads remain denied;
 - whether model-generated peer replies may be projected back into the sender provider context automatically;
 - the user-facing disclosure and consent model for idle auto-wake and metered provider use.
 
 Required artifact revision and approval evidence: `PENDING`. Draft discussion, code behavior, commit `89f322a`, or approval of the interop dependency does not approve this artifact. **No milestone, including M0, may start until the final revision is explicitly approved.**
 
-After both dependencies are complete, Clemente must explicitly authorize M0 implementation. Later progression is not implicit: M2 requires review of M1; M3 requires a separate auto-wake approval after M2 evidence; M4 requires a separate attachment approval after catalog evidence; and M5 requires a separate cross-project approval. Tests before those gates use synthetic homes, data directories, projects, sessions, providers, and transcripts only.
+After both dependencies are complete, Clemente must explicitly authorize M0 implementation. Later progression is not implicit: M2 requires review of M1; M3 requires a separate auto-wake approval after M2 evidence; M4 requires a separate attachment approval after catalog evidence; M5 requires a separate cross-project Standard approval; and M6 requires a separate same-Project/Profile Protected-send approval after dedicated isolation tests. Tests before those gates use synthetic homes, data directories, projects, sessions, providers, and transcripts only.
 
 ## 3. Source alignment and replacement boundaries
 
@@ -451,7 +453,15 @@ Only after that internal gate passes may M2 add versioned Pi projections and pro
 - validate target provider disclosure and attachment policy independently;
 - roll out pair allowlists before any general Standard target listing.
 
-Protected crossing remains out of scope unless separately redesigned and authorized.
+### M6 — exact same-Project/Profile Protected peer send (separate approval)
+
+- starts only after the final privacy artifact explicitly approves the narrow exception and Clemente separately authorizes M6;
+- source and target must both be Protected, share the exact immutable Project ID, and share the exact Agent Profile ID at choice issuance, admission, projection, dispatch, reply, and replay;
+- Protected transcripts and attachments remain unavailable to cross-session read tools, and M6 carries no attachment references;
+- any profile/project/privacy drift, unknown attribution, archive, or cross-project edge denies and cancels before the next provider/tool boundary;
+- roll out only after dedicated same-pair, mismatched-profile, mismatched-project, and policy-race isolation tests.
+
+Every other Protected crossing remains denied.
 
 ## 16. Validation matrix
 
@@ -467,7 +477,7 @@ Protected crossing remains out of scope unless separately redesigned and authori
 
 - forged sender/target/project/profile/runtime generation and copied/expired/replayed choice;
 - human route cannot mint session provenance; session tool cannot claim human actor;
-- Protected/quarantined/legacy/unresolved/archived/pending-switch/scheduled targets denied;
+- before M6, every Protected target denied; at M6, only exact same Protected Project+Profile pairs allowed while mismatched/cross-project/unknown/quarantined/legacy/archived/pending-switch/scheduled targets deny;
 - policy/profile/project/model/runtime changes at every await;
 - no PIN/approval/gate leakage; `continue_in_wayang` is terminal;
 - logs, API errors, frames, backups, and UI snapshots contain no prohibited data.
@@ -537,9 +547,9 @@ Roll back a milestone by stopping new admissions, pausing dispatch/wake, allowin
 | Archived targets | Denied/non-wakeable initially. | Archive remains an explicit human state, not a hidden work queue. |
 | Attachments | M4 after durable catalog; IDs only, read-only Standard, no paths. | Current process registry/raw prompt paths are not durable authority. |
 | Metering | Exact predispatch reservations for tokens/tools/wakes/root/day; missing metadata denies auto-run. | Prevents unbounded loops and unaccounted provider use. |
-| Cross-project | M5 only after an explicit separate approval, even if the privacy artifact permits it. | Keeps same-project rollout separable from broader disclosure and prevents policy approval from implicitly authorizing rollout. |
-| Protected | Denied in this plan. | Requires a separate privacy/authority design and authorization. |
+| Cross-project Standard | M5 only after an explicit separate approval, even if the privacy artifact permits it. | Keeps same-project rollout separable from broader disclosure and prevents policy approval from implicitly authorizing rollout. |
+| Protected peer send | M6 only for the exact same Protected Project and exact same Agent Profile, after separate privacy and rollout approval; all other Protected edges deny. Protected transcript/attachment cross-read remains denied. | Preserves the later explicit narrow exception without weakening Protected isolation generally. |
 
 ## 20. Definition of implementation readiness
 
-This plan is ready to assign for M0 only when (1) the Standard interop successor fixes SI-1/SI-2, receives independent review, is merged, and has its exact final merged SHA plus focused/full/deployment/live evidence recorded; (2) the separate final revisioned privacy decision artifact is explicitly approved; (3) Clemente explicitly authorizes M0; and (4) owners agree on the state machine, lock order, and frozen pinned-Pi feasibility corpus. Implementation remains unauthorized now. This plan is not evidence that Pi split dispatch, compaction preservation, provider framing, durable attachment provenance, auto-wake, attachments, or cross-project delivery is feasible or approved. Those are executable and separately authorized gates, not assumptions.
+This plan is ready to assign for M0 only when (1) the Standard interop successor is merged at `8e91da7`, with focused `37/37` tests and backend build already recorded, and the remaining full-check/deployment/live evidence is complete; (2) the separate final revisioned privacy decision artifact—including Standard cross-project rules and the narrow M6 Protected same-Project/Profile exception—is explicitly approved; (3) Clemente explicitly authorizes M0; and (4) owners agree on the state machine, lock order, and frozen pinned-Pi feasibility corpus. Implementation remains unauthorized now. This plan is not evidence that Pi split dispatch, compaction preservation, provider framing, durable attachment provenance, auto-wake, attachments, or cross-project delivery is feasible or approved. Those are executable and separately authorized gates, not assumptions.

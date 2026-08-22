@@ -25,7 +25,7 @@ No implementation, deployment, transcript/private-data inspection, privacy-polic
 
 ## Retained product/privacy choices
 
-- Initial privacy scope is Standard-to-Standard only; Protected, quarantined, privacy-unknown, and unresolved legacy sessions fail closed.
+- Initial rollout is Standard-to-Standard only. A later M6 exception may send only between sessions sharing the exact Protected Project and exact Agent Profile; every other Protected edge and every Protected transcript/attachment cross-read denies.
 - Target execution uses only target-owned authority.
 - Inbox state is durable and independent of target runtime/Pi branch.
 - Same-project precedes cross-project. Cross-project rollout is always M5 and requires a separate approval even if the privacy artifact permits it.
@@ -37,12 +37,12 @@ No implementation, deployment, transcript/private-data inspection, privacy-polic
 
 ### Standard interop code dependency
 
-The peer plan now depends explicitly on unmerged Standard interop commit `89f322a`, but may not reimplement, cherry-pick, copy, absorb, or patch that work in peer scope. It remains blocked by two durable audit findings:
+The peer plan depends on the Standard interop lineage beginning at `89f322a`, now fixed by reviewed successor `467c8ec` and merged at `8e91da7`. Peer scope may not reimplement, copy, or absorb that work. The successor resolved two durable audit findings:
 
 - **SI-1:** catalog discovery must reconcile durable row/canonical path/transcript header and deny quarantined, unclassified/unknown, or project-conflicting sessions before body parse; quarantine is eligible only when exactly false. The same bindings and eligibility must be rechecked immediately before commit. Denial/race regressions must prove `parseBytes = 0`.
 - **SI-2:** `session_read` needs a total processed-byte bound and cursor/resume contract, with a high-offset/large-prefix regression proving bounded total scan work rather than only bounded returned bytes.
 
-Required completion evidence remains pending: an independently reviewed successor fix commit, the exact final merged SHA, focused SI-1/SI-2 tests, full repository test/check evidence, and deployment plus live verification. Commit `89f322a` alone is not sufficient.
+Recorded completion evidence: successor `467c8ec`, merged SHA `8e91da7`, focused tests `37/37 passed`, backend TypeScript build passed. Full repository check, deployment, and live verification remain pending.
 
 ### Privacy decision artifact dependency
 
@@ -56,6 +56,7 @@ Separately, a final revisioned and explicitly approved artifact must define Stan
 - **M3:** idle auto-wake only under a separate post-M2 approval, with wake/root/day controls and operational pause/rollback.
 - **M4:** attachments only under a separate approval after the general durable object catalog passes security/privacy/purge gates.
 - **M5:** cross-project Standard only under a separate approval and pair-allowlist rollout, even if the privacy artifact permits it.
+- **M6:** exact same Protected Project+Agent Profile peer sends only under a separate privacy and rollout approval; no attachments or Protected cross-session reads.
 
 ## Source evidence used
 
@@ -69,13 +70,13 @@ Separately, a final revisioned and explicitly approved artifact must define Stan
 
 ## Open gates, not design gaps
 
-1. Standard interop successor fixing SI-1/SI-2, independent review, exact final merged SHA, focused/full tests, deployment, and live verification.
+1. Complete the remaining Standard interop full-check, deployment, and live verification record for merged SHA `8e91da7`.
 2. Final revisioned privacy decision artifact for Standard/Protected reads, attachments, and provider retention/disclosure, with explicit approval.
 3. Explicit M0 implementation authorization after both dependencies.
 4. Executable pinned-provider framing proof.
 5. M2 universal all-ingress arbiter completion before projection/turn.
 6. Pinned-Pi split append/dispatch, provider-start/settlement, and branch/compaction preservation feasibility.
 7. Durable attachment catalog implementation/review plus separate M4 approval.
-8. Separate M3 auto-wake and M5 cross-project approvals.
+8. Separate M3 auto-wake, M5 cross-project Standard, and M6 same-Project/Profile Protected-send approvals.
 
 No repository checks were run because this assignment was documentation-only and the worker had no authorized command-execution surface. The implementation orchestrator must run the plan’s checks after implementation is authorized.
