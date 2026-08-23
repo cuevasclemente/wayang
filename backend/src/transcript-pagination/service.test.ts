@@ -98,9 +98,12 @@ test("ID-less streaming overlay is bounded separately without evicting persisted
     assert.equal(latest.messages[0].id, "m-5");
     assert.ok(latest.messages.every((row) => typeof row.id === "string"));
     assert.ok(latest.before_cursor);
-    assert.equal(latest.streaming_message?.type, "custom");
+    assert.equal(latest.streaming_message?.type, "assistant");
     assert.equal(latest.streaming_message?.id, undefined);
-    assert.equal((latest.streaming_message?.message as any)?.customType, "wayang-transcript-event-placeholder-v1");
+    const placeholder = latest.streaming_message?.message as any;
+    assert.equal(placeholder?.role, "assistant");
+    assert.equal(placeholder?.streamingPlaceholder, true);
+    assert.equal(placeholder?.content?.[0]?.type, "text");
     assert.ok(Buffer.byteLength(JSON.stringify(latest)) <= TRANSCRIPT_PAGE_MAX_BYTES);
   } finally {
     await service.close();

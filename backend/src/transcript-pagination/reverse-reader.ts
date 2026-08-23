@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 export const TRANSCRIPT_PAGE_MAX_ROWS = 200;
 export const TRANSCRIPT_PAGE_MAX_BYTES = 512 * 1024;
 export const TRANSCRIPT_REVERSE_MAX_SCAN_BYTES = 16 * 1024 * 1024;
+export const TRANSCRIPT_PHYSICAL_ROW_MAX_BOUNDARY_SCAN_BYTES = 64 * 1024 * 1024;
 const HEADER_MAX_BYTES = 256 * 1024;
 const REVERSE_BOUNDARY_BLOCK_BYTES = 64 * 1024;
 const OVERSIZED_ENVELOPE_PREFIX_BYTES = 256 * 1024;
@@ -31,6 +32,13 @@ export interface ReverseTranscriptPage {
   continuation: ReversePageContinuation | null;
   hasOlder: boolean;
   scanCeilingReached: boolean;
+}
+
+export class TranscriptPhysicalRowUnsupportedError extends Error {
+  readonly code = "transcript_physical_row_unsupported";
+  constructor() {
+    super("Transcript physical row exceeds the supported boundary scan ceiling");
+  }
 }
 
 export class TranscriptRevisionChangedError extends Error {
@@ -111,7 +119,11 @@ function assertPathStillMatches(filePath: string, fd: number, expected: Transcri
   }
 }
 
-function newestPhysicalLineBounds(fd: number, end: number): { start: number; end: number } | null {
+function newestPhysicalLineBounds(
+  fd: number,
+  end: number,
+  maxBoundaryScanBytes = TRANSCRIPT_PHYSICAL_ROW_MAX_BOUNDARY_SCAN_BYTES,
+): { start: number; end: number } | null {
   if (end <= 0) return null;
   let lineEnd = end;
   const trailing = Buffer.allocUnsafe(1);
@@ -119,14 +131,19 @@ function newestPhysicalLineBounds(fd: number, end: number): { start: number; end
   if (lineEnd <= 0) return null;
   let cursor = lineEnd;
   while (cursor > 0) {
+    if (lineEnd - cursor >= maxBoundaryScanBytes) throw new TranscriptPhysicalRowUnsupportedError();
     const start = Math.max(0, cursor - REVERSE_BOUNDARY_BLOCK_BYTES);
     const block = Buffer.allocUnsafe(cursor - start);
     const read = fs.readSync(fd, block, 0, block.length, start);
     for (let index = read - 1; index >= 0; index--) {
-      if (block[index] === 0x0a) return { start: start + index + 1, end: lineEnd };
+      if (block[index] !== 0x0a) continue;
+      const lineStart = start + index + 1;
+      if (lineEnd - lineStart > maxBoundaryScanBytes) throw new TranscriptPhysicalRowUnsupportedError();
+      return { start: lineStart, end: lineEnd };
     }
     cursor = start;
   }
+  if (lineEnd > maxBoundaryScanBytes) throw new TranscriptPhysicalRowUnsupportedError();
   return { start: 0, end: lineEnd };
 }
 
@@ -229,6 +246,8 @@ export function readReverseTranscriptPage(
     continuation?: ReversePageContinuation;
     maxRows?: number;
     maxScanBytes?: number;
+    /** @internal Test seam; production uses the absolute compiled ceiling. */
+    maxBoundaryScanBytes?: number;
   } = {},
 ): ReverseTranscriptPage {
   const fd = openRegularNoFollow(filePath);
@@ -236,27 +255,35 @@ export function readReverseTranscriptPage(
     const revision = revisionFromDescriptor(fd);
     let end = Math.min(options.continuation?.beforeOffset ?? revision.size, revision.size);
     const maxScanBytes = options.maxScanBytes ?? TRANSCRIPT_REVERSE_MAX_SCAN_BYTES;
-    if (!options.continuation) {
-      const newestBounds = newestPhysicalLineBounds(fd, end);
-      if (newestBounds && newestBounds.end - newestBounds.start > maxScanBytes) {
-        const oversized = oversizedEnvelopePlaceholder(fd, newestBounds);
-        if (oversized.eventType === "session" || oversized.eventType === "session_info") {
-          end = newestBounds.start;
-        } else {
-          const continuation = oversized.parentId === null
-            ? null
-            : { beforeOffset: newestBounds.start, nextAncestorId: oversized.parentId };
-          assertPathStillMatches(filePath, fd, revision);
-          return {
-            entries: [oversized.entry],
-            revision,
-            branchTipId: oversized.id,
-            entryOffsets: Object.freeze({ [oversized.id]: newestBounds.start }),
-            continuation,
-            hasOlder: continuation !== null,
-            scanCeilingReached: continuation !== null,
-          };
-        }
+    const newestBounds = newestPhysicalLineBounds(
+      fd,
+      end,
+      options.maxBoundaryScanBytes ?? TRANSCRIPT_PHYSICAL_ROW_MAX_BOUNDARY_SCAN_BYTES,
+    );
+    if (newestBounds && newestBounds.end - newestBounds.start > maxScanBytes) {
+      const oversized = oversizedEnvelopePlaceholder(fd, newestBounds);
+      const hiddenEnvelope = oversized.eventType === "session" || oversized.eventType === "session_info";
+      const requestedAncestor = options.continuation?.nextAncestorId;
+      if (!options.continuation && hiddenEnvelope) {
+        end = newestBounds.start;
+      } else if (!options.continuation || oversized.id === requestedAncestor) {
+        const continuation = oversized.parentId === null
+          ? null
+          : { beforeOffset: newestBounds.start, nextAncestorId: oversized.parentId };
+        assertPathStillMatches(filePath, fd, revision);
+        return {
+          entries: hiddenEnvelope ? [] : [oversized.entry],
+          revision,
+          branchTipId: options.continuation ? null : oversized.id,
+          entryOffsets: hiddenEnvelope ? Object.freeze({}) : Object.freeze({ [oversized.id]: newestBounds.start }),
+          continuation,
+          hasOlder: continuation !== null,
+          scanCeilingReached: continuation !== null,
+        };
+      } else {
+        // An oversized physical sibling is not the requested ancestor. Skip its
+        // bounded envelope and continue scanning older topology.
+        end = newestBounds.start;
       }
     }
     const start = Math.max(0, end - maxScanBytes);

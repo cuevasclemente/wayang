@@ -24,15 +24,22 @@ interface WorkerReply {
 export interface DerivedTodoProjectionOptions {
   /** @internal Deterministic post-worker revision race seam. */
   beforeCachePublishForTests?: (filePath: string) => void | Promise<void>;
+  workerTimeoutMs?: number;
+  /** @internal Worker-side delay for concurrency/timeout tests. */
+  workerDelayMsForTests?: number;
 }
 
 const WORKER_SOURCE = String.raw`
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { parentPort, workerData } = require("node:worker_threads");
+if (workerData.delayMs > 0) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, workerData.delayMs);
+}
 const READ_CHUNK_BYTES = 64 * 1024;
 const MAX_CANDIDATES = 4096;
 const MAX_CANDIDATE_BYTES = 4 * 1024 * 1024;
+const MAX_ACTIVE_CANDIDATE_LINE_BYTES = 1024 * 1024;
 const MAX_TODOS = 500;
 const MAX_RESULT_BYTES = 128 * 1024;
 function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest("hex"); }
@@ -66,6 +73,14 @@ function normalizeTodo(raw, fallbackId) {
       : undefined,
   };
 }
+function candidateKindFromEntry(entry) {
+  if (entry?.type === "custom" && entry.customType === "todo-preseed") return "preseed";
+  if (entry?.type === "custom" && entry.customType === "todo-state") return "state";
+  const message = entry?.type === "message" ? entry.message : null;
+  return message?.role === "toolResult" && message.toolName === "todo" && Array.isArray(message.details?.todos)
+    ? "tool"
+    : null;
+}
 function candidateFromEntry(entry) {
   if (entry?.type === "custom" && entry.customType === "todo-preseed") {
     return { kind: "preseed", todos: compactTodos(Array.isArray(entry.data?.todos) ? entry.data.todos : []) };
@@ -93,8 +108,6 @@ try {
   const before = fs.fstatSync(fd);
   if (!before.isFile()) throw new Error("Transcript is not a regular file");
   const entries = [];
-  const candidates = new Map();
-  let candidateBytes = 0;
   let branchTipId = null;
   let ordinal = 0;
   let lineStartOffset = 0;
@@ -118,16 +131,14 @@ try {
         const value = JSON.parse(raw.toString("utf8"));
         if (value && typeof value.id === "string") {
           const eventType = typeof value.type === "string" ? value.type : "unknown";
-          entries.push({ id: value.id, parentId: typeof value.parentId === "string" ? value.parentId : null });
+          entries.push({
+            id: value.id,
+            parentId: typeof value.parentId === "string" ? value.parentId : null,
+            sourceOffset: lineStartOffset,
+            sourceLength,
+            candidateKind: candidateKindFromEntry(value),
+          });
           if (eventType !== "session" && eventType !== "session_info") branchTipId = value.id;
-          const candidate = candidateFromEntry(value);
-          if (candidate) {
-            if (candidates.size >= MAX_CANDIDATES) throw new Error("TODO candidate count exceeds bounds");
-            const bytes = Buffer.byteLength(JSON.stringify(candidate));
-            candidateBytes += bytes;
-            if (candidateBytes > MAX_CANDIDATE_BYTES) throw new Error("TODO candidates exceed byte bounds");
-            candidates.set(value.id, candidate);
-          }
         }
       } catch (error) {
         if (error && typeof error.message === "string" && error.message.startsWith("TODO ")) throw error;
@@ -188,14 +199,39 @@ try {
   let todos = [];
   let nextId;
   let source = "none";
+  let candidateCount = 0;
+  let candidateBytes = 0;
   const preseedByText = new Map();
   for (const eventId of activeIds) {
-    const candidate = candidates.get(eventId);
-    if (!candidate) continue;
+    const topology = byId.get(eventId);
+    if (!topology?.candidateKind) continue;
+    candidateCount++;
+    if (candidateCount > MAX_CANDIDATES || topology.sourceLength > MAX_ACTIVE_CANDIDATE_LINE_BYTES) {
+      throw new Error("TODO active candidate count or line size exceeds bounds");
+    }
+    const candidateLine = Buffer.allocUnsafe(topology.sourceLength);
+    let candidateRead = 0;
+    while (candidateRead < candidateLine.length) {
+      const count = fs.readSync(fd, candidateLine, candidateRead, candidateLine.length - candidateRead, topology.sourceOffset + candidateRead);
+      if (!count) break;
+      candidateRead += count;
+    }
+    if (candidateRead !== candidateLine.length) throw new Error("TODO active candidate line was truncated");
+    let candidateRaw = candidateLine;
+    while (candidateRaw.length > 0 && (candidateRaw[candidateRaw.length - 1] === 10 || candidateRaw[candidateRaw.length - 1] === 13)) {
+      candidateRaw = candidateRaw.subarray(0, candidateRaw.length - 1);
+    }
+    const candidate = candidateFromEntry(JSON.parse(candidateRaw.toString("utf8")));
+    if (!candidate || candidate.kind !== topology.candidateKind) throw new Error("TODO active candidate changed shape");
+    candidateBytes += Buffer.byteLength(JSON.stringify(candidate));
+    if (candidateBytes > MAX_CANDIDATE_BYTES) throw new Error("TODO active candidates exceed byte bounds");
     if (candidate.kind === "preseed") {
       for (const raw of candidate.todos) {
         const todo = normalizeTodo(raw, preseedByText.size + 1);
-        if (todo && !preseedByText.has(todo.text)) preseedByText.set(todo.text, todo);
+        if (todo && !preseedByText.has(todo.text)) {
+          if (preseedByText.size >= MAX_TODOS) throw new Error("TODO preseed result exceeds item bounds");
+          preseedByText.set(todo.text, todo);
+        }
       }
       continue;
     }
@@ -249,14 +285,33 @@ function cacheKey(filePath: string, fingerprint: TranscriptFileRevision): string
   ]);
 }
 
+interface ProjectionTask {
+  key: string;
+  filePath: string;
+  expected: TranscriptFileRevision;
+  promise: Promise<DerivedTodoProjection | null>;
+  resolve: (projection: DerivedTodoProjection | null) => void;
+  cancelled: boolean;
+  cancelWorker?: () => void;
+}
+
+const MAX_WORKER_CONCURRENCY = 2;
+const MAX_QUEUED_PROJECTIONS = 64;
+
 export class DerivedTodoProjectionService {
   private readonly cache = new Map<string, DerivedTodoProjection>();
   private readonly inFlight = new Map<string, Promise<DerivedTodoProjection | null>>();
-  private readonly workers = new Map<Worker, (error: Error) => void>();
+  private readonly latestByPath = new Map<string, ProjectionTask>();
+  private readonly queue: ProjectionTask[] = [];
+  private readonly workers = new Set<Worker>();
   private closed = false;
+  private activeCount = 0;
+  private peakActiveCount = 0;
   private workersStarted = 0;
   private cacheHits = 0;
   private inFlightHits = 0;
+  private superseded = 0;
+  private timeouts = 0;
 
   constructor(private readonly options: DerivedTodoProjectionOptions = {}) {}
 
@@ -279,62 +334,192 @@ export class DerivedTodoProjectionService {
       this.inFlightHits++;
       return pending;
     }
-    const work = this.runWorker(canonicalPath)
-      .then(async (projection) => {
-        if (!projection || this.closed) return null;
-        await this.options.beforeCachePublishForTests?.(canonicalPath);
-        if (this.closed || !fingerprintsEqual(expected, projection.fingerprint)) return null;
-        let current: TranscriptFileRevision;
-        try { current = readTranscriptFileRevision(canonicalPath); }
-        catch { return null; }
-        if (!fingerprintsEqual(expected, current)) return null;
-        this.cache.set(key, projection);
-        while (this.cache.size > MAX_CACHE_ENTRIES) this.cache.delete(this.cache.keys().next().value!);
-        return projection;
-      })
-      .catch(() => null)
-      .finally(() => this.inFlight.delete(key));
-    this.inFlight.set(key, work);
-    return work;
+
+    const prior = this.latestByPath.get(canonicalPath);
+    if (prior && prior.key !== key) {
+      this.superseded++;
+      prior.cancelled = true;
+      prior.cancelWorker?.();
+      const queuedIndex = this.queue.indexOf(prior);
+      if (queuedIndex >= 0) this.queue.splice(queuedIndex, 1);
+      prior.resolve(null);
+      if (this.inFlight.get(prior.key) === prior.promise) this.inFlight.delete(prior.key);
+    }
+
+    let resolveTask!: (projection: DerivedTodoProjection | null) => void;
+    const promise = new Promise<DerivedTodoProjection | null>((resolve) => { resolveTask = resolve; });
+    const task: ProjectionTask = {
+      key,
+      filePath: canonicalPath,
+      expected,
+      promise,
+      resolve: resolveTask,
+      cancelled: false,
+    };
+    this.inFlight.set(key, promise);
+    this.latestByPath.set(canonicalPath, task);
+    if (this.queue.length >= MAX_QUEUED_PROJECTIONS) {
+      const evicted = this.queue.shift()!;
+      evicted.cancelled = true;
+      evicted.resolve(null);
+      if (this.inFlight.get(evicted.key) === evicted.promise) this.inFlight.delete(evicted.key);
+      if (this.latestByPath.get(evicted.filePath) === evicted) this.latestByPath.delete(evicted.filePath);
+    }
+    this.queue.push(task);
+    this.pump();
+    return promise;
   }
 
-  getInstrumentation(): { workersStarted: number; cacheHits: number; inFlightHits: number } {
-    return { workersStarted: this.workersStarted, cacheHits: this.cacheHits, inFlightHits: this.inFlightHits };
+  getInstrumentation(): {
+    workersStarted: number;
+    cacheHits: number;
+    inFlightHits: number;
+    activeCount: number;
+    peakActiveCount: number;
+    queuedCount: number;
+    superseded: number;
+    timeouts: number;
+  } {
+    return {
+      workersStarted: this.workersStarted,
+      cacheHits: this.cacheHits,
+      inFlightHits: this.inFlightHits,
+      activeCount: this.activeCount,
+      peakActiveCount: this.peakActiveCount,
+      queuedCount: this.queue.length,
+      superseded: this.superseded,
+      timeouts: this.timeouts,
+    };
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     this.cache.clear();
-    const pending = [...this.inFlight.values()];
-    for (const [worker, reject] of this.workers) {
-      reject(new Error("TODO projection service closed"));
-      void worker.terminate();
+    for (const task of this.queue.splice(0)) {
+      task.cancelled = true;
+      task.resolve(null);
     }
+    for (const task of this.latestByPath.values()) {
+      task.cancelled = true;
+      task.cancelWorker?.();
+      task.resolve(null);
+    }
+    const terminations = [...this.workers].map((worker) => worker.terminate());
     this.workers.clear();
-    await Promise.allSettled(pending);
+    await Promise.allSettled([...this.inFlight.values(), ...terminations]);
     this.inFlight.clear();
+    this.latestByPath.clear();
   }
 
-  private runWorker(filePath: string): Promise<DerivedTodoProjection | null> {
+  private pump(): void {
+    while (!this.closed && this.activeCount < MAX_WORKER_CONCURRENCY && this.queue.length > 0) {
+      const task = this.queue.shift()!;
+      if (task.cancelled) continue;
+      this.activeCount++;
+      this.peakActiveCount = Math.max(this.peakActiveCount, this.activeCount);
+      void this.runTask(task);
+    }
+  }
+
+  private async runTask(task: ProjectionTask): Promise<void> {
+    try {
+      const projection = await this.runWorker(task);
+      if (!projection || task.cancelled || this.closed) {
+        task.resolve(null);
+        return;
+      }
+      await this.options.beforeCachePublishForTests?.(task.filePath);
+      if (task.cancelled || this.closed || !fingerprintsEqual(task.expected, projection.fingerprint)) {
+        task.resolve(null);
+        return;
+      }
+      let current: TranscriptFileRevision;
+      try { current = readTranscriptFileRevision(task.filePath); }
+      catch {
+        task.resolve(null);
+        return;
+      }
+      if (!fingerprintsEqual(task.expected, current)) {
+        task.resolve(null);
+        return;
+      }
+      this.cache.set(task.key, projection);
+      while (this.cache.size > MAX_CACHE_ENTRIES) this.cache.delete(this.cache.keys().next().value!);
+      task.resolve(projection);
+    } catch {
+      task.resolve(null);
+    } finally {
+      task.cancelWorker = undefined;
+      this.activeCount = Math.max(0, this.activeCount - 1);
+      if (this.inFlight.get(task.key) === task.promise) this.inFlight.delete(task.key);
+      if (this.latestByPath.get(task.filePath) === task) this.latestByPath.delete(task.filePath);
+      this.pump();
+    }
+  }
+
+  private runWorker(task: ProjectionTask): Promise<DerivedTodoProjection | null> {
     this.workersStarted++;
     return new Promise((resolve, reject) => {
-      const worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { filePath } });
+      const worker = new Worker(WORKER_SOURCE, {
+        eval: true,
+        workerData: {
+          filePath: task.filePath,
+          delayMs: Math.max(0, this.options.workerDelayMsForTests ?? 0),
+        },
+        resourceLimits: {
+          maxOldGenerationSizeMb: 32,
+          maxYoungGenerationSizeMb: 8,
+          stackSizeMb: 2,
+        },
+      });
+      this.workers.add(worker);
       let settled = false;
+      let timer: NodeJS.Timeout | null = null;
+      const finish = () => {
+        if (timer) clearTimeout(timer);
+        this.workers.delete(worker);
+        task.cancelWorker = undefined;
+      };
       const fail = (error: Error) => {
         if (settled) return;
         settled = true;
-        this.workers.delete(worker);
+        finish();
         reject(error);
       };
-      this.workers.set(worker, fail);
+      const terminateWithError = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        task.cancelWorker = undefined;
+        void worker.terminate().finally(() => {
+          this.workers.delete(worker);
+          reject(error);
+        });
+      };
+      const timeoutMs = Math.max(100, Math.min(this.options.workerTimeoutMs ?? 15_000, 60_000));
+      timer = setTimeout(() => {
+        if (settled) return;
+        this.timeouts++;
+        terminateWithError(new Error("TODO projection worker timed out"));
+      }, timeoutMs);
+      timer.unref?.();
+      task.cancelWorker = () => {
+        if (settled) return;
+        terminateWithError(new Error("TODO projection superseded"));
+      };
       worker.once("message", (reply: WorkerReply) => {
         if (settled) return;
         settled = true;
-        this.workers.delete(worker);
-        void worker.terminate();
-        if (reply.error || !reply.fingerprint || !reply.todoState) resolve(null);
-        else resolve({ fingerprint: reply.fingerprint, todoState: reply.todoState });
+        if (timer) clearTimeout(timer);
+        task.cancelWorker = undefined;
+        const projection = reply.error || !reply.fingerprint || !reply.todoState
+          ? null
+          : { fingerprint: reply.fingerprint, todoState: reply.todoState };
+        void worker.terminate().finally(() => {
+          this.workers.delete(worker);
+          resolve(projection);
+        });
       });
       worker.once("error", (error) => fail(
         error instanceof Error ? error : new Error(String(error)),

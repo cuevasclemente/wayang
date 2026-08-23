@@ -44,6 +44,24 @@ test("derived TODO projection follows active branch and last todo-state wins", a
   }
 });
 
+test("off-branch TODO quota poison cannot suppress valid active TODO", async () => {
+  const poison = Array.from({ length: 501 }, (_, index) => ({ text: `poison-${index}` }));
+  const { dir, file } = transcript([
+    header,
+    tip("root", null),
+    { type: "custom", id: "poison", parentId: "root", customType: "todo-state", data: { todos: poison } },
+    todoState("active", "root", "valid active"),
+  ]);
+  const service = new DerivedTodoProjectionService();
+  try {
+    const projection = await service.project(file);
+    assert.deepEqual(projection?.todoState.todos.map((todo) => todo.text), ["valid active"]);
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("derived TODO projection recognizes active todo toolResult", async () => {
   const { dir, file } = transcript([
     header,
@@ -141,6 +159,59 @@ test("same canonical path and fingerprint coalesce in-flight and cached scans", 
     assert.equal(service.getInstrumentation().cacheHits, 1);
   } finally {
     release();
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("TODO workers enforce global concurrency two with a bounded queue", async () => {
+  const fixtures = ["one", "two", "three"].map((text, index) => transcript([
+    { ...header, id: `session-${index}` },
+    todoState(`state-${index}`, null, text),
+  ]));
+  const service = new DerivedTodoProjectionService({ workerDelayMsForTests: 250, workerTimeoutMs: 2_000 });
+  try {
+    const pending = fixtures.map(({ file }) => service.project(file));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const running = service.getInstrumentation();
+    assert.equal(running.activeCount, 2);
+    assert.equal(running.peakActiveCount, 2);
+    assert.equal(running.queuedCount, 1);
+    assert.ok((await Promise.all(pending)).every(Boolean));
+    assert.equal(service.getInstrumentation().workersStarted, 3);
+  } finally {
+    await service.close();
+    for (const fixture of fixtures) fs.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("TODO worker timeout terminates and withholds projection", async () => {
+  const { dir, file } = transcript([header, todoState("state", null, "timeout")]);
+  const service = new DerivedTodoProjectionService({ workerDelayMsForTests: 500, workerTimeoutMs: 100 });
+  try {
+    assert.equal(await service.project(file), null);
+    assert.equal(service.getInstrumentation().timeouts, 1);
+    assert.equal(service.getInstrumentation().activeCount, 0);
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("new fingerprint supersedes older active request for the same canonical path", async () => {
+  const { dir, file } = transcript([header, todoState("old", null, "old")]);
+  const service = new DerivedTodoProjectionService({ workerDelayMsForTests: 250, workerTimeoutMs: 2_000 });
+  try {
+    const stale = service.project(file);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    fs.appendFileSync(file, JSON.stringify(todoState("new", "old", "new")) + "\n");
+    const latest = service.project(file);
+    assert.equal(await stale, null);
+    const projection = await latest;
+    assert.deepEqual(projection?.todoState.todos.map((todo) => todo.text), ["new"]);
+    assert.equal(service.getInstrumentation().superseded, 1);
+    assert.equal(service.getInstrumentation().workersStarted, 2);
+  } finally {
     await service.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }

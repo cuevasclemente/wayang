@@ -1,14 +1,66 @@
 import test from "node:test";
 import * as assert from "node:assert/strict";
 import {
+  buildRevisionExactLiveWindow,
+  captureModernTodoAuthorization,
   captureTranscriptWindowStreamingBoundary,
   parseTranscriptNegotiation,
+  revalidateModernTodoAuthorization,
   serializeInvalidTranscriptPageRequest,
   serializeTranscriptPageError,
   serializeTranscriptPageGateFailure,
   serializeTranscriptProtocolConfirmation,
   transcriptPageRequestCorrelation,
 } from "./ws.js";
+
+test("modern TODO projection denies before read when fresh authorization fails", () => {
+  const row = {
+    cwd: "/synthetic",
+    project_id: "project",
+    agent_profile_id: "profile",
+    pi_session_file: "/synthetic/session.jsonl",
+    legacy_private_session_quarantine: false,
+  };
+  let calls = 0;
+  const witness = captureModernTodoAuthorization(row, row.pi_session_file, () => {
+    calls++;
+    return { allowed: false };
+  });
+  assert.equal(witness, null);
+  assert.equal(calls, 1);
+});
+
+test("modern TODO authorization preserves null raw attribution while binding resolved default", () => {
+  const row = {
+    cwd: "/synthetic",
+    project_id: "project",
+    agent_profile_id: null,
+    pi_session_file: "/synthetic/session.jsonl",
+    legacy_private_session_quarantine: false,
+  };
+  const allowed = () => ({
+    allowed: true,
+    project: { id: "project" },
+    agentProfile: { id: "resolved-default" },
+  });
+  const witness = captureModernTodoAuthorization(row, row.pi_session_file, allowed);
+  assert.ok(witness);
+  assert.equal(witness.rawAgentProfileId, null);
+  assert.equal(witness.resolvedAgentProfileId, "resolved-default");
+  assert.equal(revalidateModernTodoAuthorization(row, witness, allowed), true);
+  assert.equal(revalidateModernTodoAuthorization({ ...row, agent_profile_id: "resolved-default" }, witness, allowed), false,
+    "raw durable null attribution must remain null");
+  assert.equal(revalidateModernTodoAuthorization(row, witness, () => ({
+    allowed: true,
+    project: { id: "project" },
+    agentProfile: { id: "different-default" },
+  })), false);
+  assert.equal(revalidateModernTodoAuthorization(row, witness, () => ({
+    allowed: true,
+    project: { id: "different-project" },
+    agentProfile: { id: "resolved-default" },
+  })), false);
+});
 
 test("streaming snapshot boundary freezes overlay and retains only later buffered events", () => {
   const streaming = { role: "assistant", content: [{ type: "text", text: "snapshot" }], timestamp: 1 };
@@ -17,6 +69,47 @@ test("streaming snapshot boundary freezes overlay and retains only later buffere
   streaming.content[0].text = "mutated later";
   buffered.push({ type: "text_delta", delta: "later" });
   assert.equal(((frozen?.message as any)?.content as any[])[0].text, "snapshot");
+  assert.deepEqual(buffered, [{ type: "text_delta", delta: "later" }]);
+});
+
+test("delayed around retry atomically replaces persisted overlay and pre-boundary deltas", async () => {
+  let revision = 1;
+  let persisted = false;
+  let overlay: any = { role: "assistant", content: [{ type: "text", text: "partial" }] };
+  const buffered: any[] = [{ type: "text_delta", delta: "partial" }];
+  let builds = 0;
+  let discards = 0;
+  const fingerprint = (size: number) => ({
+    device: 1, inode: 1, size, mtimeMs: size, ctimeMs: size,
+    headerDigest: "header", mutationEpoch: "epoch",
+  });
+  const result = await buildRevisionExactLiveWindow({
+    capture: () => ({
+      sessionFile: "/synthetic/session.jsonl",
+      revision: fingerprint(revision),
+      streamingMessage: captureTranscriptWindowStreamingBoundary(overlay, buffered),
+    }),
+    async build(boundary) {
+      builds++;
+      if (builds === 1) {
+        persisted = true;
+        overlay = null;
+        revision = 2;
+        buffered.push({ type: "message_end", message: { role: "assistant" } });
+      } else {
+        buffered.push({ type: "text_delta", delta: "later" });
+      }
+      return {
+        messages: persisted ? ["persisted-assistant"] : [],
+        streamingMessage: boundary.streamingMessage,
+      };
+    },
+    isCurrent: (boundary) => boundary.revision?.size === revision,
+    discard: () => { discards++; },
+  });
+  assert.deepEqual(result, { messages: ["persisted-assistant"], streamingMessage: null });
+  assert.equal(builds, 2);
+  assert.equal(discards, 1);
   assert.deepEqual(buffered, [{ type: "text_delta", delta: "later" }]);
 });
 

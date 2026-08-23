@@ -15,6 +15,7 @@ import {
 const INDEX_SCHEMA_VERSION = 1;
 const TAIL_WITNESS_BYTES = 4_096;
 export const TRANSCRIPT_INDEX_MAX_READ_BYTES = 384 * 1024;
+export const TRANSCRIPT_APPEND_REFRESH_MAX_BYTES = 1024 * 1024;
 
 export type IndexedReadPreference = "latest" | "earliest" | "around";
 
@@ -274,6 +275,8 @@ function workerBuild(filePath: string): Promise<WorkerResult> {
 export interface StructuralTranscriptIndexOptions {
   /** @internal Deterministic publication race seam; receives canonical paths. */
   beforePublishForTests?: (sessionId: string, filePath: string) => void | Promise<void>;
+  /** @internal Proves the synchronous append seam was selected. */
+  onAppendRefreshForTests?: (sessionId: string, appendedBytes: number) => void;
 }
 
 export class StructuralTranscriptIndex {
@@ -307,8 +310,12 @@ export class StructuralTranscriptIndex {
     const stored = this.readRevision(sessionId);
     if (stored && stored.filePath === canonicalPath && revisionsExactlyEqual(stored, current)) return stored;
     if (stored && stored.filePath === canonicalPath && current.size > stored.indexedSize
+      && current.size - stored.indexedSize <= TRANSCRIPT_APPEND_REFRESH_MAX_BYTES
       && sameTranscriptIdentity(stored, current) && this.canAppend(stored, canonicalPath)) {
-      try { return this.appendRefresh(stored, current); }
+      try {
+        this.options.onAppendRefreshForTests?.(sessionId, current.size - stored.indexedSize);
+        return this.appendRefresh(stored, current);
+      }
       catch { /* unsafe append falls through to an epoch rebuild */ }
     }
     const build = this.fullBuild(sessionId, canonicalPath, key);
@@ -384,6 +391,54 @@ export class StructuralTranscriptIndex {
       anchor: null,
       hasOlder: rows.length > 0 && rows[0].visibleOrdinal > 0,
       hasNewer: rows.length > 0 && this.hasVisibleAfter(revision, rows.at(-1)!.visibleOrdinal),
+    };
+  }
+
+  tryLatestCurrent(sessionId: string, filePath: string, limit = 200): IndexedWindowSelection | null {
+    const canonicalPath = path.resolve(filePath);
+    let current: TranscriptFileRevision;
+    try { current = readTranscriptFileRevision(canonicalPath); }
+    catch { return null; }
+    const revision = this.readRevision(sessionId);
+    if (!revision || revision.filePath !== canonicalPath || !revision.complete || !revisionsExactlyEqual(revision, current)) return null;
+    const rows = (this.db.prepare(
+      `SELECT event_id,active_ordinal,visible_ordinal,source_offset,source_length FROM active_branch_entries
+       WHERE session_id=? AND transcript_epoch=? AND visible_ordinal IS NOT NULL
+       ORDER BY visible_ordinal DESC LIMIT ?`,
+    ).all(sessionId, revision.transcriptEpoch, limit) as any[]).reverse().map(this.mapRow);
+    return {
+      revision,
+      rows,
+      anchor: null,
+      hasOlder: rows.length > 0 && rows[0].visibleOrdinal > 0,
+      hasNewer: false,
+    };
+  }
+
+  tryBeforeEventCurrent(
+    sessionId: string,
+    filePath: string,
+    eventId: string,
+    limit = 200,
+  ): IndexedWindowSelection | null {
+    const latest = this.tryLatestCurrent(sessionId, filePath, 1);
+    if (!latest) return null;
+    const target = this.db.prepare(
+      `SELECT visible_ordinal FROM active_branch_entries
+       WHERE session_id=? AND transcript_epoch=? AND event_id=? AND visible_ordinal IS NOT NULL`,
+    ).get(sessionId, latest.revision.transcriptEpoch, eventId) as { visible_ordinal: number } | undefined;
+    if (!target) return null;
+    const rows = (this.db.prepare(
+      `SELECT event_id,active_ordinal,visible_ordinal,source_offset,source_length FROM active_branch_entries
+       WHERE session_id=? AND transcript_epoch=? AND visible_ordinal IS NOT NULL AND visible_ordinal<=?
+       ORDER BY visible_ordinal DESC LIMIT ?`,
+    ).all(sessionId, latest.revision.transcriptEpoch, target.visible_ordinal, limit) as any[]).reverse().map(this.mapRow);
+    return {
+      revision: latest.revision,
+      rows,
+      anchor: null,
+      hasOlder: rows.length > 0 && rows[0].visibleOrdinal > 0,
+      hasNewer: this.hasVisibleAfter(latest.revision, rows.at(-1)?.visibleOrdinal ?? target.visible_ordinal),
     };
   }
 

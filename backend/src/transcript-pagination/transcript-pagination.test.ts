@@ -7,6 +7,7 @@ import { TranscriptCursorError, TranscriptCursorRegistry } from "./cursor-regist
 import {
   readReverseTranscriptPage,
   readTranscriptFileRevision,
+  TranscriptPhysicalRowUnsupportedError,
   TRANSCRIPT_REVERSE_MAX_SCAN_BYTES,
 } from "./reverse-reader.js";
 import {
@@ -96,6 +97,43 @@ test("reverse reader returns a stable placeholder for a newest row beyond the sc
     const before = readReverseTranscriptPage(file, { continuation: latest.continuation! });
     assert.deepEqual(before.entries.map((entry) => entry.id), ["root"]);
     assert.equal(before.hasOlder, false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("reverse reader pages an oversized interior ancestor by stable envelope", () => {
+  const entries: Array<ReturnType<typeof header> | ReturnType<typeof message>> = [
+    header(),
+    message("root", null, "root"),
+    message("huge-interior", "root", "q".repeat(TRANSCRIPT_REVERSE_MAX_SCAN_BYTES + 1024 * 1024)),
+  ];
+  let parent = "huge-interior";
+  for (let index = 0; index < 200; index++) {
+    const id = `tail-${index}`;
+    entries.push(message(id, parent, `tail ${index}`));
+    parent = id;
+  }
+  const { dir, file } = fixture(entries);
+  try {
+    const latest = readReverseTranscriptPage(file);
+    assert.equal(latest.entries.length, 200);
+    assert.ok(latest.continuation);
+    const interior = readReverseTranscriptPage(file, { continuation: latest.continuation! });
+    assert.equal(interior.entries[0]?.id, "huge-interior");
+    assert.equal(interior.entries[0]?.customType, "wayang-transcript-event-placeholder-v1");
+    assert.ok(interior.continuation);
+    const earliest = readReverseTranscriptPage(file, { continuation: interior.continuation! });
+    assert.deepEqual(earliest.entries.map((entry) => entry.id), ["root"]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("reverse boundary scan ceiling fails with a typed bounded error", () => {
+  const { dir, file } = fixture([header(), message("too-wide", null, "x".repeat(4_096))]);
+  try {
+    assert.throws(
+      () => readReverseTranscriptPage(file, { maxScanBytes: 512, maxBoundaryScanBytes: 1_024 }),
+      (error) => error instanceof TranscriptPhysicalRowUnsupportedError
+        && error.code === "transcript_physical_row_unsupported",
+    );
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -213,6 +251,35 @@ test("structural builds are isolated by session, canonical path, and revision", 
     fs.rmSync(firstFixture.dir, { recursive: true, force: true });
     fs.rmSync(secondFixture.dir, { recursive: true, force: true });
     fs.rmSync(dbDir, { recursive: true, force: true });
+  }
+});
+
+test("large append bypasses synchronous append refresh and yields to worker build", async () => {
+  const { dir, file } = fixture([header(), message("root", null, "root")]);
+  let appendRefreshes = 0;
+  let workerPublications = 0;
+  const index = new StructuralTranscriptIndex(path.join(dir, "transcript-index.db"), {
+    onAppendRefreshForTests() { appendRefreshes++; },
+    beforePublishForTests() { workerPublications++; },
+  });
+  try {
+    await index.ensure("large-append", file);
+    workerPublications = 0;
+    fs.appendFileSync(file, JSON.stringify(message("large", "root", "a".repeat(1024 * 1024 + 64 * 1024))) + "\n");
+    let eventLoopTurnObserved = false;
+    const refresh = index.ensure("large-append", file);
+    await new Promise<void>((resolve) => setImmediate(() => {
+      eventLoopTurnObserved = true;
+      resolve();
+    }));
+    const revision = await refresh;
+    assert.equal(eventLoopTurnObserved, true);
+    assert.equal(appendRefreshes, 0);
+    assert.equal(workerPublications, 1);
+    assert.equal(revision.branchTipId, "large");
+  } finally {
+    await index.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

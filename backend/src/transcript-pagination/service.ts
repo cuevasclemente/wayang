@@ -11,6 +11,7 @@ import { TranscriptCursorError, TranscriptCursorRegistry } from "./cursor-regist
 import {
   readReverseTranscriptPage,
   readTranscriptFileRevision,
+  TranscriptPhysicalRowUnsupportedError,
   sameTranscriptIdentity,
   TRANSCRIPT_PAGE_MAX_BYTES,
   TRANSCRIPT_PAGE_MAX_ROWS,
@@ -144,6 +145,21 @@ function boundedSerialization(
   };
 }
 
+function streamingMessagePlaceholder(encodedBytes: number): SerializedMessage {
+  return {
+    type: "assistant",
+    message: {
+      role: "assistant",
+      content: [{
+        type: "text",
+        text: "The in-progress assistant message is too large to include in this bounded snapshot.",
+      }],
+      streamingPlaceholder: true,
+      encodedBytes,
+    },
+  };
+}
+
 function boundedStreamingMessage(message: SerializedMessage | null | undefined): SerializedMessage | undefined {
   if (!message) return undefined;
   const idLessMessage: SerializedMessage = { type: message.type };
@@ -153,7 +169,7 @@ function boundedStreamingMessage(message: SerializedMessage | null | undefined):
   const encodedBytes = Buffer.byteLength(JSON.stringify(idLessMessage));
   return encodedBytes <= TRANSCRIPT_STREAMING_MESSAGE_BUDGET
     ? idLessMessage
-    : rowPlaceholder(idLessMessage, encodedBytes);
+    : streamingMessagePlaceholder(encodedBytes);
 }
 
 function boundedReverseContinuation(
@@ -209,12 +225,12 @@ export class TranscriptPaginationService {
       try { return await this.openAround(input, input.anchorId); }
       catch {
         void this.index.ensure(input.sessionId, input.sessionFile!).catch(() => undefined);
-        const latest = this.openLatest({ ...input, intent: "latest" });
+        const latest = this.openLatestWithStructuralFallback({ ...input, intent: "latest" });
         latest.anchor = { requested_id: input.anchorId, resolved_id: null, status: "pending" };
         return latest;
       }
     }
-    return this.openLatest(input);
+    return this.openLatestWithStructuralFallback(input);
   }
 
   async page(input: PageTranscriptWindowInput): Promise<TranscriptWindowMessage> {
@@ -231,7 +247,21 @@ export class TranscriptPaginationService {
     if (record.state.filePath !== input.sessionFile) throw new TranscriptCursorError("session_mismatch");
     if (record.state.kind === "reverse") {
       if (input.direction !== "before") throw new TranscriptCursorError("direction_mismatch");
-      const reverse = readReverseTranscriptPage(input.sessionFile, { continuation: record.state.continuation });
+      let reverse: ReturnType<typeof readReverseTranscriptPage>;
+      try {
+        reverse = readReverseTranscriptPage(input.sessionFile, { continuation: record.state.continuation });
+      } catch (error) {
+        if (!(error instanceof TranscriptPhysicalRowUnsupportedError)) throw error;
+        const indexed = record.state.continuation.nextAncestorId
+          ? this.index.tryBeforeEventCurrent(
+              input.sessionId, input.sessionFile, record.state.continuation.nextAncestorId, TRANSCRIPT_PAGE_MAX_ROWS,
+            )
+          : null;
+        if (!indexed) throw error;
+        return this.indexedMessage(
+          { ...input, intent: "latest", reason: "prepend" }, indexed, "latest", expectedEpoch,
+        );
+      }
       const priorCold = this.coldEpochs.get(input.sessionId);
       const tailProbe = priorCold && priorCold.revision.size !== reverse.revision.size
         ? readReverseTranscriptPage(input.sessionFile, { maxRows: TRANSCRIPT_PAGE_MAX_ROWS })
@@ -288,6 +318,11 @@ export class TranscriptPaginationService {
     } catch { return false; }
   }
 
+  discardSelection(sessionId: string, selectionId: string): void {
+    this.cursors.invalidateSelection(sessionId, selectionId);
+    this.selectionEpochs.delete(this.selectionKey(sessionId, selectionId));
+  }
+
   invalidateSession(sessionId: string): void {
     this.cursors.invalidateSession(sessionId);
     this.coldEpochs.delete(sessionId);
@@ -301,6 +336,30 @@ export class TranscriptPaginationService {
     this.selectionEpochs.clear();
     if (this.sharedIndex) await closeStructuralTranscriptIndex();
     else await this.index.close();
+  }
+
+  private openLatestWithStructuralFallback(input: OpenTranscriptWindowInput): TranscriptWindowMessage {
+    try { return this.openLatest(input); }
+    catch (error) {
+      if (!(error instanceof TranscriptPhysicalRowUnsupportedError) || !input.sessionFile) throw error;
+      const indexed = this.index.tryLatestCurrent(input.sessionId, input.sessionFile, TRANSCRIPT_PAGE_MAX_ROWS);
+      if (!indexed) throw error;
+      const existingCold = this.coldEpochs.get(input.sessionId);
+      const wireEpoch = existingCold && sameTranscriptIdentity(existingCold.revision, indexed.revision)
+        && existingCold.revision.size === indexed.revision.size
+        && existingCold.revision.mtimeMs === indexed.revision.mtimeMs
+        && existingCold.revision.ctimeMs === indexed.revision.ctimeMs
+        ? existingCold.transcriptEpoch
+        : indexed.revision.transcriptEpoch;
+      this.coldEpochs.set(input.sessionId, {
+        revision: indexed.revision,
+        transcriptEpoch: wireEpoch,
+        branchTipId: indexed.revision.branchTipId,
+        tailWitness: prefixTailWitness(input.sessionFile, indexed.revision.size),
+      });
+      this.selectionEpochs.set(this.selectionKey(input.sessionId, input.selectionId), wireEpoch);
+      return this.indexedMessage(input, indexed, "latest", wireEpoch);
+    }
   }
 
   private openLatest(input: OpenTranscriptWindowInput): TranscriptWindowMessage {
