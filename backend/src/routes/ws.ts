@@ -120,7 +120,7 @@ import type {
   TranscriptIntent,
   TranscriptWindowReason,
 } from "@wayang/protocol";
-import { authorizeProjectAction } from "../policy.js";
+import { authorizeProjectAction, getPolicyGeneration } from "../policy.js";
 import type { AuthService } from "../auth/service.js";
 import { prepareAttachments } from "../attachments.js";
 import { logSessionRuntimeStartFailure } from "../session-runtime-logging.js";
@@ -137,6 +137,7 @@ import {
   invalidateTranscriptPaginationSession,
 } from "../transcript-pagination/service.js";
 import { TranscriptCursorError } from "../transcript-pagination/cursor-registry.js";
+import { getDerivedTodoProjectionService } from "../transcript-pagination/derived-todo.js";
 
 export const router = Router();
 
@@ -615,6 +616,59 @@ function handleConnection(
     }
   };
 
+  const scheduleModernTodoProjection = (input: {
+    sessionId: string;
+    selectionId: string;
+    sessionFile: string | null | undefined;
+    transcriptEpoch: string;
+    version: number;
+  }): void => {
+    if (!input.sessionFile) return;
+    const exactSessionFile = input.sessionFile;
+    const expected = getSessionById(input.sessionId);
+    if (!expected || isLegacyPrivateSessionQuarantined(expected)) return;
+    const expectedPolicyGeneration = getPolicyGeneration();
+    const expectedBinding = {
+      cwd: expected.cwd,
+      projectId: expected.project_id,
+      agentProfileId: expected.agent_profile_id,
+      sessionFile: expected.pi_session_file,
+    };
+    if (expectedBinding.sessionFile !== exactSessionFile) return;
+    void getDerivedTodoProjectionService().project(exactSessionFile).then((projection) => {
+      if (!projection || !alive || input.version !== setupVersion
+        || currentSessionId !== input.sessionId || currentSelectionId !== input.selectionId
+        || getPolicyGeneration() !== expectedPolicyGeneration) return;
+      const current = getSessionById(input.sessionId);
+      if (!current || isLegacyPrivateSessionQuarantined(current)
+        || current.cwd !== expectedBinding.cwd
+        || current.project_id !== expectedBinding.projectId
+        || current.agent_profile_id !== expectedBinding.agentProfileId
+        || current.pi_session_file !== expectedBinding.sessionFile) return;
+      const authorization = authorizeProjectAction({
+        cwd: current.cwd,
+        actor: "interactive",
+        agentProfileId: current.agent_profile_id,
+      });
+      if (!authorization.allowed
+        || authorization.project?.id !== current.project_id
+        || authorization.agentProfile?.id !== current.agent_profile_id
+        || !getTranscriptPaginationService().isDerivedProjectionCurrent(
+          input.sessionId,
+          exactSessionFile,
+          input.transcriptEpoch,
+          projection.fingerprint,
+        )) return;
+      sendSafe(ws, {
+        ...projection.todoState,
+        session_id: input.sessionId,
+        selection_id: input.selectionId,
+      });
+    }).catch(() => {
+      // A failed/stale projection is withheld; never overwrite with empty state.
+    });
+  };
+
   const startFilePoll = (
     nextSessionId: string,
     sessionFile: string | null | undefined,
@@ -662,6 +716,13 @@ function handleConnection(
             if (!alive || version !== setupVersion) return;
             wsProfile(nextSessionId, "file_poll_window_loaded", `duration=${elapsedMs(historyStart)} messages=${window.message_count}`);
             sendSafe(ws, window);
+            scheduleModernTodoProjection({
+              sessionId: nextSessionId,
+              selectionId,
+              sessionFile,
+              transcriptEpoch: window.transcript_epoch,
+              version,
+            });
           }).catch(() => {
             // A racing external rewrite is retried by the next poll; stale pages
             // are never replaced by an unbounded fallback.
@@ -1183,9 +1244,15 @@ function handleConnection(
                 messages: [],
               });
               wsProfile(nextSessionId, "sent_transcript_window", `duration=${elapsedMs(fileHistoryStart)} messages=${window.message_count}`);
-              // Modern read-only attach deliberately defers whole-transcript
-              // todo/title projection. Live/runtime events remain authoritative;
-              // legacy clients retain their complete snapshot projection below.
+              scheduleModernTodoProjection({
+                sessionId: nextSessionId,
+                selectionId,
+                sessionFile: sessionInfo.pi_session_file,
+                transcriptEpoch: window.transcript_epoch,
+                version,
+              });
+              // Modern auto-title catch-up remains deliberately deferred.
+              // Legacy clients retain their complete snapshot projection below.
             } else {
               const snapshot = getSessionFileSnapshot(sessionInfo.pi_session_file, sessionInfo.cwd);
               const messages = snapshot?.messages ?? [];

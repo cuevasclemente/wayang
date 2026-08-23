@@ -10,6 +10,7 @@ import { serializeHistoryEntries, type SerializedMessage } from "../pi-bridge.js
 import { TranscriptCursorError, TranscriptCursorRegistry } from "./cursor-registry.js";
 import {
   readReverseTranscriptPage,
+  readTranscriptFileRevision,
   sameTranscriptIdentity,
   TRANSCRIPT_PAGE_MAX_BYTES,
   TRANSCRIPT_PAGE_MAX_ROWS,
@@ -264,6 +265,27 @@ export class TranscriptPaginationService {
     if (selection.revision.transcriptEpoch !== record.state.indexEpoch) throw new TranscriptCursorError("epoch_mismatch");
     return this.indexedMessage({ ...input, intent: "latest", reason: input.direction === "before" ? "prepend" : "append" }, selection,
       input.direction === "before" ? "latest" : "earliest", expectedEpoch);
+  }
+
+  isDerivedProjectionCurrent(
+    sessionId: string,
+    filePath: string,
+    transcriptEpoch: string,
+    fingerprint: TranscriptFileRevision,
+  ): boolean {
+    const state = this.coldEpochs.get(sessionId);
+    if (!state || state.transcriptEpoch !== transcriptEpoch
+      || state.revision.size !== fingerprint.size
+      || state.revision.mtimeMs !== fingerprint.mtimeMs
+      || state.revision.ctimeMs !== fingerprint.ctimeMs
+      || !sameTranscriptIdentity(state.revision, fingerprint)) return false;
+    try {
+      const current = readTranscriptFileRevision(filePath);
+      return current.size === fingerprint.size
+        && current.mtimeMs === fingerprint.mtimeMs
+        && current.ctimeMs === fingerprint.ctimeMs
+        && sameTranscriptIdentity(current, fingerprint);
+    } catch { return false; }
   }
 
   invalidateSession(sessionId: string): void {
