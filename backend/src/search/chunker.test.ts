@@ -179,6 +179,30 @@ test("keeps adjacent searchable messages on exact message-bound chunks", async (
   assert.ok(transcriptChunks.every((chunk) => !(chunk.text.includes("User:") && chunk.text.includes("Assistant:"))));
 });
 
+test("fingerprint rejection closes its descriptor before the promise settles", async () => {
+  const file = tempFile("fingerprint-race.jsonl", [
+    JSON.stringify({ type: "session", version: 3, id: "s-race", cwd: "/tmp/proj" }),
+    JSON.stringify({ type: "message", id: "m1", message: { role: "user", content: "before" } }),
+  ]);
+  const stat = fs.statSync(file);
+  const expectedFingerprint = {
+    ino: Number(stat.ino) || 0,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+  };
+  fs.appendFileSync(file, JSON.stringify({
+    type: "message", id: "m2", message: { role: "assistant", content: "after" },
+  }) + "\n");
+  await assert.rejects(
+    chunkJsonlFile(file, baseMeta, { expectedFingerprint }),
+    /changed before search indexing/,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  fs.writeFileSync(file, "", "utf8");
+  assert.equal(fs.readFileSync(file, "utf8"), "");
+});
+
 test("recovers from malformed lines without aborting", async () => {
   const lines = [
     "this is not json",
