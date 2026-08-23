@@ -465,6 +465,7 @@ export async function buildRevisionExactLiveWindow<T>(input: {
   build: (boundary: RevisionExactWindowBoundary) => Promise<T>;
   isCurrent: (boundary: RevisionExactWindowBoundary) => boolean;
   discard: () => void;
+  fallback?: (boundary: RevisionExactWindowBoundary) => T;
 }): Promise<T | null> {
   const maxAttempts = Math.max(1, Math.min(input.maxAttempts ?? 3, 3));
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -483,7 +484,14 @@ export async function buildRevisionExactLiveWindow<T>(input: {
     if (input.isCurrent(boundary)) return projection;
     input.discard();
   }
-  return null;
+  if (!input.fallback) return null;
+  let boundary: RevisionExactWindowBoundary;
+  try { boundary = input.capture(); }
+  catch {
+    input.discard();
+    return null;
+  }
+  return input.fallback(boundary);
 }
 
 /** @internal Shared wire projection used by every selected client. */
@@ -950,6 +958,18 @@ function handleConnection(
       discard: () => {
         if (selectionId) getTranscriptPaginationService().discardSelection(nextSessionId, selectionId);
       },
+      ...(reason === "initial" && intent === "around" && anchorId && selectionId ? {
+        fallback: (boundary: RevisionExactWindowBoundary) => getTranscriptPaginationService().openLatestPendingSync({
+          sessionId: nextSessionId,
+          selectionId,
+          sessionFile: boundary.sessionFile,
+          intent: "latest",
+          reason: "initial",
+          streamingAtSnapshot: Boolean(liveHandle.session.isStreaming),
+          compactingAtSnapshot: Boolean(liveHandle.session.isCompacting),
+          streamingMessage: boundary.streamingMessage,
+        }, anchorId),
+      } : {}),
     });
 
     if (!liveHandle.session.isStreaming) {

@@ -113,6 +113,50 @@ test("delayed around retry atomically replaces persisted overlay and pre-boundar
   assert.deepEqual(buffered, [{ type: "text_delta", delta: "later" }]);
 });
 
+test("continuously changing around attach falls back to fresh usable latest pending window", async () => {
+  let revision = 0;
+  const buffered: any[] = [];
+  let attempts = 0;
+  let fallbackCaptures = 0;
+  const fingerprint = (size: number) => ({
+    device: 1, inode: 1, size, mtimeMs: size, ctimeMs: size,
+    headerDigest: "header", mutationEpoch: "epoch",
+  });
+  const result = await buildRevisionExactLiveWindow({
+    maxAttempts: 3,
+    capture: () => ({
+      sessionFile: "/synthetic/session.jsonl",
+      revision: fingerprint(revision),
+      streamingMessage: captureTranscriptWindowStreamingBoundary(null, buffered),
+    }),
+    async build() {
+      attempts++;
+      revision++;
+      buffered.push({ type: "message_end", message: { role: "assistant" } });
+      return { messages: [`stale-${attempts}`] };
+    },
+    isCurrent: (boundary) => boundary.revision?.size === revision,
+    discard: () => undefined,
+    fallback: (boundary) => {
+      fallbackCaptures++;
+      buffered.push({ type: "text_delta", delta: "post-fallback" });
+      return {
+        messages: ["latest-persisted"],
+        streamingMessage: boundary.streamingMessage,
+        anchor: { requested_id: "old-match", resolved_id: null, status: "pending" as const },
+      };
+    },
+  });
+  assert.equal(attempts, 3);
+  assert.equal(fallbackCaptures, 1);
+  assert.deepEqual(result, {
+    messages: ["latest-persisted"],
+    streamingMessage: null,
+    anchor: { requested_id: "old-match", resolved_id: null, status: "pending" },
+  });
+  assert.deepEqual(buffered, [{ type: "text_delta", delta: "post-fallback" }]);
+});
+
 test("window-v1 negotiation is explicit and selection-bound", () => {
   assert.deepEqual(parseTranscriptNegotiation(new URLSearchParams(), "selection"), {
     protocol: null,

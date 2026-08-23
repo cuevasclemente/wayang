@@ -236,6 +236,13 @@ export class TranscriptPaginationService {
     return this.openLatestWithStructuralFallback(input);
   }
 
+  openLatestPendingSync(input: OpenTranscriptWindowInput, requestedAnchorId: string): TranscriptWindowMessage {
+    const latest = this.openLatestWithStructuralFallback({ ...input, intent: "latest" });
+    latest.anchor = { requested_id: requestedAnchorId, resolved_id: null, status: "pending" };
+    if (input.sessionFile) void this.index.ensure(input.sessionId, input.sessionFile).catch(() => undefined);
+    return latest;
+  }
+
   async page(input: PageTranscriptWindowInput): Promise<TranscriptWindowMessage> {
     if (!input.sessionFile) throw new TranscriptCursorError("unknown_cursor");
     const selectionKey = this.selectionKey(input.sessionId, input.selectionId);

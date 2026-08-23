@@ -14,6 +14,10 @@ import {
 
 const INDEX_SCHEMA_VERSION = 1;
 const TAIL_WITNESS_BYTES = 4_096;
+export const TRANSCRIPT_INDEX_MAX_TOPOLOGY_ENTRIES = 25_000;
+const TRANSCRIPT_INDEX_PUBLISH_BATCH_SIZE = 1_000;
+const TRANSCRIPT_INDEX_MAX_WORKER_CONCURRENCY = 2;
+const TRANSCRIPT_INDEX_MAX_QUEUED_BUILDS = 64;
 export const TRANSCRIPT_INDEX_MAX_READ_BYTES = 384 * 1024;
 export const TRANSCRIPT_APPEND_REFRESH_MAX_BYTES = 1024 * 1024;
 
@@ -81,7 +85,11 @@ const WORKER_SOURCE = String.raw`
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { parentPort, workerData } = require("node:worker_threads");
+if (workerData.delayMs > 0) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, workerData.delayMs);
+}
 const READ_CHUNK_BYTES = 64 * 1024;
+const MAX_TOPOLOGY_ENTRIES = ${TRANSCRIPT_INDEX_MAX_TOPOLOGY_ENTRIES};
 const TAIL_WITNESS_BYTES = ${TAIL_WITNESS_BYTES};
 function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest("hex"); }
 function visible(e) {
@@ -105,6 +113,7 @@ try {
   if (!before.isFile()) throw new Error("Transcript is not a regular file");
 
   const entries = [];
+  let topologyLimitExceeded = false;
   let branchTipId = null;
   let ordinal = 0;
   let lineStartOffset = 0;
@@ -136,7 +145,9 @@ try {
         const value = JSON.parse(raw.toString("utf8"));
         if (value && typeof value.id === "string") {
           const eventType = typeof value.type === "string" ? value.type : "unknown";
-          entries.push({
+          if (entries.length >= MAX_TOPOLOGY_ENTRIES) {
+            topologyLimitExceeded = true;
+          } else entries.push({
             eventId: value.id,
             parentId: typeof value.parentId === "string" ? value.parentId : null,
             physicalOrdinal: ordinal,
@@ -208,7 +219,7 @@ try {
   const newest = [];
   const seen = new Set();
   let current = branchTipId;
-  let error = duplicate ? "duplicate_event_id" : null;
+  let error = topologyLimitExceeded ? "topology_entry_limit" : duplicate ? "duplicate_event_id" : null;
   while (current) {
     if (seen.has(current)) { error = error || "cyclic_parent_topology"; break; }
     seen.add(current);
@@ -260,16 +271,15 @@ function structuralBuildKey(sessionId: string, filePath: string, revision: Trans
   ]);
 }
 
-function workerBuild(filePath: string): Promise<WorkerResult> {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { filePath } });
-    worker.once("message", (message: WorkerResult & { workerError?: string }) => {
-      void worker.terminate();
-      if (message.workerError) reject(new Error(message.workerError));
-      else resolve(message);
-    });
-    worker.once("error", reject);
-  });
+interface StructuralWorkerTask {
+  key: string;
+  sessionId: string;
+  filePath: string;
+  promise: Promise<WorkerResult>;
+  resolve: (result: WorkerResult) => void;
+  reject: (error: Error) => void;
+  cancelled: boolean;
+  cancelWorker?: () => void;
 }
 
 export interface StructuralTranscriptIndexOptions {
@@ -277,12 +287,23 @@ export interface StructuralTranscriptIndexOptions {
   beforePublishForTests?: (sessionId: string, filePath: string) => void | Promise<void>;
   /** @internal Proves the synchronous append seam was selected. */
   onAppendRefreshForTests?: (sessionId: string, appendedBytes: number) => void;
+  workerTimeoutMs?: number;
+  /** @internal Worker-side delay for concurrency/timeout tests. */
+  workerDelayMsForTests?: number;
+  /** @internal Called after each staged SQL publication batch. */
+  afterPublishBatchForTests?: (sessionId: string, batchNumber: number) => void | Promise<void>;
 }
 
 export class StructuralTranscriptIndex {
   private readonly db: DatabaseType;
   private readonly builds = new Map<string, Promise<StructuralIndexRevision>>();
   private readonly latestBuildKeys = new Map<string, string>();
+  private readonly workerQueue: StructuralWorkerTask[] = [];
+  private readonly activeWorkerTasks = new Map<string, StructuralWorkerTask>();
+  private activeWorkerCount = 0;
+  private peakWorkerCount = 0;
+  private workerTimeouts = 0;
+  private workersStarted = 0;
   private readonly invalidationGenerations = new Map<string, number>();
   private lastSourceBytesRead = 0;
   private totalSourceBytesRead = 0;
@@ -305,10 +326,15 @@ export class StructuralTranscriptIndex {
     const current = readTranscriptFileRevision(canonicalPath);
     const key = structuralBuildKey(sessionId, canonicalPath, current);
     this.latestBuildKeys.set(sessionId, key);
+    this.cancelSupersededWorkerTasks(sessionId, key);
     const existingBuild = this.builds.get(key);
     if (existingBuild) return existingBuild;
     const stored = this.readRevision(sessionId);
-    if (stored && stored.filePath === canonicalPath && revisionsExactlyEqual(stored, current)) return stored;
+    if (stored && stored.filePath === canonicalPath && revisionsExactlyEqual(stored, current)
+      && (stored.complete || stored.error !== "building")) return stored;
+    if (stored?.error === "building") {
+      this.db.prepare("DELETE FROM transcript_revisions WHERE session_id=?").run(sessionId);
+    }
     if (stored && stored.filePath === canonicalPath && current.size > stored.indexedSize
       && current.size - stored.indexedSize <= TRANSCRIPT_APPEND_REFRESH_MAX_BYTES
       && sameTranscriptIdentity(stored, current) && this.canAppend(stored, canonicalPath)) {
@@ -624,11 +650,139 @@ export class StructuralTranscriptIndex {
   }
 
   async close(): Promise<void> {
+    for (const task of this.workerQueue.splice(0)) {
+      task.cancelled = true;
+      task.reject(new Error("Structural index closed"));
+    }
+    for (const task of this.activeWorkerTasks.values()) {
+      task.cancelled = true;
+      task.cancelWorker?.();
+    }
     const pending = [...this.builds.values()];
     await Promise.allSettled(pending);
     this.builds.clear();
     this.latestBuildKeys.clear();
+    this.activeWorkerTasks.clear();
     try { this.db.close(); } catch { /* already closed */ }
+  }
+
+  getWorkerInstrumentation(): {
+    active: number;
+    peakActive: number;
+    queued: number;
+    timeouts: number;
+    workersStarted: number;
+  } {
+    return {
+      active: this.activeWorkerCount,
+      peakActive: this.peakWorkerCount,
+      queued: this.workerQueue.length,
+      timeouts: this.workerTimeouts,
+      workersStarted: this.workersStarted,
+    };
+  }
+
+  private cancelSupersededWorkerTasks(sessionId: string, currentKey: string): void {
+    for (let index = this.workerQueue.length - 1; index >= 0; index--) {
+      const task = this.workerQueue[index];
+      if (task.sessionId !== sessionId || task.key === currentKey) continue;
+      this.workerQueue.splice(index, 1);
+      task.cancelled = true;
+      task.reject(new Error("Structural index build superseded"));
+    }
+    for (const task of this.activeWorkerTasks.values()) {
+      if (task.sessionId !== sessionId || task.key === currentKey) continue;
+      task.cancelled = true;
+      task.cancelWorker?.();
+    }
+  }
+
+  private scheduleWorkerBuild(sessionId: string, filePath: string, key: string): Promise<WorkerResult> {
+    let resolveTask!: (result: WorkerResult) => void;
+    let rejectTask!: (error: Error) => void;
+    const promise = new Promise<WorkerResult>((resolve, reject) => {
+      resolveTask = resolve;
+      rejectTask = reject;
+    });
+    const task: StructuralWorkerTask = {
+      key, sessionId, filePath, promise,
+      resolve: resolveTask,
+      reject: rejectTask,
+      cancelled: false,
+    };
+    if (this.workerQueue.length >= TRANSCRIPT_INDEX_MAX_QUEUED_BUILDS) {
+      const evicted = this.workerQueue.shift()!;
+      evicted.cancelled = true;
+      evicted.reject(new Error("Structural index build queue is full"));
+    }
+    this.workerQueue.push(task);
+    this.pumpWorkerQueue();
+    return promise;
+  }
+
+  private pumpWorkerQueue(): void {
+    while (this.activeWorkerCount < TRANSCRIPT_INDEX_MAX_WORKER_CONCURRENCY && this.workerQueue.length > 0) {
+      const task = this.workerQueue.shift()!;
+      if (task.cancelled) continue;
+      this.activeWorkerCount++;
+      this.peakWorkerCount = Math.max(this.peakWorkerCount, this.activeWorkerCount);
+      this.activeWorkerTasks.set(task.key, task);
+      void this.executeWorkerTask(task).finally(() => {
+        this.activeWorkerTasks.delete(task.key);
+        this.activeWorkerCount = Math.max(0, this.activeWorkerCount - 1);
+        this.pumpWorkerQueue();
+      });
+    }
+  }
+
+  private async executeWorkerTask(task: StructuralWorkerTask): Promise<void> {
+    try {
+      const result = await new Promise<WorkerResult>((resolve, reject) => {
+        this.workersStarted++;
+        const worker = new Worker(WORKER_SOURCE, {
+          eval: true,
+          workerData: { filePath: task.filePath, delayMs: Math.max(0, this.options.workerDelayMsForTests ?? 0) },
+          resourceLimits: { maxOldGenerationSizeMb: 64, maxYoungGenerationSizeMb: 16, stackSizeMb: 2 },
+        });
+        let settled = false;
+        let timer: NodeJS.Timeout | null = null;
+        const terminate = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          void worker.terminate().finally(() => reject(error));
+        };
+        task.cancelWorker = () => terminate(new Error("Structural index build cancelled"));
+        const timeoutMs = Math.max(100, Math.min(this.options.workerTimeoutMs ?? 30_000, 120_000));
+        timer = setTimeout(() => {
+          this.workerTimeouts++;
+          terminate(new Error("Structural index worker timed out"));
+        }, timeoutMs);
+        timer.unref?.();
+        worker.once("message", (message: WorkerResult & { workerError?: string }) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          task.cancelWorker = undefined;
+          void worker.terminate().finally(() => {
+            if (message.workerError) reject(new Error(message.workerError));
+            else resolve(message);
+          });
+        });
+        worker.once("error", (error) => terminate(
+          error instanceof Error ? error : new Error(String(error)),
+        ));
+        worker.once("exit", () => {
+          if (!settled) terminate(new Error("Structural index worker exited unexpectedly"));
+        });
+      });
+      if (task.cancelled) throw new Error("Structural index build cancelled");
+      task.resolve(result);
+    } catch (error) {
+      task.reject(error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      task.cancelWorker = undefined;
+    }
   }
 
   private migrate(): void {
@@ -666,7 +820,7 @@ export class StructuralTranscriptIndex {
 
   private async fullBuild(sessionId: string, filePath: string, buildKey: string): Promise<StructuralIndexRevision> {
     const generation = this.invalidationGenerations.get(sessionId) ?? 0;
-    const result = await workerBuild(filePath);
+    const result = await this.scheduleWorkerBuild(sessionId, filePath, buildKey);
     await this.options.beforePublishForTests?.(sessionId, filePath);
     if ((this.invalidationGenerations.get(sessionId) ?? 0) !== generation
       || this.latestBuildKeys.get(sessionId) !== buildKey) {
@@ -678,32 +832,92 @@ export class StructuralTranscriptIndex {
       throw new Error("Transcript changed before structural index publication");
     }
     const epoch = randomUUID();
-    this.publish(sessionId, filePath, epoch, result);
+    try {
+      await this.publishStaged(sessionId, filePath, epoch, result, generation, buildKey);
+    } catch (error) {
+      this.db.prepare("DELETE FROM transcript_revisions WHERE session_id=? AND transcript_epoch=?").run(sessionId, epoch);
+      throw error;
+    }
     return this.readRevision(sessionId)!;
   }
 
-  private publish(sessionId: string, filePath: string, epoch: string, result: WorkerResult): void {
-    const byId = new Map(result.entries.map((entry) => [entry.eventId, entry]));
+  private assertBuildCurrent(
+    sessionId: string,
+    filePath: string,
+    generation: number,
+    buildKey: string,
+    expected: TranscriptFileRevision,
+  ): void {
+    if ((this.invalidationGenerations.get(sessionId) ?? 0) !== generation
+      || this.latestBuildKeys.get(sessionId) !== buildKey) {
+      throw new Error("Transcript structural index build was invalidated");
+    }
+    const current = readTranscriptFileRevision(filePath);
+    if (!revisionsExactlyEqual(expected, current)
+      || structuralBuildKey(sessionId, filePath, current) !== buildKey) {
+      throw new Error("Transcript changed during staged structural publication");
+    }
+  }
+
+  private async publishStaged(
+    sessionId: string,
+    filePath: string,
+    epoch: string,
+    result: WorkerResult,
+    generation: number,
+    buildKey: string,
+  ): Promise<void> {
+    this.assertBuildCurrent(sessionId, filePath, generation, buildKey, result.revision);
     this.db.transaction(() => {
-      this.db.prepare("DELETE FROM transcript_revisions WHERE session_id = ?").run(sessionId);
-      this.db.prepare(
-        `INSERT INTO transcript_revisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      ).run(sessionId, filePath, result.revision.device, result.revision.inode, result.revision.size,
+      this.db.prepare("DELETE FROM transcript_revisions WHERE session_id=?").run(sessionId);
+      this.db.prepare(`INSERT INTO transcript_revisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        sessionId, filePath, result.revision.device, result.revision.inode, result.revision.size,
         result.revision.mtimeMs, result.revision.ctimeMs, result.revision.headerDigest, result.revision.mutationEpoch,
-        epoch, result.branchTipId, result.revision.size, result.complete ? 1 : 0, result.error,
-        result.endedNewline ? 1 : 0, result.tailDigest);
-      const insertEntry = this.db.prepare(`INSERT INTO transcript_entries VALUES (?,?,?,?,?,?,?,?,?,?)`);
-      for (const entry of result.entries) insertEntry.run(sessionId, epoch, entry.eventId, entry.parentId,
-        entry.physicalOrdinal, entry.sourceOffset, entry.sourceLength, entry.eventType, entry.displayClass, entry.visible);
-      const insertActive = this.db.prepare(`INSERT INTO active_branch_entries VALUES (?,?,?,?,?,?,?)`);
-      let visibleOrdinal = 0;
-      result.activeIds.forEach((eventId, activeOrdinal) => {
-        const entry = byId.get(eventId);
-        if (!entry) return;
-        const visible = entry.visible ? visibleOrdinal++ : null;
-        insertActive.run(sessionId, epoch, activeOrdinal, visible, eventId, entry.sourceOffset, entry.sourceLength);
-      });
+        epoch, result.branchTipId, result.revision.size, 0, "building",
+        result.endedNewline ? 1 : 0, result.tailDigest,
+      );
     })();
+
+    const insertEntry = this.db.prepare(`INSERT INTO transcript_entries VALUES (?,?,?,?,?,?,?,?,?,?)`);
+    let batchNumber = 0;
+    for (let offset = 0; offset < result.entries.length; offset += TRANSCRIPT_INDEX_PUBLISH_BATCH_SIZE) {
+      this.assertBuildCurrent(sessionId, filePath, generation, buildKey, result.revision);
+      const batch = result.entries.slice(offset, offset + TRANSCRIPT_INDEX_PUBLISH_BATCH_SIZE);
+      this.db.transaction(() => {
+        for (const entry of batch) insertEntry.run(sessionId, epoch, entry.eventId, entry.parentId,
+          entry.physicalOrdinal, entry.sourceOffset, entry.sourceLength, entry.eventType, entry.displayClass, entry.visible);
+      })();
+      batchNumber++;
+      await this.options.afterPublishBatchForTests?.(sessionId, batchNumber);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    const byId = new Map(result.entries.map((entry) => [entry.eventId, entry]));
+    const insertActive = this.db.prepare(`INSERT INTO active_branch_entries VALUES (?,?,?,?,?,?,?)`);
+    let visibleOrdinal = 0;
+    for (let offset = 0; offset < result.activeIds.length; offset += TRANSCRIPT_INDEX_PUBLISH_BATCH_SIZE) {
+      this.assertBuildCurrent(sessionId, filePath, generation, buildKey, result.revision);
+      const batch = result.activeIds.slice(offset, offset + TRANSCRIPT_INDEX_PUBLISH_BATCH_SIZE);
+      this.db.transaction(() => {
+        batch.forEach((eventId, index) => {
+          const entry = byId.get(eventId);
+          if (!entry) return;
+          const visible = entry.visible ? visibleOrdinal++ : null;
+          insertActive.run(sessionId, epoch, offset + index, visible, eventId, entry.sourceOffset, entry.sourceLength);
+        });
+      })();
+      batchNumber++;
+      await this.options.afterPublishBatchForTests?.(sessionId, batchNumber);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    this.assertBuildCurrent(sessionId, filePath, generation, buildKey, result.revision);
+    this.db.prepare(`UPDATE transcript_revisions SET complete=?,error=? WHERE session_id=? AND transcript_epoch=?`).run(
+      result.complete ? 1 : 0,
+      result.error,
+      sessionId,
+      epoch,
+    );
   }
 
   private canAppend(stored: StructuralIndexRevision, filePath: string): boolean {

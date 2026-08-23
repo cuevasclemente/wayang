@@ -13,6 +13,7 @@ import {
 import {
   StructuralTranscriptIndex,
   TRANSCRIPT_INDEX_MAX_READ_BYTES,
+  TRANSCRIPT_INDEX_MAX_TOPOLOGY_ENTRIES,
 } from "./structural-index.js";
 
 function fixture(lines: unknown[], separator = "\n", finalNewline = true): { dir: string; file: string } {
@@ -208,6 +209,117 @@ test("structural indexed reads enforce one aggregate source-byte budget", async 
     assert.equal(index.getReadInstrumentation().lastSourceBytesRead, read.sourceBytesRead);
     const ordinals = read.rows.map((row) => row.visibleOrdinal);
     assert.ok(ordinals.every((ordinal, position) => position === 0 || ordinal === ordinals[position - 1] + 1));
+  } finally {
+    await index.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("structural workers enforce concurrency two and bounded queue", async () => {
+  const fixtures = [0, 1, 2].map((index) => fixture([
+    { ...header(), id: `session-${index}` },
+    message(`root-${index}`, null, `root ${index}`),
+  ]));
+  const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-structural-concurrency-"));
+  const index = new StructuralTranscriptIndex(path.join(dbDir, "index.db"), {
+    workerDelayMsForTests: 250,
+    workerTimeoutMs: 2_000,
+  });
+  try {
+    const pending = fixtures.map(({ file }, number) => index.ensure(`worker-${number}`, file));
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const running = index.getWorkerInstrumentation();
+    assert.equal(running.active, 2);
+    assert.equal(running.peakActive, 2);
+    assert.equal(running.queued, 1);
+    await Promise.all(pending);
+    assert.equal(index.getWorkerInstrumentation().workersStarted, 3);
+  } finally {
+    await index.close();
+    fixtures.forEach(({ dir }) => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.rmSync(dbDir, { recursive: true, force: true });
+  }
+});
+
+test("structural worker timeout and close cancel active builds", async () => {
+  const timeoutFixture = fixture([header(), message("timeout", null, "timeout")]);
+  const timeoutIndex = new StructuralTranscriptIndex(path.join(timeoutFixture.dir, "timeout.db"), {
+    workerDelayMsForTests: 500,
+    workerTimeoutMs: 100,
+  });
+  try {
+    await assert.rejects(timeoutIndex.ensure("timeout", timeoutFixture.file));
+    assert.equal(timeoutIndex.getWorkerInstrumentation().timeouts, 1);
+  } finally {
+    await timeoutIndex.close();
+    fs.rmSync(timeoutFixture.dir, { recursive: true, force: true });
+  }
+
+  const closeFixture = fixture([header(), message("close", null, "close")]);
+  const closeIndex = new StructuralTranscriptIndex(path.join(closeFixture.dir, "close.db"), {
+    workerDelayMsForTests: 1_000,
+    workerTimeoutMs: 2_000,
+  });
+  const pending = closeIndex.ensure("close", closeFixture.file);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  await closeIndex.close();
+  await assert.rejects(pending);
+  fs.rmSync(closeFixture.dir, { recursive: true, force: true });
+});
+
+test("staged structural publication yields and recovers after mid-publish invalidation", async () => {
+  const entries: Array<ReturnType<typeof header> | ReturnType<typeof message>> = [header()];
+  let parent: string | null = null;
+  for (let number = 0; number < 2_500; number++) {
+    const id = `batch-${number}`;
+    entries.push(message(id, parent, `batch ${number}`));
+    parent = id;
+  }
+  const { dir, file } = fixture(entries);
+  let invalidateOnce = true;
+  let batchCount = 0;
+  let canaryRan = false;
+  setImmediate(() => { canaryRan = true; });
+  let index!: StructuralTranscriptIndex;
+  index = new StructuralTranscriptIndex(path.join(dir, "index.db"), {
+    afterPublishBatchForTests(sessionId) {
+      batchCount++;
+      if (invalidateOnce) {
+        invalidateOnce = false;
+        index.purge(sessionId);
+      }
+    },
+  });
+  try {
+    await assert.rejects(index.ensure("batched", file), /invalidated/u);
+    const recovered = await index.ensure("batched", file);
+    assert.equal(recovered.complete, true);
+    assert.equal(recovered.branchTipId, "batch-2499");
+    assert.ok(batchCount >= 4);
+    assert.equal(canaryRan, true);
+  } finally {
+    await index.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("structural topology result limit publishes typed incomplete revision", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-topology-limit-"));
+  const file = path.join(dir, "session.jsonl");
+  const lines = [JSON.stringify(header())];
+  let parent: string | null = null;
+  for (let number = 0; number < TRANSCRIPT_INDEX_MAX_TOPOLOGY_ENTRIES; number++) {
+    const id = `limit-${number}`;
+    lines.push(JSON.stringify(message(id, parent, "x")));
+    parent = id;
+  }
+  fs.writeFileSync(file, lines.join("\n") + "\n");
+  const index = new StructuralTranscriptIndex(path.join(dir, "index.db"));
+  try {
+    const revision = await index.ensure("limited", file);
+    assert.equal(revision.complete, false);
+    assert.equal(revision.error, "topology_entry_limit");
+    await assert.rejects(index.around("limited", file, "limit-1", 20), /incomplete/u);
   } finally {
     await index.close();
     fs.rmSync(dir, { recursive: true, force: true });
