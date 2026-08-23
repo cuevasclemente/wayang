@@ -348,34 +348,85 @@ export function transcriptWindowReducer<Message>(
 
 export const MAX_TRANSCRIPT_WINDOW_MESSAGES = 200;
 export const MAX_TRANSCRIPT_WINDOW_CONTENT_BYTES = 512 * 1024;
+export const TRANSCRIPT_PROTOCOL_STRING_LIMITS = Object.freeze({
+  sessionId: 256,
+  selectionId: 256,
+  transcriptEpoch: 256,
+  eventId: 512,
+  requestId: 256,
+  cursor: 4096,
+});
 
+export type ProtocolStringError = "not_string" | "empty" | "unsafe_chars" | "too_large";
 export type TranscriptPageErrorClass = "terminal" | "transient";
+
+const UNSAFE_PROTOCOL_STRING_RE = /[\p{Cc}\p{Cf}]/u;
+
+export function protocolStringValidationError(
+  value: unknown,
+  maxUtf8Bytes: number,
+): ProtocolStringError | null {
+  if (typeof value !== "string") return "not_string";
+  if (value.length === 0) return "empty";
+  if (UNSAFE_PROTOCOL_STRING_RE.test(value)) return "unsafe_chars";
+  return new TextEncoder().encode(value).byteLength > maxUtf8Bytes ? "too_large" : null;
+}
 
 /**
  * Cursor and projection-identity failures cannot succeed with the same opaque
- * cursor. Unknown operational failures remain retryable so temporary I/O or
- * index availability does not unnecessarily discard a valid loaded window.
+ * cursor. Only recognized operational I/O/index availability failures retain
+ * the cursor; missing and unknown codes fail closed into a fresh selection.
  */
 export function classifyTranscriptPageErrorCode(code: unknown): TranscriptPageErrorClass {
-  if (typeof code !== "string") return "transient";
+  if (typeof code !== "string") return "terminal";
   const normalized = code.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_");
-  if (!normalized) return "transient";
-  return [
+  if (!normalized) return "terminal";
+
+  // Every current opaque-cursor binding failure requires a fresh selection;
+  // direction_mismatch is intentionally explicit because it contains neither
+  // the word cursor nor another identity marker in the backend code.
+  const terminalIdentityMarkers = [
     "cursor",
-    "revision",
-    "epoch",
-    "session",
+    "unknown_cursor",
+    "expired",
     "selection",
+    "session",
+    "direction",
+    "epoch",
     "path",
+    "revision",
     "source",
     "file",
     "branch",
     "stale",
-  ].some((identity) => normalized.includes(identity))
+  ];
+  if (
+    terminalIdentityMarkers.some((identity) => normalized.includes(identity))
     || normalized === "transcript_changed"
     || normalized === "transcript_invalidated"
-    ? "terminal"
-    : "transient";
+  ) return "terminal";
+
+  // Same-cursor retry is reserved for operational read/index availability.
+  const transientOperationalMarkers = [
+    "io_error",
+    "io_failure",
+    "read_error",
+    "read_failed",
+    "pread_error",
+    "pread_failed",
+    "index_busy",
+    "index_building",
+    "index_error",
+    "index_failed",
+    "index_not_ready",
+    "index_unavailable",
+    "database_busy",
+    "worker_unavailable",
+  ];
+  const operationalCode = transientOperationalMarkers.some((marker) => normalized.includes(marker))
+    || normalized.includes("index")
+    || /(^|_)(io|read|pread|database|worker)(_|$)/.test(normalized);
+  return operationalCode ? "transient" : "terminal";
 }
 
 function serializedBytes(value: unknown): number | null {
@@ -388,7 +439,11 @@ function serializedBytes(value: unknown): number | null {
   }
 }
 
-/** Serialized canonical rows plus the separate live overlay payload. */
+/**
+ * Exact protocol content accounting: UTF-8 bytes of JSON.stringify over the
+ * canonical `{ messages, streaming_message? }` content object. An explicitly
+ * present null overlay remains part of the serialized content.
+ */
 export function serializedTranscriptWindowContentBytes(value: {
   messages: unknown[];
   streaming_message?: unknown;
@@ -401,8 +456,13 @@ export function serializedTranscriptWindowContentBytes(value: {
   });
 }
 
-function nonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
+function protocolFieldError(
+  field: string,
+  value: unknown,
+  maxUtf8Bytes: number,
+): string | null {
+  const error = protocolStringValidationError(value, maxUtf8Bytes);
+  return error ? `${field}_${error}` : null;
 }
 
 /**
@@ -414,17 +474,48 @@ export function transcriptWindowValidationError(value: unknown): string | null {
   if (!value || typeof value !== "object") return "not_object";
   const message = value as Record<string, unknown>;
   if (message.type !== "transcript_window") return "wrong_type";
-  if (!nonEmptyString(message.session_id)) return "invalid_session_id";
-  if (message.selection_id !== undefined && !nonEmptyString(message.selection_id)) return "invalid_selection_id";
-  if (!nonEmptyString(message.transcript_epoch)) return "invalid_transcript_epoch";
-  if (message.branch_tip_id !== null && !nonEmptyString(message.branch_tip_id)) return "invalid_branch_tip_id";
+  const sessionIdError = protocolFieldError(
+    "session_id",
+    message.session_id,
+    TRANSCRIPT_PROTOCOL_STRING_LIMITS.sessionId,
+  );
+  if (sessionIdError) return sessionIdError;
+  if (message.selection_id !== undefined) {
+    const selectionIdError = protocolFieldError(
+      "selection_id",
+      message.selection_id,
+      TRANSCRIPT_PROTOCOL_STRING_LIMITS.selectionId,
+    );
+    if (selectionIdError) return selectionIdError;
+  }
+  const epochError = protocolFieldError(
+    "transcript_epoch",
+    message.transcript_epoch,
+    TRANSCRIPT_PROTOCOL_STRING_LIMITS.transcriptEpoch,
+  );
+  if (epochError) return epochError;
+  if (message.branch_tip_id !== null) {
+    const branchTipError = protocolFieldError(
+      "branch_tip_id",
+      message.branch_tip_id,
+      TRANSCRIPT_PROTOCOL_STRING_LIMITS.eventId,
+    );
+    if (branchTipError) return branchTipError;
+  }
 
   const reason = message.reason;
   if (!["initial", "prepend", "append", "tail_reconcile", "reset"].includes(String(reason))) {
     return "invalid_reason";
   }
   const pageReason = reason === "prepend" || reason === "append";
-  if (pageReason ? !nonEmptyString(message.request_id) : message.request_id !== undefined) {
+  if (pageReason) {
+    const requestIdError = protocolFieldError(
+      "request_id",
+      message.request_id,
+      TRANSCRIPT_PROTOCOL_STRING_LIMITS.requestId,
+    );
+    if (requestIdError) return requestIdError;
+  } else if (message.request_id !== undefined) {
     return "request_reason_mismatch";
   }
 
@@ -434,9 +525,15 @@ export function transcriptWindowValidationError(value: unknown): string | null {
   for (const candidate of message.messages) {
     if (!candidate || typeof candidate !== "object") return "invalid_message";
     const id = (candidate as Record<string, unknown>).id;
-    if (!nonEmptyString(id)) return "missing_message_id";
-    if (messageIds.has(id)) return "duplicate_message_id";
-    messageIds.add(id);
+    const eventIdError = protocolFieldError(
+      "message_id",
+      id,
+      TRANSCRIPT_PROTOCOL_STRING_LIMITS.eventId,
+    );
+    if (eventIdError) return eventIdError;
+    const stableId = id as string;
+    if (messageIds.has(stableId)) return "duplicate_message_id";
+    messageIds.add(stableId);
   }
 
   const streamingMessage = message.streaming_message;
@@ -477,9 +574,24 @@ export function transcriptWindowValidationError(value: unknown): string | null {
   });
   if (actualBytes === null) return "unserializable_content";
   if (actualBytes > MAX_TRANSCRIPT_WINDOW_CONTENT_BYTES) return "content_limit_exceeded";
+  if (message.payload_bytes !== actualBytes) return "payload_bytes_mismatch";
 
-  if (message.before_cursor !== null && !nonEmptyString(message.before_cursor)) return "invalid_before_cursor";
-  if (message.after_cursor !== null && !nonEmptyString(message.after_cursor)) return "invalid_after_cursor";
+  if (message.before_cursor !== null) {
+    const beforeCursorError = protocolFieldError(
+      "before_cursor",
+      message.before_cursor,
+      TRANSCRIPT_PROTOCOL_STRING_LIMITS.cursor,
+    );
+    if (beforeCursorError) return beforeCursorError;
+  }
+  if (message.after_cursor !== null) {
+    const afterCursorError = protocolFieldError(
+      "after_cursor",
+      message.after_cursor,
+      TRANSCRIPT_PROTOCOL_STRING_LIMITS.cursor,
+    );
+    if (afterCursorError) return afterCursorError;
+  }
   if (typeof message.has_older !== "boolean" || typeof message.has_newer !== "boolean") return "invalid_edge_flags";
   const beforeEdgeConsistent = message.has_older === (message.before_cursor !== null);
   const afterEdgeConsistent = message.has_newer === (message.after_cursor !== null);
@@ -503,13 +615,23 @@ export function transcriptWindowValidationError(value: unknown): string | null {
       return "anchor_reason_mismatch";
     }
     const record = anchor as Record<string, unknown>;
-    if (!nonEmptyString(record.requested_id)) return "invalid_anchor_requested_id";
+    const requestedAnchorError = protocolFieldError(
+      "anchor_requested_id",
+      record.requested_id,
+      TRANSCRIPT_PROTOCOL_STRING_LIMITS.eventId,
+    );
+    if (requestedAnchorError) return requestedAnchorError;
     if (!["found", "missing", "off_branch", "pending"].includes(String(record.status))) {
       return "invalid_anchor_status";
     }
     if (record.status === "found") {
-      if (!nonEmptyString(record.resolved_id)) return "found_anchor_without_resolution";
-      if (!messageIds.has(record.resolved_id)) return "resolved_anchor_not_in_window";
+      const resolvedAnchorError = protocolFieldError(
+        "anchor_resolved_id",
+        record.resolved_id,
+        TRANSCRIPT_PROTOCOL_STRING_LIMITS.eventId,
+      );
+      if (resolvedAnchorError) return resolvedAnchorError;
+      if (!messageIds.has(record.resolved_id as string)) return "resolved_anchor_not_in_window";
     } else if (record.resolved_id !== null) {
       return "unavailable_anchor_has_resolution";
     }
