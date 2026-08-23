@@ -3,10 +3,26 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { commitStoreMutation, getStore, flush, type SessionRow } from "./db.js";
-import { SessionCatalog, type CatalogScanCommit, type CatalogScanResult } from "./session-catalog.js";
+import { commitStoreMutation, getStore, flush, type SessionRow, type StoreData } from "./db.js";
+import {
+  SessionCatalog,
+  type CatalogDurableSession,
+  type CatalogScanCommit,
+  type CatalogScanResult,
+} from "./session-catalog.js";
 import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
-import { ensureProjectForCwd, ensureProjectForCwdDraft, resolveEffectiveSessionDefaults } from "./projects.js";
+import {
+  authorizeExactStandardTranscript,
+  classifyExternalStandardTranscriptHeader,
+  universallyDeniedTranscriptPath,
+  type BoundedSessionHeader,
+} from "./standard-transcript-authorization.js";
+import {
+  ensureProjectForCwd,
+  ensureProjectForCwdDraft,
+  resolveEffectiveSessionDefaults,
+} from "./projects.js";
+import { authorizeProjectAction } from "./policy.js";
 import { WorkspaceStoreError, type PendingAgentSwitch, type SessionTitleSource } from "./workspace-types.js";
 import { isProjectableOpenInterview } from "./interview-attention-policy.js";
 import {
@@ -308,16 +324,127 @@ function markDirectMutation(row: SessionRow, triggerScan = false): void {
   publishDirectMutation(triggerScan);
 }
 
+function classifyCatalogDurableSessionInStore(
+  store: StoreData,
+  filePath: string,
+  sessionId: string,
+  headerCwd: string,
+): CatalogDurableSession | null {
+  const canonicalPath = path.resolve(filePath);
+  const pathMatches = store.sessions.filter((row) => row.pi_session_file === canonicalPath);
+  const idMatches = store.sessions.filter((row) => row.id === sessionId);
+  if (pathMatches.length > 1 || idMatches.length > 1) return null;
+  const pathRow = pathMatches[0];
+  const idRow = idMatches[0];
+  if (pathRow && idRow && pathRow !== idRow) return null;
+  const row = pathRow ?? idRow;
+  if (!row || row.id !== sessionId) return null;
+  if (row.pi_session_file !== null && row.pi_session_file !== canonicalPath) return null;
+  if (row.legacy_private_session_quarantine !== false || !row.project_id) return null;
+
+  const projectsById = store.projects.filter((project) => project.id === row.project_id);
+  const projectsByCwd = store.projects.filter((project) => project.cwd === row.cwd);
+  if (projectsById.length !== 1 || projectsByCwd.length !== 1 || projectsById[0] !== projectsByCwd[0]) return null;
+  const project = projectsById[0]!;
+  if (project.cwd !== row.cwd || project.access_policy.privacy_mode !== "standard") return null;
+  let lexicalHeaderCwd = headerCwd.trim();
+  if (lexicalHeaderCwd === "~") lexicalHeaderCwd = os.homedir();
+  else if (lexicalHeaderCwd.startsWith("~/")) lexicalHeaderCwd = path.join(os.homedir(), lexicalHeaderCwd.slice(2));
+  if (!lexicalHeaderCwd || !path.isAbsolute(lexicalHeaderCwd)
+    || path.resolve(lexicalHeaderCwd) !== project.cwd) return null;
+
+  return {
+    filePath: canonicalPath,
+    sessionId: row.id,
+    projectId: project.id,
+    cwd: project.cwd,
+    mutationVersion: rowMutationVersion(row),
+  };
+}
+
+export function classifyCatalogDurableSession(
+  filePath: string,
+  sessionId: string,
+  _headerCwd: string,
+): CatalogDurableSession | null {
+  const authorized = authorizeExactStandardTranscript(filePath, { expectedSessionId: sessionId });
+  if (!authorized) return null;
+  return {
+    filePath: authorized.path,
+    sessionId: authorized.row.id,
+    projectId: authorized.project.id,
+    cwd: authorized.project.cwd,
+    mutationVersion: rowMutationVersion(authorized.row),
+  };
+}
+
+function stageCatalogDurableSession(
+  filePath: string,
+  header: BoundedSessionHeader,
+  fingerprint: FileFingerprint,
+): { classification: CatalogDurableSession; imported: boolean } | null {
+  const project = classifyExternalStandardTranscriptHeader(filePath, header);
+  if (!project) return null;
+  const policy = authorizeProjectAction({ cwd: project.cwd, actor: "indexer" });
+  if (!policy.allowed || policy.project?.id !== project.id) return null;
+  const parsedCreatedAt = typeof header.timestamp === "number"
+    ? header.timestamp
+    : typeof header.timestamp === "string" ? Date.parse(header.timestamp) : NaN;
+  const createdAt = Number.isFinite(parsedCreatedAt) ? parsedCreatedAt : Date.now();
+  commitStoreMutation((draft) => {
+    if (draft.sessions.some((row) => row.id === header.id || row.pi_session_file === filePath)) {
+      throw new WorkspaceStoreError("External session attribution changed during header staging", 409);
+    }
+    const durableProject = draft.projects.filter((candidate) => candidate.id === project.id && candidate.cwd === project.cwd);
+    if (durableProject.length !== 1 || durableProject[0]!.access_policy.privacy_mode !== "standard") {
+      throw new WorkspaceStoreError("External session Project policy changed during header staging", 409);
+    }
+    draft.sessions.push({
+      id: header.id,
+      pi_session_file: filePath,
+      title: "",
+      title_source: "provisional",
+      cwd: project.cwd,
+      project_id: project.id,
+      provider: null,
+      model: null,
+      agent_profile_id: null,
+      pending_agent_switch: null,
+      legacy_private_session_quarantine: false,
+      legacy_capability_ineligible: true,
+      created_at: createdAt,
+      last_active: createdAt,
+      archived: 0,
+      archived_at: null,
+      goal: null,
+      goal_status: null,
+      scheduled_job_id: null,
+      scheduled_run_id: null,
+      error: null,
+      catalog_fingerprint: null,
+      catalog_mutation_version: 0,
+    });
+  });
+  const authorized = authorizeExactStandardTranscript(filePath, {
+    expectedSessionId: header.id,
+    expectedFingerprint: fingerprint,
+  });
+  if (!authorized) return null;
+  return {
+    imported: true,
+    classification: {
+      filePath: authorized.path,
+      sessionId: authorized.row.id,
+      projectId: authorized.project.id,
+      cwd: authorized.project.cwd,
+      mutationVersion: rowMutationVersion(authorized.row),
+    },
+  };
+}
+
 function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; updated: number; archivedLegacy: number; changed: boolean } {
   return commitStoreMutation((store) => {
-  const byPath = new Map<string, SessionRow>();
-  const byId = new Map<string, SessionRow>();
-  for (const row of store.sessions) {
-    if (row.pi_session_file) byPath.set(row.pi_session_file, row);
-    byId.set(row.id, row);
-  }
-
-  let imported = 0;
+  const imported = 0;
   let updated = 0;
   let archivedLegacy = 0;
   let changed = false;
@@ -357,61 +484,20 @@ function catalogAdapterCommit(scan: CatalogScanCommit): { imported: number; upda
     const info = parsed.metadata;
     if (deletedSessionIds.has(info.id) || deletedSessionFiles.has(info.path)
       || sessionDeleteRecoveryMarkerMatches(info.id, info.path)) continue;
-    let row = byPath.get(info.path);
-    const matchedByPath = Boolean(row);
-    row ??= byId.get(info.id);
-    if (matchedByPath && row && rowMutationVersion(row) !== parsed.expectedMutationVersion) continue;
+    const classification = classifyCatalogDurableSessionInStore(store, info.path, info.id, info.cwd);
+    if (!classification || classification.mutationVersion !== parsed.expectedMutationVersion) continue;
+    const row = store.sessions.find((candidate) => candidate.id === classification.sessionId);
+    if (!row) continue;
 
-    const projectResult = ensureProjectForCwdDraft(store, normalizeSessionCwd(info.cwd));
-    if (projectResult.created) changed = true;
-    const cwd = projectResult.project.cwd;
     const firstMessage = info.firstMessage || "(empty session)";
-    const canonicalName = info.name?.trim()
-      ? Array.from(info.name.trim()).slice(0, 120).join("")
-      : "";
-    const derivedTitle = canonicalName || normalizeProvisionalSessionTitle(firstMessage) || "(empty session)";
-    if (!row) {
-      row = {
-        id: info.id,
-        pi_session_file: info.path,
-        title: derivedTitle,
-        title_source: canonicalName ? "pi" : "provisional",
-        cwd,
-        project_id: projectResult.project.id,
-        provider: info.provider,
-        model: info.model,
-        agent_profile_id: null,
-        pending_agent_switch: null,
-        legacy_private_session_quarantine: false,
-        legacy_capability_ineligible: true,
-        created_at: info.createdAt,
-        last_active: info.lastInteractionAt,
-        archived: 0,
-        archived_at: null,
-        goal: null,
-        goal_status: null,
-        scheduled_job_id: null,
-        scheduled_run_id: null,
-        error: null,
-        catalog_fingerprint: info.fingerprint,
-        catalog_mutation_version: 0,
-      };
-      store.sessions.push(row);
-      byPath.set(info.path, row);
-      byId.set(info.id, row);
-      imported++;
-      changed = true;
-      continue;
-    }
-
     let rowChanged = false;
     const previousLastActive = row.last_active || 0;
-    if (row.pi_session_file !== info.path) {
+    if (row.pi_session_file === null) {
       row.pi_session_file = info.path;
-      byPath.set(info.path, row);
       rowChanged = true;
     }
-    if (updateTranscriptCwd(row, cwd, store)) rowChanged = true;
+    // Durable Project attribution was already checked against the bounded
+    // header and is authoritative; catalog metadata cannot move the row.
     if (reconcileSessionTitleFromCatalog(row, { piName: info.name, firstMessage })) rowChanged = true;
     if (row.created_at !== info.createdAt) { row.created_at = info.createdAt; rowChanged = true; }
     if (row.last_active !== info.lastInteractionAt) { row.last_active = info.lastInteractionAt; rowChanged = true; }
@@ -455,6 +541,9 @@ function getSessionCatalog(): SessionCatalog {
         mutationVersion: row ? rowMutationVersion(row) : 0,
       };
     },
+    allowHeaderRead: (filePath) => !universallyDeniedTranscriptPath(path.resolve(filePath)),
+    classifyDurableSession: classifyCatalogDurableSession,
+    stageDurableSession: stageCatalogDurableSession,
     commit: catalogAdapterCommit,
   });
   return sessionCatalog;

@@ -6,6 +6,7 @@ import {
   canRetryAuthenticatedTransport,
   type BrowserViewerTransport,
 } from "../../api/client";
+import { sendFullBrowserPaste } from "./full-browser-paste";
 
 interface BrowserViewerProps {
   sessionId: string | null;
@@ -17,6 +18,10 @@ interface BrowserViewerProps {
   onPasteText?: (text: string) => void;
   /** Send human clipboard text through the authenticated CDP viewer transport. */
   pasteThroughViewer?: boolean;
+  /** Offer the named-profile human-only paste path inside the RFB viewer. */
+  pasteThroughVnc?: boolean;
+  /** False while agent control is active; paste never changes control mode. */
+  vncPasteEnabled?: boolean;
   vncTakeoverRequest?: number;
   vncTakeoverConsumed?: number;
   onVncTakeoverConsumed?: (request: number) => void;
@@ -93,11 +98,100 @@ function cdpViewerCloseMessage(event: CloseEvent, connectionLabel: string): stri
   return messages[event.reason] || `${connectionLabel} viewer disconnected.`;
 }
 
-function VncBrowserViewer({ sessionId, projectCwd, running, onPasteText, vncTakeoverRequest = 0, vncTakeoverConsumed = 0, onVncTakeoverConsumed }: BrowserViewerProps) {
+function VncBrowserViewer({
+  sessionId,
+  projectCwd,
+  running,
+  pasteThroughVnc = false,
+  vncPasteEnabled = false,
+  vncTakeoverRequest = 0,
+  vncTakeoverConsumed = 0,
+  onVncTakeoverConsumed,
+}: BrowserViewerProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const rfbRef = useRef<RFB | null>(null);
+  const pasteCaptureRef = useRef<HTMLTextAreaElement | null>(null);
+  const pasteSubmissionRef = useRef(true);
+  const pasteGenerationRef = useRef(0);
+  const vncPasteEnabledRef = useRef(vncPasteEnabled);
+  vncPasteEnabledRef.current = vncPasteEnabled;
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [remoteFocusArmed, setRemoteFocusArmed] = useState(false);
+  const [pasteCaptureOpen, setPasteCaptureOpen] = useState(false);
+  const [pasteNotice, setPasteNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!pasteCaptureOpen) return;
+    const timeout = window.setTimeout(() => pasteCaptureRef.current?.focus(), 0);
+    return () => window.clearTimeout(timeout);
+  }, [pasteCaptureOpen]);
+
+  const invalidatePasteCapture = useCallback(() => {
+    pasteGenerationRef.current += 1;
+    pasteSubmissionRef.current = true;
+    setPasteCaptureOpen(false);
+    setRemoteFocusArmed(false);
+  }, []);
+
+  useEffect(() => {
+    if (vncPasteEnabled) return;
+    invalidatePasteCapture();
+  }, [invalidatePasteCapture, vncPasteEnabled]);
+
+  const submitCapturedPaste = useCallback((text: string, generation = pasteGenerationRef.current) => {
+    if (!text || pasteSubmissionRef.current || generation !== pasteGenerationRef.current) return;
+    if (!vncPasteEnabledRef.current) {
+      invalidatePasteCapture();
+      setPasteNotice("Pause the agent before using human-only Full browser paste.");
+      return;
+    }
+    pasteSubmissionRef.current = true;
+    setPasteCaptureOpen(false);
+    setRemoteFocusArmed(false);
+    const rfb = rfbRef.current;
+    try {
+      if (!connected || !rfb) throw new Error("Full browser viewer is not connected");
+      sendFullBrowserPaste(rfb, text);
+      setPasteNotice("Clipboard text was pasted once into the focused Full browser field.");
+    } catch (caught) {
+      setPasteNotice(caught instanceof Error && /limit|invalid|empty/i.test(caught.message)
+        ? "Clipboard text is empty, invalid, or exceeds the direct paste limit."
+        : "Full browser paste could not be sent. Click the destination field and try again.");
+    }
+  }, [connected, invalidatePasteCapture]);
+
+  const openPasteCapture = useCallback(() => {
+    setPasteNotice(null);
+    if (!vncPasteEnabled) {
+      setPasteNotice("Pause the agent before using human-only Full browser paste.");
+      return;
+    }
+    if (!remoteFocusArmed) {
+      setPasteNotice("Click the destination field in Full browser before pasting.");
+      return;
+    }
+    pasteGenerationRef.current += 1;
+    pasteSubmissionRef.current = false;
+    setPasteCaptureOpen(true);
+  }, [remoteFocusArmed, vncPasteEnabled]);
+
+  const readSystemClipboard = useCallback(async () => {
+    const generation = pasteGenerationRef.current;
+    if (!navigator.clipboard?.readText) {
+      setPasteNotice("This browser cannot read the system clipboard. Paste into the capture target instead.");
+      return;
+    }
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) throw new Error("empty clipboard");
+      submitCapturedPaste(text, generation);
+    } catch {
+      if (generation === pasteGenerationRef.current && !pasteSubmissionRef.current) {
+        setPasteNotice("Clipboard access was denied or the clipboard did not contain text. Paste into the capture target instead.");
+      }
+    }
+  }, [submitCapturedPaste]);
 
   useEffect(() => {
     if (!running || (!sessionId && !projectCwd) || !hostRef.current) return;
@@ -105,6 +199,11 @@ function VncBrowserViewer({ sessionId, projectCwd, running, onPasteText, vncTake
     host.replaceChildren();
     setConnected(false);
     setError(null);
+    pasteGenerationRef.current += 1;
+    pasteSubmissionRef.current = true;
+    setRemoteFocusArmed(false);
+    setPasteCaptureOpen(false);
+    setPasteNotice(null);
 
     let rfb: RFB;
     try {
@@ -126,6 +225,10 @@ function VncBrowserViewer({ sessionId, projectCwd, running, onPasteText, vncTake
     const handleConnect = () => setConnected(true);
     const handleDisconnect = (event: Event) => {
       setConnected(false);
+      pasteGenerationRef.current += 1;
+      pasteSubmissionRef.current = true;
+      setRemoteFocusArmed(false);
+      setPasteCaptureOpen(false);
       const detail = (event as CustomEvent<{ clean?: boolean; reason?: string }>).detail;
       if (detail && detail.clean === false) setError(detail.reason || "Full browser viewer disconnected");
       void canRetryAuthenticatedTransport();
@@ -149,16 +252,65 @@ function VncBrowserViewer({ sessionId, projectCwd, running, onPasteText, vncTake
   }, [sessionId, projectCwd, running, vncTakeoverRequest]);
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-black" onPaste={(event) => directPaste(event, onPasteText)}>
+    <div className="flex h-full min-h-0 flex-col bg-black">
       <div className="flex shrink-0 items-center justify-between gap-3 border-b border-neutral-800 px-3 py-1.5 text-[11px] text-neutral-400">
         <span>{connected ? "Full browser connected" : "Full browser connecting…"}</span>
-        <span className="hidden truncate sm:block">Browser chrome and extensions. Click inside to focus.</span>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="hidden truncate sm:block">Browser chrome and extensions. Click inside to focus.</span>
+          {pasteThroughVnc && (
+            <button
+              type="button"
+              disabled={!connected}
+              title={vncPasteEnabled ? "Paste through this human-controlled Full browser viewer." : "Pause the agent before pasting private text."}
+              onClick={openPasteCapture}
+              className="shrink-0 rounded border border-neutral-700 px-2 py-1 text-[11px] text-neutral-200 hover:bg-neutral-800 disabled:opacity-40"
+            >Paste text</button>
+          )}
+        </div>
       </div>
+      {pasteCaptureOpen && (
+        <div className="shrink-0 border-b border-neutral-800 bg-neutral-950 px-3 py-3 text-xs text-neutral-300">
+          <label className="mb-2 block font-medium text-neutral-200">Full browser paste target</label>
+          <textarea
+            ref={pasteCaptureRef}
+            aria-label="Full browser paste target"
+            defaultValue=""
+            onPaste={(event) => {
+              const text = event.clipboardData.getData("text/plain");
+              if (!text) return;
+              event.preventDefault();
+              event.stopPropagation();
+              event.currentTarget.value = "";
+              submitCapturedPaste(text);
+            }}
+            onInput={(event) => {
+              const text = event.currentTarget.value;
+              event.currentTarget.value = "";
+              if (text) submitCapturedPaste(text);
+            }}
+            placeholder="Ctrl+V or middle-click here. Text is sent once over RFB and is not stored by the Wayang UI."
+            className="mb-2 h-16 w-full resize-none rounded border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-sky-500 focus:outline-none"
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            <button type="button" onClick={() => void readSystemClipboard()} className="rounded border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-xs font-medium text-neutral-200 hover:bg-neutral-800">Read and paste system clipboard</button>
+            <button type="button" onClick={invalidatePasteCapture} className="rounded border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-xs font-medium text-neutral-200 hover:bg-neutral-800">Cancel</button>
+          </div>
+        </div>
+      )}
+      {pasteNotice && <div className="shrink-0 border-b border-sky-900/50 bg-sky-950/30 px-3 py-2 text-xs text-sky-100">{pasteNotice}</div>}
       {error && <div className="shrink-0 border-b border-red-900/50 bg-red-950/40 px-3 py-2 text-xs text-red-200">{error}</div>}
       <div
         ref={hostRef}
+        data-testid="full-browser-viewer"
         className="min-h-0 flex-1 overflow-hidden bg-black [&_canvas]:mx-auto [&_canvas]:block"
-        onMouseDown={() => rfbRef.current?.focus()}
+        onPointerDownCapture={() => {
+          // noVNC owns canvas pointer handlers and may stop bubbling. Capture
+          // the explicit human click before it reaches noVNC so paste can be
+          // armed without inspecting or inferring the remote DOM target.
+          rfbRef.current?.focus();
+          setRemoteFocusArmed(true);
+          setPasteNotice(null);
+        }}
       />
     </div>
   );

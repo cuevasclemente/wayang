@@ -85,7 +85,7 @@ export function getPiSessionStorageRoots(): string[] {
   ]);
 }
 
-/** Exact known transcript files cover custom SessionManager directories too. */
+/** Exact known transcript files remain OS-denied even outside configured session roots. */
 export function getKnownPiTranscriptPaths(): string[] {
   return uniqueCanonicalPaths(getStore().sessions.flatMap((session) => (
     session.pi_session_file ? [session.pi_session_file] : []
@@ -122,19 +122,26 @@ export function getPiSecretBearingPaths(): string[] {
   ]);
 }
 
-/** Universal direct-tool/sandbox deny roots; backend and UI code remain unaffected. */
-export function getProtectedArtifactReadRoots(): string[] {
+/** Universal denies that can never be overridden by Standard transcript ownership. */
+export function getNonTranscriptUniversalReadDenyRoots(): string[] {
   return uniqueCanonicalPaths([
     getWayangDataRoot(),
     LEGACY_ATTACHMENT_ROOT,
-    ...getPiSessionStorageRoots(),
-    ...getKnownPiTranscriptPaths(),
     ...getCommandGuardIdentityPinProtectedPaths(),
     ...getPiSecretBearingPaths(),
     ...getWayangCheckoutSecretPaths(),
     ...getRegisteredProjectSecretPaths(),
     ...getRegisteredProjectBrowserRoots(),
     ...PSEUDO_CONTROL_ROOTS,
+  ]);
+}
+
+/** Universal direct-tool/sandbox deny roots; backend and UI code remain unaffected. */
+export function getProtectedArtifactReadRoots(): string[] {
+  return uniqueCanonicalPaths([
+    ...getNonTranscriptUniversalReadDenyRoots(),
+    ...getPiSessionStorageRoots(),
+    ...getKnownPiTranscriptPaths(),
   ]);
 }
 

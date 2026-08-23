@@ -53,8 +53,9 @@ dev: ## Run backend and frontend development servers with signal cleanup
 test-scripts: ## Run bootstrap/configuration script unit tests
 	@node --test scripts/tests/*.test.mjs
 
-test: ## Run backend tests, frontend lint/build, and script tests
+test: ## Run backend tests, frontend tests/lint/build, and script tests
 	npm --prefix backend test
+	npm --prefix frontend test
 	npm --prefix frontend run lint
 	npm --prefix frontend run build
 	@$(MAKE) test-scripts

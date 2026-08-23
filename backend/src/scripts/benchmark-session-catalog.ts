@@ -49,6 +49,10 @@ const adapter = {
   getKnownFile(filePath: string) {
     return { fingerprint: fingerprints.get(filePath) ?? null, mutationVersion: 0 };
   },
+  classifyDurableSession(filePath: string, sessionId: string) {
+    return { filePath, sessionId, projectId: "synthetic-benchmark-project", cwd, mutationVersion: 0 };
+  },
+  stageDurableSession() { return null; },
   commit(scan: CatalogScanCommit) {
     for (const parsed of scan.parsed) {
       fingerprints.set(parsed.metadata.path, parsed.metadata.fingerprint);
@@ -57,7 +61,11 @@ const adapter = {
     return { imported: scan.parsed.length, updated: 0, archivedLegacy: 0, changed: scan.parsed.length > 0 };
   },
 };
-const catalog = new SessionCatalog(adapter, root);
+const catalog = new SessionCatalog(adapter, root, {
+  authorizeCwd: () => true,
+  getPolicyGeneration: () => 1,
+  refreshProjection: () => undefined,
+});
 const canaryDelays: number[] = [];
 const healthDurations: number[] = [];
 const healthServer = http.createServer((_request, response) => {

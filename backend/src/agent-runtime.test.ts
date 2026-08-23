@@ -790,8 +790,20 @@ test("direct read exposes exact Standard session artifacts while recursive and P
     fs.mkdirSync(transcriptDir, { recursive: true });
     const transcript = path.join(transcriptDir, "standard.jsonl");
     const protectedTranscript = path.join(transcriptDir, "protected.jsonl");
-    fs.writeFileSync(transcript, "STANDARD_TRANSCRIPT_CANARY\n");
-    fs.writeFileSync(protectedTranscript, "PROTECTED_TRANSCRIPT_CANARY\n");
+    fs.writeFileSync(transcript, `${JSON.stringify({
+      type: "session",
+      version: 3,
+      id: row.id,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      cwd: f.cwd,
+    })}\nSTANDARD_TRANSCRIPT_CANARY\n`);
+    fs.writeFileSync(protectedTranscript, `${JSON.stringify({
+      type: "session",
+      version: 3,
+      id: protectedSession.id,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      cwd: protectedCwd,
+    })}\nPROTECTED_TRANSCRIPT_CANARY\n`);
     updatePiSessionFile(row.id, transcript);
     updatePiSessionFile(protectedSession.id, protectedTranscript);
 

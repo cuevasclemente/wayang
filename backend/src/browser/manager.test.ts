@@ -156,9 +156,21 @@ test("browser executable diagnostics report an unavailable requested VNC transpo
     platform: "darwin",
     transport: "vnc",
     state: "resolved",
+    vncAvailable: false,
     reasonCode: "transport_unavailable",
   });
   assert.equal(JSON.stringify(diagnostic).includes(process.execPath), false);
+});
+
+test("explicit CDP remains the selected rollback even when VNC dependencies are available", () => {
+  const diagnostic = getBrowserExecutableDiagnostic({
+    configuredPath: process.execPath,
+    requestedTransport: "cdp",
+    vncAvailable: true,
+    platform: "linux",
+  });
+  assert.equal(diagnostic.transport, "cdp-screencast");
+  assert.equal(diagnostic.vncAvailable, true);
 });
 
 test("public browser state omits runtime paths, ports, target ids, generations, and child logs", () => {
@@ -229,6 +241,29 @@ test("agent pause gate is enforced and control generation changes across handoff
   }
 });
 
+browserIntegrationTest("Linux auto starts headed Chromium with real Full browser dependencies", { timeout: 45_000 }, async (t) => {
+  const diagnostic = getBrowserExecutableDiagnostic({ requestedTransport: "auto" });
+  if (process.platform !== "linux" || diagnostic.vncAvailable !== true) {
+    t.skip("Linux Xvfb/x11vnc dependencies are unavailable");
+    return;
+  }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-browser-auto-vnc-"));
+  const lookup = { projectCwd: root, persistence: "project" as const };
+  const previousTransport = process.env.WAYANG_BROWSER_TRANSPORT;
+  process.env.WAYANG_BROWSER_TRANSPORT = "auto";
+  t.after(async () => {
+    await stopBrowser(lookup).catch(() => undefined);
+    if (previousTransport === undefined) delete process.env.WAYANG_BROWSER_TRANSPORT;
+    else process.env.WAYANG_BROWSER_TRANSPORT = previousTransport;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const started = await startBrowser(lookup);
+  assert.equal(started.status, "running", started.lastError);
+  assert.equal(started.viewerTransport, "vnc");
+  assert.equal(started.vncReady, true);
+  assert.equal(started.cdpReady, true);
+});
+
 browserIntegrationTest("DOM, selector, and accessibility outputs redact sensitive canaries and public fill is rejected", { timeout: 45_000 }, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-browser-redaction-"));
   const lookup = { projectCwd: root, persistence: "project" as const };
@@ -242,6 +277,8 @@ browserIntegrationTest("DOM, selector, and accessibility outputs redact sensitiv
   });
   const started = await startBrowser(lookup);
   assert.equal(started.status, "running", started.lastError);
+  assert.equal(started.viewerTransport, "cdp-screencast");
+  assert.equal(started.vncReady, false, "explicit CDP rollback must not start or expose VNC");
   const password = "SYNTHETIC_DOM_PASSWORD_CANARY";
   const otp = "482951";
   const card = "4111111111111111";
