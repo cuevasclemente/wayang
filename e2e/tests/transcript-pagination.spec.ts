@@ -1,9 +1,10 @@
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
-import { createE2eSession, openSessionInUi } from "./helpers/sessions";
+import { createE2eSession, ensureE2eProject, openSessionInUi } from "./helpers/sessions";
 import { createSyntheticCorpus, type SyntheticSessionFixture } from "./helpers/syntheticSessions";
 
 async function importFixture(request: APIRequestContext, fixture: SyntheticSessionFixture): Promise<void> {
-  for (let attempt = 0; attempt < 10; attempt++) {
+  await ensureE2eProject(request, fixture.cwd);
+  for (let attempt = 0; attempt < 30; attempt++) {
     const imported = await request.post("/api/sessions/import");
     expect(imported.ok(), await imported.text()).toBe(true);
     const sessions = await request.get("/api/sessions");

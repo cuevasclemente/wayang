@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { ensureE2eProject } from "./helpers/sessions";
 import { createSyntheticCorpus } from "./helpers/syntheticSessions";
 import { installWsProfileCollector, getWsProfileEntries } from "./helpers/wsProfile";
 
@@ -35,6 +36,9 @@ test("synthetic catalog and transcript latency remain responsive", async ({ page
   const switchTargets = histories.slice(0, 2);
 
   const expectedFixtures = [...fixtures, ...histories];
+  for (const cwd of new Set(expectedFixtures.map((fixture) => fixture.cwd))) {
+    await ensureE2eProject(request, cwd);
+  }
   let missingFixtureIds = expectedFixtures.map((fixture) => fixture.id);
   // The live catalog watcher may consume part of this generated corpus while
   // files are still being written. Explicit scans are coalesced with that work,

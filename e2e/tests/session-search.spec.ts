@@ -8,20 +8,18 @@
  * actually starting.
  */
 
+import { randomUUID } from "node:crypto";
 import { expect, test, type Page } from "@playwright/test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { repoRoot } from "./helpers/sessions";
+import { ensureE2eProject, repoRoot } from "./helpers/sessions";
 
 async function seedSessionWithTranscript(
   request: import("@playwright/test").APIRequestContext,
   opts: { title: string; transcript: Array<{ role: "user" | "assistant"; text: string; id?: string }> },
 ): Promise<{ id: string; cwd: string; piSessionFile: string }> {
-  const create = await request.post("/api/sessions", {
-    data: { cwd: repoRoot, title: opts.title },
-  });
-  expect(create.ok(), await create.text()).toBe(true);
-  const session = await create.json();
+  await ensureE2eProject(request, repoRoot);
+  const session = { id: randomUUID(), cwd: repoRoot };
 
   // Synthesize a pi JSONL file in the e2e pi sessions dir so the indexer
   // picks it up via the standard mtime watcher.
@@ -48,15 +46,27 @@ async function seedSessionWithTranscript(
       timestamp: new Date().toISOString(),
     }),
   );
+  const nameId = `${session.id}-name`;
+  lines.push(JSON.stringify({
+    type: "session_info",
+    id: nameId,
+    parentId: null,
+    timestamp: new Date().toISOString(),
+    name: opts.title,
+  }));
+  let parentId: string | null = nameId;
   for (let i = 0; i < opts.transcript.length; i++) {
     const t = opts.transcript[i];
+    const id = t.id ?? `${session.id}-m${i}`;
     lines.push(
       JSON.stringify({
         type: "message",
-        id: t.id ?? `${session.id}-m${i}`,
+        id,
+        parentId,
         message: { role: t.role, content: [{ type: "text", text: t.text }] },
       }),
     );
+    parentId = id;
   }
   fs.writeFileSync(file, lines.join("\n") + "\n", "utf-8");
 
