@@ -328,6 +328,7 @@ Treat remote TTS as a data disclosure boundary: assistant text is sent to the co
 | `~/.wayang/protected-automation/runtime/` | Owner-bound bounded run scratch, stdout/stderr diagnostics, and published job-state generations. |
 | `~/.wayang/protected-automation/browser-realms/` | Persistent exact Project/Profile/Job Chromium profiles, download staging, and runtime metadata. Profile storage is private but not byte-quota-bounded. |
 | `~/.wayang/search.db` | Search index derived from pi sessions. |
+| `~/.wayang/transcript-index.db` | Private, rebuildable content-free topology/source-offset index used for branch-aware transcript windows. Canonical transcript content remains in Pi JSONL. |
 | `~/.wayang/auth-sessions.json` | Hashed built-in-login session records when enabled. |
 | `~/.wayang/workspace-capability-approval/pin-attempt-state.json` | Owner-only non-secret capability approval attempt count, cooldown timestamp, and optional reservation metadata; never the PIN. Service startup creates it automatically when safely absent and preserves valid state; `make setup-capability-approval` is optional preflight/migration. |
 | `~/.wayang/attachments/<full-session-id>/` | Owner-private chat uploads (`0700` directories, `0600` files). Exact files from catalogued Standard sessions are cross-session readable through bounded tools/direct `read`; Protected/unclassified subtrees remain private and all writes remain denied. |

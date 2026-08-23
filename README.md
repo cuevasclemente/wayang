@@ -130,6 +130,7 @@ See [docs/configuration.md](docs/configuration.md#data-locations) for exact file
 - Projects and agent profiles: [docs/agents-and-project-settings.md](docs/agents-and-project-settings.md)
 - Project-local apps: [docs/apps-framework.md](docs/apps-framework.md)
 - Session search: [docs/session-history-search.md](docs/session-history-search.md)
+- Long-session transcript pagination: [docs/session-transcript-pagination.md](docs/session-transcript-pagination.md)
 - Transcript event editing/deletion: [docs/transcript-event-mutations.md](docs/transcript-event-mutations.md)
 - Contributions: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Vulnerability reporting: [SECURITY.md](SECURITY.md)
