@@ -14,6 +14,9 @@ import {
 
 const INDEX_SCHEMA_VERSION = 1;
 const TAIL_WITNESS_BYTES = 4_096;
+export const TRANSCRIPT_INDEX_MAX_READ_BYTES = 384 * 1024;
+
+export type IndexedReadPreference = "latest" | "earliest" | "around";
 
 export interface StructuralIndexRevision extends TranscriptFileRevision {
   sessionId: string;
@@ -31,6 +34,12 @@ export interface IndexedSourceRow {
   visibleOrdinal: number;
   sourceOffset: number;
   sourceLength: number;
+}
+
+export interface IndexedReadResult {
+  entries: any[];
+  rows: IndexedSourceRow[];
+  sourceBytesRead: number;
 }
 
 export interface IndexedWindowSelection {
@@ -191,6 +200,13 @@ function tailDigest(filePath: string, end: number): string {
   } finally { fs.closeSync(fd); }
 }
 
+function structuralBuildKey(sessionId: string, filePath: string, revision: TranscriptFileRevision): string {
+  return JSON.stringify([
+    sessionId, filePath, revision.device, revision.inode, revision.size,
+    revision.mtimeMs, revision.ctimeMs, revision.headerDigest, revision.mutationEpoch,
+  ]);
+}
+
 function workerBuild(filePath: string): Promise<WorkerResult> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { filePath } });
@@ -203,12 +219,23 @@ function workerBuild(filePath: string): Promise<WorkerResult> {
   });
 }
 
+export interface StructuralTranscriptIndexOptions {
+  /** @internal Deterministic publication race seam; receives canonical paths. */
+  beforePublishForTests?: (sessionId: string, filePath: string) => void | Promise<void>;
+}
+
 export class StructuralTranscriptIndex {
   private readonly db: DatabaseType;
   private readonly builds = new Map<string, Promise<StructuralIndexRevision>>();
+  private readonly latestBuildKeys = new Map<string, string>();
   private readonly invalidationGenerations = new Map<string, number>();
+  private lastSourceBytesRead = 0;
+  private totalSourceBytesRead = 0;
 
-  constructor(dbPath = path.join(getConfig().dataDir, "transcript-index.db")) {
+  constructor(
+    dbPath = path.join(getConfig().dataDir, "transcript-index.db"),
+    private readonly options: StructuralTranscriptIndexOptions = {},
+  ) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     fs.chmodSync(dbPath, 0o600);
@@ -219,20 +246,23 @@ export class StructuralTranscriptIndex {
   }
 
   async ensure(sessionId: string, filePath: string): Promise<StructuralIndexRevision> {
-    const existingBuild = this.builds.get(sessionId);
+    const canonicalPath = path.resolve(filePath);
+    const current = readTranscriptFileRevision(canonicalPath);
+    const key = structuralBuildKey(sessionId, canonicalPath, current);
+    this.latestBuildKeys.set(sessionId, key);
+    const existingBuild = this.builds.get(key);
     if (existingBuild) return existingBuild;
-    const current = readTranscriptFileRevision(filePath);
     const stored = this.readRevision(sessionId);
-    if (stored && stored.filePath === filePath && revisionsExactlyEqual(stored, current)) return stored;
-    if (stored && stored.filePath === filePath && current.size > stored.indexedSize
-      && sameTranscriptIdentity(stored, current) && this.canAppend(stored, filePath)) {
+    if (stored && stored.filePath === canonicalPath && revisionsExactlyEqual(stored, current)) return stored;
+    if (stored && stored.filePath === canonicalPath && current.size > stored.indexedSize
+      && sameTranscriptIdentity(stored, current) && this.canAppend(stored, canonicalPath)) {
       try { return this.appendRefresh(stored, current); }
       catch { /* unsafe append falls through to an epoch rebuild */ }
     }
-    const build = this.fullBuild(sessionId, filePath);
-    this.builds.set(sessionId, build);
+    const build = this.fullBuild(sessionId, canonicalPath, key);
+    this.builds.set(key, build);
     try { return await build; }
-    finally { if (this.builds.get(sessionId) === build) this.builds.delete(sessionId); }
+    finally { if (this.builds.get(key) === build) this.builds.delete(key); }
   }
 
   async around(sessionId: string, filePath: string, anchorId: string, limit = 200): Promise<IndexedWindowSelection> {
@@ -321,38 +351,123 @@ export class StructuralTranscriptIndex {
     return (await this.activeProjection(sessionId, filePath)).eventIds;
   }
 
-  readEntries(revision: StructuralIndexRevision, rows: readonly IndexedSourceRow[]): any[] {
-    if (rows.length === 0) return [];
+  readBoundedEntries(
+    revision: StructuralIndexRevision,
+    rows: readonly IndexedSourceRow[],
+    options: {
+      preference: IndexedReadPreference;
+      anchorEventId?: string | null;
+      maxSourceBytes?: number;
+    },
+  ): IndexedReadResult {
+    if (rows.length === 0) {
+      this.lastSourceBytesRead = 0;
+      return { entries: [], rows: [], sourceBytesRead: 0 };
+    }
+    const maxSourceBytes = options.maxSourceBytes ?? TRANSCRIPT_INDEX_MAX_READ_BYTES;
+    if (!Number.isSafeInteger(maxSourceBytes) || maxSourceBytes < 1 || maxSourceBytes > TRANSCRIPT_PAGE_MAX_BYTES) {
+      throw new Error("Indexed transcript read budget is invalid");
+    }
     const current = readTranscriptFileRevision(revision.filePath);
     if (!revisionsExactlyEqual(revision, current)) throw new Error("Transcript index revision is stale");
-    // Include hidden active entries between selected visible rows. Serializers
-    // need content-free tombstones and overflow-recovery markers to preserve
-    // the exact legacy projection, but only selected visible rows count toward
-    // page limits/cursors.
-    const firstOrdinal = rows[0].activeOrdinal;
-    const lastOrdinal = rows.at(-1)!.activeOrdinal;
-    const sources = this.db.prepare(
-      `SELECT a.source_offset,a.source_length,t.event_id,t.parent_id,t.display_class FROM active_branch_entries AS a
-       JOIN transcript_entries AS t ON t.session_id=a.session_id AND t.transcript_epoch=a.transcript_epoch AND t.event_id=a.event_id
-       WHERE a.session_id=? AND a.transcript_epoch=?
-         AND (a.visible_ordinal IS NOT NULL OR t.display_class='wayang-overflow-retry-v1')
-         AND a.active_ordinal > COALESCE((SELECT MAX(active_ordinal) FROM active_branch_entries
-           WHERE session_id=? AND transcript_epoch=? AND visible_ordinal IS NOT NULL AND active_ordinal < ?), -1)
-         AND a.active_ordinal < COALESCE((SELECT MIN(active_ordinal) FROM active_branch_entries
-           WHERE session_id=? AND transcript_epoch=? AND visible_ordinal IS NOT NULL AND active_ordinal > ?), 9223372036854775807)
-       ORDER BY a.active_ordinal`,
-    ).all(revision.sessionId, revision.transcriptEpoch,
-      revision.sessionId, revision.transcriptEpoch, firstOrdinal,
-      revision.sessionId, revision.transcriptEpoch, lastOrdinal) as Array<{
-        source_offset: number; source_length: number; event_id: string; parent_id: string | null; display_class: string;
-      }>;
+
+    const cost = (row: IndexedSourceRow) => row.sourceLength > maxSourceBytes ? 0 : row.sourceLength;
+    let retained: IndexedSourceRow[] = [];
+    let retainedCost = 0;
+    if (options.preference === "latest") {
+      for (let index = rows.length - 1; index >= 0; index--) {
+        const nextCost = cost(rows[index]);
+        if (retained.length > 0 && retainedCost + nextCost > maxSourceBytes) break;
+        retained.unshift(rows[index]);
+        retainedCost += nextCost;
+      }
+    } else if (options.preference === "earliest") {
+      for (const row of rows) {
+        const nextCost = cost(row);
+        if (retained.length > 0 && retainedCost + nextCost > maxSourceBytes) break;
+        retained.push(row);
+        retainedCost += nextCost;
+      }
+    } else {
+      const anchorIndex = Math.max(0, rows.findIndex((row) => row.eventId === options.anchorEventId));
+      let left = anchorIndex;
+      let right = anchorIndex;
+      retained = [rows[anchorIndex]];
+      retainedCost = cost(rows[anchorIndex]);
+      let blockLeft = false;
+      let blockRight = false;
+      while ((!blockLeft && left > 0) || (!blockRight && right + 1 < rows.length)) {
+        const preferLeft = !blockLeft && left > 0 && (blockRight || right - anchorIndex >= anchorIndex - left);
+        const candidate = preferLeft ? rows[left - 1] : rows[right + 1];
+        const nextCost = cost(candidate);
+        if (retainedCost + nextCost > maxSourceBytes) {
+          if (preferLeft) blockLeft = true;
+          else blockRight = true;
+          continue;
+        }
+        retainedCost += nextCost;
+        if (preferLeft) left--;
+        else right++;
+        retained = rows.slice(left, right + 1);
+      }
+    }
+    if (retained.length === 0) retained = [options.preference === "latest" ? rows.at(-1)! : rows[0]];
+
+    type SourceRow = {
+      source_offset: number;
+      source_length: number;
+      event_id: string;
+      parent_id: string | null;
+      display_class: string;
+      visible_ordinal: number | null;
+    };
+    const selectSources = (selectedRows: readonly IndexedSourceRow[]): SourceRow[] => {
+      const firstOrdinal = selectedRows[0].activeOrdinal;
+      const lastOrdinal = selectedRows.at(-1)!.activeOrdinal;
+      return this.db.prepare(
+        `SELECT a.source_offset,a.source_length,a.visible_ordinal,t.event_id,t.parent_id,t.display_class
+         FROM active_branch_entries AS a
+         JOIN transcript_entries AS t ON t.session_id=a.session_id AND t.transcript_epoch=a.transcript_epoch AND t.event_id=a.event_id
+         WHERE a.session_id=? AND a.transcript_epoch=?
+           AND (a.visible_ordinal IS NOT NULL OR t.display_class='wayang-overflow-retry-v1')
+           AND a.active_ordinal > COALESCE((SELECT MAX(active_ordinal) FROM active_branch_entries
+             WHERE session_id=? AND transcript_epoch=? AND visible_ordinal IS NOT NULL AND active_ordinal < ?), -1)
+           AND a.active_ordinal < COALESCE((SELECT MIN(active_ordinal) FROM active_branch_entries
+             WHERE session_id=? AND transcript_epoch=? AND visible_ordinal IS NOT NULL AND active_ordinal > ?), 9223372036854775807)
+         ORDER BY a.active_ordinal`,
+      ).all(revision.sessionId, revision.transcriptEpoch,
+        revision.sessionId, revision.transcriptEpoch, firstOrdinal,
+        revision.sessionId, revision.transcriptEpoch, lastOrdinal) as SourceRow[];
+    };
+    let sources = selectSources(retained);
+    const aggregateCost = (values: readonly SourceRow[]) => values.reduce((total, row) => (
+      total + (row.source_length > maxSourceBytes && row.visible_ordinal !== null ? 0 : row.source_length)
+    ), 0);
+    while (retained.length > 1 && aggregateCost(sources) > maxSourceBytes) {
+      if (options.preference === "latest") retained.shift();
+      else if (options.preference === "earliest") retained.pop();
+      else {
+        const anchorIndex = retained.findIndex((row) => row.eventId === options.anchorEventId);
+        if (anchorIndex < 0 || anchorIndex >= retained.length / 2) retained.shift();
+        else retained.pop();
+      }
+      sources = selectSources(retained);
+    }
+    if (aggregateCost(sources) > maxSourceBytes) {
+      // Overflow-retry markers are serializer context, not visible rows. If a
+      // pathological marker alone exceeds the aggregate budget, omit it rather
+      // than violating the disk-read ceiling.
+      sources = sources.filter((row) => row.visible_ordinal !== null);
+    }
+
     const fd = fs.openSync(revision.filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    let entries: any[] = [];
+    const entries: any[] = [];
+    let sourceBytesRead = 0;
     try {
       if (!fs.fstatSync(fd).isFile()) throw new Error("Transcript is not a regular file");
-      entries = sources.map((row) => {
-        if (row.source_length > TRANSCRIPT_PAGE_MAX_BYTES && row.display_class !== "wayang-overflow-retry-v1") {
-          return {
+      for (const row of sources) {
+        if (row.source_length > maxSourceBytes && row.visible_ordinal !== null) {
+          entries.push({
             type: "custom_message",
             id: row.event_id,
             parentId: row.parent_id,
@@ -360,12 +475,21 @@ export class StructuralTranscriptIndex {
             content: "This transcript event is too large to include in a bounded window.",
             display: true,
             details: { reason: "payload_limit", encoded_bytes: row.source_length },
-          };
+          });
+          continue;
         }
+        if (sourceBytesRead + row.source_length > maxSourceBytes) continue;
         const bytes = Buffer.allocUnsafe(row.source_length);
-        const read = fs.readSync(fd, bytes, 0, bytes.length, row.source_offset);
-        return JSON.parse(bytes.subarray(0, read).toString("utf8").trim());
-      });
+        let read = 0;
+        while (read < bytes.length) {
+          const count = fs.readSync(fd, bytes, read, bytes.length - read, row.source_offset + read);
+          if (count === 0) break;
+          read += count;
+          sourceBytesRead += count;
+        }
+        if (read !== bytes.length) throw new Error("Indexed transcript source row was truncated");
+        entries.push(JSON.parse(bytes.toString("utf8").trim()));
+      }
       const after = fs.fstatSync(fd);
       if (Number(after.dev) !== revision.device || Number(after.ino) !== revision.inode
         || after.size !== revision.size || after.mtimeMs !== revision.mtimeMs || after.ctimeMs !== revision.ctimeMs) {
@@ -375,11 +499,18 @@ export class StructuralTranscriptIndex {
     if (!revisionsExactlyEqual(revision, readTranscriptFileRevision(revision.filePath))) {
       throw new Error("Transcript path changed while indexed entries were read");
     }
-    return entries;
+    this.lastSourceBytesRead = sourceBytesRead;
+    this.totalSourceBytesRead += sourceBytesRead;
+    return { entries, rows: retained, sourceBytesRead };
+  }
+
+  getReadInstrumentation(): { lastSourceBytesRead: number; totalSourceBytesRead: number } {
+    return { lastSourceBytesRead: this.lastSourceBytesRead, totalSourceBytesRead: this.totalSourceBytesRead };
   }
 
   purge(sessionId: string): void {
     this.invalidationGenerations.set(sessionId, (this.invalidationGenerations.get(sessionId) ?? 0) + 1);
+    this.latestBuildKeys.delete(sessionId);
     this.db.transaction(() => {
       this.db.prepare("DELETE FROM transcript_revisions WHERE session_id = ?").run(sessionId);
     })();
@@ -389,6 +520,7 @@ export class StructuralTranscriptIndex {
     const pending = [...this.builds.values()];
     await Promise.allSettled(pending);
     this.builds.clear();
+    this.latestBuildKeys.clear();
     try { this.db.close(); } catch { /* already closed */ }
   }
 
@@ -425,14 +557,19 @@ export class StructuralTranscriptIndex {
     this.db.prepare("INSERT INTO transcript_meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(INDEX_SCHEMA_VERSION));
   }
 
-  private async fullBuild(sessionId: string, filePath: string): Promise<StructuralIndexRevision> {
+  private async fullBuild(sessionId: string, filePath: string, buildKey: string): Promise<StructuralIndexRevision> {
     const generation = this.invalidationGenerations.get(sessionId) ?? 0;
     const result = await workerBuild(filePath);
-    if ((this.invalidationGenerations.get(sessionId) ?? 0) !== generation) {
+    await this.options.beforePublishForTests?.(sessionId, filePath);
+    if ((this.invalidationGenerations.get(sessionId) ?? 0) !== generation
+      || this.latestBuildKeys.get(sessionId) !== buildKey) {
       throw new Error("Transcript structural index build was invalidated");
     }
     const current = readTranscriptFileRevision(filePath);
-    if (!revisionsExactlyEqual(result.revision, current)) throw new Error("Transcript changed before structural index publication");
+    if (!revisionsExactlyEqual(result.revision, current)
+      || structuralBuildKey(sessionId, filePath, current) !== buildKey) {
+      throw new Error("Transcript changed before structural index publication");
+    }
     const epoch = randomUUID();
     this.publish(sessionId, filePath, epoch, result);
     return this.readRevision(sessionId)!;

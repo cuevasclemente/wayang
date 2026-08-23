@@ -1,6 +1,7 @@
 import test from "node:test";
 import * as assert from "node:assert/strict";
 import {
+  captureTranscriptWindowStreamingBoundary,
   parseTranscriptNegotiation,
   serializeInvalidTranscriptPageRequest,
   serializeTranscriptPageError,
@@ -8,6 +9,16 @@ import {
   serializeTranscriptProtocolConfirmation,
   transcriptPageRequestCorrelation,
 } from "./ws.js";
+
+test("streaming snapshot boundary freezes overlay and retains only later buffered events", () => {
+  const streaming = { role: "assistant", content: [{ type: "text", text: "snapshot" }], timestamp: 1 };
+  const buffered = [{ type: "text_delta", delta: "already represented" }];
+  const frozen = captureTranscriptWindowStreamingBoundary(streaming, buffered);
+  streaming.content[0].text = "mutated later";
+  buffered.push({ type: "text_delta", delta: "later" });
+  assert.equal(((frozen?.message as any)?.content as any[])[0].text, "snapshot");
+  assert.deepEqual(buffered, [{ type: "text_delta", delta: "later" }]);
+});
 
 test("window-v1 negotiation is explicit and selection-bound", () => {
   assert.deepEqual(parseTranscriptNegotiation(new URLSearchParams(), "selection"), {

@@ -67,9 +67,9 @@ import {
   subscribeToSession,
   getMessageHistory,
   getLiveMessageHistory,
+  serializeStreamingMessageForWindow,
   getSessionFileTodoState,
   getSessionFileSnapshot,
-  getSessionFileDerivedProjection,
   invalidateSessionFileSnapshot,
   getTodoState,
   getCommandGuardState,
@@ -362,6 +362,16 @@ export function serializeTranscriptPageGateFailure(input: {
     : serializeInvalidTranscriptPageRequest(input);
 }
 
+/** @internal Synchronous subscribe/snapshot boundary for delayed around attaches. */
+export function captureTranscriptWindowStreamingBoundary(
+  streamingMessage: any,
+  bufferedEvents: SerializedMessage[],
+): SerializedMessage | null {
+  const frozen = serializeStreamingMessageForWindow(streamingMessage);
+  bufferedEvents.length = 0;
+  return frozen;
+}
+
 /** @internal Shared wire projection used by every selected client. */
 export function subscribeTranscriptInvalidationForSelection(input: {
   sessionId: string;
@@ -652,18 +662,6 @@ function handleConnection(
             if (!alive || version !== setupVersion) return;
             wsProfile(nextSessionId, "file_poll_window_loaded", `duration=${elapsedMs(historyStart)} messages=${window.message_count}`);
             sendSafe(ws, window);
-            setImmediate(() => {
-              if (!alive || version !== setupVersion) return;
-              const derived = getSessionFileDerivedProjection(sessionFile, cwd);
-              if (!derived || !getTranscriptPaginationService().isDerivedProjectionCurrent(
-                nextSessionId, sessionFile, window.transcript_epoch, derived.fingerprint,
-              )) return;
-              sendSafe(ws, { ...derived.todoState, session_id: nextSessionId, ...(selectionId ? { selection_id: selectionId } : {}) });
-              scheduleWayangAutoTitleFromActivation(nextSessionId, derived.autoTitle, {
-                stillSelected: () => alive && version === setupVersion && currentSessionId === nextSessionId && currentSelectionId === selectionId,
-                onCommitted: invalidateSessionFileSnapshot,
-              });
-            });
           }).catch(() => {
             // A racing external rewrite is retried by the next poll; stale pages
             // are never replaced by an unbounded fallback.
@@ -727,6 +725,7 @@ function handleConnection(
       intent: TranscriptIntent = "latest",
       anchorId?: string,
       compactingOverride?: boolean,
+      streamingMessage?: SerializedMessage | null,
     ) => {
       if (!selectionId) return;
       const window = await getTranscriptPaginationService().open({
@@ -738,7 +737,7 @@ function handleConnection(
         reason,
         streamingAtSnapshot: Boolean(liveHandle.session.isStreaming),
         compactingAtSnapshot: compactingOverride ?? Boolean(liveHandle.session.isCompacting),
-        liveStreamingMessage: liveHandle.liveStreamingMessage ?? liveHandle.session.state.streamingMessage,
+        streamingMessage,
         preserveCursors: reason === "tail_reconcile",
       });
       if (alive && version === setupVersion) sendSafe(ws, window);
@@ -785,7 +784,12 @@ function handleConnection(
           ? false
           : Boolean(liveHandle.session.isCompacting);
         if (modernWindowNegotiation) {
-          void sendBoundedLiveWindow("tail_reconcile", "latest", undefined, compactingAtSnapshot).catch(() => {
+          const frozenStreamingMessage = serializeStreamingMessageForWindow(
+            liveHandle.liveStreamingMessage ?? liveHandle.session.state.streamingMessage,
+          );
+          void sendBoundedLiveWindow(
+            "tail_reconcile", "latest", undefined, compactingAtSnapshot, frozenStreamingMessage,
+          ).catch(() => {
             // A concurrent append/rewrite is retried by the next authoritative
             // lifecycle event; never substitute legacy full history.
           });
@@ -832,13 +836,19 @@ function handleConnection(
       const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
       const compactingAtSnapshot = Boolean(liveHandle.session.isCompacting);
       if (modernWindowNegotiation) {
-        // Events observed after this boundary are drained below. The bounded
-        // disk/runtime overlay snapshot represents everything before it.
-        bufferedEvents.length = 0;
+        // Freeze the mutable overlay synchronously. Buffered events already
+        // observed are represented by this boundary and are discarded; only
+        // callbacks arriving after the clear are drained after awaited index work.
+        const frozenStreamingMessage = captureTranscriptWindowStreamingBoundary(
+          liveHandle.liveStreamingMessage ?? liveHandle.session.state.streamingMessage,
+          bufferedEvents,
+        );
         await sendBoundedLiveWindow(
           "initial",
           modernWindowNegotiation.intent,
           modernWindowNegotiation.anchorId,
+          undefined,
+          frozenStreamingMessage,
         );
         wsProfile(nextSessionId, "attach_live_window", `duration=${elapsedMs(liveHistoryStart)}`);
       } else {
@@ -868,7 +878,10 @@ function handleConnection(
     bufferLiveEvents = false;
     if (bufferOverflow) {
       if (modernWindowNegotiation) {
-        await sendBoundedLiveWindow("reset");
+        const frozenStreamingMessage = serializeStreamingMessageForWindow(
+          liveHandle.liveStreamingMessage ?? liveHandle.session.state.streamingMessage,
+        );
+        await sendBoundedLiveWindow("reset", "latest", undefined, undefined, frozenStreamingMessage);
       } else {
         const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
         const compactingAtSnapshot = Boolean(liveHandle.session.isCompacting);
@@ -1170,22 +1183,9 @@ function handleConnection(
                 messages: [],
               });
               wsProfile(nextSessionId, "sent_transcript_window", `duration=${elapsedMs(fileHistoryStart)} messages=${window.message_count}`);
-              // Nonessential complete derived state starts only after the
-              // bounded transcript frame is queued. It never serializes or
-              // transfers the complete branch.
-              setImmediate(() => {
-                if (!alive || version !== setupVersion) return;
-                const derived = getSessionFileDerivedProjection(sessionInfo.pi_session_file, sessionInfo.cwd);
-                if (!derived || !alive || version !== setupVersion || !sessionInfo.pi_session_file
-                  || !getTranscriptPaginationService().isDerivedProjectionCurrent(
-                    nextSessionId, sessionInfo.pi_session_file, window.transcript_epoch, derived.fingerprint,
-                  )) return;
-                sendSafe(ws, { ...derived.todoState, session_id: nextSessionId, selection_id: selectionId });
-                scheduleWayangAutoTitleFromActivation(nextSessionId, derived.autoTitle, {
-                  stillSelected: () => alive && version === setupVersion && currentSessionId === nextSessionId && currentSelectionId === selectionId,
-                  onCommitted: invalidateSessionFileSnapshot,
-                });
-              });
+              // Modern read-only attach deliberately defers whole-transcript
+              // todo/title projection. Live/runtime events remain authoritative;
+              // legacy clients retain their complete snapshot projection below.
             } else {
               const snapshot = getSessionFileSnapshot(sessionInfo.pi_session_file, sessionInfo.cwd);
               const messages = snapshot?.messages ?? [];
@@ -1217,7 +1217,7 @@ function handleConnection(
               }
             }
             startFilePoll(nextSessionId, sessionInfo.pi_session_file, sessionInfo.cwd, version, selectionId, !quarantined);
-          } else if (!quarantined) {
+          } else if (!quarantined && currentTranscriptNegotiation.protocol !== "window-v1") {
             scheduleWayangAutoTitle(nextSessionId, {
               stillSelected: () => alive && version === setupVersion && currentSessionId === nextSessionId && currentSelectionId === selectionId,
               onCommitted: invalidateSessionFileSnapshot,
@@ -1446,7 +1446,9 @@ function handleConnection(
             reason: "reset",
             streamingAtSnapshot: Boolean(handle?.session.isStreaming),
             compactingAtSnapshot: Boolean(handle?.session.isCompacting),
-            liveStreamingMessage: handle?.liveStreamingMessage ?? handle?.session.state.streamingMessage,
+            streamingMessage: serializeStreamingMessageForWindow(
+              handle?.liveStreamingMessage ?? handle?.session.state.streamingMessage,
+            ),
           });
           sendSafe(ws, window);
         },

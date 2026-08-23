@@ -4958,6 +4958,14 @@ export function appendStreamingMessageToHistory(
   ];
 }
 
+/** Freeze the ID-less in-progress overlay at an exact subscription boundary. */
+export function serializeStreamingMessageForWindow(streamingMessage: any): SerializedMessage | null {
+  const serialized = appendStreamingMessageToHistory([], streamingMessage)[0];
+  if (!serialized) return null;
+  try { return structuredClone(serialized); }
+  catch { return null; }
+}
+
 /**
  * Capture live transcript state, including the in-progress message that Pi
  * intentionally has not persisted to SessionManager until message_end.
@@ -4977,48 +4985,6 @@ export function getTodoState(id: string): SerializedTodoState {
   if (!handle) return { type: "todo_state", todos: [], source: "none" };
   const manager = handle.session.sessionManager;
   return extractTodoStateFromEntries(manager.getBranch().length > 0 ? manager.getBranch() : manager.getEntries());
-}
-
-export interface SessionFileDerivedProjection {
-  fingerprint: FileFingerprint;
-  autoTitle: AutoTitleActivationSnapshot;
-  todoState: SerializedTodoState;
-}
-
-/**
- * Complete stopped-session derived state, intentionally separate from the
- * bounded transcript pager. Modern attaches schedule this only after the first
- * window has been sent; it never serializes or transfers the complete branch.
- */
-export function getSessionFileDerivedProjection(
-  sessionFile: string | null | undefined,
-  cwd?: string | null,
-): SessionFileDerivedProjection | null {
-  if (!sessionFile) return null;
-  try {
-    const fingerprint = sessionFileFingerprint(sessionFile);
-    const manager = SessionManager.open(sessionFile, undefined, cwd || undefined);
-    const branch = manager.getBranch();
-    const activeEntries = branch.length > 0 ? branch : manager.getEntries();
-    const firstUser = activeEntries.find((entry: any) => entry?.type === "message" && entry.message?.role === "user");
-    const projection: SessionFileDerivedProjection = {
-      fingerprint,
-      autoTitle: {
-        sessionId: manager.getSessionId(),
-        cwd: manager.getHeader()?.cwd ?? "",
-        sessionFile,
-        fingerprint,
-        nameState: manager.getSessionNameState(),
-        markedProjection: extractCompletedTitleExchanges(activeEntries),
-        legacyProjection: extractCompletedTitleExchanges(activeEntries, { allowSafeLegacyUserText: true }),
-        normalizedFirstUserFallback: normalizeProvisionalSessionTitle(titleTextBlocks((firstUser as any)?.message?.content)),
-      },
-      todoState: extractTodoStateFromEntries(activeEntries),
-    };
-    return fingerprintsEqual(fingerprint, sessionFileFingerprint(sessionFile)) ? projection : null;
-  } catch {
-    return null;
-  }
 }
 
 export interface SessionFileSnapshot {

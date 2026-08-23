@@ -3,6 +3,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { serializeStreamingMessageForWindow } from "../pi-bridge.js";
 import { TranscriptPaginationService } from "./service.js";
 import { StructuralTranscriptIndex } from "./structural-index.js";
 import { TRANSCRIPT_PAGE_MAX_BYTES, TRANSCRIPT_PAGE_MAX_ROWS } from "./reverse-reader.js";
@@ -72,6 +73,41 @@ test("modern latest and before windows remain bounded and request-correlated", a
   }
 });
 
+test("streaming overlay serialization freezes mutable runtime content synchronously", () => {
+  const streaming = { role: "assistant", content: [{ type: "text", text: "before" }], timestamp: 1 };
+  const frozen = serializeStreamingMessageForWindow(streaming);
+  streaming.content[0].text = "after";
+  assert.equal(((frozen?.message as any)?.content as any[])[0].text, "before");
+});
+
+test("ID-less streaming overlay is bounded separately without evicting persisted rows", async () => {
+  const { dir, file } = makeTranscript(205, { hugeLast: false });
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const latest = await service.open({
+      sessionId: "s",
+      selectionId: "selection-streaming-overlay",
+      sessionFile: file,
+      intent: "latest",
+      streamingMessage: {
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "δ".repeat(200_000) }] },
+      },
+    });
+    assert.equal(latest.messages.length, 200);
+    assert.equal(latest.messages[0].id, "m-5");
+    assert.ok(latest.messages.every((row) => typeof row.id === "string"));
+    assert.ok(latest.before_cursor);
+    assert.equal(latest.streaming_message?.type, "custom");
+    assert.equal(latest.streaming_message?.id, undefined);
+    assert.equal((latest.streaming_message?.message as any)?.customType, "wayang-transcript-event-placeholder-v1");
+    assert.ok(Buffer.byteLength(JSON.stringify(latest)) <= TRANSCRIPT_PAGE_MAX_BYTES);
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("hidden session_info root does not create a fourth empty reverse page", async () => {
   const { dir, file } = makeTranscript(450, { hugeLast: false, sessionInfoRoot: true });
   const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
@@ -132,12 +168,44 @@ test("byte trimming keeps a gap-free reverse cursor boundary", async () => {
   try {
     const latest = await service.open({ sessionId: "s", selectionId: "selection-bytes", sessionFile: file, intent: "latest" });
     assert.ok(latest.before_cursor);
-    const before = await service.page({
-      sessionId: "s", selectionId: "selection-bytes", sessionFile: file,
-      requestId: "bytes-before", direction: "before", cursor: latest.before_cursor!,
-    });
-    const ids = [...before.messages, ...latest.messages].map((row) => row.id);
+    const windows = [latest.messages];
+    let cursor: string | null = latest.before_cursor;
+    let pageNumber = 0;
+    while (cursor) {
+      const before = await service.page({
+        sessionId: "s", selectionId: "selection-bytes", sessionFile: file,
+        requestId: `bytes-before-${pageNumber++}`, direction: "before", cursor,
+      });
+      windows.unshift(before.messages);
+      cursor = before.before_cursor;
+      assert.ok(pageNumber < 10, "bounded reverse paging must make progress");
+    }
+    const ids = windows.flat().map((row) => row.id);
     assert.deepEqual(ids, Array.from({ length: 205 }, (_, index) => `m-${index}`));
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("aggregate indexed read trimming preserves retained around cursors", async () => {
+  const { dir, file } = makeTranscript(120, { regularSize: 8 * 1024, hugeLast: false });
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const around = await service.open({
+      sessionId: "s", selectionId: "selection-index-budget", sessionFile: file,
+      intent: "around", anchorId: "m-60",
+    });
+    assert.ok(around.messages.some((row) => row.id === "m-60"));
+    assert.ok(around.before_cursor);
+    assert.ok(around.after_cursor);
+    const lastAround = Number(String(around.messages.at(-1)?.id).slice(2));
+    const after = await service.page({
+      sessionId: "s", selectionId: "selection-index-budget", sessionFile: file,
+      requestId: "index-budget-after", direction: "after", cursor: around.after_cursor!,
+    });
+    const firstAfter = Number(String(after.messages[0]?.id).slice(2));
+    assert.equal(firstAfter, lastAround + 1);
   } finally {
     await service.close();
     fs.rmSync(dir, { recursive: true, force: true });

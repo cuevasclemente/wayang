@@ -4,8 +4,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { TranscriptCursorError, TranscriptCursorRegistry } from "./cursor-registry.js";
-import { readReverseTranscriptPage } from "./reverse-reader.js";
-import { StructuralTranscriptIndex } from "./structural-index.js";
+import { readReverseTranscriptPage, TRANSCRIPT_REVERSE_MAX_SCAN_BYTES } from "./reverse-reader.js";
+import {
+  StructuralTranscriptIndex,
+  TRANSCRIPT_INDEX_MAX_READ_BYTES,
+} from "./structural-index.js";
 
 function fixture(lines: unknown[], separator = "\n", finalNewline = true): { dir: string; file: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-transcript-page-"));
@@ -76,6 +79,22 @@ test("reverse reader returns exact bounded before continuations", () => {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("reverse reader returns a stable placeholder for a newest row beyond the scan ceiling", () => {
+  const huge = message("huge-tip", "root", "z".repeat(TRANSCRIPT_REVERSE_MAX_SCAN_BYTES + 1024 * 1024));
+  const { dir, file } = fixture([header(), message("root", null, "root"), huge]);
+  try {
+    const latest = readReverseTranscriptPage(file);
+    assert.equal(latest.branchTipId, "huge-tip");
+    assert.equal(latest.entries.length, 1);
+    assert.equal(latest.entries[0].id, "huge-tip");
+    assert.equal(latest.entries[0].customType, "wayang-transcript-event-placeholder-v1");
+    assert.ok(latest.continuation);
+    const before = readReverseTranscriptPage(file, { continuation: latest.continuation! });
+    assert.deepEqual(before.entries.map((entry) => entry.id), ["root"]);
+    assert.equal(before.hasOlder, false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("opaque cursors reject selection, epoch, direction, expiry, and eviction mismatches", () => {
   let now = 10;
   const registry = new TranscriptCursorRegistry<{ offset: number }>({ maxEntries: 1, ttlMs: 5, now: () => now });
@@ -93,6 +112,74 @@ test("opaque cursors reject selection, epoch, direction, expiry, and eviction mi
   now = 20;
   assert.throws(() => registry.resolve(second, binding),
     (error) => error instanceof TranscriptCursorError && error.code === "expired_cursor");
+});
+
+test("structural indexed reads enforce one aggregate source-byte budget", async () => {
+  const entries: Array<ReturnType<typeof header> | ReturnType<typeof message>> = [header()];
+  let parentId: string | null = null;
+  for (let index = 0; index < 120; index++) {
+    const id = `bounded-${index}`;
+    entries.push(message(id, parentId, `${index}:` + "r".repeat(8 * 1024)));
+    parentId = id;
+  }
+  const { dir, file } = fixture(entries);
+  const index = new StructuralTranscriptIndex(path.join(dir, "transcript-index.db"));
+  try {
+    const selection = await index.around("bounded-session", file, "bounded-60", 120);
+    const read = index.readBoundedEntries(selection.revision, selection.rows, {
+      preference: "around",
+      anchorEventId: "bounded-60",
+    });
+    assert.ok(read.rows.some((row) => row.eventId === "bounded-60"));
+    assert.ok(read.rows.length < selection.rows.length, "aggregate budget must reduce the indexed source set");
+    assert.ok(read.sourceBytesRead <= TRANSCRIPT_INDEX_MAX_READ_BYTES);
+    assert.equal(index.getReadInstrumentation().lastSourceBytesRead, read.sourceBytesRead);
+    const ordinals = read.rows.map((row) => row.visibleOrdinal);
+    assert.ok(ordinals.every((ordinal, position) => position === 0 || ordinal === ordinals[position - 1] + 1));
+  } finally {
+    await index.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("structural builds are isolated by session, canonical path, and revision", async () => {
+  const firstFixture = fixture([header(), message("first", null, "first path")]);
+  const secondFixture = fixture([header(), message("second", null, "second path")]);
+  const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-transcript-index-race-"));
+  let releaseFirst!: () => void;
+  let firstPaused!: () => void;
+  const firstPauseReached = new Promise<void>((resolve) => { firstPaused = resolve; });
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const canonicalFirst = path.resolve(firstFixture.file);
+  let firstPublishAttempts = 0;
+  const index = new StructuralTranscriptIndex(path.join(dbDir, "transcript-index.db"), {
+    async beforePublishForTests(_sessionId, filePath) {
+      if (filePath !== canonicalFirst) return;
+      firstPublishAttempts++;
+      firstPaused();
+      await firstGate;
+    },
+  });
+  try {
+    const staleBuild = index.ensure("shared-session", firstFixture.file);
+    await firstPauseReached;
+    const coalescedStaleBuild = index.ensure("shared-session", firstFixture.file);
+    const current = await index.ensure("shared-session", secondFixture.file);
+    assert.equal(current.filePath, path.resolve(secondFixture.file));
+    releaseFirst();
+    await assert.rejects(staleBuild, /invalidated/u);
+    await assert.rejects(coalescedStaleBuild, /invalidated/u);
+    assert.equal(firstPublishAttempts, 1, "identical session/path/revision builds must coalesce");
+    const selected = await index.around("shared-session", secondFixture.file, "second", 20);
+    assert.equal(selected.anchor?.status, "found");
+    assert.equal(selected.revision.filePath, path.resolve(secondFixture.file));
+  } finally {
+    releaseFirst();
+    await index.close();
+    fs.rmSync(firstFixture.dir, { recursive: true, force: true });
+    fs.rmSync(secondFixture.dir, { recursive: true, force: true });
+    fs.rmSync(dbDir, { recursive: true, force: true });
+  }
 });
 
 test("structural index resolves active, off-branch, and appended anchors without storing content", async () => {

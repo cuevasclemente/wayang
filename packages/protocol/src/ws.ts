@@ -262,6 +262,8 @@ export interface TranscriptWindowMessage {
   transcript_epoch: string;
   branch_tip_id: string | null;
   messages: HistoryEntry[];
+  /** Frozen ID-less in-progress runtime overlay; never part of persisted paging order. */
+  streaming_message?: HistoryEntry;
   before_cursor: string | null;
   after_cursor: string | null;
   has_older: boolean;

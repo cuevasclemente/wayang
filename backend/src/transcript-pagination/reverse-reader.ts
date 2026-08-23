@@ -5,6 +5,8 @@ export const TRANSCRIPT_PAGE_MAX_ROWS = 200;
 export const TRANSCRIPT_PAGE_MAX_BYTES = 512 * 1024;
 export const TRANSCRIPT_REVERSE_MAX_SCAN_BYTES = 16 * 1024 * 1024;
 const HEADER_MAX_BYTES = 256 * 1024;
+const REVERSE_BOUNDARY_BLOCK_BYTES = 64 * 1024;
+const OVERSIZED_ENVELOPE_PREFIX_BYTES = 256 * 1024;
 
 export interface TranscriptFileRevision {
   device: number;
@@ -109,6 +111,66 @@ function assertPathStillMatches(filePath: string, fd: number, expected: Transcri
   }
 }
 
+function newestPhysicalLineBounds(fd: number, end: number): { start: number; end: number } | null {
+  if (end <= 0) return null;
+  let lineEnd = end;
+  const trailing = Buffer.allocUnsafe(1);
+  if (fs.readSync(fd, trailing, 0, 1, end - 1) === 1 && trailing[0] === 0x0a) lineEnd--;
+  if (lineEnd <= 0) return null;
+  let cursor = lineEnd;
+  while (cursor > 0) {
+    const start = Math.max(0, cursor - REVERSE_BOUNDARY_BLOCK_BYTES);
+    const block = Buffer.allocUnsafe(cursor - start);
+    const read = fs.readSync(fd, block, 0, block.length, start);
+    for (let index = read - 1; index >= 0; index--) {
+      if (block[index] === 0x0a) return { start: start + index + 1, end: lineEnd };
+    }
+    cursor = start;
+  }
+  return { start: 0, end: lineEnd };
+}
+
+function decodeJsonStringField(prefix: string, name: string): string | null | undefined {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`"${escapedName}"\\s*:\\s*(null|"(?:\\\\.|[^"\\\\])*")`, "u").exec(prefix);
+  if (!match) return undefined;
+  if (match[1] === "null") return null;
+  try {
+    const value = JSON.parse(match[1]);
+    return typeof value === "string" ? value : undefined;
+  } catch { return undefined; }
+}
+
+function oversizedEnvelopePlaceholder(
+  fd: number,
+  bounds: { start: number; end: number },
+): { entry: any; eventType: string; id: string; parentId: string | null } {
+  const prefixLength = Math.min(bounds.end - bounds.start, OVERSIZED_ENVELOPE_PREFIX_BYTES);
+  const bytes = Buffer.allocUnsafe(prefixLength);
+  const read = fs.readSync(fd, bytes, 0, bytes.length, bounds.start);
+  const prefix = bytes.subarray(0, read).toString("utf8");
+  const type = decodeJsonStringField(prefix, "type");
+  const id = decodeJsonStringField(prefix, "id");
+  const parentId = decodeJsonStringField(prefix, "parentId");
+  if (typeof type !== "string" || typeof id !== "string" || id.length === 0 || parentId === undefined) {
+    throw new Error("Oversized transcript row has no bounded stable envelope");
+  }
+  return {
+    eventType: type,
+    id,
+    parentId,
+    entry: {
+      type: "custom_message",
+      id,
+      parentId,
+      customType: "wayang-transcript-event-placeholder-v1",
+      content: "This transcript event is too large to include in a bounded window.",
+      display: true,
+      details: { reason: "payload_limit", encoded_bytes: bounds.end - bounds.start },
+    },
+  };
+}
+
 function parseReverseRange(fd: number, start: number, end: number): ParsedPhysicalLine[] {
   if (end <= start) return [];
   const bytes = Buffer.allocUnsafe(end - start);
@@ -172,8 +234,31 @@ export function readReverseTranscriptPage(
   const fd = openRegularNoFollow(filePath);
   try {
     const revision = revisionFromDescriptor(fd);
-    const end = Math.min(options.continuation?.beforeOffset ?? revision.size, revision.size);
+    let end = Math.min(options.continuation?.beforeOffset ?? revision.size, revision.size);
     const maxScanBytes = options.maxScanBytes ?? TRANSCRIPT_REVERSE_MAX_SCAN_BYTES;
+    if (!options.continuation) {
+      const newestBounds = newestPhysicalLineBounds(fd, end);
+      if (newestBounds && newestBounds.end - newestBounds.start > maxScanBytes) {
+        const oversized = oversizedEnvelopePlaceholder(fd, newestBounds);
+        if (oversized.eventType === "session" || oversized.eventType === "session_info") {
+          end = newestBounds.start;
+        } else {
+          const continuation = oversized.parentId === null
+            ? null
+            : { beforeOffset: newestBounds.start, nextAncestorId: oversized.parentId };
+          assertPathStillMatches(filePath, fd, revision);
+          return {
+            entries: [oversized.entry],
+            revision,
+            branchTipId: oversized.id,
+            entryOffsets: Object.freeze({ [oversized.id]: newestBounds.start }),
+            continuation,
+            hasOlder: continuation !== null,
+            scanCeilingReached: continuation !== null,
+          };
+        }
+      }
+    }
     const start = Math.max(0, end - maxScanBytes);
     const lines = parseReverseRange(fd, start, end);
     const maxRows = options.maxRows ?? TRANSCRIPT_PAGE_MAX_ROWS;

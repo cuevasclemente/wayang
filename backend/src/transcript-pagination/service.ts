@@ -6,11 +6,10 @@ import type {
   TranscriptWindowMessage,
   TranscriptWindowReason,
 } from "@wayang/protocol";
-import { appendStreamingMessageToHistory, serializeHistoryEntries, type SerializedMessage } from "../pi-bridge.js";
+import { serializeHistoryEntries, type SerializedMessage } from "../pi-bridge.js";
 import { TranscriptCursorError, TranscriptCursorRegistry } from "./cursor-registry.js";
 import {
   readReverseTranscriptPage,
-  readTranscriptFileRevision,
   sameTranscriptIdentity,
   TRANSCRIPT_PAGE_MAX_BYTES,
   TRANSCRIPT_PAGE_MAX_ROWS,
@@ -48,7 +47,8 @@ interface ColdEpochState {
   tailWitness: string;
 }
 
-const TRANSCRIPT_MESSAGE_BUDGET = TRANSCRIPT_PAGE_MAX_BYTES - 4_096;
+const TRANSCRIPT_STREAMING_MESSAGE_BUDGET = 128 * 1024;
+const TRANSCRIPT_MESSAGE_BUDGET = TRANSCRIPT_PAGE_MAX_BYTES - TRANSCRIPT_STREAMING_MESSAGE_BUDGET - 4_096;
 
 interface BoundedSerialization {
   messages: SerializedMessage[];
@@ -69,7 +69,8 @@ export interface OpenTranscriptWindowInput {
   requestId?: string;
   streamingAtSnapshot?: boolean;
   compactingAtSnapshot?: boolean;
-  liveStreamingMessage?: any;
+  /** Already-frozen ID-less runtime overlay captured by the transport. */
+  streamingMessage?: SerializedMessage | null;
   /** Descendant tail reconciliation keeps still-valid older edge cursors. */
   preserveCursors?: boolean;
 }
@@ -140,6 +141,18 @@ function boundedSerialization(
     lastId: typeof lastRow?.id === "string" ? lastRow.id : null,
     trimmedEarlier,
   };
+}
+
+function boundedStreamingMessage(message: SerializedMessage | null | undefined): SerializedMessage | undefined {
+  if (!message) return undefined;
+  const idLessMessage: SerializedMessage = { type: message.type };
+  for (const [key, value] of Object.entries(message)) {
+    if (key !== "id" && key !== "parentId" && key !== "type") idLessMessage[key] = value;
+  }
+  const encodedBytes = Buffer.byteLength(JSON.stringify(idLessMessage));
+  return encodedBytes <= TRANSCRIPT_STREAMING_MESSAGE_BUDGET
+    ? idLessMessage
+    : rowPlaceholder(idLessMessage, encodedBytes);
 }
 
 function boundedReverseContinuation(
@@ -253,21 +266,6 @@ export class TranscriptPaginationService {
       input.direction === "before" ? "latest" : "earliest", expectedEpoch);
   }
 
-  isDerivedProjectionCurrent(sessionId: string, filePath: string, transcriptEpoch: string, fingerprint: {
-    ino: number; size: number; mtimeMs: number; ctimeMs: number;
-  }): boolean {
-    const state = this.coldEpochs.get(sessionId);
-    if (!state || state.transcriptEpoch !== transcriptEpoch
-      || state.revision.inode !== fingerprint.ino || state.revision.size !== fingerprint.size
-      || state.revision.mtimeMs !== fingerprint.mtimeMs || state.revision.ctimeMs !== fingerprint.ctimeMs) return false;
-    try {
-      const current = readTranscriptFileRevision(filePath);
-      return current.inode === state.revision.inode && current.device === state.revision.device
-        && current.size === state.revision.size && current.mtimeMs === state.revision.mtimeMs
-        && current.ctimeMs === state.revision.ctimeMs && sameTranscriptIdentity(current, state.revision);
-    } catch { return false; }
-  }
-
   invalidateSession(sessionId: string): void {
     this.cursors.invalidateSession(sessionId);
     this.coldEpochs.delete(sessionId);
@@ -329,17 +327,22 @@ export class TranscriptPaginationService {
     preference: "latest" | "earliest" | "around",
     wireEpoch = selection.revision.transcriptEpoch,
   ): TranscriptWindowMessage {
-    const entries = this.index.readEntries(selection.revision, selection.rows);
-    const bounded = boundedSerialization(entries, preference, selection.anchor?.resolved_id);
-    const rowById = new Map(selection.rows.map((row) => [row.eventId, row]));
-    const first = (bounded.firstId && rowById.get(bounded.firstId)) ?? selection.rows[0];
-    const last = (bounded.lastId && rowById.get(bounded.lastId)) ?? selection.rows.at(-1);
+    const indexedRead = this.index.readBoundedEntries(selection.revision, selection.rows, {
+      preference,
+      anchorEventId: selection.anchor?.resolved_id,
+    });
+    const bounded = boundedSerialization(indexedRead.entries, preference, selection.anchor?.resolved_id);
+    const rowById = new Map(indexedRead.rows.map((row) => [row.eventId, row]));
+    const first = (bounded.firstId && rowById.get(bounded.firstId)) ?? indexedRead.rows[0];
+    const last = (bounded.lastId && rowById.get(bounded.lastId)) ?? indexedRead.rows.at(-1);
     const beforeCursor = first && (selection.hasOlder || first.visibleOrdinal > 0)
       ? this.cursors.issue({ sessionId: input.sessionId, selectionId: input.selectionId,
           transcriptEpoch: wireEpoch, direction: "before" },
         { kind: "index", filePath: selection.revision.filePath, indexEpoch: selection.revision.transcriptEpoch, boundaryVisibleOrdinal: first.visibleOrdinal })
       : null;
-    const afterCursor = last && (selection.hasNewer)
+    const selectedLast = selection.rows.at(-1);
+    const afterCursor = last && (selection.hasNewer
+      || Boolean(selectedLast && last.visibleOrdinal < selectedLast.visibleOrdinal))
       ? this.cursors.issue({ sessionId: input.sessionId, selectionId: input.selectionId,
           transcriptEpoch: wireEpoch, direction: "after" },
         { kind: "index", filePath: selection.revision.filePath, indexEpoch: selection.revision.transcriptEpoch, boundaryVisibleOrdinal: last.visibleOrdinal })
@@ -393,18 +396,8 @@ export class TranscriptPaginationService {
     hasNewer: boolean,
     anchor?: TranscriptAnchorResolution,
   ): TranscriptWindowMessage {
-    if (input.liveStreamingMessage) {
-      messages = appendStreamingMessageToHistory(messages, input.liveStreamingMessage);
-      while (messages.length > TRANSCRIPT_PAGE_MAX_ROWS
-        || Buffer.byteLength(JSON.stringify(messages)) > TRANSCRIPT_MESSAGE_BUDGET) {
-        if (messages.length <= 1) {
-          messages = [rowPlaceholder(messages[0], Buffer.byteLength(JSON.stringify(messages[0])))];
-          break;
-        }
-        messages.shift();
-      }
-      payloadBytes = Buffer.byteLength(JSON.stringify(messages));
-    }
+    const streamingMessage = boundedStreamingMessage(input.streamingMessage);
+    if (streamingMessage) payloadBytes += Buffer.byteLength(JSON.stringify(streamingMessage));
     return {
       type: "transcript_window",
       session_id: input.sessionId,
@@ -414,6 +407,7 @@ export class TranscriptPaginationService {
       transcript_epoch: transcriptEpoch,
       branch_tip_id: branchTipId,
       messages,
+      ...(streamingMessage ? { streaming_message: streamingMessage } : {}),
       before_cursor: beforeCursor,
       after_cursor: afterCursor,
       has_older: hasOlder,
