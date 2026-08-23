@@ -24,7 +24,7 @@ function window(overrides: Record<string, unknown> = {}) {
     has_older: false,
     has_newer: false,
     message_count: messages.length,
-    payload_bytes: Buffer.byteLength(JSON.stringify(messages)),
+    payload_bytes: Buffer.byteLength(JSON.stringify({ messages })),
     ...overrides,
   };
 }
@@ -37,6 +37,7 @@ test("window validator accepts bounded persisted rows and a separate ID-less str
   expect(transcriptWindowValidationError(window({
     streaming_message: streaming,
     streaming_at_snapshot: true,
+    payload_bytes: Buffer.byteLength(JSON.stringify({ messages: [entry("m-1")], streaming_message: streaming })),
   }))).toBeNull();
 });
 
@@ -44,14 +45,26 @@ test("window validator enforces IDs, count, byte, cursor, request, and anchor in
   expect(transcriptWindowValidationError(window({ messages: [entry("same"), entry("same")], message_count: 2 })))
     .toBe("duplicate_message_id");
   expect(transcriptWindowValidationError(window({ messages: [{ type: "user" }], message_count: 1 })))
-    .toBe("missing_message_id");
+    .toBe("message_id_not_string");
   expect(transcriptWindowValidationError(window({ message_count: 2 }))).toBe("message_count_mismatch");
+  expect(transcriptWindowValidationError(window({ payload_bytes: 1 }))).toBe("payload_bytes_mismatch");
+  expect(transcriptWindowValidationError(window({
+    messages: [entry(`unsafe\u0000id`)],
+    message_count: 1,
+    payload_bytes: Buffer.byteLength(JSON.stringify({ messages: [entry(`unsafe\u0000id`)] })),
+  }))).toBe("message_id_unsafe_chars");
+  const oversizedIdMessage = entry("λ".repeat(300));
+  expect(transcriptWindowValidationError(window({
+    messages: [oversizedIdMessage],
+    message_count: 1,
+    payload_bytes: Buffer.byteLength(JSON.stringify({ messages: [oversizedIdMessage] })),
+  }))).toBe("message_id_too_large");
   expect(transcriptWindowValidationError(window({
     messages: [entry("huge", "x".repeat(MAX_TRANSCRIPT_WINDOW_CONTENT_BYTES))],
     message_count: 1,
   }))).toBe("content_limit_exceeded");
   expect(transcriptWindowValidationError(window({ has_older: true }))).toBe("before_cursor_edge_mismatch");
-  expect(transcriptWindowValidationError(window({ reason: "prepend" }))).toBe("request_reason_mismatch");
+  expect(transcriptWindowValidationError(window({ reason: "prepend" }))).toBe("request_id_not_string");
   expect(transcriptWindowValidationError(window({
     anchor: { requested_id: "m-2", resolved_id: "m-2", status: "found" },
   }))).toBe("resolved_anchor_not_in_window");
@@ -75,10 +88,10 @@ test("window validator permits page-local opposite edges without redundant curso
 });
 
 test("terminal page identity errors reopen while operational failures remain retryable", () => {
-  for (const code of ["expired_cursor", "unknown_cursor", "epoch_mismatch", "selection_mismatch", "transcript_revision_changed"]) {
-    expect(classifyTranscriptPageErrorCode(code), code).toBe("terminal");
+  for (const code of ["expired_cursor", "unknown_cursor", "direction_mismatch", "epoch_mismatch", "selection_mismatch", "transcript_revision_changed", "transcript_page_failed", undefined]) {
+    expect(classifyTranscriptPageErrorCode(code), String(code)).toBe("terminal");
   }
-  for (const code of ["transcript_page_failed", "temporary_io_error", undefined]) {
-    expect(classifyTranscriptPageErrorCode(code), String(code)).toBe("transient");
+  for (const code of ["temporary_io_error", "index_unavailable", "database_busy"]) {
+    expect(classifyTranscriptPageErrorCode(code), code).toBe("transient");
   }
 });

@@ -119,7 +119,13 @@ async function installActiveWindowSocket(page: Page): Promise<void> {
           streaming_at_snapshot: true,
           compacting_at_snapshot: false,
           message_count: 1,
-          payload_bytes: JSON.stringify(messages).length,
+          payload_bytes: new TextEncoder().encode(JSON.stringify({
+            messages,
+            streaming_message: {
+              type: "assistant",
+              message: { role: "assistant", content: [{ type: "text", text: "Frozen partial assistant response." }] },
+            },
+          })).byteLength,
         });
       }
 
@@ -211,7 +217,7 @@ async function installTerminalCursorSocket(page: Page): Promise<void> {
           has_older: hasOlder,
           has_newer: false,
           message_count: 1,
-          payload_bytes: JSON.stringify(messages).length,
+          payload_bytes: new TextEncoder().encode(JSON.stringify({ messages })).byteLength,
         });
       }
 
