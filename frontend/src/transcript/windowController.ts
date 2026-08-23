@@ -21,6 +21,7 @@ export interface TranscriptWindowEnvelope<Message> {
   transcript_epoch: string;
   branch_tip_id: string | null;
   messages: Message[];
+  streaming_message?: Message | null;
   before_cursor: string | null;
   after_cursor: string | null;
   has_older: boolean;
@@ -345,42 +346,166 @@ export function transcriptWindowReducer<Message>(
   }
 }
 
+export const MAX_TRANSCRIPT_WINDOW_MESSAGES = 200;
+export const MAX_TRANSCRIPT_WINDOW_CONTENT_BYTES = 512 * 1024;
+
+export type TranscriptPageErrorClass = "terminal" | "transient";
+
+/**
+ * Cursor and projection-identity failures cannot succeed with the same opaque
+ * cursor. Unknown operational failures remain retryable so temporary I/O or
+ * index availability does not unnecessarily discard a valid loaded window.
+ */
+export function classifyTranscriptPageErrorCode(code: unknown): TranscriptPageErrorClass {
+  if (typeof code !== "string") return "transient";
+  const normalized = code.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  if (!normalized) return "transient";
+  return [
+    "cursor",
+    "revision",
+    "epoch",
+    "session",
+    "selection",
+    "path",
+    "source",
+    "file",
+    "branch",
+    "stale",
+  ].some((identity) => normalized.includes(identity))
+    || normalized === "transcript_changed"
+    || normalized === "transcript_invalidated"
+    ? "terminal"
+    : "transient";
+}
+
+function serializedBytes(value: unknown): number | null {
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) return null;
+    return new TextEncoder().encode(serialized).byteLength;
+  } catch {
+    return null;
+  }
+}
+
+/** Serialized canonical rows plus the separate live overlay payload. */
+export function serializedTranscriptWindowContentBytes(value: {
+  messages: unknown[];
+  streaming_message?: unknown;
+}): number | null {
+  return serializedBytes({
+    messages: value.messages,
+    ...(value.streaming_message === undefined
+      ? {}
+      : { streaming_message: value.streaming_message }),
+  });
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+/**
+ * Returns a stable machine-readable reason for malformed modern frames. The
+ * function is intentionally pure/exported for backend-independent unit/E2E
+ * fixtures even though the frontend package currently has no unit-test runner.
+ */
+export function transcriptWindowValidationError(value: unknown): string | null {
+  if (!value || typeof value !== "object") return "not_object";
+  const message = value as Record<string, unknown>;
+  if (message.type !== "transcript_window") return "wrong_type";
+  if (!nonEmptyString(message.session_id)) return "invalid_session_id";
+  if (message.selection_id !== undefined && !nonEmptyString(message.selection_id)) return "invalid_selection_id";
+  if (!nonEmptyString(message.transcript_epoch)) return "invalid_transcript_epoch";
+  if (message.branch_tip_id !== null && !nonEmptyString(message.branch_tip_id)) return "invalid_branch_tip_id";
+
+  const reason = message.reason;
+  if (!["initial", "prepend", "append", "tail_reconcile", "reset"].includes(String(reason))) {
+    return "invalid_reason";
+  }
+  const pageReason = reason === "prepend" || reason === "append";
+  if (pageReason ? !nonEmptyString(message.request_id) : message.request_id !== undefined) {
+    return "request_reason_mismatch";
+  }
+
+  if (!Array.isArray(message.messages)) return "invalid_messages";
+  if (message.messages.length > MAX_TRANSCRIPT_WINDOW_MESSAGES) return "message_limit_exceeded";
+  const messageIds = new Set<string>();
+  for (const candidate of message.messages) {
+    if (!candidate || typeof candidate !== "object") return "invalid_message";
+    const id = (candidate as Record<string, unknown>).id;
+    if (!nonEmptyString(id)) return "missing_message_id";
+    if (messageIds.has(id)) return "duplicate_message_id";
+    messageIds.add(id);
+  }
+
+  const streamingMessage = message.streaming_message;
+  if (streamingMessage !== undefined && streamingMessage !== null) {
+    if (!streamingMessage || typeof streamingMessage !== "object") return "invalid_streaming_message";
+    const streamingRecord = streamingMessage as Record<string, unknown>;
+    const nestedMessage = streamingRecord.message && typeof streamingRecord.message === "object"
+      ? streamingRecord.message as Record<string, unknown>
+      : null;
+    const streamingRole = streamingRecord.role ?? nestedMessage?.role;
+    const streamingType = streamingRecord.type;
+    if (
+      !["assistant", "toolResult", "tool_result"].includes(String(streamingType))
+      && streamingRole !== "assistant"
+      && streamingRole !== "toolResult"
+      && streamingRole !== "tool_result"
+    ) return "invalid_streaming_message_type";
+    if (message.streaming_at_snapshot !== true) return "streaming_message_without_streaming_snapshot";
+  }
+  if (message.streaming_at_snapshot !== undefined && typeof message.streaming_at_snapshot !== "boolean") {
+    return "invalid_streaming_snapshot_flag";
+  }
+  if (message.compacting_at_snapshot !== undefined && typeof message.compacting_at_snapshot !== "boolean") {
+    return "invalid_compacting_snapshot_flag";
+  }
+
+  if (!Number.isSafeInteger(message.message_count) || (message.message_count as number) < 0) {
+    return "invalid_message_count";
+  }
+  if (message.message_count !== message.messages.length) return "message_count_mismatch";
+  if (!Number.isSafeInteger(message.payload_bytes) || (message.payload_bytes as number) < 0) {
+    return "invalid_payload_bytes";
+  }
+  if ((message.payload_bytes as number) > MAX_TRANSCRIPT_WINDOW_CONTENT_BYTES) return "declared_payload_limit_exceeded";
+  const actualBytes = serializedTranscriptWindowContentBytes({
+    messages: message.messages,
+    ...(streamingMessage === undefined ? {} : { streaming_message: streamingMessage }),
+  });
+  if (actualBytes === null) return "unserializable_content";
+  if (actualBytes > MAX_TRANSCRIPT_WINDOW_CONTENT_BYTES) return "content_limit_exceeded";
+
+  if (message.before_cursor !== null && !nonEmptyString(message.before_cursor)) return "invalid_before_cursor";
+  if (message.after_cursor !== null && !nonEmptyString(message.after_cursor)) return "invalid_after_cursor";
+  if (typeof message.has_older !== "boolean" || typeof message.has_newer !== "boolean") return "invalid_edge_flags";
+  if (message.has_older !== (message.before_cursor !== null)) return "before_cursor_edge_mismatch";
+  if (message.has_newer !== (message.after_cursor !== null)) return "after_cursor_edge_mismatch";
+
+  const anchor = message.anchor;
+  if (anchor !== undefined) {
+    if ((reason !== "initial" && reason !== "reset") || !anchor || typeof anchor !== "object") {
+      return "anchor_reason_mismatch";
+    }
+    const record = anchor as Record<string, unknown>;
+    if (!nonEmptyString(record.requested_id)) return "invalid_anchor_requested_id";
+    if (!["found", "missing", "off_branch", "pending"].includes(String(record.status))) {
+      return "invalid_anchor_status";
+    }
+    if (record.status === "found") {
+      if (!nonEmptyString(record.resolved_id)) return "found_anchor_without_resolution";
+      if (!messageIds.has(record.resolved_id)) return "resolved_anchor_not_in_window";
+    } else if (record.resolved_id !== null) {
+      return "unavailable_anchor_has_resolution";
+    }
+  }
+  return null;
+}
+
 export function isTranscriptWindowEnvelope<Message = Record<string, unknown>>(
   value: unknown,
 ): value is TranscriptWindowEnvelope<Message> {
-  if (!value || typeof value !== "object") return false;
-  const message = value as Record<string, unknown>;
-  const validReason = message.reason === "initial"
-    || message.reason === "prepend"
-    || message.reason === "append"
-    || message.reason === "tail_reconcile"
-    || message.reason === "reset";
-  const anchor = message.anchor;
-  const validAnchor = anchor === undefined || Boolean(
-    anchor
-    && typeof anchor === "object"
-    && typeof (anchor as Record<string, unknown>).requested_id === "string"
-    && (((anchor as Record<string, unknown>).resolved_id === null)
-      || typeof (anchor as Record<string, unknown>).resolved_id === "string")
-    && ["found", "missing", "off_branch", "pending"].includes(
-      String((anchor as Record<string, unknown>).status),
-    ),
-  );
-  return message.type === "transcript_window"
-    && typeof message.session_id === "string"
-    && (message.selection_id === undefined || typeof message.selection_id === "string")
-    && (message.request_id === undefined || typeof message.request_id === "string")
-    && validReason
-    && typeof message.transcript_epoch === "string"
-    && (message.branch_tip_id === null || typeof message.branch_tip_id === "string")
-    && Array.isArray(message.messages)
-    && (message.before_cursor === null || typeof message.before_cursor === "string")
-    && (message.after_cursor === null || typeof message.after_cursor === "string")
-    && typeof message.has_older === "boolean"
-    && typeof message.has_newer === "boolean"
-    && validAnchor
-    && typeof message.message_count === "number"
-    && Number.isFinite(message.message_count)
-    && typeof message.payload_bytes === "number"
-    && Number.isFinite(message.payload_bytes);
+  return transcriptWindowValidationError(value) === null;
 }

@@ -46,6 +46,7 @@ import {
 import { transcriptMutationMarker } from "../components/transcript/transcriptMutationHelpers";
 import { formatContextWindow } from "../utils/context-window";
 import {
+  classifyTranscriptPageErrorCode,
   createTranscriptWindowState,
   isTranscriptWindowEnvelope,
   transcriptWindowReducer,
@@ -1893,6 +1894,28 @@ function streamingBlocksToAssistantMessage(blocks: StreamingBlocks): ChatMessage
   };
 }
 
+function streamingMessagePrefix(streamingMessage: ChatMessage): StreamingBlocks {
+  const nestedRole = streamingMessage.message?.role;
+  const normalized = ["assistant", "toolResult", "tool_result"].includes(streamingMessage.type)
+    ? streamingMessage
+    : streamingMessage.role === "assistant" || nestedRole === "assistant"
+      ? {
+          type: "assistant",
+          message: nestedRole === "assistant" ? streamingMessage.message : streamingMessage,
+        }
+      : ["toolResult", "tool_result"].includes(String(streamingMessage.role ?? nestedRole))
+        ? {
+            type: "toolResult",
+            message: nestedRole ? streamingMessage.message : streamingMessage,
+          }
+        : streamingMessage;
+  const assistant = buildDisplayAssistantMessage([normalized]);
+  const content = assistant?.message?.content;
+  return Array.isArray(content)
+    ? { content: content as StreamingContentBlock[] }
+    : { content: [] };
+}
+
 function trailingActiveStreamPrefix(messages: ChatMessage[]): StreamingBlocks {
   let suffixStart = messages.length;
   while (suffixStart > 0) {
@@ -2920,6 +2943,7 @@ export function ChatPanel({
   const [queuedUserMessages, setQueuedUserMessages] = useState<QueuedUserMessage[]>([]);
   const [streamingBlocks, setStreamingBlocks] = useState<StreamingBlocks>({ content: [] });
   const [streamingHistoryPrefix, setStreamingHistoryPrefix] = useState<StreamingBlocks>({ content: [] });
+  const [streamingPrefixReplacesHistoryTail, setStreamingPrefixReplacesHistoryTail] = useState(false);
   const [inputText, setInputText] = useState("");
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState("");
@@ -3000,12 +3024,16 @@ export function ChatPanel({
   const transcriptOwnedBySelection = Boolean(activeSessionId && messagesOwnerSessionId === activeSessionId);
   const normalizedOwnedMessages = useMemo(() => {
     const normalized = transcriptOwnedBySelection ? normalizeMessagesForDisplay(messages) : [];
-    if (streamingHistoryPrefix.content.length === 0 || normalized.at(-1)?.type !== "assistant") return normalized;
+    if (
+      !streamingPrefixReplacesHistoryTail
+      || streamingHistoryPrefix.content.length === 0
+      || normalized.at(-1)?.type !== "assistant"
+    ) return normalized;
     // The durable snapshot remains intact in messages. Hide only its trailing
     // assistant presentation while that same content is rendered as the prefix
     // of the live continuation below.
     return normalized.slice(0, -1);
-  }, [messages, streamingHistoryPrefix, transcriptOwnedBySelection]);
+  }, [messages, streamingHistoryPrefix, streamingPrefixReplacesHistoryTail, transcriptOwnedBySelection]);
   const displayMessages = useMemo(
     () => normalizedOwnedMessages.slice(visibleMessageStart),
     [normalizedOwnedMessages, visibleMessageStart],
@@ -3111,6 +3139,7 @@ export function ChatPanel({
   const transcriptOpenIntentRef = useRef<TranscriptOpenIntent>(effectiveTranscriptOpenIntent);
   const requestedTranscriptIntentKeyRef = useRef(requestedTranscriptOpenIntent.requestKey);
   requestedTranscriptIntentKeyRef.current = requestedTranscriptOpenIntent.requestKey;
+  const terminalPageReopenSelectionIdRef = useRef<string | null>(null);
   const selectionGenerationRef = useRef(0);
   const selectionStartedAtRef = useRef(0);
   const sessionSelectionStartedAtInputRef = useRef(sessionSelectionStartedAt);
@@ -3195,6 +3224,7 @@ export function ChatPanel({
       setActiveCommandGuardPinPrompt(null);
     }
     selectionIdRef.current = selectionId;
+    terminalPageReopenSelectionIdRef.current = null;
     transcriptOpenIntentRef.current = effectiveTranscriptOpenIntent;
     if (effectiveTranscriptOpenIntent.requestKey === requestedTranscriptOpenIntent.requestKey) {
       matchIntentRef.current = effectiveTranscriptOpenIntent.kind === "around"
@@ -3263,9 +3293,13 @@ export function ChatPanel({
     setStreamingBlocks(next);
   }, []);
 
-  const setStreamingHistoryPrefixSynced = useCallback((next: StreamingBlocks) => {
+  const setStreamingHistoryPrefixSynced = useCallback((
+    next: StreamingBlocks,
+    replacesHistoryTail = false,
+  ) => {
     streamingHistoryPrefixRef.current = next;
     setStreamingHistoryPrefix(next);
+    setStreamingPrefixReplacesHistoryTail(replacesHistoryTail && next.content.length > 0);
   }, []);
 
   const setQueuedMessagesSynced = useCallback((updater: (prev: QueuedUserMessage[]) => QueuedUserMessage[]) => {
@@ -3928,16 +3962,56 @@ export function ChatPanel({
             || typeof msg.request_id !== "string"
             || (msg.direction !== "before" && msg.direction !== "after")
           ) return;
+          const currentFlight = msg.direction === "before"
+            ? transcriptStateRef.current.inFlightBefore
+            : transcriptStateRef.current.inFlightAfter;
+          if (currentFlight?.requestId !== msg.request_id) return;
+          const pageError = typeof msg.error === "string"
+            ? msg.error
+            : typeof msg.message === "string"
+              ? msg.message
+              : "The server could not load this transcript page.";
           if (msg.direction === "before") prependAnchorsRef.current.delete(msg.request_id);
+          if (classifyTranscriptPageErrorCode(msg.code) === "terminal") {
+            prependAnchorsRef.current.clear();
+            pendingViewportRestoreRef.current = null;
+            applyTranscriptAction({
+              type: "invalidate",
+              error: `${pageError} Reopening a fresh bounded transcript window.`,
+            });
+            setMessagesOwnerSessionId(null);
+            setVisibleMessageStart(0);
+            setShowScrollToBottom(false);
+            pinActiveTurnScrollRef.current = false;
+            setActiveTurnScrollAnchorText(null);
+            setResendingMessageId(null);
+            setIsSessionHistoryLoading(true);
+            setStreamingHistoryPrefixSynced({ content: [] });
+            setStreamingBlocksSynced({ content: [] });
+            const selectionId = selectionIdRef.current;
+            if (selectionId && terminalPageReopenSelectionIdRef.current !== selectionId) {
+              terminalPageReopenSelectionIdRef.current = selectionId;
+              if (transcriptOpenIntentRef.current.kind === "around" && transcriptOpenIntentRef.current.anchorId) {
+                pendingViewportRestoreRef.current = {
+                  eventId: transcriptOpenIntentRef.current.anchorId,
+                  offset: Math.max(0, (scrollContainerRef.current?.clientHeight ?? 0) / 2),
+                };
+              }
+              setTranscriptNavigationOverride({
+                baseRequestKey: requestedTranscriptIntentKeyRef.current,
+                intent: createTranscriptIntent(
+                  transcriptOpenIntentRef.current.kind,
+                  transcriptOpenIntentRef.current.anchorId,
+                ),
+              });
+            }
+            return;
+          }
           applyTranscriptAction({
             type: "page_failed",
             direction: msg.direction,
             requestId: msg.request_id,
-            error: typeof msg.error === "string"
-              ? msg.error
-              : typeof msg.message === "string"
-                ? msg.message
-                : "The server could not load this transcript page.",
+            error: pageError,
           });
           return;
         }
@@ -3990,12 +4064,16 @@ export function ChatPanel({
             || transportGeneration !== transportGenerationRef.current
           ) return;
           if (!isTranscriptWindowEnvelope<ChatMessage>(msg)) {
+            prependAnchorsRef.current.clear();
+            pendingViewportRestoreRef.current = null;
             applyTranscriptAction({ type: "invalidate", error: "The server returned an invalid bounded transcript window." });
             setMessagesOwnerSessionId(null);
             setIsSessionHistoryLoading(false);
             return;
           }
           if (msg.messages.some((message) => typeof message?.id !== "string" || message.id.length === 0)) {
+            prependAnchorsRef.current.clear();
+            pendingViewportRestoreRef.current = null;
             applyTranscriptAction({ type: "invalidate", error: "The bounded transcript contained an event without a stable id." });
             setMessagesOwnerSessionId(null);
             setIsSessionHistoryLoading(false);
@@ -4066,7 +4144,12 @@ export function ChatPanel({
           if (typeof msg.streaming_at_snapshot === "boolean") {
             setStreamingBlocksSynced({ content: [] });
             setStreamingHistoryPrefixSynced(
-              msg.streaming_at_snapshot ? trailingActiveStreamPrefix(rawWindowMessages) : { content: [] },
+              msg.streaming_at_snapshot
+                ? msg.streaming_message
+                  ? streamingMessagePrefix(msg.streaming_message)
+                  : trailingActiveStreamPrefix(rawWindowMessages)
+                : { content: [] },
+              msg.streaming_at_snapshot && !msg.streaming_message,
             );
             isStreamingRef.current = msg.streaming_at_snapshot;
             setIsStreaming(msg.streaming_at_snapshot);
@@ -4180,6 +4263,7 @@ export function ChatPanel({
             setStreamingBlocksSynced({ content: [] });
             setStreamingHistoryPrefixSynced(
               msg.streaming_at_snapshot ? trailingActiveStreamPrefix(historyMessages) : { content: [] },
+              msg.streaming_at_snapshot,
             );
             isStreamingRef.current = msg.streaming_at_snapshot;
             setIsStreaming(msg.streaming_at_snapshot);
