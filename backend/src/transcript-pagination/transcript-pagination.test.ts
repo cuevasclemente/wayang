@@ -4,7 +4,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { TranscriptCursorError, TranscriptCursorRegistry } from "./cursor-registry.js";
-import { readReverseTranscriptPage, TRANSCRIPT_REVERSE_MAX_SCAN_BYTES } from "./reverse-reader.js";
+import {
+  readReverseTranscriptPage,
+  readTranscriptFileRevision,
+  TRANSCRIPT_REVERSE_MAX_SCAN_BYTES,
+} from "./reverse-reader.js";
 import {
   StructuralTranscriptIndex,
   TRANSCRIPT_INDEX_MAX_READ_BYTES,
@@ -112,6 +116,36 @@ test("opaque cursors reject selection, epoch, direction, expiry, and eviction mi
   now = 20;
   assert.throws(() => registry.resolve(second, binding),
     (error) => error instanceof TranscriptCursorError && error.code === "expired_cursor");
+});
+
+test("structural worker streams multi-chunk Unicode CRLF with malformed lines and no final newline", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-transcript-worker-stream-"));
+  const file = path.join(dir, "session.jsonl");
+  const rows = [
+    JSON.stringify(header()),
+    JSON.stringify(message("unicode-root", null, "λ".repeat(40_000))),
+    "{malformed",
+    JSON.stringify(message("unicode-middle", "unicode-root", "雪".repeat(40_000))),
+    JSON.stringify(message("unicode-tip", "unicode-middle", "終".repeat(40_000))),
+  ];
+  fs.writeFileSync(file, rows.join("\r\n"));
+  const index = new StructuralTranscriptIndex(path.join(dir, "transcript-index.db"));
+  try {
+    const selection = await index.around("unicode-session", file, "unicode-middle", 20);
+    assert.equal(selection.revision.complete, true);
+    assert.equal(selection.revision.size, fs.statSync(file).size);
+    assert.equal(selection.revision.headerDigest, readTranscriptFileRevision(file).headerDigest,
+      "worker revision digest must retain the physical CR before LF");
+    assert.deepEqual(selection.rows.map((row) => row.eventId), ["unicode-root", "unicode-middle", "unicode-tip"]);
+    const bytes = fs.readFileSync(file);
+    for (const row of selection.rows) {
+      const physical = bytes.subarray(row.sourceOffset, row.sourceOffset + row.sourceLength).toString("utf8").trim();
+      assert.equal(JSON.parse(physical).id, row.eventId);
+    }
+  } finally {
+    await index.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("structural indexed reads enforce one aggregate source-byte budget", async () => {

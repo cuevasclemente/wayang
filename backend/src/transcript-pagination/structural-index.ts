@@ -80,6 +80,8 @@ const WORKER_SOURCE = String.raw`
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { parentPort, workerData } = require("node:worker_threads");
+const READ_CHUNK_BYTES = 64 * 1024;
+const TAIL_WITNESS_BYTES = ${TAIL_WITNESS_BYTES};
 function sha(bytes) { return crypto.createHash("sha256").update(bytes).digest("hex"); }
 function visible(e) {
   if (!e || typeof e !== "object") return 0;
@@ -100,47 +102,99 @@ try {
   fd = fs.openSync(workerData.filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   const before = fs.fstatSync(fd);
   if (!before.isFile()) throw new Error("Transcript is not a regular file");
-  const bytes = Buffer.allocUnsafe(before.size);
-  let read = 0;
-  while (read < bytes.length) {
-    const count = fs.readSync(fd, bytes, read, bytes.length - read, read);
-    if (!count) break;
-    read += count;
-  }
-  const content = bytes.subarray(0, read);
+
   const entries = [];
-  const values = [];
+  let branchTipId = null;
   let ordinal = 0;
-  let lineStart = 0;
+  let lineStartOffset = 0;
+  let lineParts = [];
+  let lineBytes = 0;
   let header = Buffer.alloc(0);
-  for (let i = 0; i <= content.length; i++) {
-    if (i !== content.length && content[i] !== 10) continue;
-    let lineEnd = i;
-    if (lineEnd > lineStart && content[lineEnd - 1] === 13) lineEnd--;
-    const raw = content.subarray(lineStart, lineEnd);
-    if (ordinal === 0) header = raw;
-    if (raw.length) {
+  let tail = Buffer.alloc(0);
+  let endedNewline = before.size === 0;
+
+  function appendLinePart(part) {
+    if (!part.length) return;
+    const copy = Buffer.from(part);
+    lineParts.push(copy);
+    lineBytes += copy.length;
+  }
+
+  function consumeLine(sourceLength) {
+    const physicalRaw = lineParts.length === 0
+      ? Buffer.alloc(0)
+      : lineParts.length === 1
+        ? lineParts[0]
+        : Buffer.concat(lineParts, lineBytes);
+    if (ordinal === 0) header = Buffer.from(physicalRaw);
+    const raw = physicalRaw.length > 0 && physicalRaw[physicalRaw.length - 1] === 13
+      ? physicalRaw.subarray(0, physicalRaw.length - 1)
+      : physicalRaw;
+    if (raw.length > 0) {
       try {
         const value = JSON.parse(raw.toString("utf8"));
-        values.push(value);
-        if (value && typeof value.id === "string") entries.push({
-          eventId: value.id,
-          parentId: typeof value.parentId === "string" ? value.parentId : null,
-          physicalOrdinal: ordinal,
-          sourceOffset: lineStart,
-          sourceLength: i - lineStart + (i < content.length ? 1 : 0),
-          eventType: typeof value.type === "string" ? value.type : "unknown",
-          displayClass: displayClass(value),
-          visible: visible(value),
-        });
-      } catch { /* Pi tolerates malformed lines */ }
+        if (value && typeof value.id === "string") {
+          const eventType = typeof value.type === "string" ? value.type : "unknown";
+          entries.push({
+            eventId: value.id,
+            parentId: typeof value.parentId === "string" ? value.parentId : null,
+            physicalOrdinal: ordinal,
+            sourceOffset: lineStartOffset,
+            sourceLength,
+            eventType,
+            displayClass: displayClass(value),
+            visible: visible(value),
+          });
+          if (eventType !== "session_info" && eventType !== "session") branchTipId = value.id;
+        }
+      } catch { /* Pi tolerates malformed physical lines */ }
     }
     ordinal++;
-    lineStart = i + 1;
+    lineParts = [];
+    lineBytes = 0;
+    lineStartOffset += sourceLength;
   }
+
+  function updateTail(chunk) {
+    if (chunk.length >= TAIL_WITNESS_BYTES) {
+      tail = Buffer.from(chunk.subarray(chunk.length - TAIL_WITNESS_BYTES));
+      return;
+    }
+    const combined = Buffer.concat([tail, chunk], tail.length + chunk.length);
+    tail = combined.length > TAIL_WITNESS_BYTES
+      ? Buffer.from(combined.subarray(combined.length - TAIL_WITNESS_BYTES))
+      : combined;
+  }
+
+  let position = 0;
+  const block = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+  while (position < before.size) {
+    const requested = Math.min(block.length, before.size - position);
+    const count = fs.readSync(fd, block, 0, requested, position);
+    if (count === 0) break;
+    const chunk = block.subarray(0, count);
+    updateTail(chunk);
+    endedNewline = chunk[chunk.length - 1] === 10;
+    let segmentStart = 0;
+    for (let index = 0; index < chunk.length; index++) {
+      if (chunk[index] !== 10) continue;
+      appendLinePart(chunk.subarray(segmentStart, index));
+      const absoluteEnd = position + index + 1;
+      consumeLine(absoluteEnd - lineStartOffset);
+      segmentStart = index + 1;
+    }
+    appendLinePart(chunk.subarray(segmentStart));
+    position += count;
+  }
+  if (position !== before.size) throw new Error("Transcript ended during structural indexing");
+  if (lineStartOffset < before.size) consumeLine(before.size - lineStartOffset);
+
   let mutationEpoch = sha(header);
   try {
-    const h = JSON.parse(header.toString("utf8"));
+    const headerJson = header.length > 0 && header[header.length - 1] === 13
+      ? header.subarray(0, header.length - 1)
+      : header;
+    const h = JSON.parse(headerJson.toString("utf8"));
     const explicit = h?.mutationEpoch ?? h?.mutation_epoch ?? h?.wayangMutationEpoch;
     if (typeof explicit === "string" || typeof explicit === "number") mutationEpoch = String(explicit);
   } catch {}
@@ -150,8 +204,6 @@ try {
     if (byId.has(entry.eventId)) duplicate = true;
     else byId.set(entry.eventId, entry);
   }
-  const tipValue = [...values].reverse().find((value) => value && typeof value.id === "string" && value.type !== "session_info" && value.type !== "session");
-  const branchTipId = tipValue?.id ?? null;
   const newest = [];
   const seen = new Set();
   let current = branchTipId;
@@ -175,8 +227,8 @@ try {
     branchTipId,
     complete: !error,
     error,
-    endedNewline: content.length === 0 || content[content.length - 1] === 10,
-    tailDigest: sha(content.subarray(Math.max(0, content.length - ${TAIL_WITNESS_BYTES}))),
+    endedNewline,
+    tailDigest: sha(tail),
   });
 } catch (error) {
   parentPort.postMessage({ workerError: error && error.message ? error.message : String(error) });
