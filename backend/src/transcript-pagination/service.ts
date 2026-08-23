@@ -23,6 +23,7 @@ import {
   closeStructuralTranscriptIndex,
   getStructuralTranscriptIndex,
   purgeSharedStructuralTranscriptSession,
+  TRANSCRIPT_INDEX_MAX_READ_BYTES,
   type IndexedWindowSelection,
 } from "./structural-index.js";
 
@@ -49,8 +50,10 @@ interface ColdEpochState {
   tailWitness: string;
 }
 
-const TRANSCRIPT_STREAMING_MESSAGE_BUDGET = 128 * 1024;
-const TRANSCRIPT_MESSAGE_BUDGET = TRANSCRIPT_PAGE_MAX_BYTES - TRANSCRIPT_STREAMING_MESSAGE_BUDGET - 4_096;
+const TRANSCRIPT_MESSAGE_BUDGET = TRANSCRIPT_INDEX_MAX_READ_BYTES;
+const TRANSCRIPT_PAYLOAD_ENVELOPE_MARGIN = 4 * 1024;
+const TRANSCRIPT_STREAMING_MESSAGE_BUDGET =
+  TRANSCRIPT_PAGE_MAX_BYTES - TRANSCRIPT_MESSAGE_BUDGET - TRANSCRIPT_PAYLOAD_ENVELOPE_MARGIN;
 
 interface BoundedSerialization {
   messages: SerializedMessage[];
@@ -470,7 +473,7 @@ export class TranscriptPaginationService {
     transcriptEpoch: string,
     branchTipId: string | null,
     messages: SerializedMessage[],
-    payloadBytes: number,
+    _payloadBytes: number,
     beforeCursor: string | null,
     afterCursor: string | null,
     hasOlder: boolean,
@@ -478,7 +481,10 @@ export class TranscriptPaginationService {
     anchor?: TranscriptAnchorResolution,
   ): TranscriptWindowMessage {
     const streamingMessage = boundedStreamingMessage(input.streamingMessage);
-    if (streamingMessage) payloadBytes += Buffer.byteLength(JSON.stringify(streamingMessage));
+    const payloadContent = streamingMessage
+      ? { messages, streaming_message: streamingMessage }
+      : { messages };
+    const payloadBytes = Buffer.byteLength(JSON.stringify(payloadContent));
     return {
       type: "transcript_window",
       session_id: input.sessionId,

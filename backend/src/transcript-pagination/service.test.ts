@@ -47,6 +47,8 @@ test("modern latest and before windows remain bounded and request-correlated", a
     const latest = await service.open({ sessionId: "s", selectionId: "selection-a", sessionFile: file, intent: "latest" });
     assert.equal(latest.type, "transcript_window");
     assert.ok(latest.message_count <= TRANSCRIPT_PAGE_MAX_ROWS);
+    assert.equal(latest.streaming_message, undefined);
+    assert.equal(latest.payload_bytes, Buffer.byteLength(JSON.stringify({ messages: latest.messages })));
     assert.ok(latest.payload_bytes <= TRANSCRIPT_PAGE_MAX_BYTES);
     assert.ok(Buffer.byteLength(JSON.stringify(latest)) <= TRANSCRIPT_PAGE_MAX_BYTES);
     assert.equal(latest.messages.at(-1)?.id, "m-204");
@@ -104,6 +106,40 @@ test("ID-less streaming overlay is bounded separately without evicting persisted
     assert.equal(placeholder?.role, "assistant");
     assert.equal(placeholder?.streamingPlaceholder, true);
     assert.equal(placeholder?.content?.[0]?.type, "text");
+    assert.equal(latest.payload_bytes, Buffer.byteLength(JSON.stringify({
+      messages: latest.messages,
+      streaming_message: latest.streaming_message,
+    })));
+    assert.ok(latest.payload_bytes <= TRANSCRIPT_PAGE_MAX_BYTES);
+    assert.ok(Buffer.byteLength(JSON.stringify(latest)) <= TRANSCRIPT_PAGE_MAX_BYTES);
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("persisted and streaming payload budgets remain within aggregate 512 KiB", async () => {
+  const { dir, file } = makeTranscript(205, { regularSize: 2_000, hugeLast: false });
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const latest = await service.open({
+      sessionId: "s",
+      selectionId: "selection-aggregate-payload",
+      sessionFile: file,
+      intent: "latest",
+      streamingMessage: {
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "s".repeat(120 * 1024) }] },
+      },
+    });
+    assert.ok(latest.streaming_message);
+    assert.equal((latest.streaming_message.message as any)?.streamingPlaceholder, undefined);
+    const declaredContent = {
+      messages: latest.messages,
+      streaming_message: latest.streaming_message,
+    };
+    assert.equal(latest.payload_bytes, Buffer.byteLength(JSON.stringify(declaredContent)));
+    assert.ok(latest.payload_bytes <= TRANSCRIPT_PAGE_MAX_BYTES);
     assert.ok(Buffer.byteLength(JSON.stringify(latest)) <= TRANSCRIPT_PAGE_MAX_BYTES);
   } finally {
     await service.close();
