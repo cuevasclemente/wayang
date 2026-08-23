@@ -1,4 +1,5 @@
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import { createE2eSession, openSessionInUi } from "./helpers/sessions";
 import { createSyntheticCorpus, type SyntheticSessionFixture } from "./helpers/syntheticSessions";
 
 async function importFixture(request: APIRequestContext, fixture: SyntheticSessionFixture): Promise<void> {
@@ -47,6 +48,178 @@ async function eventTop(page: Page, eventId: string): Promise<number> {
     const container = element.closest<HTMLElement>('[data-testid="chat-message-list"]');
     if (!container) throw new Error("chat message list not found");
     return element.getBoundingClientRect().top - container.getBoundingClientRect().top;
+  });
+}
+
+async function installActiveWindowSocket(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    type Handler<T> = ((event: T) => void) | null;
+    class ActiveWindowWebSocket {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static readonly CLOSED = 3;
+      readyState = ActiveWindowWebSocket.CONNECTING;
+      onopen: Handler<Event> = null;
+      onclose: Handler<CloseEvent> = null;
+      onerror: Handler<Event> = null;
+      onmessage: Handler<MessageEvent> = null;
+      private sessionId: string;
+      private selectionId: string | null;
+
+      constructor(url: string) {
+        const parsed = new URL(url, window.location.href);
+        this.sessionId = parsed.searchParams.get("session_id") ?? "";
+        this.selectionId = parsed.searchParams.get("selection_id");
+        window.setTimeout(() => {
+          this.readyState = ActiveWindowWebSocket.OPEN;
+          this.onopen?.(new Event("open"));
+          this.emitWindow();
+        }, 0);
+      }
+
+      send(raw: string): void {
+        const message = JSON.parse(raw) as { type?: string; session_id?: string; selection_id?: string };
+        if (message.type !== "switch_session" || !message.session_id) return;
+        this.sessionId = message.session_id;
+        this.selectionId = message.selection_id ?? null;
+        this.emitWindow();
+      }
+
+      close(): void {
+        this.readyState = ActiveWindowWebSocket.CLOSED;
+      }
+
+      private emitWindow(): void {
+        this.emit({ type: "session_loading", session_id: this.sessionId, selection_id: this.selectionId });
+        this.emit({ type: "session_ready", session_id: this.sessionId, selection_id: this.selectionId });
+        this.emit({ type: "transcript_protocol", session_id: this.sessionId, selection_id: this.selectionId, protocol: "window-v1", intent: "latest" });
+        const messages = [{
+          type: "user",
+          id: "persisted-user",
+          parentId: null,
+          message: { role: "user", content: "Persisted active-session prompt." },
+        }];
+        this.emit({
+          type: "transcript_window",
+          session_id: this.sessionId,
+          selection_id: this.selectionId,
+          reason: "initial",
+          transcript_epoch: "active-stream-epoch",
+          branch_tip_id: "persisted-user",
+          messages,
+          streaming_message: {
+            type: "assistant",
+            message: { role: "assistant", content: [{ type: "text", text: "Frozen partial assistant response." }] },
+          },
+          before_cursor: null,
+          after_cursor: null,
+          has_older: false,
+          has_newer: false,
+          streaming_at_snapshot: true,
+          compacting_at_snapshot: false,
+          message_count: 1,
+          payload_bytes: JSON.stringify(messages).length,
+        });
+      }
+
+      private emit(payload: Record<string, unknown>): void {
+        this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(payload) }));
+      }
+    }
+    (window as unknown as { WebSocket: typeof ActiveWindowWebSocket }).WebSocket = ActiveWindowWebSocket;
+  });
+}
+
+async function installTerminalCursorSocket(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    type Handler<T> = ((event: T) => void) | null;
+    class TerminalCursorWebSocket {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static readonly CLOSED = 3;
+      readyState = TerminalCursorWebSocket.CONNECTING;
+      onopen: Handler<Event> = null;
+      onclose: Handler<CloseEvent> = null;
+      onerror: Handler<Event> = null;
+      onmessage: Handler<MessageEvent> = null;
+      private sessionId: string;
+      private selectionId: string | null;
+      private generation = 0;
+
+      constructor(url: string) {
+        const parsed = new URL(url, window.location.href);
+        this.sessionId = parsed.searchParams.get("session_id") ?? "";
+        this.selectionId = parsed.searchParams.get("selection_id");
+        window.setTimeout(() => {
+          this.readyState = TerminalCursorWebSocket.OPEN;
+          this.onopen?.(new Event("open"));
+          this.emitWindow(true);
+        }, 0);
+      }
+
+      send(raw: string): void {
+        const message = JSON.parse(raw) as {
+          type?: string;
+          request_id?: string;
+          direction?: "before" | "after";
+          session_id?: string;
+          selection_id?: string;
+        };
+        if (message.type === "transcript_page_request" && message.request_id && message.direction) {
+          this.emit({
+            type: "transcript_page_error",
+            session_id: this.sessionId,
+            selection_id: this.selectionId,
+            request_id: message.request_id,
+            direction: message.direction,
+            code: "expired_cursor",
+            error: "Reopen the bounded transcript window.",
+          });
+          return;
+        }
+        if (message.type === "switch_session" && message.session_id) {
+          this.sessionId = message.session_id;
+          this.selectionId = message.selection_id ?? null;
+          this.generation++;
+          (window as Window & { __terminalCursorSwitches?: number }).__terminalCursorSwitches = this.generation;
+          this.emitWindow(false);
+        }
+      }
+
+      close(): void {
+        this.readyState = TerminalCursorWebSocket.CLOSED;
+      }
+
+      private emitWindow(hasOlder: boolean): void {
+        this.emit({ type: "session_loading", session_id: this.sessionId, selection_id: this.selectionId });
+        this.emit({ type: "session_ready", session_id: this.sessionId, selection_id: this.selectionId });
+        this.emit({ type: "transcript_protocol", session_id: this.sessionId, selection_id: this.selectionId, protocol: "window-v1", intent: "latest" });
+        const id = hasOlder ? "stale-window-message" : "fresh-window-message";
+        const messages = [{ type: "user", id, parentId: null, message: { role: "user", content: id } }];
+        this.emit({
+          type: "transcript_window",
+          session_id: this.sessionId,
+          selection_id: this.selectionId,
+          reason: "initial",
+          transcript_epoch: hasOlder ? "stale-epoch" : "fresh-epoch",
+          branch_tip_id: id,
+          messages,
+          before_cursor: hasOlder ? "expired-before-cursor" : null,
+          after_cursor: null,
+          has_older: hasOlder,
+          has_newer: false,
+          message_count: 1,
+          payload_bytes: JSON.stringify(messages).length,
+        });
+      }
+
+      private emit(payload: Record<string, unknown>): void {
+        this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(payload) }));
+      }
+    }
+    (window as unknown as { WebSocket: typeof TerminalCursorWebSocket }).WebSocket = TerminalCursorWebSocket;
   });
 }
 
@@ -123,6 +296,32 @@ test("search opens around the exact match and can jump latest and back", async (
 
   await page.getByTestId("transcript-back-to-match").click();
   await expect(target).toBeInViewport({ timeout: 30_000 });
+});
+
+test("an active session accepts a separate ID-less streaming snapshot", async ({ page, request }) => {
+  await installActiveWindowSocket(page);
+  const session = await createE2eSession(request, "pagination active stream");
+  await openSessionInUi(page, session);
+
+  const transcript = page.getByTestId("chat-message-list");
+  await expect(transcript).toHaveAttribute("data-transcript-mode", "window-v1", { timeout: 30_000 });
+  await expect(transcript).toHaveAttribute("data-transcript-state", "ready");
+  await expect(transcript.getByText("Persisted active-session prompt.", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("chat-streaming").getByText("Frozen partial assistant response.", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("transcript-window-error")).toHaveCount(0);
+});
+
+test("a terminal cursor error performs one fresh bounded reopen", async ({ page, request }) => {
+  await installTerminalCursorSocket(page);
+  const session = await createE2eSession(request, "pagination cursor recovery");
+  await openSessionInUi(page, session);
+
+  await expect(page.getByText("stale-window-message", { exact: true })).toBeVisible();
+  await page.getByTestId("transcript-gap-before").getByRole("button", { name: "Load older" }).click();
+  await expect(page.getByText("fresh-window-message", { exact: true })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText("stale-window-message", { exact: true })).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => (window as Window & { __terminalCursorSwitches?: number }).__terminalCursorSwitches ?? 0)).toBe(1);
+  await expect(page.getByTestId("transcript-window-error")).toHaveCount(0);
 });
 
 test("an unnegotiated legacy socket still receives complete history", async ({ page, request }) => {
