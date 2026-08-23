@@ -326,6 +326,50 @@ test("structural topology result limit publishes typed incomplete revision", asy
   }
 });
 
+test("sub-1MiB append crossing topology cap falls back to typed incomplete full build", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-append-topology-limit-"));
+  const file = path.join(dir, "session.jsonl");
+  const lines = [JSON.stringify(header())];
+  let parent: string | null = null;
+  for (let number = 0; number < TRANSCRIPT_INDEX_MAX_TOPOLOGY_ENTRIES - 2; number++) {
+    const id = `near-limit-${number}`;
+    lines.push(JSON.stringify(message(id, parent, "x")));
+    parent = id;
+  }
+  fs.writeFileSync(file, lines.join("\n") + "\n");
+  let appendRefreshes = 0;
+  const limitEvents: Array<{ existing: number; attempted: number }> = [];
+  const index = new StructuralTranscriptIndex(path.join(dir, "index.db"), {
+    onAppendRefreshForTests() { appendRefreshes++; },
+    onAppendTopologyLimitForTests(_sessionId, existing, attempted) {
+      limitEvents.push({ existing, attempted });
+    },
+  });
+  try {
+    const initial = await index.ensure("append-limited", file);
+    assert.equal(initial.complete, true);
+    const sizeBefore = fs.statSync(file).size;
+    const first = message("append-limit-first", parent, "first");
+    const second = message("append-limit-second", "append-limit-first", "second");
+    fs.appendFileSync(file, `${JSON.stringify(first)}\n${JSON.stringify(second)}\n`);
+    assert.ok(fs.statSync(file).size - sizeBefore < 1024 * 1024);
+
+    const revision = await index.ensure("append-limited", file);
+    assert.equal(appendRefreshes, 1);
+    assert.deepEqual(limitEvents, [{
+      existing: TRANSCRIPT_INDEX_MAX_TOPOLOGY_ENTRIES - 1,
+      attempted: 2,
+    }]);
+    assert.equal(revision.complete, false);
+    assert.equal(revision.error, "topology_entry_limit");
+    assert.equal(index.tryLatestCurrent("append-limited", file), null,
+      "an over-limit incomplete revision must never serve");
+  } finally {
+    await index.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("structural builds are isolated by session, canonical path, and revision", async () => {
   const firstFixture = fixture([header(), message("first", null, "first path")]);
   const secondFixture = fixture([header(), message("second", null, "second path")]);

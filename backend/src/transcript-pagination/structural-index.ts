@@ -287,6 +287,8 @@ export interface StructuralTranscriptIndexOptions {
   beforePublishForTests?: (sessionId: string, filePath: string) => void | Promise<void>;
   /** @internal Proves the synchronous append seam was selected. */
   onAppendRefreshForTests?: (sessionId: string, appendedBytes: number) => void;
+  /** @internal Proves append parsing stopped before over-limit topology work. */
+  onAppendTopologyLimitForTests?: (sessionId: string, existingEntries: number, attemptedEntries: number) => void;
   workerTimeoutMs?: number;
   /** @internal Worker-side delay for concurrency/timeout tests. */
   workerDelayMsForTests?: number;
@@ -927,6 +929,14 @@ export class StructuralTranscriptIndex {
 
   private appendRefresh(stored: StructuralIndexRevision, current: TranscriptFileRevision): StructuralIndexRevision {
     // Appends are parsed from the previous newline boundary; existing message bodies are never reread.
+    const countRow = this.db.prepare(
+      "SELECT COUNT(*) AS count FROM transcript_entries WHERE session_id=? AND transcript_epoch=?",
+    ).get(stored.sessionId, stored.transcriptEpoch) as { count: number };
+    const existingEntryCount = countRow.count;
+    if (!Number.isSafeInteger(existingEntryCount) || existingEntryCount > TRANSCRIPT_INDEX_MAX_TOPOLOGY_ENTRIES) {
+      throw new Error("Existing structural topology exceeds the compiled limit");
+    }
+    const remainingEntryCapacity = TRANSCRIPT_INDEX_MAX_TOPOLOGY_ENTRIES - existingEntryCount;
     const fd = fs.openSync(stored.filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     let content: Buffer;
     try {
@@ -944,13 +954,23 @@ export class StructuralTranscriptIndex {
       const raw = content.subarray(lineStart, index).toString("utf8").replace(/\r$/u, "");
       if (raw) {
         const value = JSON.parse(raw);
-        if (typeof value?.id === "string") appended.push({
-          eventId: value.id, parentId: typeof value.parentId === "string" ? value.parentId : null,
-          physicalOrdinal: ordinal, sourceOffset: stored.indexedSize + lineStart,
-          sourceLength: index - lineStart + (index < content.length ? 1 : 0), eventType: String(value.type || "unknown"),
-          displayClass: value.type === "message" ? String(value.message?.role || "message") : String(value.customType || value.type || "hidden"),
-          visible: isStructurallyVisibleTranscriptEntry(value) ? 1 : 0,
-        });
+        if (typeof value?.id === "string") {
+          if (appended.length >= remainingEntryCapacity) {
+            this.options.onAppendTopologyLimitForTests?.(
+              stored.sessionId,
+              existingEntryCount,
+              appended.length + 1,
+            );
+            throw new Error("Appended structural topology exceeds the compiled limit");
+          }
+          appended.push({
+            eventId: value.id, parentId: typeof value.parentId === "string" ? value.parentId : null,
+            physicalOrdinal: ordinal, sourceOffset: stored.indexedSize + lineStart,
+            sourceLength: index - lineStart + (index < content.length ? 1 : 0), eventType: String(value.type || "unknown"),
+            displayClass: value.type === "message" ? String(value.message?.role || "message") : String(value.customType || value.type || "hidden"),
+            visible: isStructurallyVisibleTranscriptEntry(value) ? 1 : 0,
+          });
+        }
       }
       ordinal++;
       lineStart = index + 1;
