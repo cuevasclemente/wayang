@@ -481,8 +481,21 @@ export function transcriptWindowValidationError(value: unknown): string | null {
   if (message.before_cursor !== null && !nonEmptyString(message.before_cursor)) return "invalid_before_cursor";
   if (message.after_cursor !== null && !nonEmptyString(message.after_cursor)) return "invalid_after_cursor";
   if (typeof message.has_older !== "boolean" || typeof message.has_newer !== "boolean") return "invalid_edge_flags";
-  if (message.has_older !== (message.before_cursor !== null)) return "before_cursor_edge_mismatch";
-  if (message.has_newer !== (message.after_cursor !== null)) return "after_cursor_edge_mismatch";
+  const beforeEdgeConsistent = message.has_older === (message.before_cursor !== null);
+  const afterEdgeConsistent = message.has_newer === (message.after_cursor !== null);
+  if (reason === "initial" || reason === "reset") {
+    if (!beforeEdgeConsistent) return "before_cursor_edge_mismatch";
+    if (!afterEdgeConsistent) return "after_cursor_edge_mismatch";
+  } else if (reason === "prepend") {
+    // The response's before edge is newly navigable. Its newer adjacency is
+    // already represented by the client's loaded segment, so has_newer may be
+    // true without minting a redundant after cursor.
+    if (!beforeEdgeConsistent) return "before_cursor_edge_mismatch";
+  } else {
+    // Append and authoritative tail reconciliation own the after edge. Their
+    // older adjacency may already be represented by loaded client state.
+    if (!afterEdgeConsistent) return "after_cursor_edge_mismatch";
+  }
 
   const anchor = message.anchor;
   if (anchor !== undefined) {
