@@ -6,7 +6,7 @@ import {
   getNonTranscriptUniversalReadDenyRoots,
   getPiSessionStorageRoots,
 } from "./protected-artifacts.js";
-import { pathIsWithin } from "./policy.js";
+import { authorizeProjectAction, pathIsWithin } from "./policy.js";
 import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
 import type { ProjectRow } from "./workspace-types.js";
 
@@ -19,7 +19,7 @@ export interface BoundedSessionHeader {
   timestamp: string | number | null;
 }
 
-export interface ExactStandardTranscriptAuthorization {
+export interface ExactDurableTranscriptIdentity {
   path: string;
   stat: fs.Stats;
   fingerprint: FileFingerprint;
@@ -27,6 +27,13 @@ export interface ExactStandardTranscriptAuthorization {
   headerBytes: number;
   row: SessionRow;
   project: ProjectRow;
+}
+
+export interface ExactStandardTranscriptAuthorization extends ExactDurableTranscriptIdentity {}
+
+/** Exact owning-chat authorization. Protected projects are intentionally valid. */
+export interface ExactUiTranscriptAuthorization extends ExactDurableTranscriptIdentity {
+  resolvedAgentProfileId: string;
 }
 
 export function fingerprintFromStat(stat: fs.Stats): FileFingerprint {
@@ -110,8 +117,11 @@ export function readBoundedSessionHeader(
       || typeof value.timestamp === "string" || typeof value.timestamp === "number")) {
       throw new Error("Session header timestamp is invalid");
     }
-    const after = fingerprintFromStat(fs.fstatSync(fd));
-    if (!fingerprintsEqual(after, fingerprint)) throw new Error("Transcript changed during bounded header authorization");
+    const afterStat = fs.fstatSync(fd);
+    const after = fingerprintFromStat(afterStat);
+    if (!afterStat.isFile() || afterStat.nlink !== 1 || !fingerprintsEqual(after, fingerprint)) {
+      throw new Error("Transcript changed during bounded header authorization");
+    }
     return {
       path: safe.path,
       stat: opened,
@@ -147,14 +157,14 @@ export function classifyExternalStandardTranscriptHeader(
   return { ...projects[0]!, access_policy: { ...projects[0]!.access_policy } };
 }
 
-export function authorizeExactStandardTranscript(
+function authorizeExactDurableTranscriptIdentity(
   filePath: string,
   options: {
     expectedSessionId?: string;
     expectedFingerprint?: FileFingerprint;
     observedHeader?: ReturnType<typeof readBoundedSessionHeader>;
   } = {},
-): ExactStandardTranscriptAuthorization | null {
+): ExactDurableTranscriptIdentity | null {
   const requestedPath = path.resolve(filePath);
   if (universallyDeniedTranscriptPath(requestedPath)) return null;
   let observed: ReturnType<typeof readBoundedSessionHeader>;
@@ -172,13 +182,61 @@ export function authorizeExactStandardTranscript(
   const idOwners = store.sessions.filter((row) => row.id === observed.header.id);
   if (pathOwners.length !== 1 || idOwners.length !== 1 || pathOwners[0] !== idOwners[0]) return null;
   const row = pathOwners[0]!;
-  if (row.legacy_private_session_quarantine !== false || !row.project_id) return null;
+  if (!row.project_id) return null;
   const projectsById = store.projects.filter((project) => project.id === row.project_id);
   const projectsByCwd = store.projects.filter((project) => project.cwd === row.cwd);
   if (projectsById.length !== 1 || projectsByCwd.length !== 1 || projectsById[0] !== projectsByCwd[0]) return null;
   const project = projectsById[0]!;
-  if (project.access_policy.privacy_mode !== "standard" || project.cwd !== row.cwd) return null;
-  if (lexicalHeaderCwd(observed.header.cwd) !== project.cwd) return null;
+  if (project.cwd !== row.cwd || lexicalHeaderCwd(observed.header.cwd) !== project.cwd) return null;
 
   return { ...observed, row: { ...row }, project: { ...project, access_policy: { ...project.access_policy } } };
+}
+
+export function authorizeExactStandardTranscript(
+  filePath: string,
+  options: {
+    expectedSessionId?: string;
+    expectedFingerprint?: FileFingerprint;
+    observedHeader?: ReturnType<typeof readBoundedSessionHeader>;
+  } = {},
+): ExactStandardTranscriptAuthorization | null {
+  const identity = authorizeExactDurableTranscriptIdentity(filePath, options);
+  if (!identity || identity.row.legacy_private_session_quarantine !== false
+    || identity.project.access_policy.privacy_mode !== "standard") return null;
+  return identity;
+}
+
+export function authorizeExactUiTranscript(
+  filePath: string,
+  options: {
+    expectedSessionId?: string;
+    expectedFingerprint?: FileFingerprint;
+    observedHeader?: ReturnType<typeof readBoundedSessionHeader>;
+  } = {},
+): ExactUiTranscriptAuthorization | null {
+  const identity = authorizeExactDurableTranscriptIdentity(filePath, options);
+  if (!identity || identity.row.legacy_private_session_quarantine !== false
+    || identity.row.agent_profile_id === undefined) return null;
+  const decision = authorizeProjectAction({
+    cwd: identity.row.cwd,
+    actor: "interactive",
+    agentProfileId: identity.row.agent_profile_id,
+  });
+  if (!decision.allowed || decision.project?.id !== identity.project.id || !decision.agentProfile) return null;
+  return { ...identity, resolvedAgentProfileId: decision.agentProfile.id };
+}
+
+export function exactUiTranscriptAuthorizationsEqual(
+  left: ExactUiTranscriptAuthorization,
+  right: ExactUiTranscriptAuthorization,
+): boolean {
+  return left.path === right.path
+    && left.row.id === right.row.id
+    && left.row.cwd === right.row.cwd
+    && left.row.project_id === right.row.project_id
+    && left.row.agent_profile_id === right.row.agent_profile_id
+    && left.project.id === right.project.id
+    && left.project.cwd === right.project.cwd
+    && left.resolvedAgentProfileId === right.resolvedAgentProfileId
+    && fingerprintsEqual(left.fingerprint, right.fingerprint);
 }

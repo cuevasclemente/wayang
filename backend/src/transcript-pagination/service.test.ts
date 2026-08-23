@@ -6,7 +6,11 @@ import * as path from "node:path";
 import { serializeStreamingMessageForWindow } from "../pi-bridge.js";
 import { TranscriptPaginationService } from "./service.js";
 import { StructuralTranscriptIndex } from "./structural-index.js";
-import { TRANSCRIPT_PAGE_MAX_BYTES, TRANSCRIPT_PAGE_MAX_ROWS } from "./reverse-reader.js";
+import {
+  readReverseTranscriptPage,
+  TRANSCRIPT_PAGE_MAX_BYTES,
+  TRANSCRIPT_PAGE_MAX_ROWS,
+} from "./reverse-reader.js";
 
 function makeTranscript(
   count: number,
@@ -71,6 +75,161 @@ test("modern latest and before windows remain bounded and request-correlated", a
     }));
   } finally {
     await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("structural pagination publication is withheld when owning policy changes after worker read", async () => {
+  const { dir, file } = makeTranscript(40, { hugeLast: false });
+  let allowed = true;
+  const index = new StructuralTranscriptIndex(path.join(dir, "index.db"), {
+    beforePublishForTests() { allowed = false; },
+  });
+  const service = new TranscriptPaginationService(index);
+  try {
+    await assert.rejects(() => service.open({
+      sessionId: "s",
+      selectionId: "selection-policy-race",
+      sessionFile: file,
+      intent: "around",
+      anchorId: "m-20",
+      authorizationGuard: () => allowed,
+    }));
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pagination body reads reject a transcript that changed after the authorization fingerprint", async () => {
+  const { dir, file } = makeTranscript(205, { hugeLast: false });
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const stat = fs.statSync(file);
+    const expectedFingerprint = {
+      ino: Number(stat.ino) || 0,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+    };
+    fs.appendFileSync(file, JSON.stringify({
+      type: "message", id: "after-authorization", parentId: "m-204",
+      message: { role: "assistant", content: [{ type: "text", text: "racing append" }] },
+    }) + "\n");
+    await assert.rejects(() => service.open({
+      sessionId: "s",
+      selectionId: "selection-fingerprint-race",
+      sessionFile: file,
+      expectedFingerprint,
+      intent: "latest",
+    }));
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("reverse-reader rejects a stale expected fingerprint before reading header bytes", () => {
+  const { dir, file } = makeTranscript(2, { hugeLast: false });
+  try {
+    const stat = fs.statSync(file);
+    const expectedFingerprint = {
+      ino: Number(stat.ino) || 0,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+    };
+    fs.renameSync(file, `${file}.old`);
+    fs.writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: "s", cwd: "/synthetic" }) + "\n");
+    let bytesRead = 0;
+    assert.throws(() => readReverseTranscriptPage(file, {
+      expectedFingerprint,
+      observeBytesRead(bytes) { bytesRead += bytes; },
+    }));
+    assert.equal(bytesRead, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("structural worker rejects replacement before open with zero body bytes", async () => {
+  const { dir, file } = makeTranscript(20, { hugeLast: false });
+  const stat = fs.statSync(file);
+  const expectedFingerprint = {
+    ino: Number(stat.ino) || 0,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+  };
+  let observedBytes = -1;
+  const content = fs.readFileSync(file);
+  const index = new StructuralTranscriptIndex(path.join(dir, "index.db"), {
+    beforeWorkerOpenForTests() {
+      fs.renameSync(file, `${file}.old`);
+      fs.writeFileSync(file, content);
+    },
+    observeWorkerBodyBytesForTests(_sessionId, bytes) { observedBytes = bytes; },
+  });
+  try {
+    await assert.rejects(index.ensure("s", file, expectedFingerprint));
+    assert.equal(observedBytes, 0);
+  } finally {
+    await index.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("indexed source fd rejects replacement before row bytes", async () => {
+  const { dir, file } = makeTranscript(20, { hugeLast: false });
+  let armed = false;
+  let observedBytes = 0;
+  const index = new StructuralTranscriptIndex(path.join(dir, "index.db"), {
+    beforeIndexedSourceOpenForTests() {
+      if (!armed) return;
+      const content = fs.readFileSync(file);
+      fs.renameSync(file, `${file}.old`);
+      fs.writeFileSync(file, content);
+    },
+    observeIndexedSourceBytesForTests(_sessionId, bytes) { observedBytes += bytes; },
+  });
+  try {
+    const selection = await index.around("s", file, "m-10", 20);
+    armed = true;
+    assert.throws(() => index.readBoundedEntries(selection.revision, selection.rows, {
+      preference: "around",
+      anchorEventId: "m-10",
+    }));
+    assert.equal(observedBytes, 0);
+  } finally {
+    await index.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("append tail witness rejects replacement before reading bytes", async () => {
+  const { dir, file } = makeTranscript(5, { hugeLast: false });
+  let armed = false;
+  let observedBytes = 0;
+  const index = new StructuralTranscriptIndex(path.join(dir, "index.db"), {
+    beforeTailReadForTests() {
+      if (!armed) return;
+      const content = fs.readFileSync(file);
+      fs.renameSync(file, `${file}.old`);
+      fs.writeFileSync(file, content);
+    },
+    observeTailBytesForTests(bytes) { observedBytes += bytes; },
+  });
+  try {
+    await index.ensure("s", file);
+    fs.appendFileSync(file, JSON.stringify({
+      type: "message", id: "append-tail", parentId: "m-4",
+      message: { role: "assistant", content: [{ type: "text", text: "append" }] },
+    }) + "\n");
+    armed = true;
+    await assert.rejects(() => index.ensure("s", file));
+    assert.equal(observedBytes, 0);
+  } finally {
+    await index.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

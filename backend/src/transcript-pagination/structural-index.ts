@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { Worker } from "node:worker_threads";
 import Database, { type Database as DatabaseType } from "better-sqlite3";
 import { getConfig } from "../config.js";
+import type { FileFingerprint } from "../session-metadata.js";
 import {
   isStructurallyVisibleTranscriptEntry,
   readTranscriptFileRevision,
@@ -79,6 +80,7 @@ interface WorkerResult {
   error: string | null;
   endedNewline: boolean;
   tailDigest: string;
+  bodyBytesRead: number;
 }
 
 const WORKER_SOURCE = String.raw`
@@ -107,10 +109,21 @@ function displayClass(e) {
   return "hidden";
 }
 let fd;
+let bodyBytesRead = 0;
+function matchesExpected(stat, expected, revision) {
+  return stat.isFile() && stat.nlink === 1
+    && (Number(stat.dev) || 0) === revision.device
+    && (Number(stat.ino) || 0) === expected.ino
+    && stat.size === expected.size
+    && stat.mtimeMs === expected.mtimeMs
+    && stat.ctimeMs === expected.ctimeMs;
+}
 try {
   fd = fs.openSync(workerData.filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   const before = fs.fstatSync(fd);
-  if (!before.isFile()) throw new Error("Transcript is not a regular file");
+  if (!matchesExpected(before, workerData.expectedFingerprint, workerData.expectedRevision)) {
+    throw new Error("Transcript changed before structural worker body admission");
+  }
 
   const entries = [];
   let topologyLimitExceeded = false;
@@ -184,6 +197,7 @@ try {
     const requested = Math.min(block.length, before.size - position);
     const count = fs.readSync(fd, block, 0, requested, position);
     if (count === 0) break;
+    bodyBytesRead += count;
     const chunk = block.subarray(0, count);
     updateTail(chunk);
     endedNewline = chunk[chunk.length - 1] === 10;
@@ -229,7 +243,10 @@ try {
     current = entry.parentId;
   }
   const after = fs.fstatSync(fd);
-  if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) {
+  if (!matchesExpected(after, workerData.expectedFingerprint, workerData.expectedRevision)
+    || after.dev !== before.dev || after.ino !== before.ino
+    || sha(header) !== workerData.expectedRevision.headerDigest
+    || mutationEpoch !== workerData.expectedRevision.mutationEpoch) {
     throw new Error("Transcript changed during structural indexing");
   }
   parentPort.postMessage({
@@ -241,25 +258,58 @@ try {
     error,
     endedNewline,
     tailDigest: sha(tail),
+    bodyBytesRead,
   });
 } catch (error) {
-  parentPort.postMessage({ workerError: error && error.message ? error.message : String(error) });
+  parentPort.postMessage({ workerError: error && error.message ? error.message : String(error), bodyBytesRead });
 } finally { if (fd !== undefined) fs.closeSync(fd); }
 `;
+
+function statMatchesRevision(stat: fs.Stats, expected: TranscriptFileRevision): boolean {
+  return stat.isFile() && stat.nlink === 1
+    && Number(stat.dev) === expected.device
+    && Number(stat.ino) === expected.inode
+    && stat.size === expected.size
+    && stat.mtimeMs === expected.mtimeMs
+    && stat.ctimeMs === expected.ctimeMs;
+}
+
+function fingerprintFromRevision(revision: TranscriptFileRevision): FileFingerprint {
+  return {
+    ino: revision.inode,
+    size: revision.size,
+    mtimeMs: revision.mtimeMs,
+    ctimeMs: revision.ctimeMs,
+  };
+}
 
 function revisionsExactlyEqual(left: TranscriptFileRevision, right: TranscriptFileRevision): boolean {
   return sameTranscriptIdentity(left, right) && left.size === right.size
     && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
 }
 
-function tailDigest(filePath: string, end: number): string {
+function tailDigest(
+  filePath: string,
+  end: number,
+  expected: TranscriptFileRevision,
+  observeBytesRead?: (bytes: number) => void,
+): string {
   const fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.size < end) throw new Error("Transcript revision changed");
+    const before = fs.fstatSync(fd);
+    if (!statMatchesRevision(before, expected) || before.size < end) {
+      throw new Error("Transcript revision changed before tail read");
+    }
     const start = Math.max(0, end - TAIL_WITNESS_BYTES);
     const bytes = Buffer.allocUnsafe(end - start);
     const read = fs.readSync(fd, bytes, 0, bytes.length, start);
+    observeBytesRead?.(read);
+    if (read !== bytes.length) throw new Error("Transcript tail was truncated during read");
+    const after = fs.fstatSync(fd);
+    const pathStat = fs.lstatSync(filePath);
+    if (!statMatchesRevision(after, expected) || !statMatchesRevision(pathStat, expected)) {
+      throw new Error("Transcript revision changed during tail read");
+    }
     return createHash("sha256").update(bytes.subarray(0, read)).digest("hex");
   } finally { fs.closeSync(fd); }
 }
@@ -275,6 +325,8 @@ interface StructuralWorkerTask {
   key: string;
   sessionId: string;
   filePath: string;
+  expectedFingerprint: FileFingerprint;
+  expectedRevision: TranscriptFileRevision;
   promise: Promise<WorkerResult>;
   resolve: (result: WorkerResult) => void;
   reject: (error: Error) => void;
@@ -294,6 +346,18 @@ export interface StructuralTranscriptIndexOptions {
   workerDelayMsForTests?: number;
   /** @internal Called after each staged SQL publication batch. */
   afterPublishBatchForTests?: (sessionId: string, batchNumber: number) => void | Promise<void>;
+  /** @internal Runs after expected revision capture and immediately before worker creation. */
+  beforeWorkerOpenForTests?: (sessionId: string, filePath: string) => void;
+  /** @internal Reports worker transcript bytes, including zero-byte admission rejection. */
+  observeWorkerBodyBytesForTests?: (sessionId: string, bytesRead: number) => void;
+  /** @internal Reports bounded indexed source reads after descriptor admission. */
+  observeIndexedSourceBytesForTests?: (sessionId: string, bytesRead: number) => void;
+  /** @internal Reports tail-witness reads after descriptor admission. */
+  observeTailBytesForTests?: (bytesRead: number) => void;
+  /** @internal Runs after revision selection but before the indexed source fd opens. */
+  beforeIndexedSourceOpenForTests?: (sessionId: string, filePath: string) => void;
+  /** @internal Runs immediately before append-tail descriptor admission. */
+  beforeTailReadForTests?: (filePath: string) => void;
 }
 
 export class StructuralTranscriptIndex {
@@ -323,9 +387,15 @@ export class StructuralTranscriptIndex {
     this.migrate();
   }
 
-  async ensure(sessionId: string, filePath: string): Promise<StructuralIndexRevision> {
+  async ensure(
+    sessionId: string,
+    filePath: string,
+    expectedFingerprint?: FileFingerprint,
+    authorizationGuard?: () => boolean,
+  ): Promise<StructuralIndexRevision> {
+    if (authorizationGuard && !authorizationGuard()) throw new Error("Transcript structural indexing is no longer authorized");
     const canonicalPath = path.resolve(filePath);
-    const current = readTranscriptFileRevision(canonicalPath);
+    const current = readTranscriptFileRevision(canonicalPath, expectedFingerprint);
     const key = structuralBuildKey(sessionId, canonicalPath, current);
     this.latestBuildKeys.set(sessionId, key);
     this.cancelSupersededWorkerTasks(sessionId, key);
@@ -333,27 +403,45 @@ export class StructuralTranscriptIndex {
     if (existingBuild) return existingBuild;
     const stored = this.readRevision(sessionId);
     if (stored && stored.filePath === canonicalPath && revisionsExactlyEqual(stored, current)
-      && (stored.complete || stored.error !== "building")) return stored;
+      && (stored.complete || stored.error !== "building")) {
+      if (authorizationGuard && !authorizationGuard()) throw new Error("Transcript structural index is no longer authorized");
+      return stored;
+    }
     if (stored?.error === "building") {
       this.db.prepare("DELETE FROM transcript_revisions WHERE session_id=?").run(sessionId);
     }
     if (stored && stored.filePath === canonicalPath && current.size > stored.indexedSize
       && current.size - stored.indexedSize <= TRANSCRIPT_APPEND_REFRESH_MAX_BYTES
-      && sameTranscriptIdentity(stored, current) && this.canAppend(stored, canonicalPath)) {
+      && sameTranscriptIdentity(stored, current) && this.canAppend(stored, current, canonicalPath)) {
       try {
         this.options.onAppendRefreshForTests?.(sessionId, current.size - stored.indexedSize);
-        return this.appendRefresh(stored, current);
+        const appended = this.appendRefresh(stored, current);
+        if (authorizationGuard && !authorizationGuard()) {
+          this.purge(sessionId);
+          throw new Error("Transcript append index publication is no longer authorized");
+        }
+        return appended;
       }
       catch { /* unsafe append falls through to an epoch rebuild */ }
     }
-    const build = this.fullBuild(sessionId, canonicalPath, key);
+    const workerFingerprint = expectedFingerprint ?? fingerprintFromRevision(current);
+    const build = this.fullBuild(
+      sessionId, canonicalPath, key, workerFingerprint, current, authorizationGuard,
+    );
     this.builds.set(key, build);
     try { return await build; }
     finally { if (this.builds.get(key) === build) this.builds.delete(key); }
   }
 
-  async around(sessionId: string, filePath: string, anchorId: string, limit = 200): Promise<IndexedWindowSelection> {
-    const revision = await this.ensure(sessionId, filePath);
+  async around(
+    sessionId: string,
+    filePath: string,
+    anchorId: string,
+    limit = 200,
+    expectedFingerprint?: FileFingerprint,
+    authorizationGuard?: () => boolean,
+  ): Promise<IndexedWindowSelection> {
+    const revision = await this.ensure(sessionId, filePath, expectedFingerprint, authorizationGuard);
     if (!revision.complete) throw new Error(`Transcript topology is incomplete: ${revision.error ?? "unknown"}`);
     const anyEntry = this.db.prepare(
       "SELECT display_class FROM transcript_entries WHERE session_id = ? AND transcript_epoch = ? AND event_id = ?",
@@ -394,8 +482,10 @@ export class StructuralTranscriptIndex {
     direction: "before" | "after",
     boundaryVisibleOrdinal: number,
     limit = 200,
+    expectedFingerprint?: FileFingerprint,
+    authorizationGuard?: () => boolean,
   ): Promise<IndexedWindowSelection> {
-    const revision = await this.ensure(sessionId, filePath);
+    const revision = await this.ensure(sessionId, filePath, expectedFingerprint, authorizationGuard);
     if (!revision.complete) throw new Error(`Transcript topology is incomplete: ${revision.error ?? "unknown"}`);
     let rows: IndexedSourceRow[];
     if (direction === "before") {
@@ -422,10 +512,15 @@ export class StructuralTranscriptIndex {
     };
   }
 
-  tryLatestCurrent(sessionId: string, filePath: string, limit = 200): IndexedWindowSelection | null {
+  tryLatestCurrent(
+    sessionId: string,
+    filePath: string,
+    limit = 200,
+    expectedFingerprint?: FileFingerprint,
+  ): IndexedWindowSelection | null {
     const canonicalPath = path.resolve(filePath);
     let current: TranscriptFileRevision;
-    try { current = readTranscriptFileRevision(canonicalPath); }
+    try { current = readTranscriptFileRevision(canonicalPath, expectedFingerprint); }
     catch { return null; }
     const revision = this.readRevision(sessionId);
     if (!revision || revision.filePath !== canonicalPath || !revision.complete || !revisionsExactlyEqual(revision, current)) return null;
@@ -448,8 +543,9 @@ export class StructuralTranscriptIndex {
     filePath: string,
     eventId: string,
     limit = 200,
+    expectedFingerprint?: FileFingerprint,
   ): IndexedWindowSelection | null {
-    const latest = this.tryLatestCurrent(sessionId, filePath, 1);
+    const latest = this.tryLatestCurrent(sessionId, filePath, 1, expectedFingerprint);
     if (!latest) return null;
     const target = this.db.prepare(
       `SELECT visible_ordinal FROM active_branch_entries
@@ -470,11 +566,16 @@ export class StructuralTranscriptIndex {
     };
   }
 
-  async activeProjection(sessionId: string, filePath: string): Promise<{
+  async activeProjection(
+    sessionId: string,
+    filePath: string,
+    expectedFingerprint?: FileFingerprint,
+    authorizationGuard?: () => boolean,
+  ): Promise<{
     revision: StructuralIndexRevision;
     eventIds: Set<string>;
   }> {
-    const revision = await this.ensure(sessionId, filePath);
+    const revision = await this.ensure(sessionId, filePath, expectedFingerprint, authorizationGuard);
     if (!revision.complete) throw new Error(`Transcript topology is incomplete: ${revision.error ?? "unknown"}`);
     const eventIds = new Set((this.db.prepare(
       "SELECT event_id FROM active_branch_entries WHERE session_id=? AND transcript_epoch=?",
@@ -482,8 +583,8 @@ export class StructuralTranscriptIndex {
     return { revision, eventIds };
   }
 
-  async activeEventIds(sessionId: string, filePath: string): Promise<Set<string>> {
-    return (await this.activeProjection(sessionId, filePath)).eventIds;
+  async activeEventIds(sessionId: string, filePath: string, expectedFingerprint?: FileFingerprint): Promise<Set<string>> {
+    return (await this.activeProjection(sessionId, filePath, expectedFingerprint)).eventIds;
   }
 
   readBoundedEntries(
@@ -503,7 +604,10 @@ export class StructuralTranscriptIndex {
     if (!Number.isSafeInteger(maxSourceBytes) || maxSourceBytes < 1 || maxSourceBytes > TRANSCRIPT_PAGE_MAX_BYTES) {
       throw new Error("Indexed transcript read budget is invalid");
     }
-    const current = readTranscriptFileRevision(revision.filePath);
+    const current = readTranscriptFileRevision(
+      revision.filePath,
+      fingerprintFromRevision(revision),
+    );
     if (!revisionsExactlyEqual(revision, current)) throw new Error("Transcript index revision is stale");
 
     const cost = (row: IndexedSourceRow) => row.sourceLength > maxSourceBytes ? 0 : row.sourceLength;
@@ -595,11 +699,15 @@ export class StructuralTranscriptIndex {
       sources = sources.filter((row) => row.visible_ordinal !== null);
     }
 
+    this.options.beforeIndexedSourceOpenForTests?.(revision.sessionId, revision.filePath);
     const fd = fs.openSync(revision.filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     const entries: any[] = [];
     let sourceBytesRead = 0;
     try {
-      if (!fs.fstatSync(fd).isFile()) throw new Error("Transcript is not a regular file");
+      const opened = fs.fstatSync(fd);
+      if (!statMatchesRevision(opened, revision)) {
+        throw new Error("Transcript index revision changed before indexed source admission");
+      }
       for (const row of sources) {
         if (row.source_length > maxSourceBytes && row.visible_ordinal !== null) {
           entries.push({
@@ -621,17 +729,20 @@ export class StructuralTranscriptIndex {
           if (count === 0) break;
           read += count;
           sourceBytesRead += count;
+          this.options.observeIndexedSourceBytesForTests?.(revision.sessionId, count);
         }
         if (read !== bytes.length) throw new Error("Indexed transcript source row was truncated");
         entries.push(JSON.parse(bytes.toString("utf8").trim()));
       }
       const after = fs.fstatSync(fd);
-      if (Number(after.dev) !== revision.device || Number(after.ino) !== revision.inode
-        || after.size !== revision.size || after.mtimeMs !== revision.mtimeMs || after.ctimeMs !== revision.ctimeMs) {
+      if (!statMatchesRevision(after, revision)) {
         throw new Error("Transcript changed while indexed entries were read");
       }
     } finally { fs.closeSync(fd); }
-    if (!revisionsExactlyEqual(revision, readTranscriptFileRevision(revision.filePath))) {
+    if (!revisionsExactlyEqual(revision, readTranscriptFileRevision(
+      revision.filePath,
+      fingerprintFromRevision(revision),
+    ))) {
       throw new Error("Transcript path changed while indexed entries were read");
     }
     this.lastSourceBytesRead = sourceBytesRead;
@@ -699,7 +810,13 @@ export class StructuralTranscriptIndex {
     }
   }
 
-  private scheduleWorkerBuild(sessionId: string, filePath: string, key: string): Promise<WorkerResult> {
+  private scheduleWorkerBuild(
+    sessionId: string,
+    filePath: string,
+    key: string,
+    expectedFingerprint: FileFingerprint,
+    expectedRevision: TranscriptFileRevision,
+  ): Promise<WorkerResult> {
     let resolveTask!: (result: WorkerResult) => void;
     let rejectTask!: (error: Error) => void;
     const promise = new Promise<WorkerResult>((resolve, reject) => {
@@ -707,7 +824,7 @@ export class StructuralTranscriptIndex {
       rejectTask = reject;
     });
     const task: StructuralWorkerTask = {
-      key, sessionId, filePath, promise,
+      key, sessionId, filePath, expectedFingerprint, expectedRevision, promise,
       resolve: resolveTask,
       reject: rejectTask,
       cancelled: false,
@@ -741,9 +858,15 @@ export class StructuralTranscriptIndex {
     try {
       const result = await new Promise<WorkerResult>((resolve, reject) => {
         this.workersStarted++;
+        this.options.beforeWorkerOpenForTests?.(task.sessionId, task.filePath);
         const worker = new Worker(WORKER_SOURCE, {
           eval: true,
-          workerData: { filePath: task.filePath, delayMs: Math.max(0, this.options.workerDelayMsForTests ?? 0) },
+          workerData: {
+            filePath: task.filePath,
+            expectedFingerprint: task.expectedFingerprint,
+            expectedRevision: task.expectedRevision,
+            delayMs: Math.max(0, this.options.workerDelayMsForTests ?? 0),
+          },
           resourceLimits: { maxOldGenerationSizeMb: 64, maxYoungGenerationSizeMb: 16, stackSizeMb: 2 },
         });
         let settled = false;
@@ -761,9 +884,10 @@ export class StructuralTranscriptIndex {
           terminate(new Error("Structural index worker timed out"));
         }, timeoutMs);
         timer.unref?.();
-        worker.once("message", (message: WorkerResult & { workerError?: string }) => {
+        worker.once("message", (message: WorkerResult & { workerError?: string; bodyBytesRead: number }) => {
           if (settled) return;
           settled = true;
+          this.options.observeWorkerBodyBytesForTests?.(task.sessionId, message.bodyBytesRead);
           if (timer) clearTimeout(timer);
           task.cancelWorker = undefined;
           void worker.terminate().finally(() => {
@@ -820,22 +944,34 @@ export class StructuralTranscriptIndex {
     this.db.prepare("INSERT INTO transcript_meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(INDEX_SCHEMA_VERSION));
   }
 
-  private async fullBuild(sessionId: string, filePath: string, buildKey: string): Promise<StructuralIndexRevision> {
+  private async fullBuild(
+    sessionId: string,
+    filePath: string,
+    buildKey: string,
+    expectedFingerprint: FileFingerprint,
+    expectedRevision: TranscriptFileRevision,
+    authorizationGuard?: () => boolean,
+  ): Promise<StructuralIndexRevision> {
     const generation = this.invalidationGenerations.get(sessionId) ?? 0;
-    const result = await this.scheduleWorkerBuild(sessionId, filePath, buildKey);
+    const result = await this.scheduleWorkerBuild(
+      sessionId, filePath, buildKey, expectedFingerprint, expectedRevision,
+    );
     await this.options.beforePublishForTests?.(sessionId, filePath);
     if ((this.invalidationGenerations.get(sessionId) ?? 0) !== generation
-      || this.latestBuildKeys.get(sessionId) !== buildKey) {
+      || this.latestBuildKeys.get(sessionId) !== buildKey
+      || (authorizationGuard && !authorizationGuard())) {
       throw new Error("Transcript structural index build was invalidated");
     }
-    const current = readTranscriptFileRevision(filePath);
+    const current = readTranscriptFileRevision(filePath, expectedFingerprint);
     if (!revisionsExactlyEqual(result.revision, current)
       || structuralBuildKey(sessionId, filePath, current) !== buildKey) {
       throw new Error("Transcript changed before structural index publication");
     }
     const epoch = randomUUID();
     try {
-      await this.publishStaged(sessionId, filePath, epoch, result, generation, buildKey);
+      await this.publishStaged(
+        sessionId, filePath, epoch, result, generation, buildKey, authorizationGuard,
+      );
     } catch (error) {
       this.db.prepare("DELETE FROM transcript_revisions WHERE session_id=? AND transcript_epoch=?").run(sessionId, epoch);
       throw error;
@@ -849,12 +985,14 @@ export class StructuralTranscriptIndex {
     generation: number,
     buildKey: string,
     expected: TranscriptFileRevision,
+    authorizationGuard?: () => boolean,
   ): void {
     if ((this.invalidationGenerations.get(sessionId) ?? 0) !== generation
-      || this.latestBuildKeys.get(sessionId) !== buildKey) {
+      || this.latestBuildKeys.get(sessionId) !== buildKey
+      || (authorizationGuard && !authorizationGuard())) {
       throw new Error("Transcript structural index build was invalidated");
     }
-    const current = readTranscriptFileRevision(filePath);
+    const current = readTranscriptFileRevision(filePath, fingerprintFromRevision(expected));
     if (!revisionsExactlyEqual(expected, current)
       || structuralBuildKey(sessionId, filePath, current) !== buildKey) {
       throw new Error("Transcript changed during staged structural publication");
@@ -868,8 +1006,11 @@ export class StructuralTranscriptIndex {
     result: WorkerResult,
     generation: number,
     buildKey: string,
+    authorizationGuard?: () => boolean,
   ): Promise<void> {
-    this.assertBuildCurrent(sessionId, filePath, generation, buildKey, result.revision);
+    this.assertBuildCurrent(
+      sessionId, filePath, generation, buildKey, result.revision, authorizationGuard,
+    );
     this.db.transaction(() => {
       this.db.prepare("DELETE FROM transcript_revisions WHERE session_id=?").run(sessionId);
       this.db.prepare(`INSERT INTO transcript_revisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
@@ -883,7 +1024,9 @@ export class StructuralTranscriptIndex {
     const insertEntry = this.db.prepare(`INSERT INTO transcript_entries VALUES (?,?,?,?,?,?,?,?,?,?)`);
     let batchNumber = 0;
     for (let offset = 0; offset < result.entries.length; offset += TRANSCRIPT_INDEX_PUBLISH_BATCH_SIZE) {
-      this.assertBuildCurrent(sessionId, filePath, generation, buildKey, result.revision);
+      this.assertBuildCurrent(
+        sessionId, filePath, generation, buildKey, result.revision, authorizationGuard,
+      );
       const batch = result.entries.slice(offset, offset + TRANSCRIPT_INDEX_PUBLISH_BATCH_SIZE);
       this.db.transaction(() => {
         for (const entry of batch) insertEntry.run(sessionId, epoch, entry.eventId, entry.parentId,
@@ -898,7 +1041,9 @@ export class StructuralTranscriptIndex {
     const insertActive = this.db.prepare(`INSERT INTO active_branch_entries VALUES (?,?,?,?,?,?,?)`);
     let visibleOrdinal = 0;
     for (let offset = 0; offset < result.activeIds.length; offset += TRANSCRIPT_INDEX_PUBLISH_BATCH_SIZE) {
-      this.assertBuildCurrent(sessionId, filePath, generation, buildKey, result.revision);
+      this.assertBuildCurrent(
+        sessionId, filePath, generation, buildKey, result.revision, authorizationGuard,
+      );
       const batch = result.activeIds.slice(offset, offset + TRANSCRIPT_INDEX_PUBLISH_BATCH_SIZE);
       this.db.transaction(() => {
         batch.forEach((eventId, index) => {
@@ -913,7 +1058,9 @@ export class StructuralTranscriptIndex {
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
 
-    this.assertBuildCurrent(sessionId, filePath, generation, buildKey, result.revision);
+    this.assertBuildCurrent(
+      sessionId, filePath, generation, buildKey, result.revision, authorizationGuard,
+    );
     this.db.prepare(`UPDATE transcript_revisions SET complete=?,error=? WHERE session_id=? AND transcript_epoch=?`).run(
       result.complete ? 1 : 0,
       result.error,
@@ -922,9 +1069,19 @@ export class StructuralTranscriptIndex {
     );
   }
 
-  private canAppend(stored: StructuralIndexRevision, filePath: string): boolean {
+  private canAppend(
+    stored: StructuralIndexRevision,
+    current: TranscriptFileRevision,
+    filePath: string,
+  ): boolean {
     const row = this.db.prepare("SELECT ended_newline, tail_digest FROM transcript_revisions WHERE session_id = ?").get(stored.sessionId) as { ended_newline: number; tail_digest: string } | undefined;
-    return Boolean(row?.ended_newline && row.tail_digest === tailDigest(filePath, stored.indexedSize));
+    this.options.beforeTailReadForTests?.(filePath);
+    return Boolean(row?.ended_newline && row.tail_digest === tailDigest(
+      filePath,
+      stored.indexedSize,
+      current,
+      this.options.observeTailBytesForTests,
+    ));
   }
 
   private appendRefresh(stored: StructuralIndexRevision, current: TranscriptFileRevision): StructuralIndexRevision {
@@ -940,9 +1097,18 @@ export class StructuralTranscriptIndex {
     const fd = fs.openSync(stored.filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     let content: Buffer;
     try {
+      const before = fs.fstatSync(fd);
+      if (!before.isFile() || before.nlink !== 1 || Number(before.ino) !== current.inode
+        || before.size !== current.size || before.mtimeMs !== current.mtimeMs
+        || before.ctimeMs !== current.ctimeMs) throw new Error("Transcript changed before append indexing");
       content = Buffer.allocUnsafe(current.size - stored.indexedSize);
       const read = fs.readSync(fd, content, 0, content.length, stored.indexedSize);
       content = content.subarray(0, read);
+      const after = fs.fstatSync(fd);
+      if (after.nlink !== 1 || Number(after.ino) !== current.inode || after.size !== current.size
+        || after.mtimeMs !== current.mtimeMs || after.ctimeMs !== current.ctimeMs) {
+        throw new Error("Transcript changed during append indexing");
+      }
     } finally { fs.closeSync(fd); }
     const maxOrdinal = this.db.prepare("SELECT MAX(physical_ordinal) AS value FROM transcript_entries WHERE session_id = ? AND transcript_epoch = ?")
       .get(stored.sessionId, stored.transcriptEpoch) as { value: number | null };
@@ -994,7 +1160,10 @@ export class StructuralTranscriptIndex {
       }
       if (current !== stored.branchTipId) throw new Error("Append changed the active branch rather than extending its tip");
     }
-    if (!revisionsExactlyEqual(current, readTranscriptFileRevision(stored.filePath))) {
+    if (!revisionsExactlyEqual(current, readTranscriptFileRevision(
+      stored.filePath,
+      fingerprintFromRevision(current),
+    ))) {
       throw new Error("Transcript changed during append indexing");
     }
     this.db.transaction(() => {
@@ -1003,7 +1172,9 @@ export class StructuralTranscriptIndex {
         entry.physicalOrdinal, entry.sourceOffset, entry.sourceLength, entry.eventType, entry.displayClass, entry.visible);
       this.db.prepare(`UPDATE transcript_revisions SET file_size=?,mtime_ms=?,ctime_ms=?,branch_tip_id=?,indexed_size=?,ended_newline=?,tail_digest=? WHERE session_id=?`)
         .run(current.size, current.mtimeMs, current.ctimeMs, branchTipId, current.size,
-          content.length === 0 || content.at(-1) === 0x0a ? 1 : 0, tailDigest(stored.filePath, current.size), stored.sessionId);
+          content.length === 0 || content.at(-1) === 0x0a ? 1 : 0,
+          tailDigest(stored.filePath, current.size, current, this.options.observeTailBytesForTests),
+          stored.sessionId);
       this.recomputeActive(stored.sessionId, stored.transcriptEpoch, branchTipId);
     })();
     return this.readRevision(stored.sessionId)!;

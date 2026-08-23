@@ -16,7 +16,7 @@
  */
 
 import * as fs from "node:fs";
-import * as readline from "node:readline";
+import type { FileFingerprint } from "../session-metadata.js";
 import type { Chunk } from "./types.js";
 
 export const MAX_CHUNK_CHARS = 2000;
@@ -31,6 +31,8 @@ export interface MetaForChunker {
 
 export interface ChunkerOptions {
   includeThinking?: boolean;
+  /** Exact Standard authorization fingerprint witnessed before body admission. */
+  expectedFingerprint?: FileFingerprint;
 }
 
 export interface ChunkerStats {
@@ -81,33 +83,27 @@ export async function chunkJsonlFile(
     }
   };
 
-  let byteOffset = 0;
-
-  const stream = fs.createReadStream(filePath, { encoding: "utf-8" });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
-  for await (const rawLine of rl) {
-    const lineByteLen = Buffer.byteLength(rawLine, "utf-8") + 1; // +1 for \n
-    const currentOffset = byteOffset;
-    byteOffset += lineByteLen;
+  const consumeLine = (lineBytes: Buffer, currentOffset: number): void => {
     stats.linesRead++;
-
-    if (!rawLine) continue;
+    const raw = lineBytes.length > 0 && lineBytes.at(-1) === 0x0d
+      ? lineBytes.subarray(0, lineBytes.length - 1)
+      : lineBytes;
+    if (raw.length === 0) return;
     let obj: any;
     try {
-      obj = JSON.parse(rawLine);
+      obj = JSON.parse(raw.toString("utf8"));
     } catch {
       stats.skippedParseErrors++;
-      continue;
+      return;
     }
 
-    if (!obj || obj.type !== "message") continue;
+    if (!obj || obj.type !== "message") return;
     const message = obj.message ?? obj;
     const role = message?.role;
-    if (role !== "user" && role !== "assistant") continue;
+    if (role !== "user" && role !== "assistant") return;
 
     const content = message.content;
-    if (content == null) continue;
+    if (content == null) return;
 
     const parts: Array<{ kind: "text" | "thinking"; text: string }> = [];
     if (typeof content === "string") {
@@ -127,31 +123,61 @@ export async function chunkJsonlFile(
         }
       }
     } else {
-      continue;
+      return;
     }
 
-    if (parts.length === 0) continue;
+    if (parts.length === 0) return;
     stats.messagesUsed++;
-
     const messageId = typeof obj.id === "string" ? obj.id : null;
-
     for (const part of parts) {
       const partRole: Utterance["role"] = part.kind === "thinking" ? "thinking" : role;
       const text = part.text.trim();
       if (!text) continue;
-
       if (pending && pending.role === partRole && pending.messageId === messageId) {
         pending.text += `\n\n${text}`;
       } else {
         flushPending();
-        pending = {
-          role: partRole,
-          text,
-          messageId,
-          sourceOffset: currentOffset,
-        };
+        pending = { role: partRole, text, messageId, sourceOffset: currentOffset };
       }
     }
+  };
+
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const handle = await fs.promises.open(filePath, flags);
+  const expectedFingerprint = options.expectedFingerprint;
+  const fingerprintMatches = (stat: fs.Stats): boolean => stat.isFile() && stat.nlink === 1
+    && (!expectedFingerprint || (
+      (Number(stat.ino) || 0) === expectedFingerprint.ino
+      && stat.size === expectedFingerprint.size
+      && stat.mtimeMs === expectedFingerprint.mtimeMs
+      && stat.ctimeMs === expectedFingerprint.ctimeMs
+    ));
+  try {
+    if (!fingerprintMatches(await handle.stat())) throw new Error("Transcript changed before search indexing");
+    const block = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    let lineStartOffset = 0;
+    let pendingBytes = Buffer.alloc(0);
+    while (true) {
+      const { bytesRead } = await handle.read(block, 0, block.length, position);
+      if (bytesRead === 0) break;
+      const chunk = pendingBytes.length > 0
+        ? Buffer.concat([pendingBytes, block.subarray(0, bytesRead)])
+        : Buffer.from(block.subarray(0, bytesRead));
+      let segmentStart = 0;
+      for (let index = 0; index < chunk.length; index++) {
+        if (chunk[index] !== 0x0a) continue;
+        consumeLine(chunk.subarray(segmentStart, index), lineStartOffset);
+        lineStartOffset += index - segmentStart + 1;
+        segmentStart = index + 1;
+      }
+      pendingBytes = Buffer.from(chunk.subarray(segmentStart));
+      position += bytesRead;
+    }
+    if (pendingBytes.length > 0) consumeLine(pendingBytes, lineStartOffset);
+    if (!fingerprintMatches(await handle.stat())) throw new Error("Transcript changed during search indexing");
+  } finally {
+    await handle.close();
   }
   flushPending();
 

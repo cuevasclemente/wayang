@@ -126,6 +126,11 @@ import {
   authorizeProjectAction,
   getPolicyGeneration,
 } from "../policy.js";
+import {
+  authorizeExactUiTranscript,
+  exactUiTranscriptAuthorizationsEqual,
+  type ExactUiTranscriptAuthorization,
+} from "../standard-transcript-authorization.js";
 import type { AuthService } from "../auth/service.js";
 import { prepareAttachments } from "../attachments.js";
 import { logSessionRuntimeStartFailure } from "../session-runtime-logging.js";
@@ -158,7 +163,7 @@ type WindowTranscriptNegotiation = {
   anchorId?: string;
 };
 
-type TranscriptNegotiation =
+export type TranscriptNegotiation =
   | WindowTranscriptNegotiation
   | { protocol: null; intent: "latest"; anchorId?: never };
 
@@ -186,6 +191,14 @@ export function parseTranscriptNegotiation(
     return { protocol: "window-v1", intent: "around", anchorId: anchor };
   }
   return { protocol: "window-v1", intent: "latest" };
+}
+
+/** Quarantined owner-visible sessions deliberately retain the legacy read-only projection. */
+export function resolveOwningTranscriptNegotiation(
+  requested: TranscriptNegotiation,
+  quarantined: boolean,
+): TranscriptNegotiation {
+  return quarantined ? { protocol: null, intent: "latest" } : requested;
 }
 
 const wsHandshakeStarts = new WeakMap<object, number>();
@@ -374,6 +387,58 @@ export function serializeTranscriptPageGateFailure(input: {
     : serializeInvalidTranscriptPageRequest(input);
 }
 
+export interface UiTranscriptAuthorizationWitness {
+  authorization: ExactUiTranscriptAuthorization;
+  policyGeneration: number;
+}
+
+/** @internal Exact durable owning-UI authorization captured before a body read. */
+export function captureUiTranscriptAuthorization(
+  row: SessionRow,
+  exactSessionFile: string | null | undefined,
+): UiTranscriptAuthorizationWitness | null {
+  if (!exactSessionFile || row.pi_session_file !== exactSessionFile) return null;
+  const generationBefore = getPolicyGeneration();
+  const authorization = authorizeExactUiTranscript(exactSessionFile, { expectedSessionId: row.id });
+  const generationAfter = getPolicyGeneration();
+  if (!authorization || generationBefore !== generationAfter
+    || authorization.row.cwd !== row.cwd
+    || authorization.row.project_id !== row.project_id
+    || authorization.row.agent_profile_id !== row.agent_profile_id) return null;
+  return { authorization, policyGeneration: generationBefore };
+}
+
+/** @internal Reauthorize the exact row/path/header/profile/fingerprint before publication. */
+export function revalidateUiTranscriptAuthorization(witness: UiTranscriptAuthorizationWitness): boolean {
+  const generationBefore = getPolicyGeneration();
+  if (generationBefore !== witness.policyGeneration) return false;
+  const current = authorizeExactUiTranscript(witness.authorization.path, {
+    expectedSessionId: witness.authorization.row.id,
+    expectedFingerprint: witness.authorization.fingerprint,
+  });
+  const generationAfter = getPolicyGeneration();
+  return Boolean(current
+    && generationBefore === generationAfter
+    && exactUiTranscriptAuthorizationsEqual(witness.authorization, current));
+}
+
+/** @internal Final synchronous authorization gate colocated with transcript-window send. */
+export function sendUiAuthorizedTranscriptWindow(input: {
+  window: TranscriptWindowMessage;
+  witness: UiTranscriptAuthorizationWitness | null;
+  isCurrent: () => boolean;
+  send: (window: TranscriptWindowMessage) => void;
+  reauthorize?: (witness: UiTranscriptAuthorizationWitness) => boolean;
+  beforeAuthorizationForTests?: () => void;
+}): boolean {
+  if (!input.isCurrent()) return false;
+  input.beforeAuthorizationForTests?.();
+  if (input.witness
+    && !(input.reauthorize ?? revalidateUiTranscriptAuthorization)(input.witness)) return false;
+  input.send(input.window);
+  return true;
+}
+
 type TodoAuthorizationRow = Pick<SessionRow,
   "cwd" | "project_id" | "agent_profile_id" | "pi_session_file" | "legacy_private_session_quarantine"
 >;
@@ -456,6 +521,7 @@ export interface RevisionExactWindowBoundary {
   sessionFile: string | null;
   revision: TranscriptFileRevision | null;
   streamingMessage: SerializedMessage | null;
+  authorizationWitness?: UiTranscriptAuthorizationWitness | null;
 }
 
 /** @internal Bounded retry owner for active subscribe/snapshot atomicity. */
@@ -748,16 +814,17 @@ function handleConnection(
     const exactSessionFile = input.sessionFile;
     const expected = getSessionById(input.sessionId);
     if (!expected) return;
-    const authorizationWitness = captureModernTodoAuthorization(expected, exactSessionFile);
+    const authorizationWitness = captureUiTranscriptAuthorization(expected, exactSessionFile);
     if (!authorizationWitness) return;
-    const expectedPolicyGeneration = getPolicyGeneration();
-    void getDerivedTodoProjectionService().project(exactSessionFile).then((projection) => {
+    void getDerivedTodoProjectionService().project(
+      exactSessionFile,
+      authorizationWitness.authorization.fingerprint,
+      () => revalidateUiTranscriptAuthorization(authorizationWitness),
+    ).then((projection) => {
       if (!projection || !alive || input.version !== setupVersion
         || currentSessionId !== input.sessionId || currentSelectionId !== input.selectionId
-        || getPolicyGeneration() !== expectedPolicyGeneration) return;
-      const current = getSessionById(input.sessionId);
-      if (!current || !revalidateModernTodoAuthorization(current, authorizationWitness)
-        || !getTranscriptPaginationService().isDerivedProjectionCurrent(
+        || !revalidateUiTranscriptAuthorization(authorizationWitness)) return;
+      if (!getTranscriptPaginationService().isDerivedProjectionCurrent(
           input.sessionId,
           exactSessionFile,
           input.transcriptEpoch,
@@ -810,14 +877,25 @@ function handleConnection(
         lastFileRevision = revision;
         const historyStart = nowMs();
         if (pollTranscriptNegotiation.protocol === "window-v1" && selectionId) {
+          const current = getSessionById(nextSessionId);
+          const authorizationWitness = current
+            ? captureUiTranscriptAuthorization(current, sessionFile)
+            : null;
+          if (!authorizationWitness) {
+            invalidateTranscriptPaginationSession(nextSessionId);
+            return;
+          }
           void getTranscriptPaginationService().open({
             sessionId: nextSessionId,
             selectionId,
-            sessionFile,
+            sessionFile: authorizationWitness.authorization.path,
+            expectedFingerprint: authorizationWitness.authorization.fingerprint,
+            authorizationGuard: () => revalidateUiTranscriptAuthorization(authorizationWitness),
             intent: "latest",
             reason: "reset",
           }).then((window) => {
-            if (!alive || version !== setupVersion) return;
+            if (!alive || version !== setupVersion
+              || !revalidateUiTranscriptAuthorization(authorizationWitness)) return;
             wsProfile(nextSessionId, "file_poll_window_loaded", `duration=${elapsedMs(historyStart)} messages=${window.message_count}`);
             sendSafe(ws, window);
             scheduleModernTodoProjection({
@@ -886,6 +964,10 @@ function handleConnection(
         ? attachTranscriptNegotiation
         : null;
     const bufferedEvents: SerializedMessage[] = [];
+    type AuthorizedLiveWindow = {
+      window: TranscriptWindowMessage;
+      witness: UiTranscriptAuthorizationWitness | null;
+    };
     const buildBoundedLiveWindow = async (
       reason: TranscriptWindowReason,
       intent: TranscriptIntent = "latest",
@@ -893,12 +975,21 @@ function handleConnection(
       compactingOverride?: boolean,
       streamingMessage?: SerializedMessage | null,
       sessionFile = liveHandle.sessionFile ?? durable?.pi_session_file,
-    ): Promise<TranscriptWindowMessage | null> => {
+    ): Promise<AuthorizedLiveWindow | null> => {
       if (!selectionId) return null;
-      return getTranscriptPaginationService().open({
+      const current = getSessionById(nextSessionId);
+      const authorizationWitness = sessionFile && current
+        ? captureUiTranscriptAuthorization(current, sessionFile)
+        : null;
+      if (sessionFile && !authorizationWitness) throw new Error("Transcript window is no longer authorized");
+      const window = await getTranscriptPaginationService().open({
         sessionId: nextSessionId,
         selectionId,
-        sessionFile,
+        sessionFile: authorizationWitness?.authorization.path ?? sessionFile,
+        expectedFingerprint: authorizationWitness?.authorization.fingerprint,
+        authorizationGuard: authorizationWitness
+          ? () => revalidateUiTranscriptAuthorization(authorizationWitness)
+          : undefined,
         intent,
         anchorId,
         reason,
@@ -907,6 +998,10 @@ function handleConnection(
         streamingMessage,
         preserveCursors: reason === "tail_reconcile",
       });
+      if (authorizationWitness && !revalidateUiTranscriptAuthorization(authorizationWitness)) {
+        throw new Error("Transcript window authorization changed during loading");
+      }
+      return { window, witness: authorizationWitness };
     };
 
     const sendBoundedLiveWindow = async (
@@ -916,8 +1011,13 @@ function handleConnection(
       compactingOverride?: boolean,
       streamingMessage?: SerializedMessage | null,
     ): Promise<void> => {
-      const window = await buildBoundedLiveWindow(reason, intent, anchorId, compactingOverride, streamingMessage);
-      if (window && alive && version === setupVersion) sendSafe(ws, window);
+      const authorized = await buildBoundedLiveWindow(reason, intent, anchorId, compactingOverride, streamingMessage);
+      if (authorized) sendUiAuthorizedTranscriptWindow({
+        window: authorized.window,
+        witness: authorized.witness,
+        isCurrent: () => alive && version === setupVersion,
+        send: (window) => sendSafe(ws, window),
+      });
     };
 
     const currentSessionFile = () => liveHandle.sessionFile ?? getSessionById(nextSessionId)?.pi_session_file ?? null;
@@ -936,39 +1036,67 @@ function handleConnection(
           bufferedEvents,
         );
         const sessionFile = currentSessionFile();
+        const current = getSessionById(nextSessionId);
+        const authorizationWitness = sessionFile && current
+          ? captureUiTranscriptAuthorization(current, sessionFile)
+          : null;
+        if (sessionFile && !authorizationWitness) throw new Error("Transcript snapshot is no longer authorized");
         return {
           sessionFile,
-          revision: sessionFile ? readTranscriptFileRevision(sessionFile) : null,
+          revision: sessionFile ? readTranscriptFileRevision(
+            sessionFile,
+            authorizationWitness?.authorization.fingerprint,
+          ) : null,
           streamingMessage,
+          authorizationWitness,
         };
       },
       build: (boundary) => buildBoundedLiveWindow(
         reason, intent, anchorId, undefined, boundary.streamingMessage, boundary.sessionFile,
-      ).then((window) => {
-        if (!window) throw new Error("Window selection is unavailable");
-        return window;
+      ).then((authorized) => {
+        if (!authorized) throw new Error("Window selection is unavailable");
+        return authorized;
       }),
       isCurrent: (boundary) => {
         const sessionFile = currentSessionFile();
-        if (sessionFile !== boundary.sessionFile) return false;
+        if (sessionFile !== boundary.sessionFile
+          || (boundary.authorizationWitness
+            && !revalidateUiTranscriptAuthorization(boundary.authorizationWitness))) return false;
         if (!sessionFile || !boundary.revision) return sessionFile === null && boundary.revision === null;
-        try { return revisionsEqual(boundary.revision, readTranscriptFileRevision(sessionFile)); }
+        try {
+          return revisionsEqual(boundary.revision, readTranscriptFileRevision(
+            sessionFile,
+            boundary.authorizationWitness?.authorization.fingerprint ?? {
+              ino: boundary.revision.inode,
+              size: boundary.revision.size,
+              mtimeMs: boundary.revision.mtimeMs,
+              ctimeMs: boundary.revision.ctimeMs,
+            },
+          ));
+        }
         catch { return false; }
       },
       discard: () => {
         if (selectionId) getTranscriptPaginationService().discardSelection(nextSessionId, selectionId);
       },
       ...(reason === "initial" && intent === "around" && anchorId && selectionId ? {
-        fallback: (boundary: RevisionExactWindowBoundary) => getTranscriptPaginationService().openLatestPendingSync({
-          sessionId: nextSessionId,
-          selectionId,
-          sessionFile: boundary.sessionFile,
-          intent: "latest",
-          reason: "initial",
-          streamingAtSnapshot: Boolean(liveHandle.session.isStreaming),
-          compactingAtSnapshot: Boolean(liveHandle.session.isCompacting),
-          streamingMessage: boundary.streamingMessage,
-        }, anchorId),
+        fallback: (boundary: RevisionExactWindowBoundary): AuthorizedLiveWindow => ({
+          window: getTranscriptPaginationService().openLatestPendingSync({
+            sessionId: nextSessionId,
+            selectionId,
+            sessionFile: boundary.authorizationWitness?.authorization.path ?? boundary.sessionFile,
+            expectedFingerprint: boundary.authorizationWitness?.authorization.fingerprint,
+            authorizationGuard: boundary.authorizationWitness
+              ? () => revalidateUiTranscriptAuthorization(boundary.authorizationWitness!)
+              : undefined,
+            intent: "latest",
+            reason: "initial",
+            streamingAtSnapshot: Boolean(liveHandle.session.isStreaming),
+            compactingAtSnapshot: Boolean(liveHandle.session.isCompacting),
+            streamingMessage: boundary.streamingMessage,
+          }, anchorId),
+          witness: boundary.authorizationWitness ?? null,
+        }),
       } : {}),
     });
 
@@ -1064,13 +1192,18 @@ function handleConnection(
       const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
       const compactingAtSnapshot = Boolean(liveHandle.session.isCompacting);
       if (modernWindowNegotiation) {
-        const window = await buildAtomicLiveWindow(
+        const authorized = await buildAtomicLiveWindow(
           "initial",
           modernWindowNegotiation.intent,
           modernWindowNegotiation.anchorId,
         );
-        if (!window) throw new Error("Live transcript changed repeatedly during initial window capture");
-        if (alive && version === setupVersion) sendSafe(ws, window);
+        if (!authorized) throw new Error("Live transcript changed repeatedly during initial window capture");
+        sendUiAuthorizedTranscriptWindow({
+          window: authorized.window,
+          witness: authorized.witness,
+          isCurrent: () => alive && version === setupVersion,
+          send: (window) => sendSafe(ws, window),
+        });
         wsProfile(nextSessionId, "attach_live_window", `duration=${elapsedMs(liveHistoryStart)}`);
       } else {
         const liveHistory = getLiveMessageHistory(nextSessionId);
@@ -1099,9 +1232,14 @@ function handleConnection(
     if (bufferOverflow) {
       if (modernWindowNegotiation) {
         bufferOverflow = false;
-        const window = await buildAtomicLiveWindow("reset", "latest");
-        if (!window || bufferOverflow) throw new Error("Live transcript changed repeatedly during reset capture");
-        if (alive && version === setupVersion) sendSafe(ws, window);
+        const authorized = await buildAtomicLiveWindow("reset", "latest");
+        if (!authorized || bufferOverflow) throw new Error("Live transcript changed repeatedly during reset capture");
+        sendUiAuthorizedTranscriptWindow({
+          window: authorized.window,
+          witness: authorized.witness,
+          isCurrent: () => alive && version === setupVersion,
+          send: (window) => sendSafe(ws, window),
+        });
       } else {
         const streamingAtSnapshot = Boolean(liveHandle.session.isStreaming);
         const compactingAtSnapshot = Boolean(liveHandle.session.isCompacting);
@@ -1149,7 +1287,7 @@ function handleConnection(
       wsProfile(nextSessionId, "setup_session_lookup", `duration=${elapsedMs(lookupStart)} found=${Boolean(sessionInfo)}`);
       if (!sessionInfo) throw new Error("Session not found");
       const quarantined = isLegacyPrivateSessionQuarantined(sessionInfo);
-      if (quarantined) currentTranscriptNegotiation = { protocol: null, intent: "latest" };
+      currentTranscriptNegotiation = resolveOwningTranscriptNegotiation(currentTranscriptNegotiation, quarantined);
       if (!quarantined) {
         const authorization = authorizeProjectAction({
           cwd: sessionInfo.cwd,
@@ -1386,15 +1524,28 @@ function handleConnection(
             const fileHistoryStart = nowMs();
             const stoppedTranscriptNegotiation = currentTranscriptNegotiation;
             if (stoppedTranscriptNegotiation.protocol === "window-v1" && selectionId) {
+              const current = getSessionById(nextSessionId);
+              const authorizationWitness = current
+                ? captureUiTranscriptAuthorization(current, sessionInfo.pi_session_file)
+                : null;
+              if (sessionInfo.pi_session_file && !authorizationWitness) {
+                invalidateTranscriptPaginationSession(nextSessionId);
+                throw new Error("Transcript window is no longer authorized");
+              }
               const window = await getTranscriptPaginationService().open({
                 sessionId: nextSessionId,
                 selectionId,
-                sessionFile: sessionInfo.pi_session_file,
+                sessionFile: authorizationWitness?.authorization.path ?? sessionInfo.pi_session_file,
+                expectedFingerprint: authorizationWitness?.authorization.fingerprint,
+                authorizationGuard: authorizationWitness
+                  ? () => revalidateUiTranscriptAuthorization(authorizationWitness)
+                  : undefined,
                 intent: stoppedTranscriptNegotiation.intent,
                 anchorId: stoppedTranscriptNegotiation.anchorId,
                 reason: "initial",
               });
-              if (!alive || version !== setupVersion) return;
+              if (!alive || version !== setupVersion
+                || (authorizationWitness && !revalidateUiTranscriptAuthorization(authorizationWitness))) return;
               sendSafe(ws, window);
               sendSafe(ws, {
                 type: "queued_message_snapshot",
@@ -1584,8 +1735,10 @@ function handleConnection(
         return;
       }
       const row = getSessionById(requestSessionId);
-      const authorization = row && authorizeProjectAction({ cwd: row.cwd, actor: "interactive", agentProfileId: row.agent_profile_id });
-      if (!row || !authorization || !authorization.allowed) {
+      const authorizationWitness = row
+        ? captureUiTranscriptAuthorization(row, row.pi_session_file)
+        : null;
+      if (!row || !authorizationWitness) {
         invalidateTranscriptPaginationSession(requestSessionId);
         sendSafe(ws, serializeTranscriptPageError({
           sessionId: requestSessionId,
@@ -1600,12 +1753,16 @@ function handleConnection(
       void getTranscriptPaginationService().page({
         sessionId: requestSessionId,
         selectionId: requestSelectionId,
-        sessionFile: row.pi_session_file,
+        sessionFile: authorizationWitness.authorization.path,
+        expectedFingerprint: authorizationWitness.authorization.fingerprint,
+        authorizationGuard: () => revalidateUiTranscriptAuthorization(authorizationWitness),
         requestId,
         direction,
         cursor,
       }).then((window) => {
-        if (alive && requestVersion === setupVersion && currentSessionId === requestSessionId && currentSelectionId === requestSelectionId) sendSafe(ws, window);
+        if (alive && requestVersion === setupVersion && currentSessionId === requestSessionId
+          && currentSelectionId === requestSelectionId
+          && revalidateUiTranscriptAuthorization(authorizationWitness)) sendSafe(ws, window);
       }).catch((error) => {
         if (!alive || requestVersion !== setupVersion) return;
         const code = error instanceof TranscriptCursorError
@@ -1667,10 +1824,19 @@ function handleConnection(
           const row = getSessionById(actionSessionId);
           if (!row) throw new Error("Session not found");
           const handle = getPiSession(actionSessionId);
+          const sessionFile = handle?.sessionFile ?? row.pi_session_file;
+          const authorizationWitness = sessionFile
+            ? captureUiTranscriptAuthorization(row, sessionFile)
+            : null;
+          if (sessionFile && !authorizationWitness) throw new Error("Transcript reset is no longer authorized");
           const window = await getTranscriptPaginationService().open({
             sessionId: actionSessionId,
             selectionId: actionSelectionId,
-            sessionFile: handle?.sessionFile ?? row.pi_session_file,
+            sessionFile: authorizationWitness?.authorization.path ?? sessionFile,
+            expectedFingerprint: authorizationWitness?.authorization.fingerprint,
+            authorizationGuard: authorizationWitness
+              ? () => revalidateUiTranscriptAuthorization(authorizationWitness)
+              : undefined,
             intent: "latest",
             reason: "reset",
             streamingAtSnapshot: Boolean(handle?.session.isStreaming),
@@ -1679,6 +1845,9 @@ function handleConnection(
               handle?.liveStreamingMessage ?? handle?.session.state.streamingMessage,
             ),
           });
+          if (authorizationWitness && !revalidateUiTranscriptAuthorization(authorizationWitness)) {
+            throw new Error("Transcript reset authorization changed during loading");
+          }
           sendSafe(ws, window);
         },
       } : undefined,

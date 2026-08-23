@@ -7,6 +7,7 @@ import type {
   TranscriptWindowReason,
 } from "@wayang/protocol";
 import { serializeHistoryEntries, type SerializedMessage } from "../pi-bridge.js";
+import type { FileFingerprint } from "../session-metadata.js";
 import { TranscriptCursorError, TranscriptCursorRegistry } from "./cursor-registry.js";
 import {
   readReverseTranscriptPage,
@@ -76,6 +77,10 @@ export interface OpenTranscriptWindowInput {
   compactingAtSnapshot?: boolean;
   /** Already-frozen ID-less runtime overlay captured by the transport. */
   streamingMessage?: SerializedMessage | null;
+  /** Exact durable owning-UI authorization fingerprint for every transcript body read. */
+  expectedFingerprint?: FileFingerprint;
+  /** Reauthorizes policy/profile immediately before derived publication. */
+  authorizationGuard?: () => boolean;
   /** Descendant tail reconciliation keeps still-valid older edge cursors. */
   preserveCursors?: boolean;
 }
@@ -87,6 +92,10 @@ export interface PageTranscriptWindowInput {
   requestId: string;
   direction: "before" | "after";
   cursor: string;
+  /** Exact durable owning-UI authorization fingerprint for this page read. */
+  expectedFingerprint?: FileFingerprint;
+  /** Reauthorizes policy/profile immediately before derived publication. */
+  authorizationGuard?: () => boolean;
 }
 
 function rowPlaceholder(row: SerializedMessage, encodedBytes: number): SerializedMessage {
@@ -192,11 +201,14 @@ function boundedReverseContinuation(
   return { beforeOffset, nextAncestorId: firstEntry.parentId };
 }
 
-function prefixTailWitness(filePath: string, end: number): string {
+function prefixTailWitness(filePath: string, end: number, expectedFingerprint?: FileFingerprint): string {
   const fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.size < end) return "";
+    if (!stat.isFile() || stat.nlink !== 1 || stat.size < end
+      || (expectedFingerprint && (Number(stat.ino) !== expectedFingerprint.ino
+        || stat.size !== expectedFingerprint.size || stat.mtimeMs !== expectedFingerprint.mtimeMs
+        || stat.ctimeMs !== expectedFingerprint.ctimeMs))) return "";
     const start = Math.max(0, end - 4_096);
     const bytes = Buffer.allocUnsafe(end - start);
     const read = fs.readSync(fd, bytes, 0, bytes.length, start);
@@ -218,6 +230,7 @@ export class TranscriptPaginationService {
   }
 
   async open(input: OpenTranscriptWindowInput): Promise<TranscriptWindowMessage> {
+    if (input.authorizationGuard && !input.authorizationGuard()) throw new Error("Transcript window is no longer authorized");
     if (!input.preserveCursors) this.cursors.invalidateSelection(input.sessionId, input.selectionId);
     if (!input.sessionFile) {
       const transcriptEpoch = this.selectionEpochs.get(this.selectionKey(input.sessionId, input.selectionId)) ?? randomUUID();
@@ -227,7 +240,12 @@ export class TranscriptPaginationService {
     if (input.intent === "around" && input.anchorId) {
       try { return await this.openAround(input, input.anchorId); }
       catch {
-        void this.index.ensure(input.sessionId, input.sessionFile!).catch(() => undefined);
+        if (input.authorizationGuard && !input.authorizationGuard()) {
+          throw new Error("Transcript window is no longer authorized");
+        }
+        void this.index.ensure(
+          input.sessionId, input.sessionFile!, input.expectedFingerprint, input.authorizationGuard,
+        ).catch(() => undefined);
         const latest = this.openLatestWithStructuralFallback({ ...input, intent: "latest" });
         latest.anchor = { requested_id: input.anchorId, resolved_id: null, status: "pending" };
         return latest;
@@ -239,11 +257,14 @@ export class TranscriptPaginationService {
   openLatestPendingSync(input: OpenTranscriptWindowInput, requestedAnchorId: string): TranscriptWindowMessage {
     const latest = this.openLatestWithStructuralFallback({ ...input, intent: "latest" });
     latest.anchor = { requested_id: requestedAnchorId, resolved_id: null, status: "pending" };
-    if (input.sessionFile) void this.index.ensure(input.sessionId, input.sessionFile).catch(() => undefined);
+    if (input.sessionFile) void this.index.ensure(
+      input.sessionId, input.sessionFile, input.expectedFingerprint, input.authorizationGuard,
+    ).catch(() => undefined);
     return latest;
   }
 
   async page(input: PageTranscriptWindowInput): Promise<TranscriptWindowMessage> {
+    if (input.authorizationGuard && !input.authorizationGuard()) throw new Error("Transcript page is no longer authorized");
     if (!input.sessionFile) throw new TranscriptCursorError("unknown_cursor");
     const selectionKey = this.selectionKey(input.sessionId, input.selectionId);
     const expectedEpoch = this.selectionEpochs.get(selectionKey);
@@ -259,12 +280,16 @@ export class TranscriptPaginationService {
       if (input.direction !== "before") throw new TranscriptCursorError("direction_mismatch");
       let reverse: ReturnType<typeof readReverseTranscriptPage>;
       try {
-        reverse = readReverseTranscriptPage(input.sessionFile, { continuation: record.state.continuation });
+        reverse = readReverseTranscriptPage(input.sessionFile, {
+          continuation: record.state.continuation,
+          expectedFingerprint: input.expectedFingerprint,
+        });
       } catch (error) {
         if (!(error instanceof TranscriptPhysicalRowUnsupportedError)) throw error;
         const indexed = record.state.continuation.nextAncestorId
           ? this.index.tryBeforeEventCurrent(
               input.sessionId, input.sessionFile, record.state.continuation.nextAncestorId, TRANSCRIPT_PAGE_MAX_ROWS,
+              input.expectedFingerprint,
             )
           : null;
         if (!indexed) throw error;
@@ -274,7 +299,10 @@ export class TranscriptPaginationService {
       }
       const priorCold = this.coldEpochs.get(input.sessionId);
       const tailProbe = priorCold && priorCold.revision.size !== reverse.revision.size
-        ? readReverseTranscriptPage(input.sessionFile, { maxRows: TRANSCRIPT_PAGE_MAX_ROWS })
+        ? readReverseTranscriptPage(input.sessionFile, {
+            maxRows: TRANSCRIPT_PAGE_MAX_ROWS,
+            expectedFingerprint: input.expectedFingerprint,
+          })
         : null;
       if (tailProbe && (tailProbe.revision.size !== reverse.revision.size
         || tailProbe.revision.mtimeMs !== reverse.revision.mtimeMs
@@ -289,9 +317,12 @@ export class TranscriptPaginationService {
         reverse.revision,
         currentBranchTip,
         tailProbe?.entries ?? [],
+        input.expectedFingerprint,
       );
       if (epoch !== expectedEpoch) throw new TranscriptCursorError("epoch_mismatch");
-      if (reverse.scanCeilingReached) void this.index.ensure(input.sessionId, input.sessionFile).catch(() => undefined);
+      if (reverse.scanCeilingReached) void this.index.ensure(
+        input.sessionId, input.sessionFile, input.expectedFingerprint, input.authorizationGuard,
+      ).catch(() => undefined);
       const bounded = boundedSerialization(reverse.entries, "latest");
       const continuation = boundedReverseContinuation(reverse, bounded);
       const beforeCursor = continuation ? this.cursors.issue({
@@ -301,7 +332,8 @@ export class TranscriptPaginationService {
         currentBranchTip, bounded.messages, bounded.payloadBytes, beforeCursor, null, Boolean(beforeCursor), true);
     }
     const selection = await this.index.adjacent(input.sessionId, input.sessionFile, input.direction,
-      record.state.boundaryVisibleOrdinal, TRANSCRIPT_PAGE_MAX_ROWS);
+      record.state.boundaryVisibleOrdinal, TRANSCRIPT_PAGE_MAX_ROWS, input.expectedFingerprint,
+      input.authorizationGuard);
     if (selection.revision.transcriptEpoch !== record.state.indexEpoch) throw new TranscriptCursorError("epoch_mismatch");
     return this.indexedMessage({ ...input, intent: "latest", reason: input.direction === "before" ? "prepend" : "append" }, selection,
       input.direction === "before" ? "latest" : "earliest", expectedEpoch);
@@ -320,7 +352,12 @@ export class TranscriptPaginationService {
       || state.revision.ctimeMs !== fingerprint.ctimeMs
       || !sameTranscriptIdentity(state.revision, fingerprint)) return false;
     try {
-      const current = readTranscriptFileRevision(filePath);
+      const current = readTranscriptFileRevision(filePath, {
+        ino: fingerprint.inode,
+        size: fingerprint.size,
+        mtimeMs: fingerprint.mtimeMs,
+        ctimeMs: fingerprint.ctimeMs,
+      });
       return current.size === fingerprint.size
         && current.mtimeMs === fingerprint.mtimeMs
         && current.ctimeMs === fingerprint.ctimeMs
@@ -352,7 +389,9 @@ export class TranscriptPaginationService {
     try { return this.openLatest(input); }
     catch (error) {
       if (!(error instanceof TranscriptPhysicalRowUnsupportedError) || !input.sessionFile) throw error;
-      const indexed = this.index.tryLatestCurrent(input.sessionId, input.sessionFile, TRANSCRIPT_PAGE_MAX_ROWS);
+      const indexed = this.index.tryLatestCurrent(
+        input.sessionId, input.sessionFile, TRANSCRIPT_PAGE_MAX_ROWS, input.expectedFingerprint,
+      );
       if (!indexed) throw error;
       const existingCold = this.coldEpochs.get(input.sessionId);
       const wireEpoch = existingCold && sameTranscriptIdentity(existingCold.revision, indexed.revision)
@@ -365,7 +404,7 @@ export class TranscriptPaginationService {
         revision: indexed.revision,
         transcriptEpoch: wireEpoch,
         branchTipId: indexed.revision.branchTipId,
-        tailWitness: prefixTailWitness(input.sessionFile, indexed.revision.size),
+        tailWitness: prefixTailWitness(input.sessionFile, indexed.revision.size, input.expectedFingerprint),
       });
       this.selectionEpochs.set(this.selectionKey(input.sessionId, input.selectionId), wireEpoch);
       return this.indexedMessage(input, indexed, "latest", wireEpoch);
@@ -373,9 +412,16 @@ export class TranscriptPaginationService {
   }
 
   private openLatest(input: OpenTranscriptWindowInput): TranscriptWindowMessage {
-    const reverse = readReverseTranscriptPage(input.sessionFile!);
-    const epoch = this.resolveColdEpoch(input.sessionId, input.sessionFile!, reverse.revision, reverse.branchTipId, reverse.entries);
-    if (reverse.scanCeilingReached) void this.index.ensure(input.sessionId, input.sessionFile!).catch(() => undefined);
+    const reverse = readReverseTranscriptPage(input.sessionFile!, {
+      expectedFingerprint: input.expectedFingerprint,
+    });
+    const epoch = this.resolveColdEpoch(
+      input.sessionId, input.sessionFile!, reverse.revision, reverse.branchTipId, reverse.entries,
+      input.expectedFingerprint,
+    );
+    if (reverse.scanCeilingReached) void this.index.ensure(
+      input.sessionId, input.sessionFile!, input.expectedFingerprint, input.authorizationGuard,
+    ).catch(() => undefined);
     const selectionKey = this.selectionKey(input.sessionId, input.selectionId);
     const previousEpoch = this.selectionEpochs.get(selectionKey);
     this.selectionEpochs.set(selectionKey, epoch);
@@ -394,7 +440,10 @@ export class TranscriptPaginationService {
   }
 
   private async openAround(input: OpenTranscriptWindowInput, anchorId: string): Promise<TranscriptWindowMessage> {
-    const selection = await this.index.around(input.sessionId, input.sessionFile!, anchorId, TRANSCRIPT_PAGE_MAX_ROWS);
+    const selection = await this.index.around(
+      input.sessionId, input.sessionFile!, anchorId, TRANSCRIPT_PAGE_MAX_ROWS, input.expectedFingerprint,
+      input.authorizationGuard,
+    );
     const existingCold = this.coldEpochs.get(input.sessionId);
     const wireEpoch = existingCold && sameTranscriptIdentity(existingCold.revision, selection.revision)
       && existingCold.revision.size === selection.revision.size
@@ -406,7 +455,7 @@ export class TranscriptPaginationService {
       revision: selection.revision,
       transcriptEpoch: wireEpoch,
       branchTipId: selection.revision.branchTipId,
-      tailWitness: prefixTailWitness(input.sessionFile!, selection.revision.size),
+      tailWitness: prefixTailWitness(input.sessionFile!, selection.revision.size, input.expectedFingerprint),
     });
     this.selectionEpochs.set(this.selectionKey(input.sessionId, input.selectionId), wireEpoch);
     return this.indexedMessage(input, selection, "around", wireEpoch);
@@ -418,6 +467,7 @@ export class TranscriptPaginationService {
     preference: "latest" | "earliest" | "around",
     wireEpoch = selection.revision.transcriptEpoch,
   ): TranscriptWindowMessage {
+    if (input.authorizationGuard && !input.authorizationGuard()) throw new Error("Indexed transcript read is no longer authorized");
     const indexedRead = this.index.readBoundedEntries(selection.revision, selection.rows, {
       preference,
       anchorEventId: selection.anchor?.resolved_id,
@@ -449,6 +499,7 @@ export class TranscriptPaginationService {
     revision: TranscriptFileRevision,
     branchTipId: string | null,
     scannedEntries: readonly any[],
+    expectedFingerprint?: FileFingerprint,
   ): string {
     const existing = this.coldEpochs.get(sessionId);
     if (existing && sameTranscriptIdentity(existing.revision, revision)) {
@@ -456,12 +507,12 @@ export class TranscriptPaginationService {
           && revision.mtimeMs === existing.revision.mtimeMs
           && revision.ctimeMs === existing.revision.ctimeMs)
         || (revision.size > existing.revision.size
-          && prefixTailWitness(filePath, existing.revision.size) === existing.tailWitness
+          && prefixTailWitness(filePath, existing.revision.size, expectedFingerprint) === existing.tailWitness
           && (existing.branchTipId === branchTipId || existing.branchTipId === null
             || scannedEntries.some((entry) => entry?.id === existing.branchTipId)))) {
         existing.revision = revision;
         existing.branchTipId = branchTipId;
-        existing.tailWitness = prefixTailWitness(filePath, revision.size);
+        existing.tailWitness = prefixTailWitness(filePath, revision.size, expectedFingerprint);
         return existing.transcriptEpoch;
       }
     }
@@ -469,7 +520,7 @@ export class TranscriptPaginationService {
       revision,
       transcriptEpoch: randomUUID(),
       branchTipId,
-      tailWitness: prefixTailWitness(filePath, revision.size),
+      tailWitness: prefixTailWitness(filePath, revision.size, expectedFingerprint),
     };
     this.coldEpochs.set(sessionId, created);
     return created.transcriptEpoch;
@@ -487,6 +538,7 @@ export class TranscriptPaginationService {
     hasNewer: boolean,
     anchor?: TranscriptAnchorResolution,
   ): TranscriptWindowMessage {
+    if (input.authorizationGuard && !input.authorizationGuard()) throw new Error("Transcript window publication is no longer authorized");
     const streamingMessage = boundedStreamingMessage(input.streamingMessage);
     const payloadContent = streamingMessage
       ? { messages, streaming_message: streamingMessage }

@@ -108,6 +108,66 @@ test("empty active state falls back to deduplicated preseed TODOs", async () => 
   }
 });
 
+test("TODO projection rejects a file changed after the owning authorization fingerprint", async () => {
+  const { dir, file } = transcript([header, todoState("state", null, "stale authorization")]);
+  const stat = fs.statSync(file);
+  const expectedFingerprint = {
+    ino: Number(stat.ino) || 0,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+  };
+  fs.appendFileSync(file, JSON.stringify(tip("changed", "state")) + "\n");
+  const service = new DerivedTodoProjectionService();
+  try {
+    assert.equal(await service.project(file, expectedFingerprint), null);
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("policy change before TODO cache publication withholds the derived result", async () => {
+  const { dir, file } = transcript([header, todoState("state", null, "policy stale")]);
+  let allowed = true;
+  const service = new DerivedTodoProjectionService({
+    beforeCachePublishForTests() { allowed = false; },
+  });
+  try {
+    assert.equal(await service.project(file, undefined, () => allowed), null);
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("TODO worker rejects replacement before open with zero body bytes", async () => {
+  const { dir, file } = transcript([header, todoState("state", null, "pre-open")]);
+  const stat = fs.statSync(file);
+  const expectedFingerprint = {
+    ino: Number(stat.ino) || 0,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+  };
+  let observedBytes = -1;
+  const content = fs.readFileSync(file);
+  const service = new DerivedTodoProjectionService({
+    beforeWorkerOpenForTests() {
+      fs.renameSync(file, `${file}.old`);
+      fs.writeFileSync(file, content);
+    },
+    observeWorkerBodyBytesForTests(_filePath, bytes) { observedBytes = bytes; },
+  });
+  try {
+    assert.equal(await service.project(file, expectedFingerprint), null);
+    assert.equal(observedBytes, 0);
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("revision change before cache publication withholds TODO projection", async () => {
   const { dir, file } = transcript([header, todoState("state", null, "stale")]);
   let release!: () => void;

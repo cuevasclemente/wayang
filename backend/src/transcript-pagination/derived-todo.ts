@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Worker } from "node:worker_threads";
 import type { SerializedTodoState } from "../pi-bridge.js";
+import type { FileFingerprint } from "../session-metadata.js";
 import {
   readTranscriptFileRevision,
   sameTranscriptIdentity,
@@ -19,6 +20,7 @@ interface WorkerReply {
   fingerprint?: TranscriptFileRevision;
   todoState?: SerializedTodoState;
   error?: string;
+  bodyBytesRead: number;
 }
 
 export interface DerivedTodoProjectionOptions {
@@ -27,6 +29,10 @@ export interface DerivedTodoProjectionOptions {
   workerTimeoutMs?: number;
   /** @internal Worker-side delay for concurrency/timeout tests. */
   workerDelayMsForTests?: number;
+  /** @internal Runs after expected revision capture and immediately before worker creation. */
+  beforeWorkerOpenForTests?: (filePath: string) => void;
+  /** @internal Reports worker transcript bytes, including zero-byte admission rejection. */
+  observeWorkerBodyBytesForTests?: (filePath: string, bytesRead: number) => void;
 }
 
 const WORKER_SOURCE = String.raw`
@@ -103,10 +109,21 @@ function candidateFromEntry(entry) {
   return null;
 }
 let fd;
+let bodyBytesRead = 0;
+function matchesExpected(stat, expected, revision) {
+  return stat.isFile() && stat.nlink === 1
+    && (Number(stat.dev) || 0) === revision.device
+    && (Number(stat.ino) || 0) === expected.ino
+    && stat.size === expected.size
+    && stat.mtimeMs === expected.mtimeMs
+    && stat.ctimeMs === expected.ctimeMs;
+}
 try {
   fd = fs.openSync(workerData.filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   const before = fs.fstatSync(fd);
-  if (!before.isFile()) throw new Error("Transcript is not a regular file");
+  if (!matchesExpected(before, workerData.expectedFingerprint, workerData.expectedRevision)) {
+    throw new Error("Transcript changed before TODO worker body admission");
+  }
   const entries = [];
   let branchTipId = null;
   let ordinal = 0;
@@ -156,6 +173,7 @@ try {
     const requested = Math.min(block.length, before.size - position);
     const count = fs.readSync(fd, block, 0, requested, position);
     if (!count) break;
+    bodyBytesRead += count;
     const chunk = block.subarray(0, count);
     let segmentStart = 0;
     for (let index = 0; index < chunk.length; index++) {
@@ -214,6 +232,7 @@ try {
     while (candidateRead < candidateLine.length) {
       const count = fs.readSync(fd, candidateLine, candidateRead, candidateLine.length - candidateRead, topology.sourceOffset + candidateRead);
       if (!count) break;
+      bodyBytesRead += count;
       candidateRead += count;
     }
     if (candidateRead !== candidateLine.length) throw new Error("TODO active candidate line was truncated");
@@ -251,8 +270,11 @@ try {
   }
   const after = fs.fstatSync(fd);
   const pathStat = fs.lstatSync(workerData.filePath);
-  if (!pathStat.isFile() || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size
-    || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs
+  if (!pathStat.isFile() || pathStat.nlink !== 1
+    || !matchesExpected(after, workerData.expectedFingerprint, workerData.expectedRevision)
+    || after.dev !== before.dev || after.ino !== before.ino
+    || sha(header) !== workerData.expectedRevision.headerDigest
+    || mutationEpoch !== workerData.expectedRevision.mutationEpoch
     || pathStat.dev !== before.dev || pathStat.ino !== before.ino || pathStat.size !== before.size) {
     throw new Error("Transcript changed during TODO projection");
   }
@@ -267,9 +289,10 @@ try {
       mutationEpoch,
     },
     todoState,
+    bodyBytesRead,
   });
 } catch (error) {
-  parentPort.postMessage({ error: error && error.message ? error.message : String(error) });
+  parentPort.postMessage({ error: error && error.message ? error.message : String(error), bodyBytesRead });
 } finally { if (fd !== undefined) fs.closeSync(fd); }
 `;
 
@@ -289,6 +312,8 @@ interface ProjectionTask {
   key: string;
   filePath: string;
   expected: TranscriptFileRevision;
+  expectedFingerprint: FileFingerprint;
+  authorizationGuard?: () => boolean;
   promise: Promise<DerivedTodoProjection | null>;
   resolve: (projection: DerivedTodoProjection | null) => void;
   cancelled: boolean;
@@ -315,11 +340,15 @@ export class DerivedTodoProjectionService {
 
   constructor(private readonly options: DerivedTodoProjectionOptions = {}) {}
 
-  project(filePath: string): Promise<DerivedTodoProjection | null> {
-    if (this.closed) return Promise.resolve(null);
+  project(
+    filePath: string,
+    expectedFingerprint?: FileFingerprint,
+    authorizationGuard?: () => boolean,
+  ): Promise<DerivedTodoProjection | null> {
+    if (this.closed || (authorizationGuard && !authorizationGuard())) return Promise.resolve(null);
     const canonicalPath = path.resolve(filePath);
     let expected: TranscriptFileRevision;
-    try { expected = readTranscriptFileRevision(canonicalPath); }
+    try { expected = readTranscriptFileRevision(canonicalPath, expectedFingerprint); }
     catch { return Promise.resolve(null); }
     const key = cacheKey(canonicalPath, expected);
     const cached = this.cache.get(key);
@@ -352,6 +381,13 @@ export class DerivedTodoProjectionService {
       key,
       filePath: canonicalPath,
       expected,
+      expectedFingerprint: expectedFingerprint ?? {
+        ino: expected.inode,
+        size: expected.size,
+        mtimeMs: expected.mtimeMs,
+        ctimeMs: expected.ctimeMs,
+      },
+      authorizationGuard,
       promise,
       resolve: resolveTask,
       cancelled: false,
@@ -425,17 +461,20 @@ export class DerivedTodoProjectionService {
   private async runTask(task: ProjectionTask): Promise<void> {
     try {
       const projection = await this.runWorker(task);
-      if (!projection || task.cancelled || this.closed) {
+      if (!projection || task.cancelled || this.closed
+        || (task.authorizationGuard && !task.authorizationGuard())) {
         task.resolve(null);
         return;
       }
       await this.options.beforeCachePublishForTests?.(task.filePath);
-      if (task.cancelled || this.closed || !fingerprintsEqual(task.expected, projection.fingerprint)) {
+      if (task.cancelled || this.closed
+        || (task.authorizationGuard && !task.authorizationGuard())
+        || !fingerprintsEqual(task.expected, projection.fingerprint)) {
         task.resolve(null);
         return;
       }
       let current: TranscriptFileRevision;
-      try { current = readTranscriptFileRevision(task.filePath); }
+      try { current = readTranscriptFileRevision(task.filePath, task.expectedFingerprint); }
       catch {
         task.resolve(null);
         return;
@@ -461,10 +500,13 @@ export class DerivedTodoProjectionService {
   private runWorker(task: ProjectionTask): Promise<DerivedTodoProjection | null> {
     this.workersStarted++;
     return new Promise((resolve, reject) => {
+      this.options.beforeWorkerOpenForTests?.(task.filePath);
       const worker = new Worker(WORKER_SOURCE, {
         eval: true,
         workerData: {
           filePath: task.filePath,
+          expectedFingerprint: task.expectedFingerprint,
+          expectedRevision: task.expected,
           delayMs: Math.max(0, this.options.workerDelayMsForTests ?? 0),
         },
         resourceLimits: {
@@ -511,6 +553,7 @@ export class DerivedTodoProjectionService {
       worker.once("message", (reply: WorkerReply) => {
         if (settled) return;
         settled = true;
+        this.options.observeWorkerBodyBytesForTests?.(task.filePath, reply.bodyBytesRead);
         if (timer) clearTimeout(timer);
         task.cancelWorker = undefined;
         const projection = reply.error || !reply.fingerprint || !reply.todoState

@@ -6,6 +6,8 @@ import {
   captureTranscriptWindowStreamingBoundary,
   parseTranscriptNegotiation,
   revalidateModernTodoAuthorization,
+  resolveOwningTranscriptNegotiation,
+  sendUiAuthorizedTranscriptWindow,
   serializeInvalidTranscriptPageRequest,
   serializeTranscriptPageError,
   serializeTranscriptPageGateFailure,
@@ -60,6 +62,36 @@ test("modern TODO authorization preserves null raw attribution while binding res
     project: { id: "different-project" },
     agentProfile: { id: "resolved-default" },
   })), false);
+});
+
+test("live transcript send reauthorizes synchronously after an immediate policy change", () => {
+  let policyAllowed = true;
+  let sends = 0;
+  const sent = sendUiAuthorizedTranscriptWindow({
+    window: { type: "transcript_window" } as any,
+    witness: {} as any,
+    isCurrent: () => true,
+    beforeAuthorizationForTests() { policyAllowed = false; },
+    reauthorize: () => policyAllowed,
+    send: () => { sends++; },
+  });
+  assert.equal(sent, false);
+  assert.equal(sends, 0);
+});
+
+test("live transcript send reauthorizes synchronously after an immediate path change", () => {
+  let exactPathCurrent = true;
+  let sends = 0;
+  const sent = sendUiAuthorizedTranscriptWindow({
+    window: { type: "transcript_window" } as any,
+    witness: {} as any,
+    isCurrent: () => true,
+    beforeAuthorizationForTests() { exactPathCurrent = false; },
+    reauthorize: () => exactPathCurrent,
+    send: () => { sends++; },
+  });
+  assert.equal(sent, false);
+  assert.equal(sends, 0);
 });
 
 test("streaming snapshot boundary freezes overlay and retains only later buffered events", () => {
@@ -155,6 +187,19 @@ test("continuously changing around attach falls back to fresh usable latest pend
     anchor: { requested_id: "old-match", resolved_id: null, status: "pending" },
   });
   assert.deepEqual(buffered, [{ type: "text_delta", delta: "post-fallback" }]);
+});
+
+test("quarantined owning reads retain the legacy owner-visible transcript projection", () => {
+  const requested = parseTranscriptNegotiation(new URLSearchParams({
+    transcript_protocol: "window-v1",
+    transcript_intent: "around",
+    transcript_anchor_id: "message-7",
+  }), "selection");
+  assert.deepEqual(resolveOwningTranscriptNegotiation(requested, true), {
+    protocol: null,
+    intent: "latest",
+  });
+  assert.deepEqual(resolveOwningTranscriptNegotiation(requested, false), requested);
 });
 
 test("window-v1 negotiation is explicit and selection-bound", () => {

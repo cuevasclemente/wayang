@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import type { FileFingerprint } from "../session-metadata.js";
 
 export const TRANSCRIPT_PAGE_MAX_ROWS = 200;
 export const TRANSCRIPT_PAGE_MAX_BYTES = 512 * 1024;
@@ -61,7 +62,8 @@ function digest(value: Buffer): string {
 function openRegularNoFollow(filePath: string): number {
   const fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
-    if (!fs.fstatSync(fd).isFile()) throw new Error("Transcript is not a regular file");
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.nlink !== 1) throw new Error("Transcript is not a single-link regular file");
     return fd;
   } catch (error) {
     fs.closeSync(fd);
@@ -69,10 +71,23 @@ function openRegularNoFollow(filePath: string): number {
   }
 }
 
-function readHeader(fd: number, size: number): { digest: string; mutationEpoch: string } {
+function statMatchesFingerprint(stat: fs.Stats, expected: FileFingerprint): boolean {
+  return stat.isFile() && stat.nlink === 1
+    && (Number(stat.ino) || 0) === expected.ino
+    && stat.size === expected.size
+    && stat.mtimeMs === expected.mtimeMs
+    && stat.ctimeMs === expected.ctimeMs;
+}
+
+function readHeader(
+  fd: number,
+  size: number,
+  observeBytesRead?: (bytes: number) => void,
+): { digest: string; mutationEpoch: string } {
   const length = Math.min(size, HEADER_MAX_BYTES);
   const bytes = Buffer.allocUnsafe(length);
   const read = fs.readSync(fd, bytes, 0, length, 0);
+  observeBytesRead?.(read);
   const view = bytes.subarray(0, read);
   const newline = view.indexOf(0x0a);
   const header = view.subarray(0, newline >= 0 ? newline : view.length);
@@ -86,9 +101,16 @@ function readHeader(fd: number, size: number): { digest: string; mutationEpoch: 
   return { digest: headerDigest, mutationEpoch };
 }
 
-function revisionFromDescriptor(fd: number): TranscriptFileRevision {
+function revisionFromDescriptor(
+  fd: number,
+  expectedFingerprint?: FileFingerprint,
+  observeBytesRead?: (bytes: number) => void,
+): TranscriptFileRevision {
   const stat = fs.fstatSync(fd);
-  const header = readHeader(fd, stat.size);
+  if (expectedFingerprint && !statMatchesFingerprint(stat, expectedFingerprint)) {
+    throw new TranscriptRevisionChangedError();
+  }
+  const header = readHeader(fd, stat.size, observeBytesRead);
   return {
     device: Number(stat.dev) || 0,
     inode: Number(stat.ino) || 0,
@@ -105,7 +127,7 @@ function assertPathStillMatches(filePath: string, fd: number, expected: Transcri
   let pathStat: fs.Stats;
   try { pathStat = fs.lstatSync(filePath); }
   catch { throw new TranscriptRevisionChangedError(); }
-  if (!pathStat.isFile()
+  if (!pathStat.isFile() || pathStat.nlink !== 1
     || descriptor.device !== expected.device
     || descriptor.inode !== expected.inode
     || descriptor.size !== expected.size
@@ -222,6 +244,16 @@ export function isStructurallyVisibleTranscriptEntry(entry: any): boolean {
   return entry.customType === "wayang-deleted-event-v1" || entry.customType === "wayang-agent-change";
 }
 
+export function transcriptRevisionMatchesFingerprint(
+  revision: TranscriptFileRevision,
+  fingerprint: FileFingerprint,
+): boolean {
+  return revision.inode === fingerprint.ino
+    && revision.size === fingerprint.size
+    && revision.mtimeMs === fingerprint.mtimeMs
+    && revision.ctimeMs === fingerprint.ctimeMs;
+}
+
 export function sameTranscriptIdentity(
   left: Pick<TranscriptFileRevision, "device" | "inode" | "headerDigest" | "mutationEpoch">,
   right: Pick<TranscriptFileRevision, "device" | "inode" | "headerDigest" | "mutationEpoch">,
@@ -230,10 +262,19 @@ export function sameTranscriptIdentity(
     && left.headerDigest === right.headerDigest && left.mutationEpoch === right.mutationEpoch;
 }
 
-export function readTranscriptFileRevision(filePath: string): TranscriptFileRevision {
+export function readTranscriptFileRevision(
+  filePath: string,
+  expectedFingerprint?: FileFingerprint,
+  observeBytesRead?: (bytes: number) => void,
+): TranscriptFileRevision {
   const fd = openRegularNoFollow(filePath);
-  try { return revisionFromDescriptor(fd); }
-  finally { fs.closeSync(fd); }
+  try {
+    const revision = revisionFromDescriptor(fd, expectedFingerprint, observeBytesRead);
+    if (expectedFingerprint && !transcriptRevisionMatchesFingerprint(revision, expectedFingerprint)) {
+      throw new TranscriptRevisionChangedError();
+    }
+    return revision;
+  } finally { fs.closeSync(fd); }
 }
 
 /**
@@ -246,13 +287,20 @@ export function readReverseTranscriptPage(
     continuation?: ReversePageContinuation;
     maxRows?: number;
     maxScanBytes?: number;
+    /** Exact durable authorization fingerprint witnessed before this body read. */
+    expectedFingerprint?: FileFingerprint;
+    /** @internal Counts descriptor bytes; mismatched fingerprints must report zero. */
+    observeBytesRead?: (bytes: number) => void;
     /** @internal Test seam; production uses the absolute compiled ceiling. */
     maxBoundaryScanBytes?: number;
   } = {},
 ): ReverseTranscriptPage {
   const fd = openRegularNoFollow(filePath);
   try {
-    const revision = revisionFromDescriptor(fd);
+    const revision = revisionFromDescriptor(fd, options.expectedFingerprint, options.observeBytesRead);
+    if (options.expectedFingerprint && !transcriptRevisionMatchesFingerprint(revision, options.expectedFingerprint)) {
+      throw new TranscriptRevisionChangedError();
+    }
     let end = Math.min(options.continuation?.beforeOffset ?? revision.size, revision.size);
     const maxScanBytes = options.maxScanBytes ?? TRANSCRIPT_REVERSE_MAX_SCAN_BYTES;
     const newestBounds = newestPhysicalLineBounds(
