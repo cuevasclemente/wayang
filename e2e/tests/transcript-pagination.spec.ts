@@ -138,6 +138,189 @@ async function installActiveWindowSocket(page: Page): Promise<void> {
   });
 }
 
+async function installRepeatedUserWindowSocket(page: Page, emitPreWindowReplay = false): Promise<void> {
+  await page.addInitScript(({ emitPreWindowReplay }) => {
+    type Handler<T> = ((event: T) => void) | null;
+    class RepeatedUserWindowWebSocket {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static readonly CLOSED = 3;
+      readyState = RepeatedUserWindowWebSocket.CONNECTING;
+      onopen: Handler<Event> = null;
+      onclose: Handler<CloseEvent> = null;
+      onerror: Handler<Event> = null;
+      onmessage: Handler<MessageEvent> = null;
+      private sessionId: string;
+      private selectionId: string | null;
+      private active = true;
+
+      constructor(url: string) {
+        const parsed = new URL(url, window.location.href);
+        this.sessionId = parsed.searchParams.get("session_id") ?? "";
+        this.selectionId = parsed.searchParams.get("selection_id");
+        (window as Window & {
+          __repeatedUserWindow?: {
+            emitIdlessReplay: () => void;
+            emitStaleAppend: () => void;
+            emitAppend: () => void;
+            settle: () => void;
+          };
+        }).__repeatedUserWindow = {
+          emitIdlessReplay: () => this.emit({
+            type: "message_start",
+            session_id: this.sessionId,
+            selection_id: this.selectionId,
+            message: { role: "user", content: "done" },
+          }),
+          emitStaleAppend: () => this.emitWindow("append", [{
+            type: "user",
+            id: "stale-append-done",
+            parentId: "latest-user",
+            message: { role: "user", content: "done" },
+          }], "stale-after-request"),
+          emitAppend: () => this.emitWindow("tail_reconcile", [{
+            type: "user",
+            id: "new-done",
+            parentId: "latest-user",
+            message: { role: "user", content: "done" },
+          }]),
+          settle: () => {
+            this.active = false;
+            this.emit({
+              type: "agent_end",
+              session_id: this.sessionId,
+              selection_id: this.selectionId,
+              messages: [],
+              will_retry: false,
+            });
+            this.emit({
+              type: "agent_settled",
+              session_id: this.sessionId,
+              selection_id: this.selectionId,
+            });
+          },
+        };
+        window.setTimeout(() => {
+          this.readyState = RepeatedUserWindowWebSocket.OPEN;
+          this.onopen?.(new Event("open"));
+          this.emitInitial();
+        }, 0);
+      }
+
+      send(raw: string): void {
+        const message = JSON.parse(raw) as {
+          type?: string;
+          content?: string;
+          client_message_id?: string;
+          request_id?: string;
+          direction?: "before" | "after";
+          session_id?: string;
+          selection_id?: string;
+        };
+        if (message.type === "switch_session" && message.session_id) {
+          this.sessionId = message.session_id;
+          this.selectionId = message.selection_id ?? null;
+          this.emitInitial();
+          return;
+        }
+        if (message.type === "message" && message.client_message_id && this.active) {
+          this.emit({
+            type: "queued_message_ack",
+            session_id: this.sessionId,
+            client_message_id: message.client_message_id,
+            status: "queued",
+            cancellable: true,
+          });
+          return;
+        }
+        if (
+          message.type === "transcript_page_request"
+          && message.direction === "before"
+          && message.request_id
+        ) {
+          this.emitWindow("prepend", [{
+            type: "user",
+            id: "old-done",
+            parentId: null,
+            message: { role: "user", content: "done" },
+          }], message.request_id);
+        }
+      }
+
+      close(): void {
+        this.readyState = RepeatedUserWindowWebSocket.CLOSED;
+      }
+
+      private emitInitial(): void {
+        this.emit({ type: "session_loading", session_id: this.sessionId, selection_id: this.selectionId });
+        this.emit({ type: "session_ready", session_id: this.sessionId, selection_id: this.selectionId });
+        this.emit({
+          type: "transcript_protocol",
+          session_id: this.sessionId,
+          selection_id: this.selectionId,
+          protocol: "window-v1",
+          intent: "latest",
+        });
+        if (emitPreWindowReplay) {
+          this.emit({
+            type: "message_start",
+            id: "pre-window-replay",
+            message: { role: "user", content: "pre-window-replay" },
+          });
+        }
+        window.setTimeout(() => this.emitWindow("initial", [{
+          type: "user",
+          id: "latest-user",
+          parentId: "old-done",
+          message: { role: "user", content: "Latest prompt before the active response." },
+        }]), emitPreWindowReplay ? 500 : 0);
+      }
+
+      private emitWindow(
+        reason: "initial" | "prepend" | "append" | "tail_reconcile",
+        messages: Array<Record<string, unknown>>,
+        requestId?: string,
+      ): void {
+        const streamingMessage = reason === "initial" ? {
+          type: "assistant",
+          message: { role: "assistant", content: [{ type: "text", text: "Active response remains in progress." }] },
+        } : undefined;
+        const payload = {
+          messages,
+          ...(streamingMessage ? { streaming_message: streamingMessage } : {}),
+        };
+        this.emit({
+          type: "transcript_window",
+          session_id: this.sessionId,
+          selection_id: this.selectionId,
+          reason,
+          ...(requestId ? { request_id: requestId } : {}),
+          transcript_epoch: "repeated-user-epoch",
+          branch_tip_id: reason === "tail_reconcile" ? "new-done" : "latest-user",
+          messages,
+          ...(streamingMessage ? { streaming_message: streamingMessage } : {}),
+          before_cursor: reason === "initial" ? "older-done-cursor" : null,
+          after_cursor: null,
+          has_older: reason === "initial",
+          has_newer: false,
+          ...(reason === "initial" ? {
+            streaming_at_snapshot: true,
+            compacting_at_snapshot: false,
+          } : {}),
+          message_count: messages.length,
+          payload_bytes: new TextEncoder().encode(JSON.stringify(payload)).byteLength,
+        });
+      }
+
+      private emit(payload: Record<string, unknown>): void {
+        this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(payload) }));
+      }
+    }
+    (window as unknown as { WebSocket: typeof RepeatedUserWindowWebSocket }).WebSocket = RepeatedUserWindowWebSocket;
+  }, { emitPreWindowReplay });
+}
+
 async function installTerminalCursorSocket(page: Page): Promise<void> {
   await page.addInitScript(() => {
     type Handler<T> = ((event: T) => void) | null;
@@ -316,6 +499,107 @@ test("an active session accepts a separate ID-less streaming snapshot", async ({
   await expect(transcript.getByText("Persisted active-session prompt.", { exact: true })).toBeVisible();
   await expect(page.getByTestId("chat-streaming").getByText("Frozen partial assistant response.", { exact: true })).toBeVisible();
   await expect(page.getByTestId("transcript-window-error")).toHaveCount(0);
+});
+
+test("window-v1 correlation applies immediately after negotiation before the first window", async ({ page, request }) => {
+  await installRepeatedUserWindowSocket(page, true);
+  const session = await createE2eSession(request, "pagination pre-window correlation");
+  await openSessionInUi(page, session);
+
+  await page.waitForTimeout(250);
+  await expect(page.getByText("pre-window-replay", { exact: true })).toHaveCount(0);
+  const transcript = page.getByTestId("chat-message-list");
+  await expect(transcript).toHaveAttribute("data-transcript-mode", "window-v1", { timeout: 30_000 });
+  await expect(transcript.getByText("Latest prompt before the active response.", { exact: true })).toBeVisible();
+});
+
+test("repeated queued users ignore ID-less live replay and prepended history until a new tail occurrence", async ({ page, request }) => {
+  await installRepeatedUserWindowSocket(page);
+  const session = await createE2eSession(request, "pagination repeated queued user");
+  await openSessionInUi(page, session);
+
+  const transcript = page.getByTestId("chat-message-list");
+  await expect(transcript).toHaveAttribute("data-transcript-mode", "window-v1", { timeout: 30_000 });
+  await expect(page.getByTestId("chat-send-button")).toContainText("Queue");
+
+  await page.getByTestId("chat-input").fill("done");
+  await page.getByTestId("chat-send-button").click();
+  const queued = page.getByTestId("chat-queued-user-message");
+  await expect(queued).toHaveCount(1);
+  await expect(queued).toContainText("done");
+
+  await page.evaluate(() => {
+    (window as Window & {
+      __repeatedUserWindow?: { emitIdlessReplay: () => void };
+    }).__repeatedUserWindow?.emitIdlessReplay();
+  });
+  await expect(queued).toHaveCount(1);
+  await expect(page.locator('[data-message-id="old-done"]')).toHaveCount(0);
+
+  await page.evaluate(() => {
+    (window as Window & {
+      __repeatedUserWindow?: { emitStaleAppend: () => void };
+    }).__repeatedUserWindow?.emitStaleAppend();
+  });
+  await expect(queued).toHaveCount(1);
+  await expect(page.locator('[data-message-id="stale-append-done"]')).toHaveCount(0);
+
+  await page.getByTestId("transcript-gap-before").getByRole("button", { name: "Load older" }).click();
+  await expect(page.locator('[data-message-id="old-done"]')).toBeVisible();
+  await expect(queued).toHaveCount(1);
+
+  await page.evaluate(() => {
+    (window as Window & {
+      __repeatedUserWindow?: { emitAppend: () => void };
+    }).__repeatedUserWindow?.emitAppend();
+  });
+  await expect(queued).toHaveCount(0);
+  await expect(page.locator('[data-message-id="old-done"]')).toBeVisible();
+  const accepted = page.locator('[data-message-id="new-done"]');
+  await expect(accepted).toBeVisible();
+  const activePrefix = page.getByText("Active response remains in progress.", { exact: true });
+  await expect(activePrefix).toBeVisible();
+  expect(await activePrefix.evaluate((prefix, acceptedId) => {
+    const acceptedRow = document.querySelector(`[data-message-id="${acceptedId}"]`);
+    return Boolean(acceptedRow && (prefix.compareDocumentPosition(acceptedRow) & Node.DOCUMENT_POSITION_FOLLOWING));
+  }, "new-done")).toBe(true);
+});
+
+test("repeated optimistic users survive ID-less replay and prepended history until durable tail acceptance", async ({ page, request }) => {
+  await installRepeatedUserWindowSocket(page);
+  const session = await createE2eSession(request, "pagination repeated optimistic user");
+  await openSessionInUi(page, session);
+
+  await page.evaluate(() => {
+    (window as Window & {
+      __repeatedUserWindow?: { settle: () => void };
+    }).__repeatedUserWindow?.settle();
+  });
+  await expect(page.getByTestId("chat-send-button")).toContainText("Send");
+
+  await page.getByTestId("chat-input").fill("done");
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByText("done", { exact: true })).toHaveCount(1);
+
+  await page.evaluate(() => {
+    (window as Window & {
+      __repeatedUserWindow?: { emitIdlessReplay: () => void };
+    }).__repeatedUserWindow?.emitIdlessReplay();
+  });
+  await expect(page.getByText("done", { exact: true })).toHaveCount(1);
+
+  await page.getByTestId("transcript-gap-before").getByRole("button", { name: "Load older" }).click();
+  await expect(page.locator('[data-message-id="old-done"]')).toBeVisible();
+  await expect(page.getByText("done", { exact: true })).toHaveCount(2);
+
+  await page.evaluate(() => {
+    (window as Window & {
+      __repeatedUserWindow?: { emitAppend: () => void };
+    }).__repeatedUserWindow?.emitAppend();
+  });
+  await expect(page.locator('[data-message-id="old-done"]')).toBeVisible();
+  await expect(page.locator('[data-message-id="new-done"]')).toBeVisible();
+  await expect(page.getByText("done", { exact: true })).toHaveCount(2);
 });
 
 test("a terminal cursor error performs one fresh bounded reopen", async ({ page, request }) => {

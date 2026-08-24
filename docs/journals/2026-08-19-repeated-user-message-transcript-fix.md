@@ -44,3 +44,29 @@ The same assumption also affected authoritative history and queued-turn reconcil
 
 - `frontend/src/panels/ChatPanel.tsx`
 - `e2e/tests/assistant-stream-timeline.spec.ts`
+
+## 2026-08-24 pagination integration
+
+The original fix conflicted with the newer `window-v1` transcript state in `ChatPanel`. A conservative consolidation review found that directly cherry-picking it would let a prepended historical occurrence consume a newer repeated queued or optimistic turn.
+
+The integration now:
+
+- admits every bounded window through the reducer before changing seen IDs, queues, submitted-message correlation, or optimistic rows;
+- treats only genuinely unmatched `initial`, `reset`, `append`, or `tail_reconcile` user occurrences as new acceptances;
+- never consumes a pending or queued turn from a `prepend` page;
+- activates exact session/selection correlation synchronously when `window-v1` is negotiated, before the first window arrives;
+- ignores ID-less live user echoes in window mode and waits for a stable durable tail occurrence;
+- keeps selection-scoped durable user IDs and synchronizes transcript/owner refs with reducer updates;
+- preserves a separate active streaming snapshot before inserting an accepted queued user turn, while avoiding duplication when the live prefix replaces an existing durable tail.
+
+Added browser regressions cover pre-window unscoped replay, a reducer-rejected stale append, prepended repeated content, queued and optimistic repeated turns, durable tail acceptance, and assistant-before-user ordering.
+
+Final validation on the isolated consolidation branch:
+
+- frontend lint: 0 errors, one pre-existing Fast Refresh warning;
+- frontend production build: pass;
+- focused transcript/queue/pagination matrix: 31/31 pass;
+- full Playwright suite: 113/113 pass;
+- independent final concurrency review: GO, no actionable findings;
+- release backend suite: 1017 passed, 6 skipped, 0 failed;
+- `make check` still reaches the unchanged synthetic browser-credential helper baseline failure at 62/63 script tests.

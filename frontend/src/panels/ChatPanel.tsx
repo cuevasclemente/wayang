@@ -2987,9 +2987,11 @@ export function ChatPanel({
     () => createTranscriptWindowState<ChatMessage>(requestedTranscriptOpenIntent),
   );
   const transcriptStateRef = useRef(transcriptState);
+  const messagesRef = useRef<ChatMessage[]>(transcriptState.messages);
   const applyTranscriptAction = useCallback((action: TranscriptWindowAction<ChatMessage>) => {
     const next = transcriptWindowReducer(transcriptStateRef.current, action);
     transcriptStateRef.current = next;
+    messagesRef.current = next.messages;
     setTranscriptState(next);
     return next;
   }, []);
@@ -2997,7 +2999,12 @@ export function ChatPanel({
   const setMessages = useCallback((updater: ChatMessage[] | ((messages: ChatMessage[]) => ChatMessage[])) => {
     applyTranscriptAction({ type: "local_update", updater });
   }, [applyTranscriptAction]);
-  const [messagesOwnerSessionId, setMessagesOwnerSessionId] = useState<string | null>(null);
+  const [messagesOwnerSessionId, setMessagesOwnerSessionIdState] = useState<string | null>(null);
+  const messagesOwnerSessionIdRef = useRef<string | null>(messagesOwnerSessionId);
+  const setMessagesOwnerSessionId = useCallback((sessionId: string | null) => {
+    messagesOwnerSessionIdRef.current = sessionId;
+    setMessagesOwnerSessionIdState(sessionId);
+  }, []);
   const [visibleMessageStart, setVisibleMessageStart] = useState(0);
   const [deferredUserMessages, setDeferredUserMessages] = useState<ChatMessage[]>([]);
   const [queuedUserMessages, setQueuedUserMessages] = useState<QueuedUserMessage[]>([]);
@@ -3196,6 +3203,7 @@ export function ChatPanel({
   const activeSessionIdRef = useRef<string | null>(null);
   const selectedSessionIdRef = useRef<string | null>(activeSessionId);
   const selectionIdRef = useRef<string | null>(null);
+  const windowTranscriptProtocolSelectionIdRef = useRef<string | null>(null);
   const transcriptOpenIntentRef = useRef<TranscriptOpenIntent>(effectiveTranscriptOpenIntent);
   const requestedTranscriptIntentKeyRef = useRef(requestedTranscriptOpenIntent.requestKey);
   requestedTranscriptIntentKeyRef.current = requestedTranscriptOpenIntent.requestKey;
@@ -3234,10 +3242,11 @@ export function ChatPanel({
   const submittedUserMessagesRef = useRef(new Map<string, SubmittedUserMessage>());
   const attachmentDraftsBySessionRef = useRef(new Map<string, PendingAttachment[]>());
   const deferredUserMessagesRef = useRef<ChatMessage[]>([]);
-  const messagesRef = useRef<ChatMessage[]>(messages);
-  const messagesOwnerSessionIdRef = useRef<string | null>(messagesOwnerSessionId);
+  const seenUserMessageIdsRef = useRef(new Set<string>());
+  const seenUserMessageSelectionIdRef = useRef<string | null>(null);
   const streamingBlocksRef = useRef<StreamingBlocks>({ content: [] });
   const streamingHistoryPrefixRef = useRef<StreamingBlocks>({ content: [] });
+  const streamingPrefixReplacesHistoryTailRef = useRef(false);
   const interviewQueueRef = useRef<QueuedInterview[]>([]);
   const externalActionApprovalsRef = useRef<ExternalActionApprovalRequest[]>([]);
   const poisonedExternalActionKeysRef = useRef<Set<string>>(new Set());
@@ -3249,8 +3258,6 @@ export function ChatPanel({
   const identityPinReturnFocusRef = useRef<HTMLButtonElement | null>(null);
   const isRestoringDraftRef = useRef(false);
   const suppressedDraftPersistenceRef = useRef<{ sessionId: string; value: string } | null>(null);
-  messagesRef.current = messages;
-  messagesOwnerSessionIdRef.current = messagesOwnerSessionId;
   activeSessionErrorRef.current = activeSession?.error ?? null;
   activeSessionRuntimeStreamingRef.current = Boolean(activeSession?.runtime_is_streaming);
   activeSessionRuntimeCompactingRef.current = Boolean(activeSession?.runtime_is_compacting);
@@ -3288,6 +3295,9 @@ export function ChatPanel({
       setActiveCommandGuardPinPrompt(null);
     }
     selectionIdRef.current = selectionId;
+    windowTranscriptProtocolSelectionIdRef.current = null;
+    seenUserMessageSelectionIdRef.current = selectionId;
+    seenUserMessageIdsRef.current = new Set();
     terminalPageReopenSelectionIdRef.current = null;
     transcriptOpenIntentRef.current = effectiveTranscriptOpenIntent;
     if (effectiveTranscriptOpenIntent.requestKey === requestedTranscriptOpenIntent.requestKey) {
@@ -3361,9 +3371,11 @@ export function ChatPanel({
     next: StreamingBlocks,
     replacesHistoryTail = false,
   ) => {
+    const replacesTail = replacesHistoryTail && next.content.length > 0;
     streamingHistoryPrefixRef.current = next;
+    streamingPrefixReplacesHistoryTailRef.current = replacesTail;
     setStreamingHistoryPrefix(next);
-    setStreamingPrefixReplacesHistoryTail(replacesHistoryTail && next.content.length > 0);
+    setStreamingPrefixReplacesHistoryTail(replacesTail);
   }, []);
 
   const setQueuedMessagesSynced = useCallback((updater: (prev: QueuedUserMessage[]) => QueuedUserMessage[]) => {
@@ -3449,7 +3461,15 @@ export function ChatPanel({
 
   const insertAcceptedUsersAfterActiveStreaming = useCallback((userMessages: ChatMessage[]) => {
     if (userMessages.length === 0) return;
-    const assistantMessage = streamingBlocksToAssistantMessage(streamingBlocksRef.current);
+    const liveBlocks = streamingPrefixReplacesHistoryTailRef.current
+      ? streamingBlocksRef.current
+      : {
+          content: [
+            ...streamingHistoryPrefixRef.current.content,
+            ...streamingBlocksRef.current.content,
+          ],
+        };
+    const assistantMessage = streamingBlocksToAssistantMessage(liveBlocks);
     setMessages((prev) => {
       let next = assistantMessage ? [...prev, assistantMessage] : prev;
       for (const userMessage of userMessages) {
@@ -4009,6 +4029,9 @@ export function ChatPanel({
             || ws !== wsRef.current
             || transportGeneration !== transportGenerationRef.current
           ) return;
+          windowTranscriptProtocolSelectionIdRef.current = msg.protocol === "window-v1"
+            ? msg.selection_id
+            : null;
           chatWsProfile("message_transcript_protocol", {
             sessionId: msg.session_id,
             selectionId: msg.selection_id,
@@ -4112,9 +4135,17 @@ export function ChatPanel({
         // Every live event emitted by the current backend is correlated to the
         // session selection that subscribed to it. Ignore an A event already
         // queued in the browser when React has switched the durable socket to B.
+        const requiresExactTranscriptCorrelation = transcriptStateRef.current.mode === "window-v1"
+          || windowTranscriptProtocolSelectionIdRef.current === selectionIdRef.current;
         if (
-          (typeof msg.session_id === "string" && msg.session_id !== activeSessionIdRef.current)
-          || (typeof msg.selection_id === "string" && msg.selection_id !== selectionIdRef.current)
+          (requiresExactTranscriptCorrelation && (
+            msg.session_id !== activeSessionIdRef.current
+            || msg.selection_id !== selectionIdRef.current
+          ))
+          || (!requiresExactTranscriptCorrelation && (
+            (typeof msg.session_id === "string" && msg.session_id !== activeSessionIdRef.current)
+            || (typeof msg.selection_id === "string" && msg.selection_id !== selectionIdRef.current)
+          ))
         ) return;
 
         // Negotiated bounded transcript projection. A frozen window is accepted
@@ -4144,26 +4175,70 @@ export function ChatPanel({
             return;
           }
 
+          // Prove the reducer will accept this request/epoch/edge before any
+          // occurrence, queue, optimistic-message, or seen-ID side effect. A
+          // stale same-selection response must be a complete no-op.
+          const transcriptBeforeWindow = transcriptStateRef.current;
+          const admittedTranscript = transcriptWindowReducer(transcriptBeforeWindow, { type: "window", window: msg });
+          if (admittedTranscript === transcriptBeforeWindow) return;
+          if (admittedTranscript.invalidated) {
+            const invalidatedTranscript = applyTranscriptAction({ type: "window", window: msg });
+            if (!invalidatedTranscript.invalidated) return;
+            setMessagesOwnerSessionId(null);
+            setIsSessionHistoryLoading(true);
+            setTranscriptNavigationOverride({
+              baseRequestKey: requestedTranscriptIntentKeyRef.current,
+              intent: createTranscriptIntent(
+                transcriptOpenIntentRef.current.kind,
+                transcriptOpenIntentRef.current.anchorId,
+              ),
+            });
+            return;
+          }
+
           const rawWindowMessages = msg.streaming_at_snapshot === true
             ? suppressActiveRecoveryErrors(msg.messages)
             : msg.messages;
           let windowMessages = rawWindowMessages;
+          const currentSessionMessages = messagesOwnerSessionIdRef.current === activeSessionIdRef.current
+            ? messagesRef.current
+            : [];
+          const acceptsNewUserOccurrences = msg.reason === "initial"
+            || msg.reason === "reset"
+            || msg.reason === "append"
+            || msg.reason === "tail_reconcile";
+          const newWindowUserOccurrences = new Set(
+            acceptsNewUserOccurrences
+              ? unmatchedHistoryUserOccurrences(rawWindowMessages, currentSessionMessages)
+              : [],
+          );
+          for (const historyMessage of rawWindowMessages) {
+            if (historyMessage.type !== "user") continue;
+            const id = userMessageId(historyMessage);
+            if (id) seenUserMessageIdsRef.current.add(id);
+          }
+
           let remainingQueued = queuedUserMessagesRef.current;
           const acceptedNextTurnMessages: ChatMessage[] = [];
-          if (hasActiveAssistantOutput() && remainingQueued.length > 0) {
+          if (hasActiveAssistantOutput() && remainingQueued.length > 0 && newWindowUserOccurrences.size > 0) {
             remainingQueued = [...remainingQueued];
             windowMessages = rawWindowMessages.filter((historyMessage) => {
-              if (historyMessage?.type !== "user" || !historyMessage.message) return true;
+              if (
+                historyMessage?.type !== "user"
+                || !historyMessage.message
+                || !newWindowUserOccurrences.has(historyMessage)
+              ) return true;
               const content = getUserMessageText(historyMessage.message);
               const queuedIndex = remainingQueued.findIndex((queued) => queuedMessageMatchesContent(queued, content));
               if (queuedIndex === -1) return true;
+              submittedUserMessagesRef.current.delete(remainingQueued[queuedIndex].id);
               remainingQueued.splice(queuedIndex, 1);
               acceptedNextTurnMessages.push(historyMessage);
               return false;
             });
           }
           if (msg.reason === "initial" || msg.reason === "reset" || transcriptStateRef.current.mode !== "window-v1") {
-            windowMessages = mergeHistoryWithLocalPending(windowMessages, transcriptStateRef.current.messages);
+            windowMessages = mergeHistoryWithLocalPending(windowMessages, currentSessionMessages);
           }
 
           if (msg.reason === "prepend" && msg.request_id) {
@@ -4175,7 +4250,7 @@ export function ChatPanel({
             (msg.reason === "append" || msg.reason === "tail_reconcile")
             && !transcriptStateRef.current.hasNewer
           ) {
-            const durableUsers = windowMessages.filter((message) => message.type === "user");
+            const durableUsers = [...newWindowUserOccurrences].filter((message) => message.type === "user");
             if (durableUsers.length > 0 || msg.reason === "tail_reconcile") {
               setMessages((current) => current.filter((message) => {
                 if (
@@ -5043,6 +5118,10 @@ export function ChatPanel({
                   ? { id: typeof msg.id === "string" ? msg.id : message.id }
                   : {}),
               };
+              const userId = userMessageId(userMessage);
+              if (requiresExactTranscriptCorrelation && !userId) return;
+              if (userId && seenUserMessageIdsRef.current.has(userId)) return;
+              if (userId) seenUserMessageIdsRef.current.add(userId);
               const currentSessionMessages = messagesOwnerSessionIdRef.current === activeSessionIdRef.current
                 ? messagesRef.current
                 : [];
@@ -5109,6 +5188,10 @@ export function ChatPanel({
           msg.type === "custom"
         ) {
           if (msg.type === "user") {
+            const userId = userMessageId(msg);
+            if (requiresExactTranscriptCorrelation && !userId) return;
+            if (userId && seenUserMessageIdsRef.current.has(userId)) return;
+            if (userId) seenUserMessageIdsRef.current.add(userId);
             const currentSessionMessages = messagesOwnerSessionIdRef.current === activeSessionIdRef.current
               ? messagesRef.current
               : [];
@@ -5342,7 +5425,7 @@ export function ChatPanel({
       chatWsProfile("invoke_connect", { activeSessionId });
       connectRef.current();
     }
-  }, [activeSessionId, activeSession?.error_kind, effectiveTranscriptOpenIntent.requestKey, sendWs, setMessages, clearExternalActionAuthority, clearQueuedAndDeferredUserMessages, setExternalActionApprovalsSynced, setInterviewQueueSynced, setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
+  }, [activeSessionId, activeSession?.error_kind, effectiveTranscriptOpenIntent.requestKey, sendWs, setMessages, setMessagesOwnerSessionId, clearExternalActionAuthority, clearQueuedAndDeferredUserMessages, setExternalActionApprovalsSynced, setInterviewQueueSynced, setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
 
   // Mark a sent response retryable when a connected socket never returns the
   // required durable acknowledgement. This does not resend in a loop; the
@@ -5559,7 +5642,7 @@ export function ChatPanel({
     } finally {
       setIsAgentSwitching(false);
     }
-  }, [agentSwitchDialog, applyTranscriptAction, isAgentSwitching, onSessionChange, onSessionUpdate]);
+  }, [agentSwitchDialog, applyTranscriptAction, isAgentSwitching, onSessionChange, onSessionUpdate, setMessagesOwnerSessionId]);
 
   const addAttachmentFiles = useCallback(async (files: File[] | FileList) => {
     const sourceSessionId = activeSessionIdRef.current;
@@ -5791,6 +5874,7 @@ export function ChatPanel({
     hasActiveAssistantOutput,
     onSessionChange,
     sendWs,
+    setMessagesOwnerSessionId,
     setStreamingBlocksSynced,
     wsStatus,
   ]);
@@ -5802,7 +5886,7 @@ export function ChatPanel({
     setMessagesOwnerSessionId(null);
     setIsSessionHistoryLoading(true);
     onSessionChange?.();
-  }, [applyTranscriptAction, onSessionChange]);
+  }, [applyTranscriptAction, onSessionChange, setMessagesOwnerSessionId]);
 
   const handleTranscriptMutationControlledReconnect = useCallback(() => {
     if (!activeSessionIdRef.current || !selectionIdRef.current) return;
