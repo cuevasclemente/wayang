@@ -7,6 +7,7 @@ export interface SyntheticCorpusOptions {
   bytesPerSession?: number;
   projectCount?: number;
   prefix?: string;
+  messageText?: (input: { sessionIndex: number; messageIndex: number; role: "user" | "assistant" }) => string;
 }
 
 export interface SyntheticSessionFixture {
@@ -59,7 +60,8 @@ export function createSyntheticCorpus(options: SyntheticCorpusOptions): Syntheti
         timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, 1) + messageIndex * 1_000).toISOString(),
         message: {
           role,
-          content: `Public synthetic ${role} message ${messageIndex}. **Markdown fixture** with stable text.`,
+          content: options.messageText?.({ sessionIndex: index, messageIndex, role })
+            ?? `Public synthetic ${role} message ${messageIndex}. **Markdown fixture** with stable text.`,
           ...(role === "assistant" ? { provider: "offline", model: "deterministic-fixture" } : {}),
         },
       });

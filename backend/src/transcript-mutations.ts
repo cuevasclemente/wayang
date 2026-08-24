@@ -41,6 +41,7 @@ import {
   DELETED_EVENT_TOMBSTONE,
   INVALIDATED_DERIVED_EVENT_TOMBSTONE,
 } from "./transcript-mutation-markers.js";
+import { invalidateTranscriptPaginationSession } from "./transcript-pagination/service.js";
 import {
   beginTranscriptMutationSearchFence,
   endTranscriptMutationSearchFence,
@@ -406,7 +407,11 @@ function productionDependencies(): TranscriptMutationDependencies {
     clearRecoveryMarker: clearTranscriptRecoveryMarker,
     async purgeSearch(id) { beginTranscriptMutationSearchFence(id); },
     releaseSearchFence: endTranscriptMutationSearchFence,
-    invalidateSnapshots: invalidateSessionFileSnapshot,
+    invalidateSnapshots(sessionFile) {
+      invalidateSessionFileSnapshot(sessionFile);
+      const row = sessionFile ? getStore().sessions.find((candidate) => candidate.pi_session_file === sessionFile) : undefined;
+      if (row) invalidateTranscriptPaginationSession(row.id);
+    },
     reconcileMetadata: reconcileTranscriptMetadataAfterMutation,
     async forceReindex(id, recoveryMarkerId) {
       try {

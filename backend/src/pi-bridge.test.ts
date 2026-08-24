@@ -52,13 +52,13 @@ import {
   type ScheduledPromptSession,
 } from "./pi-bridge.js";
 import { createAgentProfile } from "./agent-profiles.js";
-import { close, getStore, init } from "./db.js";
+import { close, commitStoreMutation, getStore, init } from "./db.js";
 import { createProject } from "./projects.js";
 import { beginAgentSwitch, createSession, getSessionById, updatePiSessionFile } from "./sessions.js";
 import { browserTurnContentHash } from "./interactive-turn-provenance.js";
 import { createHostBashOperations } from "./host-execution.js";
 import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability, revokeWorkspaceCapabilityAssociation } from "./workspace-capabilities.js";
-import type { PendingAgentSwitch } from "./workspace-types.js";
+import { WREN_AGENT_PROFILE_ID, type PendingAgentSwitch } from "./workspace-types.js";
 import type { ProtectedBrowserToolRuntime } from "./browser/protected-tools.js";
 import type { ProtectedBrowserBinding } from "./browser/types.js";
 import { getActionApprovalBridge } from "./action-approval-bridge.js";
@@ -611,6 +611,62 @@ test("starting runtime revocation fences privileged loading and publication, whi
     assert.equal(getPiSessionRuntimeState(row.id).runtime_status, "stopped", "destroy fences an unpublished creation");
   } finally {
     release.resolve();
+    await cleanupPiSessionCapabilityDenial([row.id]);
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("legacy Wren runtime authorizes provider extension loading before model resolution", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-legacy-wren-provider-load-"));
+  const cwd = path.join(dir, "project");
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  fs.mkdirSync(cwd, { recursive: true });
+  process.env.WAYANG_DATA_DIR = path.join(dir, "data");
+  init();
+  const now = Date.now();
+  commitStoreMutation((draft) => {
+    draft.agentProfiles.push({
+      id: WREN_AGENT_PROFILE_ID,
+      name: "Renamed legacy Wren",
+      description: null,
+      builtin_kind: "wren",
+      deletable: false,
+      enabled: true,
+      resource_mode: "standard",
+      instructions: null,
+      memory_access: "read_write",
+      default_provider: null,
+      default_model: null,
+      allowed_tools: null,
+      allowed_extensions: null,
+      created_at: now,
+      updated_at: now,
+    });
+  });
+  const project = createProject({ cwd, name: "Legacy Wren provider load", default_agent_profile_id: WREN_AGENT_PROFILE_ID });
+  const row = createSession(cwd, {
+    provider: "narwhal-horn",
+    model: "qwen3.8-27b",
+    agentProfileId: WREN_AGENT_PROFILE_ID,
+  });
+
+  let authorized = false;
+  try {
+    await assert.rejects(createPiSession(row.id, cwd, row.provider, row.model, null, {
+      testHooks: {
+        async afterStandardResourcesResolution(value) {
+          authorized = value;
+          throw new Error("synthetic stop before provider discovery");
+        },
+      },
+    }), /synthetic stop before provider discovery/);
+    assert.equal(authorized, true,
+      "the same legacy Wren witness used by resource loading must authorize reviewed provider discovery");
+    assert.equal(project.access_policy.privacy_mode, "standard");
+  } finally {
     await cleanupPiSessionCapabilityDenial([row.id]);
     close();
     if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;

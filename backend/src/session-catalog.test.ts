@@ -3,7 +3,12 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SessionCatalog, type CatalogScanCommit } from "./session-catalog.js";
+import {
+  MAX_CATALOG_BODY_BYTES,
+  SessionCatalog,
+  type CatalogScanCommit,
+  type SessionCatalogAdapter,
+} from "./session-catalog.js";
 import type { FileFingerprint } from "./session-metadata.js";
 
 function syntheticSession(id: string, cwd: string, extra: object[] = []): string {
@@ -18,23 +23,24 @@ function syntheticSession(id: string, cwd: string, extra: object[] = []): string
 function createAdapter() {
   const fingerprints = new Map<string, FileFingerprint>();
   const commits: CatalogScanCommit[] = [];
-  return {
-    fingerprints,
-    commits,
-    adapter: {
+  const adapter: SessionCatalogAdapter = {
       getKnownFile(filePath: string) {
         return { fingerprint: fingerprints.get(filePath) ?? null, mutationVersion: 0 };
       },
+      classifyDurableSession(filePath: string, sessionId: string, headerCwd: string) {
+        return { filePath, sessionId, projectId: "synthetic-standard-project", cwd: headerCwd, mutationVersion: 0 };
+      },
+      stageDurableSession() { return null; },
       commit(scan: CatalogScanCommit) {
         commits.push(scan);
         for (const parsed of scan.parsed) fingerprints.set(parsed.metadata.path, parsed.metadata.fingerprint);
         return { imported: scan.parsed.length, updated: 0, archivedLegacy: 0, changed: scan.parsed.length > 0 };
       },
-    },
-  };
+    };
+  return { fingerprints, commits, adapter };
 }
 
-test("incremental catalog parses unknown/changed files once and unchanged scans parse zero", async () => {
+test("incremental catalog parses classified changed files once and unchanged scans parse zero", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-catalog-test-"));
   const project = path.join(root, "--synthetic-project--");
   fs.mkdirSync(project, { recursive: true });
@@ -202,6 +208,81 @@ test("catalog discards first-message and model metadata when policy protects dur
   }
 });
 
+test("header-only staging becomes durable before external body admission", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-catalog-header-stage-"));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project, { recursive: true });
+  fs.writeFileSync(path.join(project, "external.jsonl"), syntheticSession("external-stage", project));
+  const state = createAdapter();
+  let staged = false;
+  const token = (filePath: string, sessionId: string, cwd: string) => ({
+    filePath, sessionId, projectId: "synthetic-standard-project", cwd, mutationVersion: 0,
+  });
+  state.adapter.classifyDurableSession = (filePath, sessionId, cwd) => (
+    staged ? token(filePath, sessionId, cwd) : null
+  );
+  state.adapter.stageDurableSession = (filePath, header) => {
+    staged = true;
+    return { classification: token(filePath, header.id, header.cwd), imported: true };
+  };
+  state.adapter.commit = (scan) => {
+    state.commits.push(scan);
+    return { imported: 0, updated: scan.parsed.length, archivedLegacy: 0, changed: scan.parsed.length > 0 };
+  };
+  const catalog = new SessionCatalog(state.adapter, root, {
+    authorizeCwd: () => true,
+    getPolicyGeneration: () => 1,
+    refreshProjection: () => undefined,
+    onAuthorizedBodyTransferred() { assert.equal(staged, true); },
+  });
+  try {
+    const result = await catalog.scan();
+    assert.equal(result.imported, 1);
+    assert.equal(result.parsed, 1);
+    assert.equal(state.commits[0]?.parsed.length, 1);
+  } finally {
+    await catalog.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("catalog rechecks the exact durable classification immediately before metadata commit", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-catalog-durable-race-"));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project, { recursive: true });
+  const file = path.join(project, "race.jsonl");
+  fs.writeFileSync(file, syntheticSession("durable-race", project));
+  const state = createAdapter();
+  let mutationVersion = 1;
+  state.adapter.classifyDurableSession = (filePath, sessionId, headerCwd) => ({
+    filePath,
+    sessionId,
+    projectId: "synthetic-standard-project",
+    cwd: headerCwd,
+    mutationVersion,
+  });
+  let transferred = false;
+  const catalog = new SessionCatalog(state.adapter, root, {
+    authorizeCwd: () => true,
+    getPolicyGeneration: () => 1,
+    refreshProjection: () => undefined,
+    onAuthorizedBodyTransferred() {
+      transferred = true;
+      mutationVersion++;
+    },
+  });
+  try {
+    const result = await catalog.scan();
+    assert.equal(transferred, true);
+    assert.ok(result.parseBytes > 0);
+    assert.equal(result.parsed, 0);
+    assert.equal(state.commits[0]?.parsed.length, 0);
+  } finally {
+    await catalog.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("generation bump during an old scan reports the discarded generation and a fresh scan commits metadata", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-catalog-generation-race-"));
   const project = path.join(root, "project");
@@ -235,6 +316,45 @@ test("generation bump during an old scan reports the discarded generation and a 
   }
 });
 
+test("catalog bounds worker admission and rejects oversized bodies before allocation", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-catalog-admission-bound-"));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project, { recursive: true });
+  for (let index = 0; index < 12; index++) {
+    fs.writeFileSync(path.join(project, `bounded-${index}.jsonl`), syntheticSession(`bounded-${index}`, project, [{
+      type: "message",
+      id: `bounded-body-${index}`,
+      message: { role: "assistant", content: "bounded synthetic payload ".repeat(2_000) },
+    }]));
+  }
+  const oversizedPath = path.join(project, "oversized.jsonl");
+  fs.writeFileSync(oversizedPath, syntheticSession("oversized", project));
+  fs.truncateSync(oversizedPath, MAX_CATALOG_BODY_BYTES + 1);
+  const state = createAdapter();
+  let maxInFlight = 0;
+  const previousWorkers = process.env.WAYANG_SESSION_CATALOG_WORKERS;
+  process.env.WAYANG_SESSION_CATALOG_WORKERS = "2";
+  const catalog = new SessionCatalog(state.adapter, root, {
+    authorizeCwd: () => true,
+    getPolicyGeneration: () => 1,
+    refreshProjection: () => undefined,
+    observeWorkerTasksInFlight(count) { maxInFlight = Math.max(maxInFlight, count); },
+  });
+  try {
+    const result = await catalog.scan();
+    assert.equal(result.discovered, 13);
+    assert.equal(result.parsed, 12);
+    assert.equal(result.parseFailures, 1);
+    assert.ok(maxInFlight <= 2, `worker admission reached ${maxInFlight}`);
+    assert.ok(result.parseBytes < MAX_CATALOG_BODY_BYTES);
+  } finally {
+    await catalog.stop();
+    if (previousWorkers === undefined) delete process.env.WAYANG_SESSION_CATALOG_WORKERS;
+    else process.env.WAYANG_SESSION_CATALOG_WORKERS = previousWorkers;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("large metadata parsing stays off the main event loop", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-catalog-loop-test-"));
   const project = path.join(root, "--synthetic-project--");
@@ -243,7 +363,7 @@ test("large metadata parsing stays off the main event loop", async () => {
   const publicChunk = "synthetic markdown fixture ".repeat(1_000);
   const entries: object[] = [];
   let parentId = "user-a";
-  for (let index = 0; index < 700; index++) {
+  for (let index = 0; index < 400; index++) {
     const id = `assistant-${index}`;
     entries.push({
       type: "message",

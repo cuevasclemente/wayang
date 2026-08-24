@@ -1,7 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { openSessionInUi, repoRoot, type CreatedSession } from "./helpers/sessions";
+import { ensureE2eProject, openSessionInUi, repoRoot, type CreatedSession } from "./helpers/sessions";
 
 const SYNTHETIC_PIN = "12345678";
 
@@ -16,11 +17,8 @@ async function seedMutationSession(
   oldText: string,
 ): Promise<SeededMutationSession> {
   const title = `e2e transcript mutation ${Date.now()} ${Math.random().toString(36).slice(2, 8)}`;
-  const created = await request.post("/api/sessions", {
-    data: { cwd: repoRoot, title },
-  });
-  expect(created.ok(), await created.text()).toBe(true);
-  const session = await created.json() as CreatedSession;
+  await ensureE2eProject(request, repoRoot);
+  const session: CreatedSession = { id: randomUUID(), cwd: repoRoot, title };
   const sessionsRoot = process.env.WAYANG_E2E_PI_SESSIONS_DIR;
   if (!sessionsRoot) throw new Error("WAYANG_E2E_PI_SESSIONS_DIR is unavailable");
 
@@ -31,6 +29,7 @@ async function seedMutationSession(
   const userEventId = `${session.id.slice(0, 8)}-user`;
   const assistantEventId = `${session.id.slice(0, 8)}-assistant`;
   const now = Date.now();
+  const nameEventId = `${session.id.slice(0, 8)}-name`;
   const lines = [
     {
       type: "session",
@@ -40,9 +39,16 @@ async function seedMutationSession(
       cwd: session.cwd,
     },
     {
+      type: "session_info",
+      id: nameEventId,
+      parentId: null,
+      timestamp: new Date(now).toISOString(),
+      name: title,
+    },
+    {
       type: "message",
       id: userEventId,
-      parentId: null,
+      parentId: nameEventId,
       timestamp: new Date(now + 1).toISOString(),
       message: {
         role: "user",

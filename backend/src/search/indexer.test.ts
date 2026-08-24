@@ -12,7 +12,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-indexer-"));
+const piSessionsRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-indexer-pi-"));
 process.env.WAYANG_DATA_DIR = tmpRoot;
+process.env.PI_CODING_AGENT_SESSION_DIR = piSessionsRoot;
 
 // Import after env is set so getConfig() reads the temp dir.
 const dbMod = await import("../db.js");
@@ -25,27 +27,33 @@ const indexerMod = await import("./indexer.js");
 const policyFilterMod = await import("./policy-filter.js");
 const searchMod = await import("./search.js");
 const watcherMod = await import("./watcher.js");
+const transcriptIndexMod = await import("../transcript-pagination/structural-index.js");
+const transcriptAuthorizationMod = await import("../standard-transcript-authorization.js");
 
 dbMod.init();
 
 function writeFixture(sessionId: string, cwd: string, transcript: Array<{ role: "user" | "assistant"; text: string; id?: string }>): string {
-  const dir = path.join(tmpRoot, "sessions", sessionId);
+  const dir = path.join(piSessionsRoot, sessionId);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, "session.jsonl");
   const lines: string[] = [];
   lines.push(JSON.stringify({ type: "session", version: 3, id: sessionId, cwd }));
+  let parentId: string | null = null;
   for (let i = 0; i < transcript.length; i++) {
     const t = transcript[i];
+    const messageId = t.id ?? `m${i}`;
     lines.push(
       JSON.stringify({
         type: "message",
-        id: t.id ?? `m${i}`,
+        id: messageId,
+        parentId,
         message: {
           role: t.role,
           content: [{ type: "text", text: t.text }],
         },
       }),
     );
+    parentId = messageId;
   }
   fs.writeFileSync(file, lines.join("\n") + "\n", "utf-8");
   return file;
@@ -341,6 +349,9 @@ test("standard allowlist live-filters stale profile chunks from query, facets, a
   assert.equal(hidden.results.some((result) => result.session_id === id), false);
   assert.equal(hidden.facets.cwds.some((facet) => facet.value === row.cwd), false);
   assert.equal(policyFilterMod.getIndexableSessionIds().has(id), false);
+  assert.equal(transcriptAuthorizationMod.authorizeExactUiTranscript(
+    row.pi_session_file!, { expectedSessionId: id },
+  ), null, "owning UI authorization must observe the current profile allowlist");
 
   const health = searchRouteMod.getSearchHealthSnapshot();
   const authorizedIds = policyFilterMod.getIndexableSessionIds();
@@ -386,6 +397,15 @@ test("protected policy live-filters stale results and indexing denial purges chu
     },
   });
 
+  assert.equal(transcriptAuthorizationMod.authorizeExactStandardTranscript(
+    row.pi_session_file!, { expectedSessionId: id },
+  ), null, "global Standard authorization must deny Protected transcripts");
+  const owningAuthorization = transcriptAuthorizationMod.authorizeExactUiTranscript(
+    row.pi_session_file!, { expectedSessionId: id },
+  );
+  assert.equal(owningAuthorization?.project.id, project.id,
+    "the exact owning interactive UI remains authorized for Protected transcripts");
+
   // Query-time policy is independent of purge completion.
   const db = searchDbMod.getSearchDb();
   assert.ok((db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?").get(id) as { n: number }).n > 0);
@@ -398,12 +418,96 @@ test("protected policy live-filters stale results and indexing denial purges chu
   assert.equal((db.prepare("SELECT COUNT(*) AS n FROM session_index_state WHERE session_id = ?").get(id) as { n: number }).n, 0);
 });
 
+test("exact Standard path collisions and header identity mismatches deny indexing and purge stale search text", async () => {
+  const id = seedSession({
+    title: "Exact durable authorization",
+    transcript: [{ role: "user", text: "exact durable wombat canary" }],
+  });
+  await indexerMod.indexSession(id);
+  assert.equal(searchMod.runSearch("wombat canary").results.some((result) => result.session_id === id), true);
+
+  const store = dbMod.getStore();
+  const row = store.sessions.find((session) => session.id === id)!;
+  store.sessions.push({ ...row, id: `${id}-collision`, title: "Synthetic collision" });
+  assert.equal(transcriptAuthorizationMod.authorizeExactStandardTranscript(
+    row.pi_session_file!, { expectedSessionId: id },
+  ), null);
+  const collisionDenied = await indexerMod.indexSession(id, { force: true });
+  assert.equal(collisionDenied.policySkipped, true);
+  assert.equal(searchMod.runSearch("wombat canary", { archived: "any" }).results.some((result) => result.session_id === id), false);
+
+  store.sessions.splice(store.sessions.findIndex((session) => session.id === `${id}-collision`), 1);
+  dbMod.flush();
+  const restored = await indexerMod.indexSession(id, { force: true });
+  assert.equal(restored.skipped, false);
+  assert.equal(searchMod.runSearch("wombat canary", { archived: "any" }).results.some((result) => result.session_id === id), true);
+
+  const original = fs.readFileSync(row.pi_session_file!, "utf8").split("\n");
+  original[0] = JSON.stringify({ type: "session", version: 3, id: `${id}-wrong-header`, cwd: row.cwd });
+  fs.writeFileSync(row.pi_session_file!, original.join("\n"));
+  assert.equal(searchMod.runSearch("wombat canary", { archived: "any" }).results.some((result) => result.session_id === id), false,
+    "query-time exact authorization must hide stale chunks before the watcher purge");
+  const idDenied = await indexerMod.indexSession(id, { force: true });
+  assert.equal(idDenied.policySkipped, true);
+
+  original[0] = JSON.stringify({ type: "session", version: 3, id, cwd: `${row.cwd}-wrong` });
+  fs.writeFileSync(row.pi_session_file!, original.join("\n"));
+  const cwdDenied = await indexerMod.indexSession(id, { force: true });
+  assert.equal(cwdDenied.policySkipped, true);
+});
+
+test("fingerprint replacement after search chunking is purged before publication", async () => {
+  const id = seedSession({
+    title: "Fingerprint race",
+    transcript: [{ role: "user", text: "stale fingerprint echidna canary" }],
+  });
+  const row = dbMod.getStore().sessions.find((session) => session.id === id)!;
+  let raced = false;
+  const result = await indexerMod.indexSession(id, {
+    force: true,
+    afterChunkingForTests() {
+      if (raced) return;
+      raced = true;
+      fs.appendFileSync(row.pi_session_file!, JSON.stringify({
+        type: "message", id: "fingerprint-race", parentId: "m0",
+        message: { role: "assistant", content: [{ type: "text", text: "replacement" }] },
+      }) + "\n");
+    },
+  });
+  assert.equal(raced, true);
+  assert.equal(result.policySkipped, true);
+  assert.equal(searchMod.runSearch("echidna canary", { archived: "any" }).results.some((entry) => entry.session_id === id), false);
+});
+
+test("search publishes exact active-branch message anchors and excludes sibling content", async () => {
+  const id = seedSession({
+    title: "Branch-aware exact anchors",
+    transcript: [{ role: "user", text: "placeholder" }],
+  });
+  const row = dbMod.getStore().sessions.find((session) => session.id === id)!;
+  const lines = [
+    { type: "session", version: 3, id, cwd: row.cwd },
+    { type: "message", id: "root", parentId: null, message: { role: "user", content: [{ type: "text", text: "shared root" }] } },
+    { type: "message", id: "off-branch", parentId: "root", message: { role: "assistant", content: [{ type: "text", text: "sibling marmot canary" }] } },
+    { type: "message", id: "active-exact", parentId: "root", message: { role: "assistant", content: [{ type: "text", text: "active exact capybara" }] } },
+  ];
+  fs.writeFileSync(row.pi_session_file!, lines.map((line) => JSON.stringify(line)).join("\n") + "\n");
+  await indexerMod.indexSession(id, { force: true });
+  assert.equal(searchMod.runSearch("sibling marmot", { archived: "any" }).results.some((result) => result.session_id === id), false);
+  const active = searchMod.runSearch("exact capybara", { archived: "any" }).results.find((result) => result.session_id === id);
+  assert.equal(active?.best_message_id, "active-exact");
+  assert.equal(active?.best_message_active, true);
+  assert.equal(active?.best_anchor_status, "active");
+  assert.ok(active?.best_transcript_epoch);
+});
+
 test("search returns empty for short queries without throwing", () => {
   const out = searchMod.runSearch("a");
   assert.deepEqual(out.results, []);
 });
 
 // Cleanup hook — done via process exit; we leave the temp dir for inspection if needed.
-test("close db handles", () => {
+test("close db handles", async () => {
   searchDbMod.closeSearchDb();
+  await transcriptIndexMod.closeStructuralTranscriptIndex();
 });

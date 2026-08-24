@@ -9,11 +9,13 @@ Wayang maintains a local keyword index over past pi sessions. Keyword search and
   - `chunks_fts` — SQLite FTS5 mirror (BM25 + snippet).
   - `chunk_vectors` — empty until M3 (semantic search) lands.
   - `session_index_state` — per-session bookkeeping (mtime, size, chunk_count).
-- **Chunker**: streams pi JSONL, keeps only `message.role ∈ {user, assistant}`
-  text content, greedy-packs into ≤ 2000-char chunks with 200-char overlap.
-  Tool inputs/outputs and (by default) `thinking` blocks are skipped. Every
-  session also gets a synthetic `role='meta'` chunk so metadata-only sessions
-  are still findable.
+- **Chunker**: streams pi JSONL and keeps only active-branch
+  `message.role ∈ {user, assistant}` text content. Each searchable message
+  retains its exact Pi message ID; oversized messages split into ≤ 2000-char
+  chunks with bounded within-message overlap. Adjacent same-role messages are
+  never coalesced across IDs. Tool inputs/outputs and (by default) `thinking`
+  blocks are skipped. Every session also gets a synthetic `role='meta'` chunk
+  so metadata-only sessions remain findable.
 - **Indexer**: lazy + idempotent. Compares the session's pi JSONL mtime/size
   against `session_index_state`; reindexes only what changed.
 - **Watcher**: kicks off a full backfill ~2 s after boot, then polls every
@@ -39,8 +41,11 @@ least 2 chars long (with a 250 ms debounce). A collapsible "Filters" strip
 exposes project, date range, model, has-goal, has-error, and the "Include
 archived" toggle. Archived sessions are hidden by default.
 
-Clicking a result opens the session and scrolls the transcript to the matched
-message via the `data-message-id` anchor set on each rendered message.
+Clicking a result requests a bounded transcript window centered on the exact
+matched active-branch message. The web UI highlights that message and provides
+**Jump to latest** / **Back to match** navigation without loading the intervening
+history. Missing or off-branch anchors are reported rather than silently mixed
+into the active conversation. See [Session transcript pagination](session-transcript-pagination.md).
 
 ## Manual reindex
 

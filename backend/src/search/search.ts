@@ -33,6 +33,8 @@ interface FtsRow {
   archived: number;
   role: ChunkRole;
   message_id: string | null;
+  transcript_epoch: string | null;
+  active_branch: number;
   snippet: string;
   bm25: number;
 }
@@ -114,6 +116,8 @@ export function runSearch(query: string, filters: SearchFilters = {}): SearchRes
       c.archived,
       c.role,
       c.message_id,
+      c.transcript_epoch,
+      c.active_branch,
       snippet(chunks_fts, 0, '${MARK_OPEN}', '${MARK_CLOSE}', '…', 16) AS snippet,
       bm25(chunks_fts) AS bm25
     FROM chunks_fts
@@ -146,6 +150,9 @@ export function runSearch(query: string, filters: SearchFilters = {}): SearchRes
       archived: !!row.archived,
       best_role: row.role,
       best_message_id: row.message_id,
+      best_message_active: Boolean(row.message_id && row.active_branch),
+      best_transcript_epoch: row.transcript_epoch,
+      best_anchor_status: row.message_id && row.active_branch ? "active" : "unavailable",
       // RRF-shaped single-leg score for now; M3 will fuse with semantic leg.
       score: 1 / (60 + index + 1),
       snippet_html: sanitizeSnippet(row.snippet),
@@ -170,6 +177,9 @@ export function runSearch(query: string, filters: SearchFilters = {}): SearchRes
     best_role: r.best_role,
     snippet_html: r.snippet_html,
     best_message_id: r.best_message_id,
+    best_message_active: r.best_message_active,
+    best_transcript_epoch: r.best_transcript_epoch,
+    best_anchor_status: r.best_anchor_status,
   }));
 
   const facets = buildFacets(aggregated);

@@ -14,13 +14,17 @@
  * do not abort the batch.
  */
 
-import * as fs from "node:fs";
 import { getStore, type SessionRow } from "../db.js";
+import { getPolicyGeneration } from "../policy.js";
+import { fingerprintsEqual } from "../session-metadata.js";
+import { authorizeExactStandardTranscript } from "../standard-transcript-authorization.js";
 import { listSessions } from "../sessions.js";
 import { getSearchDb, SCHEMA_VERSION } from "./db.js";
 import { isSessionIndexable } from "./policy-filter.js";
 import { chunkJsonlFile, type MetaForChunker } from "./chunker.js";
 import { writeDreamPolicyProjection } from "./policy-projection.js";
+import { invalidateTranscriptPaginationSession } from "../transcript-pagination/service.js";
+import { getStructuralTranscriptIndex } from "../transcript-pagination/structural-index.js";
 
 export interface IndexResult {
   sessionId: string;
@@ -164,20 +168,25 @@ async function indexSessionAttempt(
   if (initialDenial) return purgePolicyDeniedSession(sessionId, initialDenial);
   const db = getSearchDb();
   const filePath = row.pi_session_file;
-  let fileMtime: number | null = null;
-  let fileSize: number | null = null;
-  if (filePath) {
-    try {
-      const stat = fs.statSync(filePath);
-      fileMtime = stat.mtimeMs;
-      fileSize = stat.size;
-    } catch {
-      // File missing — fall through; we still index the meta chunk so the
-      // session is searchable by title/goal.
-    }
+  const initialAuthorization = filePath
+    ? authorizeExactStandardTranscript(filePath, { expectedSessionId: sessionId })
+    : null;
+  if (filePath && !initialAuthorization) {
+    return purgePolicyDeniedSession(sessionId, "Exact durable Standard transcript authorization failed");
   }
+  const authorizedFingerprint = initialAuthorization?.fingerprint ?? null;
+  const authorizationGeneration = getPolicyGeneration();
+  const fileMtime = authorizedFingerprint?.mtimeMs ?? null;
+  const fileSize = authorizedFingerprint?.size ?? null;
+  const exactAuthorizationCurrent = (): boolean => Boolean(filePath && authorizedFingerprint
+    && getPolicyGeneration() === authorizationGeneration
+    && !policyDenial(row, options.recoveryMarkerId)
+    && authorizeExactStandardTranscript(filePath, {
+      expectedSessionId: sessionId,
+      expectedFingerprint: authorizedFingerprint,
+    }));
 
-  // Recheck after stat and before the unchanged shortcut so a policy change
+  // Recheck after exact stat/header authorization and before the unchanged shortcut so a policy change
   // cannot preserve stale searchable content merely because bytes are stable.
   if (transcriptMutationFences.has(sessionId)) {
     purgeSessionIndex(sessionId);
@@ -185,6 +194,14 @@ async function indexSessionAttempt(
   }
   const postStatDenial = policyDenial(row, options.recoveryMarkerId);
   if (postStatDenial) return purgePolicyDeniedSession(sessionId, postStatDenial);
+  if (filePath && (!authorizedFingerprint
+    || getPolicyGeneration() !== authorizationGeneration
+    || !authorizeExactStandardTranscript(filePath, {
+      expectedSessionId: sessionId,
+      expectedFingerprint: authorizedFingerprint,
+    }))) {
+    return purgePolicyDeniedSession(sessionId, "Exact Standard transcript authorization changed after stat");
+  }
 
   // Skip if unchanged.
   const existing = db
@@ -233,6 +250,7 @@ async function indexSessionAttempt(
 
   let chunks: Awaited<ReturnType<typeof chunkJsonlFile>>["chunks"] = [];
   let chunkerError: string | undefined;
+  let structuralEpoch: string | null = null;
 
   const meta = makeMeta(row);
   if (filePath && fileMtime != null) {
@@ -241,6 +259,7 @@ async function indexSessionAttempt(
     try {
       const result = await chunkJsonlFile(filePath, meta, {
         includeThinking: _includeThinking || options.includeThinking,
+        expectedFingerprint: authorizedFingerprint ?? undefined,
       });
       chunks = result.chunks;
     } catch (err: any) {
@@ -274,9 +293,29 @@ async function indexSessionAttempt(
     ];
   }
 
+  if (filePath && fileMtime != null && !chunkerError) {
+    try {
+      const active = await getStructuralTranscriptIndex().activeProjection(
+        sessionId, filePath, authorizedFingerprint ?? undefined, exactAuthorizationCurrent,
+      );
+      structuralEpoch = active.revision.transcriptEpoch;
+      chunks = chunks.filter((chunk) => chunk.role === "meta" || Boolean(chunk.messageId && active.eventIds.has(chunk.messageId)));
+    } catch (error) {
+      purgeSessionIndex(sessionId);
+      invalidateTranscriptPaginationSession(sessionId);
+      return {
+        sessionId,
+        chunkCount: 0,
+        skipped: true,
+        retryable: true,
+        error: `Active-branch transcript structure is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
   await options.afterChunkingForTests?.();
 
-  // chunkJsonlFile and test seams yield while streaming. Reauthorize and
+  // chunkJsonlFile, structural indexing, and test seams yield. Reauthorize and
   // compare the complete index projection before preparing a commit.
   if (transcriptMutationFences.has(sessionId)) {
     purgeSessionIndex(sessionId);
@@ -284,6 +323,14 @@ async function indexSessionAttempt(
   }
   const preCommitDenial = policyDenial(row, options.recoveryMarkerId);
   if (preCommitDenial) return purgePolicyDeniedSession(sessionId, preCommitDenial);
+  if (filePath && (!authorizedFingerprint
+    || getPolicyGeneration() !== authorizationGeneration
+    || !authorizeExactStandardTranscript(filePath, {
+      expectedSessionId: sessionId,
+      expectedFingerprint: authorizedFingerprint,
+    }))) {
+    return purgePolicyDeniedSession(sessionId, "Exact Standard transcript authorization changed during indexing");
+  }
   const afterChunkingRow = await loadSessionRow(sessionId);
   if (!afterChunkingRow || !sameIndexMetadata(expectedMetadata, indexMetadataProjection(afterChunkingRow))) {
     return RETRY_FRESH_ROW;
@@ -293,11 +340,11 @@ async function indexSessionAttempt(
     `INSERT INTO chunks (
       session_id, cwd, title, goal, model, provider,
       created_at, last_active, archived, has_error,
-      chunk_index, role, text, message_id, source_offset
+      chunk_index, role, text, message_id, source_offset, transcript_epoch, active_branch
     ) VALUES (
       @session_id, @cwd, @title, @goal, @model, @provider,
       @created_at, @last_active, @archived, @has_error,
-      @chunk_index, @role, @text, @message_id, @source_offset
+      @chunk_index, @role, @text, @message_id, @source_offset, @transcript_epoch, @active_branch
     )`,
   );
 
@@ -323,6 +370,19 @@ async function indexSessionAttempt(
   if (!preTransactionRow || !sameIndexMetadata(expectedMetadata, indexMetadataProjection(preTransactionRow))) {
     return RETRY_FRESH_ROW;
   }
+  const finalGenerationBefore = getPolicyGeneration();
+  const finalAuthorization = filePath && authorizedFingerprint
+    ? authorizeExactStandardTranscript(filePath, {
+        expectedSessionId: sessionId,
+        expectedFingerprint: authorizedFingerprint,
+      })
+    : null;
+  const finalGenerationAfter = getPolicyGeneration();
+  if (filePath && (!finalAuthorization || finalGenerationBefore !== authorizationGeneration
+    || finalGenerationAfter !== finalGenerationBefore
+    || !fingerprintsEqual(finalAuthorization.fingerprint, authorizedFingerprint))) {
+    return purgePolicyDeniedSession(sessionId, "Exact Standard transcript authorization changed before publication");
+  }
 
   const trx = db.transaction(() => {
     deleteStmt.run(sessionId);
@@ -343,6 +403,8 @@ async function indexSessionAttempt(
         text: c.text,
         message_id: c.messageId ?? null,
         source_offset: c.sourceOffset ?? null,
+        transcript_epoch: structuralEpoch,
+        active_branch: c.messageId && structuralEpoch ? 1 : 0,
       });
     }
     stateStmt.run(
@@ -363,6 +425,7 @@ async function indexSessionAttempt(
 
 export async function removeSession(sessionId: string): Promise<void> {
   purgeSessionIndex(sessionId);
+  invalidateTranscriptPaginationSession(sessionId);
 }
 
 /** Prevent watcher/manual indexing from republishing stale text during rewrite. */
@@ -373,6 +436,7 @@ export function beginTranscriptMutationSearchFence(sessionId: string): void {
   transcriptMutationFences.add(sessionId);
   try {
     purgeSessionIndex(sessionId);
+    invalidateTranscriptPaginationSession(sessionId);
   } catch (error) {
     transcriptMutationFences.delete(sessionId);
     throw error;
@@ -390,6 +454,7 @@ export function purgePolicyDeniedSessions(): { purged: number; errors: number } 
     if (!policyDenial(row)) continue;
     try {
       purgeSessionIndex(row.id);
+      invalidateTranscriptPaginationSession(row.id);
       purged++;
     } catch (error) {
       errors++;
@@ -445,6 +510,7 @@ function purgeSessionIndex(sessionId: string): void {
 function purgePolicyDeniedSession(sessionId: string, reason: string): IndexResult {
   try {
     purgeSessionIndex(sessionId);
+    invalidateTranscriptPaginationSession(sessionId);
     return { sessionId, chunkCount: 0, skipped: true, policySkipped: true };
   } catch (error) {
     return {

@@ -4,6 +4,7 @@
 
 import { normalizeHumanAttention, type HumanAttention } from "../humanAttention";
 import { editableTranscriptPayload } from "../components/transcript/transcriptMutationHelpers";
+import type { TranscriptOpenIntent } from "../transcript/windowController";
 
 export {
   editableTranscriptPayload,
@@ -1299,10 +1300,45 @@ export function reindexSessions(sessionId?: string): Promise<{ queued: number }>
 // WebSocket
 // ---------------------------------------------------------------------------
 
-export function chatWsUrl(sessionId: string, selectionId?: string | null): string {
+export function transcriptNegotiationFields(
+  intent: Pick<TranscriptOpenIntent, "kind" | "anchorId">,
+): Record<string, string> {
+  return {
+    transcript_protocol: "window-v1",
+    transcript_intent: intent.kind,
+    ...(intent.kind === "around" && intent.anchorId
+      ? { transcript_anchor_id: intent.anchorId }
+      : {}),
+  };
+}
+
+export function transcriptSwitchEnvelope(
+  intent: Pick<TranscriptOpenIntent, "kind" | "anchorId">,
+): { transcript: { protocol: "window-v1"; intent: TranscriptOpenIntent["kind"]; anchor_id?: string } } {
+  return {
+    transcript: {
+      protocol: "window-v1",
+      intent: intent.kind,
+      ...(intent.kind === "around" && intent.anchorId
+        ? { anchor_id: intent.anchorId }
+        : {}),
+    },
+  };
+}
+
+export function chatWsUrl(
+  sessionId: string,
+  selectionId?: string | null,
+  transcriptIntent?: Pick<TranscriptOpenIntent, "kind" | "anchorId">,
+): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   const params = new URLSearchParams({ session_id: sessionId });
   if (selectionId) params.set("selection_id", selectionId);
+  if (transcriptIntent) {
+    for (const [key, value] of Object.entries(transcriptNegotiationFields(transcriptIntent))) {
+      params.set(key, value);
+    }
+  }
   return `${proto}//${window.location.host}/ws/chat?${params.toString()}`;
 }
 

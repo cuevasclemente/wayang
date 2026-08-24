@@ -286,6 +286,10 @@ export interface SessionSearchResult {
   best_role: SearchChunkRole;
   snippet_html: string;
   best_message_id?: string | null;
+  /** Exact structural validation stamped when the best chunk has an active-branch event anchor. */
+  best_message_active?: boolean;
+  best_transcript_epoch?: string | null;
+  best_anchor_status?: "active" | "unavailable";
 }
 
 export interface SessionSearchFacets {

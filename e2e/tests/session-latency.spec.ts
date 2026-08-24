@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { ensureE2eProject } from "./helpers/sessions";
 import { createSyntheticCorpus } from "./helpers/syntheticSessions";
 import { installWsProfileCollector, getWsProfileEntries } from "./helpers/wsProfile";
 
@@ -35,6 +36,9 @@ test("synthetic catalog and transcript latency remain responsive", async ({ page
   const switchTargets = histories.slice(0, 2);
 
   const expectedFixtures = [...fixtures, ...histories];
+  for (const cwd of new Set(expectedFixtures.map((fixture) => fixture.cwd))) {
+    await ensureE2eProject(request, cwd);
+  }
   let missingFixtureIds = expectedFixtures.map((fixture) => fixture.id);
   // The live catalog watcher may consume part of this generated corpus while
   // files are still being written. Explicit scans are coalesced with that work,
@@ -89,8 +93,12 @@ test("synthetic catalog and transcript latency remain responsive", async ({ page
   await page.locator(`div[title="${target.cwd}"]`).first().click();
   await page.getByText(target.title, { exact: true }).click();
   await expect.poll(() => page.evaluate(() => Boolean((window as Window & { __wayangLoadingShellSeen?: boolean }).__wayangLoadingShellSeen))).toBe(true);
-  await expect(page.getByTestId("chat-message-list")).toHaveAttribute("data-transcript-state", "ready", { timeout: 120_000 });
-  await expect(page.locator("[data-message-id]")).toHaveCount(target.messageCount, { timeout: 120_000 });
+  const transcript = page.getByTestId("chat-message-list");
+  await expect(transcript).toHaveAttribute("data-transcript-state", "ready", { timeout: 120_000 });
+  await expect(transcript).toHaveAttribute("data-transcript-mode", "window-v1");
+  await expect(page.locator("[data-message-id]")).toHaveCount(200, { timeout: 120_000 });
+  await expect(page.locator(`[data-message-id="${target.id}-message-${target.messageCount - 1}"]`)).toBeAttached();
+  await expect(page.getByTestId("transcript-gap-before")).toBeVisible();
 
   const entries = await getWsProfileEntries(page);
   const selection = [...entries].reverse().find((entry) => entry.event === "selection_started" && entry.details.activeSessionId === target.id);
@@ -99,6 +107,8 @@ test("synthetic catalog and transcript latency remain responsive", async ({ page
   expect(selection).toBeTruthy();
   expect(painted).toBeTruthy();
   expect(usable).toBeTruthy();
+  expect(painted!.details.domRows).toBeLessThanOrEqual(200);
+  expect(painted!.details.payloadBytes).toBeLessThanOrEqual(512 * 1024);
   const transcriptUsableDurations = [usable!.at - selection!.at];
 
   // Warm durable-socket selection matrix (30 samples total) for p50/p95/max.
@@ -136,12 +146,13 @@ test("synthetic catalog and transcript latency remain responsive", async ({ page
   expect(backendMetricsResponse.ok()).toBe(true);
   const backendMetrics = await backendMetricsResponse.json() as Record<string, unknown>;
   const report = {
-    schema_version: 1,
+    schema_version: 2,
     aggregate_only: true,
     network_profile: networkProfile,
     fixture: {
       catalog_sessions: fixtures.length,
       history_message_counts: histories.map((item) => item.messageCount),
+      initial_window_messages: 200,
       total_synthetic_bytes: [...fixtures, ...histories].reduce((sum, item) => sum + item.bytes, 0),
     },
     list_request_ms: summary(listDurations),

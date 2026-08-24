@@ -24,6 +24,7 @@ import {
 import { recoverTranscriptRecoveryJournal } from "./transcript-recovery.js";
 import { closeSearchDb, getSearchDb } from "./search/db.js";
 import { removeSession as removeSearchSession } from "./search/indexer.js";
+import { authorizeExactStandardTranscript } from "./standard-transcript-authorization.js";
 
 function environment(name: string) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), name));
@@ -107,6 +108,8 @@ test("event marker persistence failure mutates nothing; durable marker recovers 
     const manager = materializedSession(f.project, f.sessions, session.id);
     const file = manager.getSessionFile()!;
     updatePiSessionFile(session.id, file);
+    assert.ok(authorizeExactStandardTranscript(file, { expectedSessionId: session.id }),
+      "synthetic recovery fixture must have exact durable Standard identity before journaling");
 
     failNextCommitStoreMutationPersistenceForTests();
     assert.throws(() => createEventReconcileMarker(session.id, file), /Synthetic store persistence failure/);
@@ -118,6 +121,8 @@ test("event marker persistence failure mutates nothing; durable marker recovers 
     close();
     init();
     assert.equal(getStore().transcriptRecoveryJournal[0]?.id, marker.id);
+    assert.ok(authorizeExactStandardTranscript(file, { expectedSessionId: session.id }),
+      "synthetic recovery fixture must retain exact durable Standard identity after restart");
 
     const result = await recoverTranscriptRecoveryJournal();
     assert.deepEqual(result, { recovered: 1, pending: 0 });

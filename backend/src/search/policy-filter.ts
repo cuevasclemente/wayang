@@ -1,6 +1,7 @@
 import type { SessionRow } from "../db.js";
 import { authorizeProjectAction } from "../policy.js";
 import { isLegacyPrivateSessionQuarantined, listSessions } from "../sessions.js";
+import { authorizeExactStandardTranscript } from "../standard-transcript-authorization.js";
 import { eventRecoveryMarkerForSession } from "../transcript-recovery-journal.js";
 
 /** Current per-session index authorization; unknown or stale references deny. */
@@ -12,11 +13,16 @@ export function isSessionIndexable(
   if (isLegacyPrivateSessionQuarantined(session)) return false;
   const recovery = eventRecoveryMarkerForSession(session.id);
   if (recovery && recovery.id !== options.recoveryMarkerId) return false;
-  return authorizeProjectAction({
+  const policy = authorizeProjectAction({
     cwd: session.cwd,
     actor: "indexer",
     agentProfileId: session.agent_profile_id ?? null,
-  }).allowed;
+  });
+  if (!policy.allowed) return false;
+  return !session.pi_session_file || Boolean(authorizeExactStandardTranscript(
+    session.pi_session_file,
+    { expectedSessionId: session.id },
+  ));
 }
 
 export function listIndexableSessions(): SessionRow[] {

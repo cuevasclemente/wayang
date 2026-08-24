@@ -89,6 +89,8 @@ import {
 import { getProject } from "./projects.js";
 import { recoverTranscriptRecoveryJournal } from "./transcript-recovery.js";
 import { authorizeProjectAction } from "./policy.js";
+import { closeTranscriptPagination } from "./transcript-pagination/service.js";
+import { closeDerivedTodoProjectionService } from "./transcript-pagination/derived-todo.js";
 
 const serverCredentialBrokers = new WeakMap<http.Server, CredentialBroker>();
 const serverProtectedAutomationWsClosers = new WeakMap<http.Server, () => void>();
@@ -339,6 +341,8 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
     Promise.resolve().then(() => stopSessionCatalog()),
     Promise.resolve().then(() => stopAllApps()),
     Promise.resolve().then(() => stopAllBrowsers()),
+    Promise.resolve().then(() => closeTranscriptPagination()),
+    Promise.resolve().then(() => closeDerivedTodoProjectionService()),
   ]);
   clearBrowserAgentToken();
   clearAppsAgentToken();

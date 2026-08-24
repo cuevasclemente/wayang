@@ -51,6 +51,7 @@ async function installTimelineSocket(
       private readonly selectionId: string | null;
       private promptHandled = false;
       private timelineStep = 0;
+      private suppressNextUserEcho = false;
 
       constructor(url: string) {
         const parsed = new URL(url, window.location.href);
@@ -145,6 +146,21 @@ async function installTimelineSocket(
             ],
           });
         };
+        (window as unknown as { suppressNextSyntheticUserEcho: () => void }).suppressNextSyntheticUserEcho = () => {
+          this.suppressNextUserEcho = true;
+        };
+        (window as unknown as { emitSyntheticHistory: (messages: unknown[]) => void }).emitSyntheticHistory = (messages) => {
+          this.emit({
+            type: "history",
+            session_id: this.sessionId,
+            selection_id: this.selectionId,
+            reason: "synthetic_reconciliation",
+            messages,
+          });
+        };
+        (window as unknown as { emitSyntheticUserReplay: (message: unknown) => void }).emitSyntheticUserReplay = (message) => {
+          this.emit(message as Record<string, unknown>);
+        };
         window.setTimeout(() => {
           this.readyState = TimelineWebSocket.OPEN;
           this.onopen?.(new Event("open"));
@@ -170,7 +186,11 @@ async function installTimelineSocket(
         if (message.content.startsWith("/compact")) return;
         if (this.promptHandled) return;
         this.promptHandled = true;
-        this.emit({ type: "message_start", message: { id: "timeline-user", role: "user", content: message.content } });
+        if (this.suppressNextUserEcho) {
+          this.suppressNextUserEcho = false;
+        } else {
+          this.emit({ type: "message_start", message: { id: "timeline-user", role: "user", content: message.content } });
+        }
         this.emit({ type: "agent_start" });
         this.emit({ type: "text_delta", delta: timelineMarkers.opening });
       }
@@ -306,6 +326,127 @@ test("preserves assistant text, thinking, and tool chronology while streaming an
   await expect(settledAssistant).toContainText(markers.conclusion);
   await expandThinking(settledAssistant);
   await expectMarkerOrder(settledAssistant, orderedMarkers);
+});
+
+test("renders a repeated short user reply as a distinct live turn", async ({ page, request }) => {
+  await installTimelineSocket(page, [
+    {
+      type: "user",
+      id: "earlier-done-user",
+      message: { role: "user", content: "done", timestamp: 1_700_000_000_000 },
+    },
+    {
+      type: "assistant",
+      id: "earlier-done-assistant",
+      message: { role: "assistant", content: "Earlier acknowledgement." },
+    },
+  ]);
+  const session = await createE2eSession(request, "e2e repeated short user reply");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "done");
+
+  await expect(page.getByTestId("chat-streaming")).toContainText(markers.opening);
+  const userMessages = page.locator('[data-testid="chat-message"][data-role="user"]');
+  await expect(userMessages).toHaveCount(2);
+  await expect(userMessages.nth(0)).toContainText("done");
+  await expect(userMessages.nth(1)).toContainText("done");
+});
+
+test("reconciles repeated optimistic replies by occurrence without consuming them on old replay", async ({ page, request }) => {
+  const earlierUser = {
+    type: "user",
+    id: "earlier-done-user",
+    message: { role: "user", content: "done", timestamp: 1_700_000_000_000 },
+  };
+  const removedSameContentUser = {
+    type: "user",
+    id: "removed-done-user",
+    message: { role: "user", content: "done", timestamp: 1_699_999_999_000 },
+  };
+  const earlierAssistant = {
+    type: "assistant",
+    id: "earlier-done-assistant",
+    message: { role: "assistant", content: "Earlier acknowledgement." },
+  };
+  await installTimelineSocket(page, [removedSameContentUser, earlierUser, earlierAssistant]);
+  const session = await createE2eSession(request, "e2e repeated reply reconciliation");
+  await openSessionInUi(page, session);
+
+  await page.evaluate(() => {
+    (window as unknown as { suppressNextSyntheticUserEcho: () => void }).suppressNextSyntheticUserEcho();
+  });
+  await sendPrompt(page, "done");
+  const userMessages = page.locator('[data-testid="chat-message"][data-role="user"]');
+  await expect(userMessages).toHaveCount(3);
+
+  await page.evaluate(({ removedUser, oldUser, oldAssistant }) => {
+    (window as unknown as { emitSyntheticHistory: (messages: unknown[]) => void })
+      .emitSyntheticHistory([removedUser, oldUser, oldAssistant]);
+  }, { removedUser: removedSameContentUser, oldUser: earlierUser, oldAssistant: earlierAssistant });
+  await expect(userMessages).toHaveCount(3);
+
+  await page.evaluate((oldUser) => {
+    (window as unknown as { emitSyntheticUserReplay: (message: unknown) => void }).emitSyntheticUserReplay(oldUser);
+  }, earlierUser);
+  await expect(userMessages).toHaveCount(3);
+  await expect(page.locator('[data-message-id="earlier-done-user"]')).toHaveCount(1);
+
+  const acceptedUser = {
+    type: "user",
+    id: "accepted-done-user",
+    message: { role: "user", content: "done", timestamp: 1_700_000_001_000 },
+  };
+  await page.evaluate(({ oldUser, oldAssistant, newUser }) => {
+    (window as unknown as { emitSyntheticHistory: (messages: unknown[]) => void })
+      .emitSyntheticHistory([oldUser, oldAssistant, newUser]);
+  }, { oldUser: earlierUser, oldAssistant: earlierAssistant, newUser: acceptedUser });
+  await expect(userMessages).toHaveCount(2);
+  await expect(page.locator('[data-message-id="removed-done-user"]')).toHaveCount(0);
+  await expect(page.locator('[data-message-id="earlier-done-user"]')).toHaveCount(1);
+  await expect(page.locator('[data-message-id="accepted-done-user"]')).toHaveCount(1);
+});
+
+test("does not consume a repeated queued reply from an older history occurrence", async ({ page, request }) => {
+  const earlierUser = {
+    type: "user",
+    id: "queued-earlier-done-user",
+    message: { role: "user", content: "done", timestamp: 1_700_000_000_000 },
+  };
+  const activeAssistant = {
+    type: "assistant",
+    id: "queued-active-assistant",
+    message: { role: "assistant", content: "Active response prefix." },
+  };
+  await installTimelineSocket(page, [earlierUser, activeAssistant], false, true);
+  const session = await createE2eSession(request, "e2e repeated queued reply reconciliation");
+  await openSessionInUi(page, session);
+
+  await page.evaluate(() => {
+    (window as unknown as { suppressNextSyntheticUserEcho: () => void }).suppressNextSyntheticUserEcho();
+  });
+  await sendPrompt(page, "done");
+  const queued = page.getByTestId("chat-queued-user-message");
+  await expect(queued).toHaveCount(1);
+
+  await page.evaluate(({ oldUser, assistant }) => {
+    (window as unknown as { emitSyntheticHistory: (messages: unknown[]) => void })
+      .emitSyntheticHistory([oldUser, assistant]);
+  }, { oldUser: earlierUser, assistant: activeAssistant });
+  await expect(queued).toHaveCount(1);
+
+  const acceptedUser = {
+    type: "user",
+    id: "queued-accepted-done-user",
+    message: { role: "user", content: "done", timestamp: 1_700_000_001_000 },
+  };
+  await page.evaluate(({ oldUser, assistant, newUser }) => {
+    (window as unknown as { emitSyntheticHistory: (messages: unknown[]) => void })
+      .emitSyntheticHistory([oldUser, assistant, newUser]);
+  }, { oldUser: earlierUser, assistant: activeAssistant, newUser: acceptedUser });
+  await expect(queued).toHaveCount(0);
+  await expect(page.locator('[data-message-id="queued-earlier-done-user"]')).toHaveCount(1);
+  await expect(page.locator('[data-message-id="queued-accepted-done-user"]')).toHaveCount(1);
 });
 
 test("keeps retrying runs active until settlement", async ({ page, request }) => {

@@ -5,7 +5,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { authorizeProjectAction, getPolicyGeneration } from "./policy.js";
-import { ensureProjectForCwd } from "./projects.js";
 import { recordLatencyMetric } from "./latency-metrics.js";
 import { writeDreamPolicyProjection } from "./search/policy-projection.js";
 import {
@@ -14,9 +13,25 @@ import {
   type FileFingerprint,
   type SessionFileMetadata,
 } from "./session-metadata.js";
+import {
+  MAX_SESSION_HEADER_BYTES,
+  MAX_SESSION_HEADER_ID_BYTES,
+  readBoundedSessionHeader,
+  type BoundedSessionHeader,
+} from "./standard-transcript-authorization.js";
+
+export { MAX_SESSION_HEADER_BYTES, MAX_SESSION_HEADER_ID_BYTES };
 
 export interface CatalogKnownFile {
   fingerprint: FileFingerprint | null;
+  mutationVersion: number;
+}
+
+export interface CatalogDurableSession {
+  filePath: string;
+  sessionId: string;
+  projectId: string;
+  cwd: string;
   mutationVersion: number;
 }
 
@@ -47,13 +62,23 @@ export interface CatalogScanResult {
 
 export interface SessionCatalogAdapter {
   getKnownFile(filePath: string): CatalogKnownFile;
+  /** Universal path gate evaluated before even the bounded header is opened. */
+  allowHeaderRead?(filePath: string): boolean;
+  /** Resolve one canonical file/header pair against durable Standard-session authority. */
+  classifyDurableSession(filePath: string, sessionId: string, headerCwd: string): CatalogDurableSession | null;
+  /** Header-only denial-first import seam; must durably commit before returning authority. */
+  stageDurableSession?(
+    filePath: string,
+    header: BoundedSessionHeader,
+    fingerprint: FileFingerprint,
+  ): { classification: CatalogDurableSession; imported: boolean } | null;
   commit(scan: CatalogScanCommit): { imported: number; updated: number; archivedLegacy: number; changed: boolean };
 }
 
 const SAFETY_SCAN_MS = Math.max(1_000, Number.parseInt(process.env.WAYANG_SESSION_CATALOG_SCAN_MS || "30000", 10) || 30_000);
 const COMPLETION_COOLDOWN_MS = Math.max(100, Number.parseInt(process.env.WAYANG_SESSION_CATALOG_COOLDOWN_MS || "1000", 10) || 1_000);
 const WATCH_DEBOUNCE_MS = 250;
-export const MAX_SESSION_HEADER_BYTES = 64 * 1024;
+export const MAX_CATALOG_BODY_BYTES = 16 * 1024 * 1024;
 
 export interface SessionCatalogOptions {
   /** Test seams; production uses the central evaluator and atomic projection. */
@@ -62,83 +87,19 @@ export interface SessionCatalogOptions {
   refreshProjection?: () => void;
   observePreAuthorizationBytes?: (bytes: Uint8Array) => void;
   onAuthorizedBodyTransferred?: () => void;
+  observeWorkerTasksInFlight?: (count: number) => void;
 }
 
 function authorizeCatalogCwd(cwd: string): boolean {
-  let decision = authorizeProjectAction({ cwd, actor: "indexer" });
-  if (decision.code === "project_not_registered") {
-    // Catalog discovery has always reconciled new cwd values into Projects.
-    // Registration happens after bounded header parsing and before body access.
-    ensureProjectForCwd(cwd);
-    decision = authorizeProjectAction({ cwd, actor: "indexer" });
-  }
-  return decision.allowed;
+  return authorizeProjectAction({ cwd, actor: "indexer" }).allowed;
 }
 
-function readAuthorizedContent(
-  filePath: string,
-  fingerprint: FileFingerprint,
-  authorizeCwd: (cwd: string) => boolean,
-  observePreAuthorizationBytes?: (bytes: Uint8Array) => void,
-): { content: Uint8Array | null; headerBytes: number; denied: boolean } {
-  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
-  const fd = fs.openSync(filePath, flags);
-  try {
-    const before = fingerprintFromStat(fs.fstatSync(fd));
-    if (!fingerprintsEqual(before, fingerprint)) throw new Error("Session file changed before header authorization");
-    // Read exactly through LF, one byte at a time. Chunked pread/read calls may
-    // fill their buffer with body bytes after a short header, which would cross
-    // the authorization boundary even if those bytes were not parsed.
-    const maximum = Math.min(MAX_SESSION_HEADER_BYTES, fingerprint.size);
-    const headerBuffer = new Uint8Array(maximum);
-    const singleByte = new Uint8Array(1);
-    let headerLength = 0;
-    let foundNewline = false;
-    while (headerLength < maximum) {
-      const count = fs.readSync(fd, singleByte, 0, 1, null);
-      if (count === 0) break;
-      headerBuffer[headerLength++] = singleByte[0]!;
-      if (singleByte[0] === 0x0a) {
-        foundNewline = true;
-        break;
-      }
-    }
-    if (!foundNewline && fingerprint.size > headerLength) {
-      throw new Error("Session header exceeds the bounded authorization limit");
-    }
-    const authorizedPrefix = headerBuffer.subarray(0, headerLength);
-    observePreAuthorizationBytes?.(authorizedPrefix);
-    const lineLength = foundNewline ? headerLength - 1 : headerLength;
-    const headerLine = Buffer.from(authorizedPrefix.subarray(0, lineLength)).toString("utf8").replace(/\r$/, "").trim();
-    let header: unknown;
-    try { header = JSON.parse(headerLine); } catch { throw new Error("Session header is malformed"); }
-    if (!header || typeof header !== "object" || (header as { type?: unknown }).type !== "session") {
-      throw new Error("Session header is missing");
-    }
-    const cwd = (header as { cwd?: unknown }).cwd;
-    if (typeof cwd !== "string" || !cwd.trim()) throw new Error("Session header cwd is missing");
-    if (!authorizeCwd(cwd)) return { content: null, headerBytes: headerLength, denied: true };
-
-    // No await/yield occurs between the central decision and this read. Policy
-    // writes run on the same main event loop, so tightening cannot interleave.
-    // The fd offset is exactly after the header LF; continue from there and
-    // prepend only the already-authorized header for off-thread parsing.
-    const content = new Uint8Array(fingerprint.size);
-    content.set(authorizedPrefix, 0);
-    let offset = headerLength;
-    while (offset < content.byteLength) {
-      const count = fs.readSync(fd, content, offset, content.byteLength - offset, null);
-      if (count === 0) break;
-      offset += count;
-    }
-    const after = fingerprintFromStat(fs.fstatSync(fd));
-    if (!fingerprintsEqual(after, fingerprint) || offset !== fingerprint.size) {
-      throw new Error("Session file changed during authorized metadata read");
-    }
-    return { content, headerBytes: headerLength, denied: false };
-  } finally {
-    fs.closeSync(fd);
-  }
+function durableClassificationsEqual(left: CatalogDurableSession, right: CatalogDurableSession): boolean {
+  return left.filePath === right.filePath
+    && left.sessionId === right.sessionId
+    && left.projectId === right.projectId
+    && left.cwd === right.cwd
+    && left.mutationVersion === right.mutationVersion;
 }
 
 export function getCanonicalSessionsRoot(): string {
@@ -289,56 +250,103 @@ export class SessionCatalog {
     recordLatencyMetric("catalog_enumerate_ms", performance.now() - enumerateStartedAt);
     this.refreshWatchers(discovered);
 
-    const changed: Array<{ filePath: string; fingerprint: FileFingerprint; mutationVersion: number }> = [];
+    const changed: Array<{ filePath: string; fingerprint: FileFingerprint }> = [];
     for (const [filePath, fingerprint] of discovered) {
       const known = this.adapter.getKnownFile(filePath);
       if (!fingerprintsEqual(known.fingerprint, fingerprint)) {
-        changed.push({ filePath, fingerprint, mutationVersion: known.mutationVersion });
+        changed.push({ filePath, fingerprint });
       }
     }
 
     const workerStartedAt = performance.now();
-    const parsedCandidates: Array<CatalogParsedFile & { authorizationGeneration: number }> = [];
+    const parsedCandidates: Array<CatalogParsedFile & {
+      authorizationGeneration: number;
+      classification: CatalogDurableSession;
+    }> = [];
     let parseBytes = 0;
     let headerBytes = 0;
     let parseFailures = 0;
+    let stagedImports = 0;
+    let workerTasksInFlight = 0;
     const authorizeCwd = this.options.authorizeCwd ?? authorizeCatalogCwd;
     const policyGeneration = this.options.getPolicyGeneration ?? getPolicyGeneration;
-    const results = await Promise.all(changed.map(async (task) => {
-      try {
-        const authorizationGeneration = policyGeneration();
-        const gated = readAuthorizedContent(
-          task.filePath,
-          task.fingerprint,
-          authorizeCwd,
-          this.options.observePreAuthorizationBytes,
-        );
-        headerBytes += gated.headerBytes;
-        if (gated.denied || gated.content === null) return null;
-        const metadataPromise = this.workerPool.parseAuthorizedContent(task.filePath, task.fingerprint, gated.content);
-        this.options.onAuthorizedBodyTransferred?.();
-        const metadata = await metadataPromise;
-        return metadata ? { metadata, expectedMutationVersion: task.mutationVersion, authorizationGeneration } : null;
-      } catch {
-        parseFailures++;
-        return null;
-      }
-    }));
 
-    for (const result of results) {
-      if (!result) continue;
-      try {
-        const current = fingerprintFromStat(await fsp.stat(result.metadata.path));
-        if (!fingerprintsEqual(current, result.metadata.fingerprint)) {
+    // Admit at most one task per worker. No whole-corpus Promise.all or main-
+    // thread body buffer exists; each worker reopens one bounded authorized file.
+    for (let batchOffset = 0; batchOffset < changed.length; batchOffset += this.workerPool.capacity) {
+      const batch = changed.slice(batchOffset, batchOffset + this.workerPool.capacity);
+      const results = await Promise.all(batch.map(async (task) => {
+        try {
+          if (this.adapter.allowHeaderRead && !this.adapter.allowHeaderRead(task.filePath)) return null;
+          const observed = readBoundedSessionHeader(
+            task.filePath,
+            task.fingerprint,
+            this.options.observePreAuthorizationBytes,
+          );
+          headerBytes += observed.headerBytes;
+          let classification = this.adapter.classifyDurableSession(
+            observed.path,
+            observed.header.id,
+            observed.header.cwd,
+          );
+          if (!classification) {
+            const staged = this.adapter.stageDurableSession?.(observed.path, observed.header, observed.fingerprint) ?? null;
+            if (staged?.imported) stagedImports++;
+            classification = staged?.classification ?? null;
+          }
+          if (!classification || !authorizeCwd(classification.cwd)) return null;
+          const authorizationGeneration = policyGeneration();
+          const rechecked = this.adapter.classifyDurableSession(
+            observed.path,
+            observed.header.id,
+            observed.header.cwd,
+          );
+          if (!rechecked || !durableClassificationsEqual(classification, rechecked)
+            || authorizationGeneration !== policyGeneration()) return null;
+
+          workerTasksInFlight++;
+          this.options.observeWorkerTasksInFlight?.(workerTasksInFlight);
+          this.options.onAuthorizedBodyTransferred?.();
+          try {
+            const metadata = await this.workerPool.parseAuthorizedFile(
+              observed.path,
+              observed.fingerprint,
+              MAX_CATALOG_BODY_BYTES,
+            );
+            return metadata ? {
+              metadata,
+              expectedMutationVersion: rechecked.mutationVersion,
+              authorizationGeneration,
+              classification: rechecked,
+            } : null;
+          } finally {
+            workerTasksInFlight--;
+            this.options.observeWorkerTasksInFlight?.(workerTasksInFlight);
+          }
+        } catch {
+          parseFailures++;
+          return null;
+        }
+      }));
+
+      for (const result of results) {
+        if (!result) continue;
+        try {
+          const current = fingerprintFromStat(await fsp.stat(result.metadata.path));
+          if (!fingerprintsEqual(current, result.metadata.fingerprint)) {
+            this.pendingScan = true;
+            continue;
+          }
+        } catch {
           this.pendingScan = true;
           continue;
         }
-      } catch {
-        this.pendingScan = true;
-        continue;
+        parsedCandidates.push(result);
+        parseBytes += result.metadata.approximateBytes;
       }
-      parsedCandidates.push(result);
-      parseBytes += result.metadata.approximateBytes;
+      if (batchOffset + this.workerPool.capacity < changed.length) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
     }
     const workerDuration = performance.now() - workerStartedAt;
     recordLatencyMetric("catalog_worker_ms", workerDuration);
@@ -371,19 +379,25 @@ export class SessionCatalog {
     }
 
     // Worker parsing is deliberately asynchronous. Immediately before commit,
-    // require both a fresh cwd authorization and the exact generation captured
-    // before authorized body transfer. No await occurs between this barrier and
-    // adapter.commit(), so a policy write cannot interleave on the main thread.
+    // require the same unique durable row/path/Project classification plus a
+    // fresh policy decision. No await occurs between this barrier and commit.
     const parsed: CatalogParsedFile[] = [];
     for (const candidate of parsedCandidates) {
       const generationBefore = policyGeneration();
-      const stillAllowed = authorizeCwd(candidate.metadata.cwd);
+      const fresh = this.adapter.classifyDurableSession(
+        candidate.metadata.path,
+        candidate.metadata.id,
+        candidate.metadata.cwd,
+      );
+      const stillAllowed = Boolean(fresh && authorizeCwd(fresh.cwd));
       const generationAfter = policyGeneration();
-      if (!stillAllowed || candidate.authorizationGeneration !== generationBefore || generationBefore !== generationAfter) {
+      if (!fresh || !durableClassificationsEqual(candidate.classification, fresh)
+        || !stillAllowed || candidate.authorizationGeneration !== generationBefore
+        || generationBefore !== generationAfter) {
         this.pendingScan = true;
         continue;
       }
-      parsed.push({ metadata: candidate.metadata, expectedMutationVersion: candidate.expectedMutationVersion });
+      parsed.push({ metadata: candidate.metadata, expectedMutationVersion: fresh.mutationVersion });
     }
 
     const committed = this.adapter.commit({
@@ -392,9 +406,9 @@ export class SessionCatalog {
       parsed,
       parseFailures,
     });
-    if (committed.changed) {
-      // The projection is atomic and complete; publish after catalog metadata
-      // commits. Until publication, a newly seen path is unknown-deny.
+    if (committed.changed || stagedImports > 0) {
+      // Header-only staging is durable before body admission. Publish its new
+      // Standard row together with any parsed metadata changes.
       try { (this.options.refreshProjection ?? writeDreamPolicyProjection)(); }
       catch (error) { console.error("[session-catalog] policy projection refresh failed", error); }
       this.bumpGeneration();
@@ -406,7 +420,7 @@ export class SessionCatalog {
       console.log(`[session-catalog] discovered=${discovered.size} parsed=${parsed.length} bytes=${parseBytes} header_bytes=${headerBytes} failures=${parseFailures} duration_ms=${durationMs.toFixed(1)}`);
     }
     return {
-      imported: committed.imported,
+      imported: committed.imported + stagedImports,
       updated: committed.updated,
       archivedLegacy: committed.archivedLegacy,
       discovered: discovered.size,

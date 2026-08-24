@@ -5,11 +5,10 @@
  *   1. Stream JSONL line by line; skip non-`message` types.
  *   2. Keep only items where message.role ∈ {user, assistant} and each
  *      content item has type="text".
- *   3. Concatenate consecutive same-role text into one role-prefixed
- *      utterance: `User: …\n\nAssistant: …`.
- *   4. Greedy-pack utterances into ≤ MAX_CHUNK_CHARS chunks, breaking only
- *      on utterance boundaries; allow OVERLAP_CHARS overlap with the previous
- *      chunk for context.
+ *   3. Keep one exact message id per utterance (multiple text blocks from the
+ *      same message may coalesce; adjacent same-role messages may not).
+ *   4. Emit message-bound chunks of ≤ MAX_CHUNK_CHARS. Oversized messages are
+ *      split with bounded within-message overlap so every result anchor remains exact.
  *   5. One synthetic role='meta' chunk per session, so metadata-only sessions
  *      are still searchable.
  *
@@ -17,7 +16,7 @@
  */
 
 import * as fs from "node:fs";
-import * as readline from "node:readline";
+import type { FileFingerprint } from "../session-metadata.js";
 import type { Chunk } from "./types.js";
 
 export const MAX_CHUNK_CHARS = 2000;
@@ -32,6 +31,8 @@ export interface MetaForChunker {
 
 export interface ChunkerOptions {
   includeThinking?: boolean;
+  /** Exact Standard authorization fingerprint witnessed before body admission. */
+  expectedFingerprint?: FileFingerprint;
 }
 
 export interface ChunkerStats {
@@ -82,33 +83,27 @@ export async function chunkJsonlFile(
     }
   };
 
-  let byteOffset = 0;
-
-  const stream = fs.createReadStream(filePath, { encoding: "utf-8" });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
-  for await (const rawLine of rl) {
-    const lineByteLen = Buffer.byteLength(rawLine, "utf-8") + 1; // +1 for \n
-    const currentOffset = byteOffset;
-    byteOffset += lineByteLen;
+  const consumeLine = (lineBytes: Buffer, currentOffset: number): void => {
     stats.linesRead++;
-
-    if (!rawLine) continue;
+    const raw = lineBytes.length > 0 && lineBytes.at(-1) === 0x0d
+      ? lineBytes.subarray(0, lineBytes.length - 1)
+      : lineBytes;
+    if (raw.length === 0) return;
     let obj: any;
     try {
-      obj = JSON.parse(rawLine);
+      obj = JSON.parse(raw.toString("utf8"));
     } catch {
       stats.skippedParseErrors++;
-      continue;
+      return;
     }
 
-    if (!obj || obj.type !== "message") continue;
+    if (!obj || obj.type !== "message") return;
     const message = obj.message ?? obj;
     const role = message?.role;
-    if (role !== "user" && role !== "assistant") continue;
+    if (role !== "user" && role !== "assistant") return;
 
     const content = message.content;
-    if (content == null) continue;
+    if (content == null) return;
 
     const parts: Array<{ kind: "text" | "thinking"; text: string }> = [];
     if (typeof content === "string") {
@@ -128,32 +123,61 @@ export async function chunkJsonlFile(
         }
       }
     } else {
-      continue;
+      return;
     }
 
-    if (parts.length === 0) continue;
+    if (parts.length === 0) return;
     stats.messagesUsed++;
-
     const messageId = typeof obj.id === "string" ? obj.id : null;
-
     for (const part of parts) {
       const partRole: Utterance["role"] = part.kind === "thinking" ? "thinking" : role;
       const text = part.text.trim();
       if (!text) continue;
-
-      if (pending && pending.role === partRole) {
+      if (pending && pending.role === partRole && pending.messageId === messageId) {
         pending.text += `\n\n${text}`;
-        // Keep the original messageId/offset of the first contributor.
       } else {
         flushPending();
-        pending = {
-          role: partRole,
-          text,
-          messageId,
-          sourceOffset: currentOffset,
-        };
+        pending = { role: partRole, text, messageId, sourceOffset: currentOffset };
       }
     }
+  };
+
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  const handle = await fs.promises.open(filePath, flags);
+  const expectedFingerprint = options.expectedFingerprint;
+  const fingerprintMatches = (stat: fs.Stats): boolean => stat.isFile() && stat.nlink === 1
+    && (!expectedFingerprint || (
+      (Number(stat.ino) || 0) === expectedFingerprint.ino
+      && stat.size === expectedFingerprint.size
+      && stat.mtimeMs === expectedFingerprint.mtimeMs
+      && stat.ctimeMs === expectedFingerprint.ctimeMs
+    ));
+  try {
+    if (!fingerprintMatches(await handle.stat())) throw new Error("Transcript changed before search indexing");
+    const block = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    let lineStartOffset = 0;
+    let pendingBytes = Buffer.alloc(0);
+    while (true) {
+      const { bytesRead } = await handle.read(block, 0, block.length, position);
+      if (bytesRead === 0) break;
+      const chunk = pendingBytes.length > 0
+        ? Buffer.concat([pendingBytes, block.subarray(0, bytesRead)])
+        : Buffer.from(block.subarray(0, bytesRead));
+      let segmentStart = 0;
+      for (let index = 0; index < chunk.length; index++) {
+        if (chunk[index] !== 0x0a) continue;
+        consumeLine(chunk.subarray(segmentStart, index), lineStartOffset);
+        lineStartOffset += index - segmentStart + 1;
+        segmentStart = index + 1;
+      }
+      pendingBytes = Buffer.from(chunk.subarray(segmentStart));
+      position += bytesRead;
+    }
+    if (pendingBytes.length > 0) consumeLine(pendingBytes, lineStartOffset);
+    if (!fingerprintMatches(await handle.stat())) throw new Error("Transcript changed during search indexing");
+  } finally {
+    await handle.close();
   }
   flushPending();
 
@@ -174,8 +198,8 @@ export async function chunkJsonlFile(
     sourceOffset: null,
   });
 
-  // Greedy-pack utterances into chunks ≤ MAX_CHUNK_CHARS, with OVERLAP_CHARS
-  // tail of the previous chunk prepended for context. We never split mid-utterance.
+  // Keep chunks message-bound so best_message_id identifies the exact
+  // searchable event rather than the first contributor to a coalesced chunk.
   const utteranceToText = (u: Utterance): string => {
     const prefix =
       u.role === "user" ? "User: " : u.role === "assistant" ? "Assistant: " : "Thinking: ";
@@ -197,71 +221,40 @@ export async function chunkJsonlFile(
     else transcriptStream.push(u);
   }
 
-  const packStream = (
-    stream: Utterance[],
-    fallbackRole: "user" | "assistant" | "thinking",
-  ): void => {
-    let localBuffer = "";
-    let localStart: { messageId: string | null; sourceOffset: number } | null = null;
-    let localLastRole: Utterance["role"] = fallbackRole;
-    let lastEmittedTail = "";
-
-    const localEmit = (): void => {
-      if (!localBuffer || !localStart) return;
-      chunks.push({
-        chunkIndex: chunkIndex++,
-        role: localLastRole,
-        text: localBuffer,
-        messageId: localStart.messageId,
-        sourceOffset: localStart.sourceOffset,
-      });
-      lastEmittedTail = overlapTail(localBuffer);
-      localBuffer = "";
-      localStart = null;
-    };
-
-    for (const u of stream) {
-      const utteranceText = utteranceToText(u);
-      const nextLenIfAdded = localBuffer
-        ? localBuffer.length + 2 + utteranceText.length
-        : utteranceText.length;
-
-      // If a single utterance is longer than MAX, hard-split it at MAX boundaries.
-      if (utteranceText.length > MAX_CHUNK_CHARS && !localBuffer) {
-        for (let i = 0; i < utteranceText.length; i += MAX_CHUNK_CHARS) {
-          const slice = utteranceText.slice(i, i + MAX_CHUNK_CHARS);
-          chunks.push({
-            chunkIndex: chunkIndex++,
-            role: u.role,
-            text: lastEmittedTail ? `${lastEmittedTail}\n\n${slice}` : slice,
-            messageId: u.messageId,
-            sourceOffset: u.sourceOffset,
-          });
-          lastEmittedTail = overlapTail(slice);
-        }
+  const packStream = (stream: Utterance[]): void => {
+    for (const utterance of stream) {
+      const text = utteranceToText(utterance);
+      if (text.length <= MAX_CHUNK_CHARS) {
+        chunks.push({
+          chunkIndex: chunkIndex++,
+          role: utterance.role,
+          text,
+          messageId: utterance.messageId,
+          sourceOffset: utterance.sourceOffset,
+        });
         continue;
       }
-
-      if (nextLenIfAdded > MAX_CHUNK_CHARS && localBuffer) {
-        localEmit();
+      let offset = 0;
+      let priorTail = "";
+      while (offset < text.length) {
+        const available = Math.max(1, MAX_CHUNK_CHARS - (priorTail ? priorTail.length + 2 : 0));
+        const slice = text.slice(offset, offset + available);
+        const projected = priorTail ? `${priorTail}\n\n${slice}` : slice;
+        chunks.push({
+          chunkIndex: chunkIndex++,
+          role: utterance.role,
+          text: projected,
+          messageId: utterance.messageId,
+          sourceOffset: utterance.sourceOffset,
+        });
+        offset += available;
+        priorTail = overlapTail(slice);
       }
-
-      if (!localBuffer) {
-        const prefix = lastEmittedTail ? `${lastEmittedTail}\n\n` : "";
-        localBuffer = prefix + utteranceText;
-        localStart = { messageId: u.messageId, sourceOffset: u.sourceOffset };
-      } else {
-        localBuffer += `\n\n${utteranceText}`;
-      }
-      localLastRole = u.role;
     }
-    localEmit();
   };
 
-  packStream(transcriptStream, "user");
-  if (options.includeThinking && thinkingStream.length > 0) {
-    packStream(thinkingStream, "thinking");
-  }
+  packStream(transcriptStream);
+  if (options.includeThinking && thinkingStream.length > 0) packStream(thinkingStream);
 
   return { chunks, stats };
 }

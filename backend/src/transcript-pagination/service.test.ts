@@ -1,0 +1,437 @@
+import test from "node:test";
+import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { serializeStreamingMessageForWindow } from "../pi-bridge.js";
+import { TranscriptPaginationService } from "./service.js";
+import { StructuralTranscriptIndex } from "./structural-index.js";
+import {
+  readReverseTranscriptPage,
+  TRANSCRIPT_PAGE_MAX_BYTES,
+  TRANSCRIPT_PAGE_MAX_ROWS,
+} from "./reverse-reader.js";
+
+function makeTranscript(
+  count: number,
+  options: { regularSize?: number; hugeLast?: boolean; sessionInfoRoot?: boolean } = {},
+): { dir: string; file: string } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-window-service-"));
+  const file = path.join(dir, "session.jsonl");
+  const rows: any[] = [{ type: "session", version: 3, id: "s", cwd: "/synthetic" }];
+  let parentId: string | null = null;
+  if (options.sessionInfoRoot) {
+    rows.push({
+      type: "session_info",
+      id: "session-info-root",
+      parentId: null,
+      timestamp: new Date(0).toISOString(),
+      name: "Synthetic session",
+    });
+    parentId = "session-info-root";
+  }
+  for (let index = 0; index < count; index++) {
+    const id = `m-${index}`;
+    rows.push({
+      type: "message", id, parentId, timestamp: new Date(index).toISOString(),
+      message: { role: index % 2 ? "assistant" : "user", content: [{ type: "text", text: index === count - 1 && options.hugeLast !== false
+        ? "x".repeat(600_000)
+        : options.regularSize ? `${index}:` + "y".repeat(options.regularSize) : `synthetic ${index}` }], timestamp: index },
+    });
+    parentId = id;
+  }
+  fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+  return { dir, file };
+}
+
+test("modern latest and before windows remain bounded and request-correlated", async () => {
+  const { dir, file } = makeTranscript(205);
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const latest = await service.open({ sessionId: "s", selectionId: "selection-a", sessionFile: file, intent: "latest" });
+    assert.equal(latest.type, "transcript_window");
+    assert.ok(latest.message_count <= TRANSCRIPT_PAGE_MAX_ROWS);
+    assert.equal(latest.streaming_message, undefined);
+    assert.equal(latest.payload_bytes, Buffer.byteLength(JSON.stringify({ messages: latest.messages })));
+    assert.ok(latest.payload_bytes <= TRANSCRIPT_PAGE_MAX_BYTES);
+    assert.ok(Buffer.byteLength(JSON.stringify(latest)) <= TRANSCRIPT_PAGE_MAX_BYTES);
+    assert.equal(latest.messages.at(-1)?.id, "m-204");
+    assert.equal((latest.messages.at(-1)?.message as any)?.customType, "wayang-transcript-event-placeholder-v1");
+    assert.ok(latest.before_cursor);
+
+    const before = await service.page({
+      sessionId: "s", selectionId: "selection-a", sessionFile: file,
+      requestId: "page-1", direction: "before", cursor: latest.before_cursor!,
+    });
+    assert.equal(before.request_id, "page-1");
+    assert.equal(before.reason, "prepend");
+    assert.equal(before.has_older, false);
+    assert.deepEqual(before.messages.map((row) => row.id), ["m-0", "m-1", "m-2", "m-3", "m-4"]);
+
+    service.invalidateSession("s");
+    await assert.rejects(() => service.page({
+      sessionId: "s", selectionId: "selection-a", sessionFile: file,
+      requestId: "stale", direction: "before", cursor: latest.before_cursor!,
+    }));
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("structural pagination publication is withheld when owning policy changes after worker read", async () => {
+  const { dir, file } = makeTranscript(40, { hugeLast: false });
+  let allowed = true;
+  const index = new StructuralTranscriptIndex(path.join(dir, "index.db"), {
+    beforePublishForTests() { allowed = false; },
+  });
+  const service = new TranscriptPaginationService(index);
+  try {
+    await assert.rejects(() => service.open({
+      sessionId: "s",
+      selectionId: "selection-policy-race",
+      sessionFile: file,
+      intent: "around",
+      anchorId: "m-20",
+      authorizationGuard: () => allowed,
+    }));
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pagination body reads reject a transcript that changed after the authorization fingerprint", async () => {
+  const { dir, file } = makeTranscript(205, { hugeLast: false });
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const stat = fs.statSync(file);
+    const expectedFingerprint = {
+      ino: Number(stat.ino) || 0,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+    };
+    fs.appendFileSync(file, JSON.stringify({
+      type: "message", id: "after-authorization", parentId: "m-204",
+      message: { role: "assistant", content: [{ type: "text", text: "racing append" }] },
+    }) + "\n");
+    await assert.rejects(() => service.open({
+      sessionId: "s",
+      selectionId: "selection-fingerprint-race",
+      sessionFile: file,
+      expectedFingerprint,
+      intent: "latest",
+    }));
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("reverse-reader rejects a stale expected fingerprint before reading header bytes", () => {
+  const { dir, file } = makeTranscript(2, { hugeLast: false });
+  try {
+    const stat = fs.statSync(file);
+    const expectedFingerprint = {
+      ino: Number(stat.ino) || 0,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+    };
+    fs.renameSync(file, `${file}.old`);
+    fs.writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: "s", cwd: "/synthetic" }) + "\n");
+    let bytesRead = 0;
+    assert.throws(() => readReverseTranscriptPage(file, {
+      expectedFingerprint,
+      observeBytesRead(bytes) { bytesRead += bytes; },
+    }));
+    assert.equal(bytesRead, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("structural worker rejects replacement before open with zero body bytes", async () => {
+  const { dir, file } = makeTranscript(20, { hugeLast: false });
+  const stat = fs.statSync(file);
+  const expectedFingerprint = {
+    ino: Number(stat.ino) || 0,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+  };
+  let observedBytes = -1;
+  const content = fs.readFileSync(file);
+  const index = new StructuralTranscriptIndex(path.join(dir, "index.db"), {
+    beforeWorkerOpenForTests() {
+      fs.renameSync(file, `${file}.old`);
+      fs.writeFileSync(file, content);
+    },
+    observeWorkerBodyBytesForTests(_sessionId, bytes) { observedBytes = bytes; },
+  });
+  try {
+    await assert.rejects(index.ensure("s", file, expectedFingerprint));
+    assert.equal(observedBytes, 0);
+  } finally {
+    await index.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("indexed source fd rejects replacement before row bytes", async () => {
+  const { dir, file } = makeTranscript(20, { hugeLast: false });
+  let armed = false;
+  let observedBytes = 0;
+  const index = new StructuralTranscriptIndex(path.join(dir, "index.db"), {
+    beforeIndexedSourceOpenForTests() {
+      if (!armed) return;
+      const content = fs.readFileSync(file);
+      fs.renameSync(file, `${file}.old`);
+      fs.writeFileSync(file, content);
+    },
+    observeIndexedSourceBytesForTests(_sessionId, bytes) { observedBytes += bytes; },
+  });
+  try {
+    const selection = await index.around("s", file, "m-10", 20);
+    armed = true;
+    assert.throws(() => index.readBoundedEntries(selection.revision, selection.rows, {
+      preference: "around",
+      anchorEventId: "m-10",
+    }));
+    assert.equal(observedBytes, 0);
+  } finally {
+    await index.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("append tail witness rejects replacement before reading bytes", async () => {
+  const { dir, file } = makeTranscript(5, { hugeLast: false });
+  let armed = false;
+  let observedBytes = 0;
+  const index = new StructuralTranscriptIndex(path.join(dir, "index.db"), {
+    beforeTailReadForTests() {
+      if (!armed) return;
+      const content = fs.readFileSync(file);
+      fs.renameSync(file, `${file}.old`);
+      fs.writeFileSync(file, content);
+    },
+    observeTailBytesForTests(bytes) { observedBytes += bytes; },
+  });
+  try {
+    await index.ensure("s", file);
+    fs.appendFileSync(file, JSON.stringify({
+      type: "message", id: "append-tail", parentId: "m-4",
+      message: { role: "assistant", content: [{ type: "text", text: "append" }] },
+    }) + "\n");
+    armed = true;
+    await assert.rejects(() => index.ensure("s", file));
+    assert.equal(observedBytes, 0);
+  } finally {
+    await index.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("streaming overlay serialization freezes mutable runtime content synchronously", () => {
+  const streaming = { role: "assistant", content: [{ type: "text", text: "before" }], timestamp: 1 };
+  const frozen = serializeStreamingMessageForWindow(streaming);
+  streaming.content[0].text = "after";
+  assert.equal(((frozen?.message as any)?.content as any[])[0].text, "before");
+});
+
+test("ID-less streaming overlay is bounded separately without evicting persisted rows", async () => {
+  const { dir, file } = makeTranscript(205, { hugeLast: false });
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const latest = await service.open({
+      sessionId: "s",
+      selectionId: "selection-streaming-overlay",
+      sessionFile: file,
+      intent: "latest",
+      streamingMessage: {
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "δ".repeat(200_000) }] },
+      },
+    });
+    assert.equal(latest.messages.length, 200);
+    assert.equal(latest.messages[0].id, "m-5");
+    assert.ok(latest.messages.every((row) => typeof row.id === "string"));
+    assert.ok(latest.before_cursor);
+    assert.equal(latest.streaming_message?.type, "assistant");
+    assert.equal(latest.streaming_message?.id, undefined);
+    const placeholder = latest.streaming_message?.message as any;
+    assert.equal(placeholder?.role, "assistant");
+    assert.equal(placeholder?.streamingPlaceholder, true);
+    assert.equal(placeholder?.content?.[0]?.type, "text");
+    assert.equal(latest.payload_bytes, Buffer.byteLength(JSON.stringify({
+      messages: latest.messages,
+      streaming_message: latest.streaming_message,
+    })));
+    assert.ok(latest.payload_bytes <= TRANSCRIPT_PAGE_MAX_BYTES);
+    assert.ok(Buffer.byteLength(JSON.stringify(latest)) <= TRANSCRIPT_PAGE_MAX_BYTES);
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("persisted and streaming payload budgets remain within aggregate 512 KiB", async () => {
+  const { dir, file } = makeTranscript(205, { regularSize: 2_000, hugeLast: false });
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const latest = await service.open({
+      sessionId: "s",
+      selectionId: "selection-aggregate-payload",
+      sessionFile: file,
+      intent: "latest",
+      streamingMessage: {
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "s".repeat(120 * 1024) }] },
+      },
+    });
+    assert.ok(latest.streaming_message);
+    assert.equal((latest.streaming_message.message as any)?.streamingPlaceholder, undefined);
+    const declaredContent = {
+      messages: latest.messages,
+      streaming_message: latest.streaming_message,
+    };
+    assert.equal(latest.payload_bytes, Buffer.byteLength(JSON.stringify(declaredContent)));
+    assert.ok(latest.payload_bytes <= TRANSCRIPT_PAGE_MAX_BYTES);
+    assert.ok(Buffer.byteLength(JSON.stringify(latest)) <= TRANSCRIPT_PAGE_MAX_BYTES);
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("hidden session_info root does not create a fourth empty reverse page", async () => {
+  const { dir, file } = makeTranscript(450, { hugeLast: false, sessionInfoRoot: true });
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const latest = await service.open({
+      sessionId: "s", selectionId: "selection-session-info", sessionFile: file, intent: "latest",
+    });
+    assert.equal(latest.messages.length, 200);
+    assert.equal(latest.has_older, true);
+    assert.ok(latest.before_cursor);
+
+    const middle = await service.page({
+      sessionId: "s", selectionId: "selection-session-info", sessionFile: file,
+      requestId: "session-info-middle", direction: "before", cursor: latest.before_cursor!,
+    });
+    assert.equal(middle.messages.length, 200);
+    assert.equal(middle.has_older, true);
+    assert.ok(middle.before_cursor);
+
+    const earliest = await service.page({
+      sessionId: "s", selectionId: "selection-session-info", sessionFile: file,
+      requestId: "session-info-earliest", direction: "before", cursor: middle.before_cursor!,
+    });
+    assert.equal(earliest.messages.length, 50);
+    assert.deepEqual(earliest.messages.map((row) => row.id),
+      Array.from({ length: 50 }, (_, index) => `m-${index}`));
+    assert.equal(earliest.before_cursor, null);
+    assert.equal(earliest.has_older, false);
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a branch-changing append invalidates cold reverse cursors", async () => {
+  const { dir, file } = makeTranscript(205, { hugeLast: false });
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const latest = await service.open({ sessionId: "s", selectionId: "selection-branch", sessionFile: file, intent: "latest" });
+    assert.ok(latest.before_cursor);
+    fs.appendFileSync(file, JSON.stringify({
+      type: "message", id: "new-branch", parentId: "m-0",
+      message: { role: "assistant", content: [{ type: "text", text: "branch changed" }] },
+    }) + "\n");
+    await assert.rejects(() => service.page({
+      sessionId: "s", selectionId: "selection-branch", sessionFile: file,
+      requestId: "stale-branch", direction: "before", cursor: latest.before_cursor!,
+    }));
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("byte trimming keeps a gap-free reverse cursor boundary", async () => {
+  const { dir, file } = makeTranscript(205, { regularSize: 4_000, hugeLast: false });
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const latest = await service.open({ sessionId: "s", selectionId: "selection-bytes", sessionFile: file, intent: "latest" });
+    assert.ok(latest.before_cursor);
+    const windows = [latest.messages];
+    let cursor: string | null = latest.before_cursor;
+    let pageNumber = 0;
+    while (cursor) {
+      const before = await service.page({
+        sessionId: "s", selectionId: "selection-bytes", sessionFile: file,
+        requestId: `bytes-before-${pageNumber++}`, direction: "before", cursor,
+      });
+      windows.unshift(before.messages);
+      cursor = before.before_cursor;
+      assert.ok(pageNumber < 10, "bounded reverse paging must make progress");
+    }
+    const ids = windows.flat().map((row) => row.id);
+    assert.deepEqual(ids, Array.from({ length: 205 }, (_, index) => `m-${index}`));
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("aggregate indexed read trimming preserves retained around cursors", async () => {
+  const { dir, file } = makeTranscript(120, { regularSize: 8 * 1024, hugeLast: false });
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const around = await service.open({
+      sessionId: "s", selectionId: "selection-index-budget", sessionFile: file,
+      intent: "around", anchorId: "m-60",
+    });
+    assert.ok(around.messages.some((row) => row.id === "m-60"));
+    assert.ok(around.before_cursor);
+    assert.ok(around.after_cursor);
+    const lastAround = Number(String(around.messages.at(-1)?.id).slice(2));
+    const after = await service.page({
+      sessionId: "s", selectionId: "selection-index-budget", sessionFile: file,
+      requestId: "index-budget-after", direction: "after", cursor: around.after_cursor!,
+    });
+    const firstAfter = Number(String(after.messages[0]?.id).slice(2));
+    assert.equal(firstAfter, lastAround + 1);
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("around windows resolve exact active anchors and issue forward cursors", async () => {
+  const { dir, file } = makeTranscript(300);
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const around = await service.open({
+      sessionId: "s", selectionId: "selection-b", sessionFile: file,
+      intent: "around", anchorId: "m-10",
+    });
+    assert.equal(around.anchor?.status, "found");
+    assert.equal(around.anchor?.resolved_id, "m-10");
+    assert.ok(around.messages.some((row) => row.id === "m-10"));
+    assert.ok(around.after_cursor);
+    const after = await service.page({
+      sessionId: "s", selectionId: "selection-b", sessionFile: file,
+      requestId: "after-1", direction: "after", cursor: around.after_cursor!,
+    });
+    assert.equal(after.request_id, "after-1");
+    assert.equal(after.reason, "append");
+    assert.ok(after.messages.some((row) => row.id === "m-299"));
+    assert.ok(after.payload_bytes <= TRANSCRIPT_PAGE_MAX_BYTES);
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
