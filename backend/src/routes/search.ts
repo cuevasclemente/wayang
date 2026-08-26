@@ -118,6 +118,9 @@ export function getSearchHealthSnapshot() {
     schema_version: SCHEMA_VERSION,
     embedder: "off" as const,
     watcher: {
+      started: watcher.started,
+      background_indexing_enabled: watcher.backgroundIndexingEnabled,
+      policy_projection_available: watcher.policyProjectionAvailable,
       backfill_done: watcher.backfillDone,
       backfill_running: watcher.backfillRunning,
       last_tick_at: watcher.lastTickAt,

@@ -34,6 +34,85 @@ const transcriptAuthorizationMod = await import("../standard-transcript-authoriz
 
 dbMod.init();
 
+test("background search indexing pause is explicit and fail-safe", () => {
+  assert.equal(watcherMod.isSearchBackgroundIndexingEnabled(undefined), true);
+  assert.equal(watcherMod.isSearchBackgroundIndexingEnabled("1"), true);
+  assert.equal(watcherMod.isSearchBackgroundIndexingEnabled("true"), true);
+  assert.equal(watcherMod.isSearchBackgroundIndexingEnabled("0"), false);
+});
+
+test("paused watcher work preserves policy refresh while suppressing transcript indexing", async () => {
+  const previous = process.env.WAYANG_SEARCH_BACKGROUND_INDEXING;
+  process.env.WAYANG_SEARCH_BACKGROUND_INDEXING = "0";
+  let calls = 0;
+  const fakeIndex: typeof indexerMod.indexSession = async (sessionId) => {
+    calls++;
+    return { sessionId, chunkCount: 0, skipped: false };
+  };
+  try {
+    watcherMod.startWatcher();
+    let status = watcherMod.getWatcherStatus();
+    assert.equal(status.started, true);
+    assert.equal(status.backgroundIndexingEnabled, false);
+    assert.equal(status.backfillRunning, false);
+    watcherMod.stopWatcher();
+    assert.equal(watcherMod.getWatcherStatus().started, false);
+
+    await watcherMod.runWatcherTickForTests(fakeIndex);
+    await watcherMod.indexSessionNow("paused-synthetic-session", fakeIndex);
+    assert.equal(calls, 0);
+    let projectionAttempts = 0;
+    let purges = 0;
+    const fakePurge = () => {
+      purges++;
+      return { purged: 0, errors: 0 };
+    };
+    watcherMod.runPausedPolicyHeartbeat(fakePurge, () => {
+      projectionAttempts++;
+      throw new Error("synthetic projection outage");
+    });
+    let health = searchRouteMod.getSearchHealthSnapshot();
+    assert.equal(health.watcher.background_indexing_enabled, false);
+    assert.equal(health.watcher.policy_projection_available, false);
+    assert.equal(health.last_error, "Dream policy projection is unavailable");
+
+    watcherMod.runPausedPolicyHeartbeat(fakePurge, () => {
+      projectionAttempts++;
+      return undefined;
+    });
+    health = searchRouteMod.getSearchHealthSnapshot();
+    assert.equal(projectionAttempts, 2);
+    assert.equal(purges, 2, "paused policy heartbeat must retain denial purge");
+    assert.equal(health.watcher.policy_projection_available, true);
+    assert.equal(health.last_error, undefined);
+
+    assert.doesNotThrow(() => watcherMod.runPausedPolicyHeartbeat(
+      fakePurge,
+      () => undefined,
+      () => { throw new Error("synthetic generation failure"); },
+    ));
+    health = searchRouteMod.getSearchHealthSnapshot();
+    assert.equal(health.watcher.policy_projection_available, false);
+    assert.equal(health.last_error, "Dream policy projection is unavailable");
+
+    assert.doesNotThrow(() => watcherMod.runPausedPolicyHeartbeat(
+      () => { throw new Error("synthetic purge failure"); },
+      () => undefined,
+      () => undefined,
+    ));
+    health = searchRouteMod.getSearchHealthSnapshot();
+    assert.equal(health.last_error, "Denied search-index purge is unavailable");
+
+    watcherMod.runPausedPolicyHeartbeat(fakePurge, () => undefined, () => undefined);
+    health = searchRouteMod.getSearchHealthSnapshot();
+    assert.equal(health.watcher.policy_projection_available, true);
+    assert.equal(health.last_error, undefined);
+  } finally {
+    if (previous === undefined) delete process.env.WAYANG_SEARCH_BACKGROUND_INDEXING;
+    else process.env.WAYANG_SEARCH_BACKGROUND_INDEXING = previous;
+  }
+});
+
 function writeFixture(sessionId: string, cwd: string, transcript: Array<{ role: "user" | "assistant"; text: string; id?: string }>): string {
   const dir = path.join(piSessionsRoot, sessionId);
   fs.mkdirSync(dir, { recursive: true });

@@ -18,6 +18,7 @@ import { getSearchDb } from "./db.js";
 import { indexSession, purgePolicyDeniedSessions, reindexAll } from "./indexer.js";
 import {
   DreamPolicyProjectionUnavailableError,
+  ensureDreamPolicyProjection,
   startDreamPolicyProjection,
   stopDreamPolicyProjection,
 } from "./policy-projection.js";
@@ -32,17 +33,80 @@ let lastTickAt: number | null = null;
 let backfillDone = false;
 let backfillRunning = false;
 let unsubscribePolicy: (() => void) | null = null;
+let started = false;
+let backgroundIndexingEnabled = isSearchBackgroundIndexingEnabled();
+let policyProjectionAvailable = false;
+const POLICY_PROJECTION_ERROR = "Dream policy projection is unavailable";
+const POLICY_PURGE_ERROR = "Denied search-index purge is unavailable";
+
+export function isSearchBackgroundIndexingEnabled(
+  value = process.env.WAYANG_SEARCH_BACKGROUND_INDEXING,
+): boolean {
+  return value !== "0";
+}
+
+export function refreshSearchPolicyProjection(
+  ensureProjection: () => unknown = ensureDreamPolicyProjection,
+  refreshGeneration: () => unknown = getPolicyGeneration,
+): boolean {
+  try {
+    refreshGeneration();
+    ensureProjection();
+    policyProjectionAvailable = true;
+    if (lastError === POLICY_PROJECTION_ERROR) lastError = null;
+    return true;
+  } catch {
+    policyProjectionAvailable = false;
+    lastError = POLICY_PROJECTION_ERROR;
+    return false;
+  }
+}
+
+export function runPausedPolicyHeartbeat(
+  purgeDenied: typeof purgePolicyDeniedSessions = purgePolicyDeniedSessions,
+  ensureProjection: () => unknown = ensureDreamPolicyProjection,
+  refreshGeneration: () => unknown = getPolicyGeneration,
+): void {
+  lastTickAt = Date.now();
+  if (!refreshSearchPolicyProjection(ensureProjection, refreshGeneration)) {
+    console.error("[search] paused policy projection refresh remains unavailable");
+  }
+  try {
+    const result = purgeDenied();
+    if (result.errors > 0) lastError = `Policy purge failed for ${result.errors} session(s)`;
+    else if (lastError === POLICY_PURGE_ERROR) lastError = null;
+  } catch {
+    lastError = POLICY_PURGE_ERROR;
+    console.error("[search] paused denied-index purge remains unavailable");
+  }
+}
 
 export function startWatcher(): void {
-  if (timer || bootTimer) return;
-  getPolicyGeneration();
-  startDreamPolicyProjection();
+  if (started) return;
+  backgroundIndexingEnabled = isSearchBackgroundIndexingEnabled();
   const purgeForPolicy = (): void => {
     const result = purgePolicyDeniedSessions();
     if (result.errors > 0) lastError = `Policy purge failed for ${result.errors} session(s)`;
   };
-  purgeForPolicy();
-  unsubscribePolicy = onPolicyChanged(purgeForPolicy);
+  try {
+    getPolicyGeneration();
+    startDreamPolicyProjection();
+    refreshSearchPolicyProjection();
+    purgeForPolicy();
+    unsubscribePolicy = onPolicyChanged(purgeForPolicy);
+    started = true;
+  } catch (error) {
+    unsubscribePolicy?.();
+    unsubscribePolicy = null;
+    stopDreamPolicyProjection();
+    throw error;
+  }
+  if (!backgroundIndexingEnabled) {
+    console.warn("[search] background indexing paused by WAYANG_SEARCH_BACKGROUND_INDEXING=0");
+    timer = setInterval(() => runPausedPolicyHeartbeat(), WATCH_INTERVAL_MS);
+    timer.unref?.();
+    return;
+  }
   bootTimer = setTimeout(() => {
     bootTimer = null;
     runBackfill().catch((err) => {
@@ -62,6 +126,7 @@ export function startWatcher(): void {
 }
 
 export function stopWatcher(): void {
+  started = false;
   if (timer) clearInterval(timer);
   if (bootTimer) clearTimeout(bootTimer);
   timer = null;
@@ -76,8 +141,19 @@ export function getWatcherStatus(): {
   lastTickAt: number | null;
   backfillDone: boolean;
   backfillRunning: boolean;
+  started: boolean;
+  backgroundIndexingEnabled: boolean;
+  policyProjectionAvailable: boolean;
 } {
-  return { lastError, lastTickAt, backfillDone, backfillRunning };
+  return {
+    lastError,
+    lastTickAt,
+    backfillDone,
+    backfillRunning,
+    started,
+    backgroundIndexingEnabled: started ? backgroundIndexingEnabled : isSearchBackgroundIndexingEnabled(),
+    policyProjectionAvailable,
+  };
 }
 
 async function runBackfill(): Promise<void> {
@@ -94,7 +170,7 @@ async function runBackfill(): Promise<void> {
   }
 }
 
-async function tick(): Promise<void> {
+async function tick(indexOne: typeof indexSession = indexSession): Promise<void> {
   lastTickAt = Date.now();
   // Detect policy-bearing repository writes even if their caller omitted the
   // eager notification hook; onPolicyChanged performs the purge.
@@ -142,7 +218,7 @@ async function tick(): Promise<void> {
     }
     if (needsReindex) {
       try {
-        await indexSession(s.id);
+        await indexOne(s.id);
       } catch (err) {
         if (err instanceof DreamPolicyProjectionUnavailableError) throw err;
         console.error(`[search] tick indexSession(${s.id}) failed:`, err);
@@ -152,8 +228,14 @@ async function tick(): Promise<void> {
 }
 
 /** @internal Deterministic watcher-cycle seam for synthetic tests. */
-export async function runWatcherTickForTests(): Promise<void> {
-  await tick();
+export async function runWatcherTickForTests(
+  indexOne: typeof indexSession = indexSession,
+): Promise<void> {
+  if (!isSearchBackgroundIndexingEnabled()) {
+    getPolicyGeneration();
+    return;
+  }
+  await tick(indexOne);
 }
 
 /**
@@ -161,11 +243,15 @@ export async function runWatcherTickForTests(): Promise<void> {
  * discovered/changed, so it can be indexed immediately rather than waiting
  * for the next tick.
  */
-export async function indexSessionNow(sessionId: string): Promise<void> {
+export async function indexSessionNow(
+  sessionId: string,
+  indexOne: typeof indexSession = indexSession,
+): Promise<void> {
+  if (!isSearchBackgroundIndexingEnabled()) return;
   try {
     // indexSession ensures the complete current decision before a newly linked
     // transcript can be considered by external Dream enumeration.
-    await indexSession(sessionId);
+    await indexOne(sessionId);
   } catch (err) {
     console.error(`[search] immediate indexSession(${sessionId}) failed:`, err);
   }

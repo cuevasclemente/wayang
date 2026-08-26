@@ -483,6 +483,11 @@ export function start() {
       schedulerManager.start();
       startWatcher();
       startSessionCatalog();
+    })
+    .catch(async () => {
+      console.error("[startup] scheduler/search/catalog services could not be started safely");
+      process.exitCode = 1;
+      await closeWayangServer(server);
     });
   void credentialBroker.startUnlockSocket().catch(() => {
     console.error("[browser-credentials] private unlock socket could not be started");

@@ -323,6 +323,10 @@ TTS is disabled unless a service URL is configured.
 
 Treat remote TTS as a data disclosure boundary: assistant text is sent to the configured service. Keep local URLs loopback-only unless the service has its own reviewed transport security.
 
+## Search background indexing
+
+Automatic session-search backfill and changed-session indexing are enabled by default. Set `WAYANG_SEARCH_BACKGROUND_INDEXING=0` only as a reversible maintenance measure when background indexing is harming service availability. After a restart, existing `search.db` results remain readable, but new or changed transcripts are not indexed automatically and search health reports the paused state. Explicit authenticated manual reindex requests remain available. Remove the override and restart Wayang to resume normal indexing; canonical Pi transcripts are never changed by this switch.
+
 ## Data locations
 
 | Location | Contents |

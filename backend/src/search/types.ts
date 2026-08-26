@@ -62,7 +62,16 @@ export interface SearchHealth {
   total_sessions: number;
   indexed_sessions: number;
   pending: number;
+  errored?: number;
   last_error?: string;
   schema_version: number;
   embedder: "off" | "http";
+  watcher?: {
+    started: boolean;
+    background_indexing_enabled: boolean;
+    policy_projection_available: boolean;
+    backfill_done: boolean;
+    backfill_running: boolean;
+    last_tick_at: number | null;
+  };
 }

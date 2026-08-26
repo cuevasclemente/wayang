@@ -47,9 +47,11 @@ matched active-branch message. The web UI highlights that message and provides
 history. Missing or off-branch anchors are reported rather than silently mixed
 into the active conversation. See [Session transcript pagination](session-transcript-pagination.md).
 
-## Manual reindex
+## Manual reindex and maintenance pause
 
 The UI normally keeps the index current. A local administrator can request a rebuild through `POST /api/sessions/search/reindex`, with optional JSON body `{ "session_id": "<uuid>" }`; omit the body to reindex everything. When built-in authentication is enabled, use the authenticated same-origin UI rather than copying session cookies into a command line.
+
+If automatic backfill or refresh work harms service availability, `WAYANG_SEARCH_BACKGROUND_INDEXING=0` pauses boot backfill, periodic transcript refresh, and immediate changed-session indexing after restart. Existing indexed results remain readable and explicit manual reindex remains available. A lightweight policy-only heartbeat continues refreshing the durable authorization projection and purging denied entries. Search health exposes `watcher.background_indexing_enabled` and `watcher.policy_projection_available`; remove the override and restart to resume automatic indexing.
 
 ## Deferred semantic search
 
