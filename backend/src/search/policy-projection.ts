@@ -7,6 +7,7 @@ import {
   authorizeProjectAction,
   buildProjectPolicyProjection,
   canonicalizePolicyPath,
+  getPolicyGeneration,
   onPolicyChanged,
 } from "../policy.js";
 
@@ -32,9 +33,97 @@ export interface DreamPolicyProjection {
   }>;
 }
 
+interface ProjectionFileFingerprint {
+  dev: number;
+  ino: number;
+  size: number;
+  mtime_ms: number;
+  ctime_ms: number;
+  mode: number;
+  nlink: number;
+  uid: number;
+}
+
+export class DreamPolicyProjectionUnavailableError extends Error {
+  constructor(cause: unknown) {
+    super("Current Dream policy projection could not be durably published", { cause });
+    this.name = "DreamPolicyProjectionUnavailableError";
+  }
+}
+
 let unsubscribe: (() => void) | null = null;
 let storeWatcher: fs.FSWatcher | null = null;
 let refreshTimer: NodeJS.Timeout | null = null;
+let lastPublished: {
+  destination: string;
+  projection: DreamPolicyProjection;
+  file: ProjectionFileFingerprint;
+} | null = null;
+
+function currentStoreFingerprint(): DreamPolicyProjection["source_store"] {
+  const storeStat = fs.statSync(path.join(getConfig().dataDir, "store.json"));
+  return {
+    size: storeStat.size,
+    mtime_ms: storeStat.mtimeMs,
+    ctime_ms: storeStat.ctimeMs,
+    ino: Number(storeStat.ino) || 0,
+  };
+}
+
+function storeFingerprintsEqual(
+  left: DreamPolicyProjection["source_store"],
+  right: DreamPolicyProjection["source_store"],
+): boolean {
+  return left.size === right.size
+    && left.mtime_ms === right.mtime_ms
+    && left.ctime_ms === right.ctime_ms
+    && left.ino === right.ino;
+}
+
+function currentProjectionFileFingerprint(destination: string): ProjectionFileFingerprint {
+  const stat = fs.lstatSync(destination);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0) {
+    throw new Error("Dream policy projection must remain a private single-link regular file");
+  }
+  return {
+    dev: Number(stat.dev) || 0,
+    ino: Number(stat.ino) || 0,
+    size: stat.size,
+    mtime_ms: stat.mtimeMs,
+    ctime_ms: stat.ctimeMs,
+    mode: stat.mode,
+    nlink: stat.nlink,
+    uid: stat.uid,
+  };
+}
+
+function projectionFileFingerprintsEqual(
+  left: ProjectionFileFingerprint,
+  right: ProjectionFileFingerprint,
+): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtime_ms === right.mtime_ms
+    && left.ctime_ms === right.ctime_ms
+    && left.mode === right.mode
+    && left.nlink === right.nlink
+    && left.uid === right.uid;
+}
+
+function publishedProjectionFileIsCurrent(
+  destination: string,
+  fingerprint: ProjectionFileFingerprint,
+): boolean {
+  try {
+    return projectionFileFingerprintsEqual(
+      fingerprint,
+      currentProjectionFileFingerprint(destination),
+    );
+  } catch {
+    return false;
+  }
+}
 
 export function getDreamPolicyProjectionPath(): string {
   return path.join(getConfig().dataDir, DREAM_POLICY_PROJECTION_FILE);
@@ -65,17 +154,11 @@ export function buildDreamPolicyProjection(): DreamPolicyProjection {
       };
     })
     .sort((a, b) => a.path.localeCompare(b.path) || a.session_id.localeCompare(b.session_id));
-  const storeStat = fs.statSync(path.join(getConfig().dataDir, "store.json"));
   return {
     schema_version: 1,
     generation: projectProjection.generation,
     complete: true,
-    source_store: {
-      size: storeStat.size,
-      mtime_ms: storeStat.mtimeMs,
-      ctime_ms: storeStat.ctimeMs,
-      ino: Number(storeStat.ino) || 0,
-    },
+    source_store: currentStoreFingerprint(),
     projects: projectProjection.projects,
     sessions,
   };
@@ -105,6 +188,11 @@ export function writeDreamPolicyProjection(): DreamPolicyProjection {
       const directoryFd = fs.openSync(directory, fs.constants.O_RDONLY);
       try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
     } catch { /* directory fsync is not portable to every supported filesystem */ }
+    lastPublished = {
+      destination,
+      projection,
+      file: currentProjectionFileFingerprint(destination),
+    };
     return projection;
   } finally {
     if (fd !== null) {
@@ -113,6 +201,30 @@ export function writeDreamPolicyProjection(): DreamPolicyProjection {
     if (created) {
       try { fs.unlinkSync(temporary); } catch { /* renamed or best effort */ }
     }
+  }
+}
+
+/**
+ * Reuse only the exact durable projection published by this process for the
+ * current data directory, store inode/fingerprint, and policy generation.
+ * Indexing keeps this freshness gate per attempt without rebuilding and
+ * fsyncing the complete session projection for every unchanged session.
+ */
+export function ensureDreamPolicyProjection(): DreamPolicyProjection {
+  try {
+    const destination = getDreamPolicyProjectionPath();
+    const published = lastPublished;
+    if (published
+      && published.destination === destination
+      && published.projection.generation === getPolicyGeneration()
+      && storeFingerprintsEqual(published.projection.source_store, currentStoreFingerprint())
+      && publishedProjectionFileIsCurrent(destination, published.file)) {
+      return published.projection;
+    }
+    return writeDreamPolicyProjection();
+  } catch (error) {
+    if (error instanceof DreamPolicyProjectionUnavailableError) throw error;
+    throw new DreamPolicyProjectionUnavailableError(error);
   }
 }
 

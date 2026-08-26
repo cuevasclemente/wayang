@@ -16,7 +16,11 @@ import { getPolicyGeneration, onPolicyChanged } from "../policy.js";
 import { listSessions } from "../sessions.js";
 import { getSearchDb } from "./db.js";
 import { indexSession, purgePolicyDeniedSessions, reindexAll } from "./indexer.js";
-import { startDreamPolicyProjection, stopDreamPolicyProjection, writeDreamPolicyProjection } from "./policy-projection.js";
+import {
+  DreamPolicyProjectionUnavailableError,
+  startDreamPolicyProjection,
+  stopDreamPolicyProjection,
+} from "./policy-projection.js";
 
 const WATCH_INTERVAL_MS = 30_000;
 const BOOT_DELAY_MS = 2_000;
@@ -140,10 +144,16 @@ async function tick(): Promise<void> {
       try {
         await indexSession(s.id);
       } catch (err) {
+        if (err instanceof DreamPolicyProjectionUnavailableError) throw err;
         console.error(`[search] tick indexSession(${s.id}) failed:`, err);
       }
     }
   }
+}
+
+/** @internal Deterministic watcher-cycle seam for synthetic tests. */
+export async function runWatcherTickForTests(): Promise<void> {
+  await tick();
 }
 
 /**
@@ -153,9 +163,8 @@ async function tick(): Promise<void> {
  */
 export async function indexSessionNow(sessionId: string): Promise<void> {
   try {
-    // Publish the complete decision before a newly linked transcript can be
-    // considered by external Dream enumeration. Unknown paths remain denied.
-    writeDreamPolicyProjection();
+    // indexSession ensures the complete current decision before a newly linked
+    // transcript can be considered by external Dream enumeration.
     await indexSession(sessionId);
   } catch (err) {
     console.error(`[search] immediate indexSession(${sessionId}) failed:`, err);

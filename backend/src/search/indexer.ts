@@ -22,7 +22,10 @@ import { listSessions } from "../sessions.js";
 import { getSearchDb, SCHEMA_VERSION } from "./db.js";
 import { isSessionIndexable } from "./policy-filter.js";
 import { chunkJsonlFile, type MetaForChunker } from "./chunker.js";
-import { writeDreamPolicyProjection } from "./policy-projection.js";
+import {
+  DreamPolicyProjectionUnavailableError,
+  ensureDreamPolicyProjection,
+} from "./policy-projection.js";
 import { invalidateTranscriptPaginationSession } from "../transcript-pagination/service.js";
 import { getStructuralTranscriptIndex } from "../transcript-pagination/structural-index.js";
 
@@ -158,9 +161,10 @@ async function indexSessionAttempt(
   }
   const expectedMetadata = indexMetadataProjection(row);
 
-  // Publish the current complete path decision before this background path can
-  // touch transcript metadata. Unknown paths remain denied by the Dream runner.
-  writeDreamPolicyProjection();
+  // Ensure the current complete path decision is durably published before
+  // this background path can touch transcript metadata. Unchanged store/policy
+  // state reuses the exact in-process publication; unknown paths remain denied.
+  ensureDreamPolicyProjection();
 
   // Authorization precedes search DB lookup, transcript stat/read, and the
   // unchanged shortcut. Denial removes stale indexed content.
@@ -467,6 +471,9 @@ export function purgePolicyDeniedSessions(): { purged: number; errors: number } 
 export async function reindexAll(options: IndexerOptions = {}): Promise<IndexBatchSummary> {
   const start = Date.now();
   const sessions = listSessions(true); // include archived
+  // A missing/unsafe/unwritable projection is one batch-global prerequisite
+  // failure, not a per-session error to retry across the whole corpus.
+  ensureDreamPolicyProjection();
   let indexed = 0;
   let skipped = 0;
   let errors = 0;
@@ -477,6 +484,7 @@ export async function reindexAll(options: IndexerOptions = {}): Promise<IndexBat
       else indexed++;
       if (r.error) errors++;
     } catch (err) {
+      if (err instanceof DreamPolicyProjectionUnavailableError) throw err;
       errors++;
       console.error(`[search] indexSession(${s.id}) failed:`, err);
     }

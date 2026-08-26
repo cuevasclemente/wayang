@@ -5,9 +5,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createAgentProfile } from "../agent-profiles.js";
 import { close, flush, getStore, init } from "../db.js";
+import { notifyPolicyChanged } from "../policy.js";
 import { createProject } from "../projects.js";
 import { createSession, updatePiSessionFile } from "../sessions.js";
 import {
+  ensureDreamPolicyProjection,
   getDreamPolicyProjectionPath,
   startDreamPolicyProjection,
   stopDreamPolicyProjection,
@@ -72,9 +74,27 @@ test("Dream policy projection is atomic, private, complete, and metadata-only", 
     assert.equal(projection.sessions.find((entry) => entry.session_id === privateSession.id)?.agent_profile_id, privateProfile.id);
     assert.equal(projection.sessions.find((entry) => entry.session_id === legacyPrivateStandard.id)?.dream, false);
 
-    const serialized = fs.readFileSync(getDreamPolicyProjectionPath(), "utf8");
+    const projectionPath = getDreamPolicyProjectionPath();
+    const serialized = fs.readFileSync(projectionPath, "utf8");
     const durable = JSON.parse(serialized) as typeof projection;
     assert.deepEqual(durable, projection);
+    const unchangedStat = fs.statSync(projectionPath);
+    assert.strictEqual(ensureDreamPolicyProjection(), projection,
+      "ensure-current should reuse the exact in-process durable publication");
+    assert.equal(fs.statSync(projectionPath).ino, unchangedStat.ino);
+
+    fs.chmodSync(projectionPath, 0o644);
+    ensureDreamPolicyProjection();
+    const repairedStat = fs.statSync(projectionPath);
+    assert.notEqual(repairedStat.ino, unchangedStat.ino,
+      "a replaced or permission-changed projection must be republished");
+    if (process.platform !== "win32") assert.equal(repairedStat.mode & 0o777, 0o600);
+
+    notifyPolicyChanged();
+    const refreshedGeneration = ensureDreamPolicyProjection();
+    assert.ok(refreshedGeneration.generation > projection.generation);
+    assert.notEqual(fs.statSync(projectionPath).ino, repairedStat.ino,
+      "a policy-generation change must force a fresh atomic publication");
     assert.doesNotMatch(serialized, /TRANSCRIPT_CANARY/);
     assert.deepEqual(fs.readdirSync(root).filter((name) => name.includes("project-access-policy.json.")), []);
     if (process.platform !== "win32") {

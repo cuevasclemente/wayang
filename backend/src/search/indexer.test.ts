@@ -19,12 +19,14 @@ process.env.PI_CODING_AGENT_SESSION_DIR = piSessionsRoot;
 // Import after env is set so getConfig() reads the temp dir.
 const dbMod = await import("../db.js");
 const projectsMod = await import("../projects.js");
+const policyMod = await import("../policy.js");
 const sessionsMod = await import("../sessions.js");
 const agentProfilesMod = await import("../agent-profiles.js");
 const searchRouteMod = await import("../routes/search.js");
 const searchDbMod = await import("./db.js");
 const indexerMod = await import("./indexer.js");
 const policyFilterMod = await import("./policy-filter.js");
+const policyProjectionMod = await import("./policy-projection.js");
 const searchMod = await import("./search.js");
 const watcherMod = await import("./watcher.js");
 const transcriptIndexMod = await import("../transcript-pagination/structural-index.js");
@@ -63,11 +65,12 @@ function seedSession(opts: {
   title: string;
   goal?: string;
   archived?: boolean;
+  cwd?: string;
   transcript: Array<{ role: "user" | "assistant"; text: string; id?: string }>;
 }): string {
   const store = dbMod.getStore();
   const id = `sess-${store.sessions.length + 1}`;
-  const cwd = path.join(tmpRoot, `proj-${id}`);
+  const cwd = opts.cwd ?? path.join(tmpRoot, `proj-${id}`);
   fs.mkdirSync(cwd, { recursive: true });
   const { project } = projectsMod.ensureProjectForCwd(cwd);
   const file = writeFixture(id, project.cwd, opts.transcript);
@@ -111,9 +114,122 @@ test("indexer is idempotent when mtime is unchanged", async () => {
   const first = await indexerMod.indexSession(id);
   assert.equal(first.skipped, false);
   assert.ok(first.chunkCount >= 1);
+  const projectionPath = policyProjectionMod.getDreamPolicyProjectionPath();
+  const projectionAfterFirst = fs.statSync(projectionPath);
 
   const second = await indexerMod.indexSession(id);
   assert.equal(second.skipped, true);
+  const projectionAfterSecond = fs.statSync(projectionPath);
+  assert.equal(projectionAfterSecond.ino, projectionAfterFirst.ino,
+    "an unchanged store/policy must reuse the exact durable projection inode");
+  assert.equal(projectionAfterSecond.mtimeMs, projectionAfterFirst.mtimeMs);
+});
+
+test("store replacement publishes a newly added Standard-session decision before indexing", async () => {
+  const baselineId = seedSession({
+    title: "Projection baseline",
+    transcript: [{ role: "user", text: "synthetic projection baseline" }],
+  });
+  const baselineCwd = dbMod.getStore().sessions.find((session) => session.id === baselineId)!.cwd;
+  policyProjectionMod.writeDreamPolicyProjection();
+  const projectionPath = policyProjectionMod.getDreamPolicyProjectionPath();
+  const before = fs.statSync(projectionPath);
+  const sourceBefore = JSON.parse(fs.readFileSync(projectionPath, "utf8"))
+    .source_store as { ino: number };
+
+  const generationBefore = policyMod.getPolicyGeneration();
+  const addedId = seedSession({
+    title: "Projection invalidation",
+    cwd: baselineCwd,
+    transcript: [{ role: "user", text: "synthetic projection invalidation canary" }],
+  });
+  assert.equal(policyMod.getPolicyGeneration(), generationBefore,
+    "adding a session in the same Standard project must isolate store-fingerprint invalidation");
+  const beforeDecision = JSON.parse(fs.readFileSync(projectionPath, "utf8")) as {
+    sessions: Array<{ session_id: string }>;
+  };
+  assert.equal(beforeDecision.sessions.some((entry) => entry.session_id === addedId), false);
+
+  const indexed = await indexerMod.indexSession(addedId, { force: true });
+  assert.equal(indexed.skipped, false);
+  const after = fs.statSync(projectionPath);
+  const durable = JSON.parse(fs.readFileSync(projectionPath, "utf8")) as {
+    source_store: { ino: number };
+    sessions: Array<{ session_id: string; dream: boolean }>;
+  };
+  assert.notEqual(after.ino, before.ino,
+    "atomic store replacement must force a fresh durable projection publication");
+  assert.notEqual(durable.source_store.ino, sourceBefore.ino);
+  const addedDecision = durable.sessions.find((entry) => entry.session_id === addedId);
+  assert.ok(addedDecision);
+  assert.equal(addedDecision.dream, true);
+});
+
+test("full unchanged reindex reuses one exact durable projection", async () => {
+  seedSession({
+    title: "Projection batch reuse one",
+    transcript: [{ role: "user", text: "synthetic projection batch one" }],
+  });
+  seedSession({
+    title: "Projection batch reuse two",
+    transcript: [{ role: "assistant", text: "synthetic projection batch two" }],
+  });
+  policyProjectionMod.writeDreamPolicyProjection();
+  const projectionPath = policyProjectionMod.getDreamPolicyProjectionPath();
+  const before = fs.statSync(projectionPath);
+  const summary = await indexerMod.reindexAll();
+  assert.ok(summary.total >= 2);
+  assert.equal(summary.errors, 0);
+  assert.equal(fs.statSync(projectionPath).ino, before.ino,
+    "an unchanged full-corpus pass must not replace the durable projection");
+});
+
+test("full reindex aborts once when the projection cannot be published", async () => {
+  const id = seedSession({
+    title: "Projection publication failure",
+    transcript: [{ role: "user", text: "synthetic unavailable projection canary" }],
+  });
+  const projectionPath = policyProjectionMod.getDreamPolicyProjectionPath();
+  fs.rmSync(projectionPath, { force: true });
+  fs.mkdirSync(projectionPath);
+  try {
+    await assert.rejects(
+      indexerMod.reindexAll({ force: true }),
+      (error: unknown) => error instanceof policyProjectionMod.DreamPolicyProjectionUnavailableError,
+    );
+    const db = searchDbMod.getSearchDb();
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?").get(id) as { n: number }).n, 0);
+  } finally {
+    fs.rmdirSync(projectionPath);
+    policyProjectionMod.writeDreamPolicyProjection();
+  }
+});
+
+test("periodic watcher tick aborts on the first global projection failure", async () => {
+  const firstId = seedSession({
+    title: "Watcher projection failure one",
+    transcript: [{ role: "user", text: "synthetic watcher failure one" }],
+  });
+  const secondId = seedSession({
+    title: "Watcher projection failure two",
+    transcript: [{ role: "assistant", text: "synthetic watcher failure two" }],
+  });
+  const projectionPath = policyProjectionMod.getDreamPolicyProjectionPath();
+  fs.rmSync(projectionPath, { force: true });
+  fs.mkdirSync(projectionPath);
+  try {
+    await assert.rejects(
+      watcherMod.runWatcherTickForTests(),
+      (error: unknown) => error instanceof policyProjectionMod.DreamPolicyProjectionUnavailableError,
+    );
+    const db = searchDbMod.getSearchDb();
+    for (const id of [firstId, secondId]) {
+      assert.equal((db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?").get(id) as { n: number }).n, 0);
+    }
+  } finally {
+    fs.rmdirSync(projectionPath);
+    policyProjectionMod.writeDreamPolicyProjection();
+  }
 });
 
 test("FTS search returns a session by transcript content", async () => {
