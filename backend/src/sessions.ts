@@ -321,7 +321,7 @@ export function notifySessionSummaryProjectionChanged(): void {
 
 function markDirectMutation(row: SessionRow, triggerScan = false): void {
   incrementDirectMutation(row);
-  publishDirectMutation(triggerScan);
+  publishDirectMutation(triggerScan && isSessionCatalogBackgroundSyncEnabled());
 }
 
 function classifyCatalogDurableSessionInStore(
@@ -549,7 +549,19 @@ function getSessionCatalog(): SessionCatalog {
   return sessionCatalog;
 }
 
+export function isSessionCatalogBackgroundSyncEnabled(
+  value = process.env.WAYANG_SESSION_CATALOG_BACKGROUND_SYNC,
+): boolean {
+  if (value === undefined || value === "" || value === "1") return true;
+  if (value === "0") return false;
+  throw new Error("WAYANG_SESSION_CATALOG_BACKGROUND_SYNC must be 0 or 1");
+}
+
 export function startSessionCatalog(): void {
+  if (!isSessionCatalogBackgroundSyncEnabled()) {
+    console.warn("[session-catalog] background synchronization paused by WAYANG_SESSION_CATALOG_BACKGROUND_SYNC=0");
+    return;
+  }
   if (process.env.WAYANG_LEGACY_SESSION_SCAN === "1") {
     if (legacyCatalogTimer) return;
     void legacySyncPiSessionFiles().catch((error) => console.error("[sessions] legacy startup scan failed", error));
@@ -574,12 +586,36 @@ export function getSessionCatalogGeneration(): number {
   return sessionCatalog?.getGeneration() ?? 1;
 }
 
+export function getSessionCatalogStatus(): {
+  background_sync_enabled: boolean;
+  mode: "paused" | "legacy" | "incremental";
+  instantiated: boolean;
+  started: boolean;
+  scan_running: boolean;
+  watcher_count: number;
+  last_completed_at: number | null;
+  last_error: "scan_failed" | null;
+} {
+  const enabled = isSessionCatalogBackgroundSyncEnabled();
+  const status = sessionCatalog?.getStatus();
+  return {
+    background_sync_enabled: enabled,
+    mode: !enabled ? "paused" : process.env.WAYANG_LEGACY_SESSION_SCAN === "1" ? "legacy" : "incremental",
+    instantiated: sessionCatalog !== null,
+    started: status?.started ?? false,
+    scan_running: status?.scanRunning ?? false,
+    watcher_count: status?.watcherCount ?? 0,
+    last_completed_at: status?.lastCompletedAt ?? null,
+    last_error: status?.lastError ?? null,
+  };
+}
+
 export function onSessionCatalogGeneration(listener: (generation: number) => void): () => void {
   return getSessionCatalog().onGeneration(listener);
 }
 
 export function requestSessionCatalogScan(reason = "internal-write"): void {
-  if (process.env.WAYANG_LEGACY_SESSION_SCAN === "1") return;
+  if (!isSessionCatalogBackgroundSyncEnabled() || process.env.WAYANG_LEGACY_SESSION_SCAN === "1") return;
   getSessionCatalog().requestScan(reason, 0);
 }
 
@@ -775,6 +811,7 @@ async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
 }
 
 export function syncPiSessionFilesInBackground(force = false): Promise<SyncPiSessionFilesResult | null> | null {
+  if (!isSessionCatalogBackgroundSyncEnabled()) return null;
   if (process.env.WAYANG_LEGACY_SESSION_SCAN !== "1") {
     getSessionCatalog().requestScan(force ? "forced-background" : "background", force ? 0 : BACKGROUND_SYNC_START_DELAY_MS);
     return null;

@@ -37,8 +37,9 @@ dbMod.init();
 test("background search indexing pause is explicit and fail-safe", () => {
   assert.equal(watcherMod.isSearchBackgroundIndexingEnabled(undefined), true);
   assert.equal(watcherMod.isSearchBackgroundIndexingEnabled("1"), true);
-  assert.equal(watcherMod.isSearchBackgroundIndexingEnabled("true"), true);
   assert.equal(watcherMod.isSearchBackgroundIndexingEnabled("0"), false);
+  assert.throws(() => watcherMod.isSearchBackgroundIndexingEnabled("true"), /must be 0 or 1/);
+  assert.throws(() => watcherMod.isSearchBackgroundIndexingEnabled("off"), /must be 0 or 1/);
 });
 
 test("paused watcher work preserves policy refresh while suppressing transcript indexing", async () => {

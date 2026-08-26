@@ -173,6 +173,7 @@ export class SessionCatalog {
   private lastCompletedAt = 0;
   private pendingScan = false;
   private started = false;
+  private lastError: "scan_failed" | null = null;
 
   constructor(
     private readonly adapter: SessionCatalogAdapter,
@@ -182,6 +183,22 @@ export class SessionCatalog {
 
   getGeneration(): number {
     return this.generation;
+  }
+
+  getStatus(): {
+    started: boolean;
+    scanRunning: boolean;
+    watcherCount: number;
+    lastCompletedAt: number | null;
+    lastError: "scan_failed" | null;
+  } {
+    return {
+      started: this.started,
+      scanRunning: this.scanInFlight !== null,
+      watcherCount: this.watchers.size,
+      lastCompletedAt: this.lastCompletedAt > 0 ? this.lastCompletedAt : null,
+      lastError: this.lastError,
+    };
   }
 
   onGeneration(listener: (generation: number) => void): () => void {
@@ -216,6 +233,7 @@ export class SessionCatalog {
   }
 
   requestScan(_reason = "internal", minimumDelayMs = WATCH_DEBOUNCE_MS): void {
+    if (!this.started) return;
     this.pendingScan = true;
     if (this.scanInFlight || this.scanTimer) return;
     const cooldownRemaining = Math.max(0, this.lastCompletedAt + COMPLETION_COOLDOWN_MS - Date.now());
@@ -234,11 +252,20 @@ export class SessionCatalog {
       this.pendingScan = true;
       return this.scanInFlight;
     }
-    this.scanInFlight = this.performScan().finally(() => {
-      this.lastCompletedAt = Date.now();
-      this.scanInFlight = null;
-      if (this.pendingScan && this.started) this.requestScan("coalesced");
-    });
+    this.scanInFlight = this.performScan()
+      .then((result) => {
+        this.lastError = null;
+        return result;
+      })
+      .catch((error) => {
+        this.lastError = "scan_failed";
+        throw error;
+      })
+      .finally(() => {
+        this.lastCompletedAt = Date.now();
+        this.scanInFlight = null;
+        if (this.pendingScan && this.started) this.requestScan("coalesced");
+      });
     return this.scanInFlight;
   }
 
@@ -248,7 +275,9 @@ export class SessionCatalog {
     const enumerateStartedAt = performance.now();
     const discovered = await enumerateCanonicalFiles(this.root);
     recordLatencyMetric("catalog_enumerate_ms", performance.now() - enumerateStartedAt);
-    this.refreshWatchers(discovered);
+    // Explicit manual import on an administratively paused/unstarted catalog
+    // is one-shot and must never install persistent filesystem watchers.
+    if (this.started) this.refreshWatchers(discovered);
 
     const changed: Array<{ filePath: string; fingerprint: FileFingerprint }> = [];
     for (const [filePath, fingerprint] of discovered) {

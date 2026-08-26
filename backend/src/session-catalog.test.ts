@@ -73,6 +73,15 @@ test("incremental catalog parses classified changed files once and unchanged sca
     const changed = await catalog.scan();
     assert.equal(changed.parsed, 1);
     assert.equal(state.commits.at(-1)?.parsed[0]?.metadata.model, "fixture-b");
+    assert.equal(catalog.getStatus().started, false);
+    assert.equal(catalog.getStatus().watcherCount, 0,
+      "one-shot manual scan must not install persistent filesystem watchers");
+
+    const commitsBeforeLaterWrite = state.commits.length;
+    fs.appendFileSync(file, "\n");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(state.commits.length, commitsBeforeLaterWrite,
+      "later file changes must not reactivate an unstarted catalog");
   } finally {
     await catalog.stop();
     fs.rmSync(root, { recursive: true, force: true });

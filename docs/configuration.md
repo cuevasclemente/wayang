@@ -323,9 +323,11 @@ TTS is disabled unless a service URL is configured.
 
 Treat remote TTS as a data disclosure boundary: assistant text is sent to the configured service. Keep local URLs loopback-only unless the service has its own reviewed transport security.
 
-## Search background indexing
+## Transcript background maintenance
 
-Automatic session-search backfill and changed-session indexing are enabled by default. Set `WAYANG_SEARCH_BACKGROUND_INDEXING=0` only as a reversible maintenance measure when background indexing is harming service availability. After a restart, existing `search.db` results remain readable, but new or changed transcripts are not indexed automatically and search health reports the paused state. Explicit authenticated manual reindex requests remain available. Remove the override and restart Wayang to resume normal indexing; canonical Pi transcripts are never changed by this switch.
+Automatic session-search backfill and changed-session indexing are enabled by default. Set `WAYANG_SEARCH_BACKGROUND_INDEXING=0` only as a reversible maintenance measure when background indexing is harming service availability. After a restart, existing `search.db` results remain readable, but new or changed transcripts are not indexed automatically and search health reports the paused state. Explicit authenticated manual reindex requests remain available.
+
+Automatic discovery and metadata refresh for externally created or changed Pi sessions are also enabled by default. Set `WAYANG_SESSION_CATALOG_BACKGROUND_SYNC=0` to pause the startup scan, filesystem-watch/safety scans, and request-triggered background scans. Existing Wayang catalog rows and Wayang-created sessions remain available, but external Pi/TUI session changes remain stale until an authenticated `POST /api/sessions/import` is requested or the pause is removed. One-shot manual import does not install watchers while paused. `GET /api/sessions/catalog/health` reports the effective mode, scan state, watcher count, last completion, and a fixed bounded error code. Remove either override and restart Wayang to resume its corresponding background work; neither switch changes canonical Pi transcripts. Canonical-mutation recovery still runs before these background services and is not disabled by either maintenance switch.
 
 ## Data locations
 

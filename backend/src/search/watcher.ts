@@ -42,7 +42,9 @@ const POLICY_PURGE_ERROR = "Denied search-index purge is unavailable";
 export function isSearchBackgroundIndexingEnabled(
   value = process.env.WAYANG_SEARCH_BACKGROUND_INDEXING,
 ): boolean {
-  return value !== "0";
+  if (value === undefined || value === "" || value === "1") return true;
+  if (value === "0") return false;
+  throw new Error("WAYANG_SEARCH_BACKGROUND_INDEXING must be 0 or 1");
 }
 
 export function refreshSearchPolicyProjection(
@@ -74,7 +76,7 @@ export function runPausedPolicyHeartbeat(
   try {
     const result = purgeDenied();
     if (result.errors > 0) lastError = `Policy purge failed for ${result.errors} session(s)`;
-    else if (lastError === POLICY_PURGE_ERROR) lastError = null;
+    else if (lastError === POLICY_PURGE_ERROR || lastError?.startsWith("Policy purge failed for ")) lastError = null;
   } catch {
     lastError = POLICY_PURGE_ERROR;
     console.error("[search] paused denied-index purge remains unavailable");

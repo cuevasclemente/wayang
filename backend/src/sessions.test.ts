@@ -30,6 +30,7 @@ import {
   deleteSession,
   getSessionById,
   isLegacyPrivateSessionQuarantined,
+  isSessionCatalogBackgroundSyncEnabled,
   listSessions,
   markSessionTranscriptMutated,
   normalizeSessionCwd,
@@ -54,6 +55,14 @@ process.env.WAYANG_LEGACY_SESSION_SCAN = "1";
 after(() => {
   if (previousLegacyScan === undefined) delete process.env.WAYANG_LEGACY_SESSION_SCAN;
   else process.env.WAYANG_LEGACY_SESSION_SCAN = previousLegacyScan;
+});
+
+test("session catalog background synchronization pause is explicit and fail-safe", () => {
+  assert.equal(isSessionCatalogBackgroundSyncEnabled(undefined), true);
+  assert.equal(isSessionCatalogBackgroundSyncEnabled("1"), true);
+  assert.equal(isSessionCatalogBackgroundSyncEnabled("0"), false);
+  assert.throws(() => isSessionCatalogBackgroundSyncEnabled("true"), /must be 0 or 1/);
+  assert.throws(() => isSessionCatalogBackgroundSyncEnabled("off"), /must be 0 or 1/);
 });
 
 test("every supported pre-title-provenance schema classifies blank titles as provisional", () => {

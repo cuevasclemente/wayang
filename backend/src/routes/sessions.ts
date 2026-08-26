@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { createSession, listSessions, syncPiSessionFiles, persistManualSessionTitle, archiveSession, deleteSession, getSessionById, updateGoal, getSessionCatalogGeneration, onSessionCatalogGeneration, validateManualSessionTitle, type SessionRow } from "../sessions.js";
+import { createSession, listSessions, syncPiSessionFiles, persistManualSessionTitle, archiveSession, deleteSession, getSessionById, updateGoal, getSessionCatalogGeneration, getSessionCatalogStatus, onSessionCatalogGeneration, validateManualSessionTitle, type SessionRow } from "../sessions.js";
 import { classifyAssistantErrorKind, getPiSession, getPiSessionBashMode, getPiSessionBrowserAgentDiagnostic, getPiSessionBrowserMode, getPiSessionRuntimeState, listModels, listSlashCommands, previewSessionAgentSwitch, setSessionDefaultModel, setSessionModel, stopPiSession, switchSessionAgent } from "../pi-bridge.js";
 import {
   indexSession as forceIndexSession,
@@ -68,6 +68,11 @@ router.get("/sessions", (_req: Request, res: Response) => {
   } catch (err) {
     res.status(500).json({ error: String(err) });
   }
+});
+
+router.get("/sessions/catalog/health", (_req: Request, res: Response) => {
+  try { res.json(getSessionCatalogStatus()); }
+  catch { res.status(500).json({ error: "Session catalog status is unavailable" }); }
 });
 
 router.get("/sessions/events", (req: Request, res: Response) => {
