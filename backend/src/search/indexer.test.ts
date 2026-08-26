@@ -63,12 +63,7 @@ test("paused watcher work preserves policy refresh while suppressing transcript 
     await watcherMod.indexSessionNow("paused-synthetic-session", fakeIndex);
     assert.equal(calls, 0);
     let projectionAttempts = 0;
-    let purges = 0;
-    const fakePurge = () => {
-      purges++;
-      return { purged: 0, errors: 0 };
-    };
-    watcherMod.runPausedPolicyHeartbeat(fakePurge, () => {
+    watcherMod.runPausedPolicyHeartbeat(() => {
       projectionAttempts++;
       throw new Error("synthetic projection outage");
     });
@@ -77,18 +72,16 @@ test("paused watcher work preserves policy refresh while suppressing transcript 
     assert.equal(health.watcher.policy_projection_available, false);
     assert.equal(health.last_error, "Dream policy projection is unavailable");
 
-    watcherMod.runPausedPolicyHeartbeat(fakePurge, () => {
+    watcherMod.runPausedPolicyHeartbeat(() => {
       projectionAttempts++;
       return undefined;
     });
     health = searchRouteMod.getSearchHealthSnapshot();
     assert.equal(projectionAttempts, 2);
-    assert.equal(purges, 2, "paused policy heartbeat must retain denial purge");
     assert.equal(health.watcher.policy_projection_available, true);
     assert.equal(health.last_error, undefined);
 
     assert.doesNotThrow(() => watcherMod.runPausedPolicyHeartbeat(
-      fakePurge,
       () => undefined,
       () => { throw new Error("synthetic generation failure"); },
     ));
@@ -96,15 +89,7 @@ test("paused watcher work preserves policy refresh while suppressing transcript 
     assert.equal(health.watcher.policy_projection_available, false);
     assert.equal(health.last_error, "Dream policy projection is unavailable");
 
-    assert.doesNotThrow(() => watcherMod.runPausedPolicyHeartbeat(
-      () => { throw new Error("synthetic purge failure"); },
-      () => undefined,
-      () => undefined,
-    ));
-    health = searchRouteMod.getSearchHealthSnapshot();
-    assert.equal(health.last_error, "Denied search-index purge is unavailable");
-
-    watcherMod.runPausedPolicyHeartbeat(fakePurge, () => undefined, () => undefined);
+    watcherMod.runPausedPolicyHeartbeat(() => undefined, () => undefined);
     health = searchRouteMod.getSearchHealthSnapshot();
     assert.equal(health.watcher.policy_projection_available, true);
     assert.equal(health.last_error, undefined);
@@ -569,13 +554,21 @@ test("standard allowlist live-filters stale profile chunks from query, facets, a
   assert.equal(health.indexed_sessions, states.filter((state) => authorizedIds.has(state.session_id)).length);
   assert.ok(states.some((state) => state.session_id === id), "stale denied state must exist for the health filter assertion");
 
-  // Restore access, start the watcher, then tighten again. The central policy
-  // notification must synchronously purge the now-disallowed standard session.
+  // A no-change paused heartbeat must not exact-authorize the whole corpus or
+  // physically purge this stale row. Query-time authorization already hid it.
+  watcherMod.runPausedPolicyHeartbeat();
+  assert.ok((db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id = ?").get(id) as { n: number }).n > 0);
+  assert.ok(db.prepare("SELECT session_id FROM session_index_state WHERE session_id = ?").get(id));
+
+  // Restore access, start the paused watcher, then tighten again. An actual
+  // policy notification must still synchronously purge the disallowed session.
   projectsMod.updateProject(project.id, {
     default_agent_profile_id: originalProfileId,
     access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: null },
   });
   assert.ok(searchMod.runSearch("quokka allowlist").results.some((result) => result.session_id === id));
+  const previousPause = process.env.WAYANG_SEARCH_BACKGROUND_INDEXING;
+  process.env.WAYANG_SEARCH_BACKGROUND_INDEXING = "0";
   watcherMod.startWatcher();
   try {
     projectsMod.updateProject(project.id, {
@@ -586,6 +579,8 @@ test("standard allowlist live-filters stale profile chunks from query, facets, a
     assert.equal((db.prepare("SELECT COUNT(*) AS n FROM session_index_state WHERE session_id = ?").get(id) as { n: number }).n, 0);
   } finally {
     watcherMod.stopWatcher();
+    if (previousPause === undefined) delete process.env.WAYANG_SEARCH_BACKGROUND_INDEXING;
+    else process.env.WAYANG_SEARCH_BACKGROUND_INDEXING = previousPause;
   }
 });
 

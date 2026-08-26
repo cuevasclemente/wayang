@@ -47,7 +47,9 @@ The first reviewed commit (`bc52181`) was fast-forwarded into clean canonical `m
 
 That deployment exposed a second, narrower availability defect: the unchanged-session loop repeatedly awaited already-resolved promises, remaining in the microtask queue and delaying HTTP even though projection I/O was fixed. `/api/auth/status` eventually returned 200 but took about 2.0 seconds during the pass. The event-loop yield change and deterministic regression were then added; focused tests remained 23/23, backend build passed, and independent security delta review returned GO.
 
-Final restart and production responsiveness measurements are pending this journal update.
+A reversible maintenance deployment then set both `WAYANG_SEARCH_BACKGROUND_INDEXING=0` and `WAYANG_SESSION_CATALOG_BACKGROUND_SYNC=0`. Startup confirmed both paths paused, but HTTP again accepted connections without returning bytes. The child remained near 29% CPU in FUSE requests. The remaining cause was the paused search heartbeat: every 30 seconds it synchronously called `purgePolicyDeniedSessions()`, which exact-authorized every transcript. On this corpus each purge took longer than the interval, so queued heartbeats continuously starved the event loop.
+
+The emergency follow-up removes only that unconditional no-change purge from the paused heartbeat. Projection freshness checks continue every 30 seconds without transcript reads. Actual policy-generation changes retain the existing immediate `onPolicyChanged` purge, and search query-time exact authorization independently hides denied stale rows before purge completion. Focused validation, independent review, deployment, and production responsiveness measurements are pending this journal update.
 
 ## Rollback
 

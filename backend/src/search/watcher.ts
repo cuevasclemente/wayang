@@ -37,7 +37,6 @@ let started = false;
 let backgroundIndexingEnabled = isSearchBackgroundIndexingEnabled();
 let policyProjectionAvailable = false;
 const POLICY_PROJECTION_ERROR = "Dream policy projection is unavailable";
-const POLICY_PURGE_ERROR = "Denied search-index purge is unavailable";
 
 export function isSearchBackgroundIndexingEnabled(
   value = process.env.WAYANG_SEARCH_BACKGROUND_INDEXING,
@@ -65,21 +64,12 @@ export function refreshSearchPolicyProjection(
 }
 
 export function runPausedPolicyHeartbeat(
-  purgeDenied: typeof purgePolicyDeniedSessions = purgePolicyDeniedSessions,
   ensureProjection: () => unknown = ensureDreamPolicyProjection,
   refreshGeneration: () => unknown = getPolicyGeneration,
 ): void {
   lastTickAt = Date.now();
   if (!refreshSearchPolicyProjection(ensureProjection, refreshGeneration)) {
     console.error("[search] paused policy projection refresh remains unavailable");
-  }
-  try {
-    const result = purgeDenied();
-    if (result.errors > 0) lastError = `Policy purge failed for ${result.errors} session(s)`;
-    else if (lastError === POLICY_PURGE_ERROR || lastError?.startsWith("Policy purge failed for ")) lastError = null;
-  } catch {
-    lastError = POLICY_PURGE_ERROR;
-    console.error("[search] paused denied-index purge remains unavailable");
   }
 }
 
