@@ -19,12 +19,14 @@ Plan: `docs/plans/2026-08-26-search-backfill-projection-recovery.md`
 - Indexing retains the ensure-current gate on every attempt and CAS retry; exact transcript authorization, mutation fences, file fingerprints, and query-time filtering are unchanged.
 - Projection-publication failures are typed as one global prerequisite failure. Full backfill and periodic watcher ticks abort instead of rebuilding/failing once per pending session.
 - Removed the immediate watcher hook's duplicate unconditional projection write; `indexSession()` owns the freshness boundary.
+- Added an explicit `setImmediate` yield after every completed backfill session so a large unchanged catalog cannot monopolize the microtask queue and starve auth, health, or WebSocket I/O.
 
 ## Tests and review
 
 Focused synthetic tests cover:
 
 - unchanged single-session and full-corpus indexing reuse the exact durable projection inode;
+- a warmed full-corpus pass yields to a scheduled event-loop turn before completing and leaves no projection temp artifacts;
 - a store-only change (new session in the same Standard project, unchanged policy generation) publishes the new `dream: true` decision;
 - policy-generation changes force publication;
 - permission tampering forces a private replacement;
@@ -41,7 +43,11 @@ Validation evidence before deployment:
 
 ## Deployment and production validation
 
-Pending at journal creation. The reviewed commit will be integrated only if canonical `main` remains clean at the expected base, followed by one service restart and direct auth/health/projection-stability measurements.
+The first reviewed commit (`bc52181`) was fast-forwarded into clean canonical `main`, built, and restarted. It eliminated the projection-write storm: the store and projection inode/mtime remained stable and backend writes fell from about 8.6 MiB/s to zero. The one-time startup projection/purge reached the listener after about 67 seconds.
+
+That deployment exposed a second, narrower availability defect: the unchanged-session loop repeatedly awaited already-resolved promises, remaining in the microtask queue and delaying HTTP even though projection I/O was fixed. `/api/auth/status` eventually returned 200 but took about 2.0 seconds during the pass. The event-loop yield change and deterministic regression were then added; focused tests remained 23/23, backend build passed, and independent security delta review returned GO.
+
+Final restart and production responsiveness measurements are pending this journal update.
 
 ## Rollback
 

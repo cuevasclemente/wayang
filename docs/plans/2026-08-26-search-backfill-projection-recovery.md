@@ -50,6 +50,7 @@ This preserves the per-attempt freshness check. It is preferable to publishing o
 - Replace the immediate watcher hook's unconditional write with ensure-current (or rely on the indexer ensure) so a changed store still refreshes while unchanged state does not duplicate work.
 - Keep `startDreamPolicyProjection()` and explicit policy-change refreshes on the durable force-write path.
 - Do not alter exact transcript authorization, policy-generation CAS checks, mutation fences, query-time filtering, or transcript fingerprints.
+- Yield to `setImmediate` after each completed `reindexAll()` session so rapidly resolved unchanged-session promises cannot monopolize the microtask queue and starve HTTP/WebSocket I/O.
 
 ## Tests
 
@@ -57,9 +58,10 @@ Use only synthetic temporary Wayang/Pi roots.
 
 Focused regressions:
 
-1. Publish a projection, index multiple sessions with an unchanged store, and assert the projection inode/source fingerprint remains unchanged. Under the current implementation, atomic rewrite changes the inode and this test fails.
+1. Publish a projection, index multiple sessions with an unchanged store, and assert the projection inode/source fingerprint remains unchanged. Under the original implementation, atomic rewrite changes the inode and this test fails.
 2. Mutate/persist the synthetic store, index again, and assert ensure-current publishes a new projection that contains the new synthetic Standard-session decision.
-3. Preserve existing denial, collision, header mismatch, metadata CAS, mutation-fence, and policy-change tests.
+3. Warm the synthetic catalog, schedule an event-loop turn, run an unchanged full reindex, and assert that turn runs before the catalog loop completes while the projection inode remains stable.
+4. Preserve existing denial, collision, header mismatch, metadata CAS, mutation-fence, and policy-change tests.
 
 Validation commands:
 
@@ -88,7 +90,7 @@ Validation commands:
 - **False cache hit:** mitigated by destination plus inode/size/mtime/ctime and policy-generation comparison. Atomic store replacement changes inode/ctime even when size is unchanged.
 - **Long-batch mutation:** mitigated by retaining ensure-current on every index attempt, including CAS retries.
 - **Cross-test/config reuse:** cache identity includes the current projection destination.
-- **Event-loop cost remains:** one cheap store stat and generation read per attempt remains; transcript parsing/indexing is unchanged and may still be substantial, but the pathological full-projection rebuild/fsync is removed.
+- **Event-loop cost remains:** one cheap store stat and generation read per attempt remains; transcript parsing/indexing is unchanged and may still be substantial, but the pathological full-projection rebuild/fsync is removed and completed sessions yield before the next catalog item.
 
 ## Deferred scope
 

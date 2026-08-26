@@ -488,6 +488,10 @@ export async function reindexAll(options: IndexerOptions = {}): Promise<IndexBat
       errors++;
       console.error(`[search] indexSession(${s.id}) failed:`, err);
     }
+    // Awaiting an already-resolved indexSession promise stays in the microtask
+    // queue. Yield explicitly so a large unchanged backfill cannot starve auth,
+    // health, and WebSocket I/O until the whole catalog has been visited.
+    await new Promise<void>((resolve) => setImmediate(resolve));
   }
   return {
     total: sessions.length,

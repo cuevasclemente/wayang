@@ -165,7 +165,7 @@ test("store replacement publishes a newly added Standard-session decision before
   assert.equal(addedDecision.dream, true);
 });
 
-test("full unchanged reindex reuses one exact durable projection", async () => {
+test("full unchanged reindex reuses one projection and yields to HTTP event-loop work", async () => {
   seedSession({
     title: "Projection batch reuse one",
     transcript: [{ role: "user", text: "synthetic projection batch one" }],
@@ -174,14 +174,27 @@ test("full unchanged reindex reuses one exact durable projection", async () => {
     title: "Projection batch reuse two",
     transcript: [{ role: "assistant", text: "synthetic projection batch two" }],
   });
+  await indexerMod.reindexAll();
   policyProjectionMod.writeDreamPolicyProjection();
   const projectionPath = policyProjectionMod.getDreamPolicyProjectionPath();
   const before = fs.statSync(projectionPath);
+  let ioTurnObserved = false;
+  const ioTurn = new Promise<void>((resolve) => setImmediate(() => {
+    ioTurnObserved = true;
+    resolve();
+  }));
   const summary = await indexerMod.reindexAll();
   assert.ok(summary.total >= 2);
   assert.equal(summary.errors, 0);
+  assert.equal(ioTurnObserved, true,
+    "an unchanged full-corpus pass must yield before completing the catalog loop");
+  await ioTurn;
   assert.equal(fs.statSync(projectionPath).ino, before.ino,
     "an unchanged full-corpus pass must not replace the durable projection");
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(projectionPath)).filter((name) => name.startsWith(`${path.basename(projectionPath)}.`)),
+    [],
+  );
 });
 
 test("full reindex aborts once when the projection cannot be published", async () => {
