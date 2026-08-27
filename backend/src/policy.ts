@@ -60,7 +60,19 @@ export function authorizeProjectAction(options: {
     };
   }
 
-  if (project.access_policy.privacy_mode === "protected" && options.actor !== "interactive") {
+  if (project.access_policy.privacy_mode === "protected"
+    && options.actor === "scheduled" && !options.agentProfileId) {
+    return {
+      allowed: false,
+      code: "agent_not_allowed",
+      reason: "Protected scheduled jobs require an explicit agent profile",
+      project,
+      agentProfile,
+    };
+  }
+
+  if (project.access_policy.privacy_mode === "protected"
+    && options.actor !== "interactive" && options.actor !== "scheduled") {
     return {
       allowed: false,
       code: "protected_actor_denied",
@@ -183,7 +195,7 @@ export function buildProjectPolicyProjection(): ProjectPolicyProjection {
           ? [...project.access_policy.allowed_agent_profile_ids]
           : null,
         dream: !protectedMode,
-        scheduled: !protectedMode,
+        scheduled: true,
         subagents: !protectedMode,
         global_index: !protectedMode,
       };

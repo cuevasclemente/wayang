@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import * as dgram from "node:dgram";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -33,7 +34,7 @@ async function run(
   sessionId: string,
   command: string,
   env: NodeJS.ProcessEnv = process.env,
-  networkMode: SandboxNetworkMode = "allow_all_proxy",
+  networkMode: SandboxNetworkMode = process.platform === "linux" ? "host" : "allow_all_proxy",
 ): Promise<{ code: number | null; output: string }> {
   let output = "";
   const result = await createPolicySandboxedBashOperations(sessionId, { networkMode }).exec(command, process.cwd(), {
@@ -80,6 +81,22 @@ async function listeningUnixServer(root: string): Promise<{ socketPath: string; 
   };
 }
 
+async function listeningUdpServer(): Promise<{ port: number; close: () => Promise<void> }> {
+  const server = dgram.createSocket("udp4");
+  server.on("message", (message, remote) => {
+    if (message.toString("utf8") === "ping") server.send("pong", remote.port, remote.address);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.bind(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  return {
+    port: address.port,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
 async function listeningServer(): Promise<{ port: number; close: () => Promise<void> }> {
   const sockets = new Set<net.Socket>();
   const server = net.createServer((socket) => {
@@ -112,7 +129,7 @@ async function listeningServer(): Promise<{ port: number; close: () => Promise<v
   };
 }
 
-test("per-exec bash sandbox denies protected files and capabilities while allowing proxy-mediated network", { timeout: 60_000 }, async (t) => {
+test("per-exec bash sandbox denies protected files and capabilities under the platform network mode", { timeout: 60_000 }, async (t) => {
   const availability = getBashSandboxAvailability();
   if (!availability.available) {
     t.skip(availability.reason ?? "sandbox unavailable");
@@ -228,7 +245,7 @@ test("per-exec bash sandbox denies protected files and capabilities while allowi
   });
 
   const policy = buildBashSandboxPolicy(source.id);
-  assert.equal(policy.networkMode, "allow_all_proxy");
+  assert.equal(policy.networkMode, process.platform === "linux" ? "host" : "allow_all_proxy");
   assert.deepEqual(policy.config.network.allowedDomains, []);
   assert.deepEqual(policy.config.network.deniedDomains, []);
   assert.equal(policy.config.network.strictAllowlist, false);
@@ -352,9 +369,11 @@ test("actual concurrent sandboxes isolate an allowed Standard project from an un
   const sourceA = createSession(projectA, { agentProfileId: standardProfile.id });
   const sourceB = createSession(projectB, { agentProfileId: protectedProfile.id });
   const loopback = await listeningServer();
+  const udpLoopback = await listeningUdpServer();
 
   t.after(async () => {
     await loopback.close();
+    await udpLoopback.close();
     close();
     if (previousData === undefined) delete process.env.WAYANG_DATA_DIR;
     else process.env.WAYANG_DATA_DIR = previousData;
@@ -380,10 +399,15 @@ test("actual concurrent sandboxes isolate an allowed Standard project from an un
   const aOwn = path.join(projectA, "only-a.txt");
   const bOwn = path.join(projectB, "only-b.txt");
   const standardCommand = `cat ${quote(aOwn)} && test ! -e ${quote(bOwn)} && ${process.platform === "linux" ? "/usr/bin/sleep 3 && " : ""}printf ok > ${quote(path.join(projectA, "a-write.txt"))}`;
-  const protectedCommand = `cat ${quote(bOwn)} && cat ${quote(aOwn)} && test ! -s ${quote(standardEnv)} && (! printf blocked > ${quote(path.join(projectA, "blocked-by-protected.txt"))}) && (/usr/bin/curl --silent --show-error --max-time 5 http://127.0.0.1:${loopback.port}/ | grep -q '^ok$') && printf ok > ${quote(path.join(projectB, "b-write.txt"))}`;
+  const rawTcpScript = `const net=require("node:net");let body="";const s=net.createConnection({host:"127.0.0.1",port:${loopback.port}});s.on("data",d=>body+=d);s.on("end",()=>process.exit(body.endsWith("ok")?0:41));s.on("error",()=>process.exit(42));setTimeout(()=>process.exit(43),3000);`;
+  const rawUdpScript = `const dgram=require("node:dgram");const s=dgram.createSocket("udp4");s.on("message",m=>{s.close();process.exit(m.toString()==="pong"?0:44)});s.on("error",()=>process.exit(45));s.send("ping",${udpLoopback.port},"127.0.0.1");setTimeout(()=>process.exit(46),3000);`;
+  const networkCheck = process.platform === "linux"
+    ? `test -z "\${HTTP_PROXY-}\${HTTPS_PROXY-}\${ALL_PROXY-}\${http_proxy-}\${https_proxy-}\${all_proxy-}" && node -e ${quote(rawTcpScript)} && node -e ${quote(rawUdpScript)}`
+    : `(/usr/bin/curl --silent --show-error --max-time 5 http://127.0.0.1:${loopback.port}/ | grep -q '^ok$')`;
+  const protectedCommand = `cat ${quote(bOwn)} && cat ${quote(aOwn)} && test ! -s ${quote(standardEnv)} && (! printf blocked > ${quote(path.join(projectA, "blocked-by-protected.txt"))}) && ${networkCheck} && (/usr/bin/curl --silent --show-error --max-time 5 http://127.0.0.1:${loopback.port}/ | grep -q '^ok$') && printf ok > ${quote(path.join(projectB, "b-write.txt"))}`;
   const standardRun = run(sourceA.id, standardCommand);
   if (process.platform === "linux") {
-    for (let attempt = 0; attempt < 200 && !fs.existsSync(missingStandardEnvBackup); attempt += 1) {
+    for (let attempt = 0; attempt < 800 && !fs.existsSync(missingStandardEnvBackup); attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(fs.existsSync(missingStandardEnvBackup), true, "Standard SRT helper should hold its synthetic denyWrite mountpoint");

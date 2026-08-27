@@ -1123,7 +1123,7 @@ function ScheduledJobsSection({ jobs, projects, activeJobId, onSelectJob }: {
         <div className="mt-1">
           {safeJobs.slice(0, 8).map((job) => {
             const cwd = job.cwd.replace(/\/+$/, "") || "/";
-            const blocked = projects.some((project) => (
+            const protectedProject = projects.some((project) => (
               (project.cwd.replace(/\/+$/, "") || "/") === cwd
               && project.access_policy.privacy_mode === "protected"
             ));
@@ -1136,12 +1136,12 @@ function ScheduledJobsSection({ jobs, projects, activeJobId, onSelectJob }: {
                   "block w-full px-3 py-1.5 text-left transition-colors " +
                   (job.id === activeJobId ? "bg-neutral-800 text-neutral-100" : "text-neutral-300 hover:bg-neutral-900")
                 }
-                title={blocked ? "Retained job; cannot run while its project is Protected" : `${job.cron_expr} · ${job.cwd}`}
+                title={protectedProject ? `Protected scheduled job · ${job.cron_expr} · ${job.cwd}` : `${job.cron_expr} · ${job.cwd}`}
               >
                 <div className="flex items-center justify-between gap-2">
                   <span className="truncate text-xs font-medium">{job.name}</span>
-                  <span className={blocked ? "inline-flex items-center gap-0.5 text-[10px] text-amber-400" : job.enabled ? "text-[10px] text-emerald-500" : "text-[10px] text-neutral-600"}>
-                    {blocked && <Lock size={9} />}{blocked ? "blocked" : job.enabled ? "on" : "off"}
+                  <span className={protectedProject ? "inline-flex items-center gap-0.5 text-[10px] text-blue-300" : job.enabled ? "text-[10px] text-emerald-500" : "text-[10px] text-neutral-600"}>
+                    {protectedProject && <Lock size={9} />}{protectedProject ? `protected · ${job.enabled ? "on" : "off"}` : job.enabled ? "on" : "off"}
                   </span>
                 </div>
                 <div className="truncate font-mono text-[10px] text-neutral-600">{job.cron_expr}</div>

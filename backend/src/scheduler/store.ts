@@ -209,6 +209,9 @@ function normalizeNullableString(value: unknown): string | null {
 function requireScheduledAuthorization(cwd: string, agentProfileId: string | null): void {
   const decision = authorizeProjectAction({ cwd, actor: "scheduled", agentProfileId });
   if (!decision.allowed) throw new WorkspaceStoreError(decision.reason ?? "Scheduled project access denied", 403);
+  if (decision.project?.access_policy.privacy_mode === "protected" && agentProfileId === null) {
+    throw new WorkspaceStoreError("Protected scheduled jobs require an explicit agent_profile_id", 403);
+  }
 }
 
 function validateAgentProfileId(value: unknown): string | null {

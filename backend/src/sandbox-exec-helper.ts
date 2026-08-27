@@ -18,9 +18,12 @@ async function run(request: SandboxExecRequest): Promise<number> {
     || typeof request.command !== "string"
     || typeof request.cwd !== "string"
     || !request.config
-    || !["allow_all_proxy", "deny_all"].includes(networkMode)
+    || !["host", "allow_all_proxy", "deny_all"].includes(networkMode)
   ) {
     throw new Error("Invalid sandbox execution request");
+  }
+  if (networkMode === "host" && process.platform !== "linux") {
+    throw new Error("Host-network filesystem sandbox is supported only on Linux");
   }
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-bash-"));
   const config = structuredClone(request.config);
@@ -28,21 +31,35 @@ async function run(request: SandboxExecRequest): Promise<number> {
   process.env.CLAUDE_CODE_TMPDIR = tempDir;
 
   try {
-    // Production Wayang uses allow_all_proxy: its project boundary is
-    // filesystem- and workflow-oriented rather than a destination allowlist.
-    // deny_all is retained for fail-closed live-upgrade compatibility.
+    // Initialize SRT so its filesystem and credential policy is prepared.
+    // Production host mode then uses SRT's live config update to remove the
+    // allowlist field entirely. SRT interprets an absent allowedDomains field
+    // as no network restriction, so Bubblewrap retains the host network
+    // namespace while filesystem/PID/seccomp controls remain active.
     await SandboxManager.initialize(
       config,
       networkMode === "allow_all_proxy" ? async () => true : undefined,
     );
-    // SRT deliberately places loopback in NO_PROXY. In Wayang's selected
-    // allow-all mode that would bypass the host proxy and target the empty
-    // sandbox namespace instead. Clear both conventional spellings inside the
-    // command shell so loopback/LAN/public destinations all use proxy egress.
+    if (networkMode === "host") {
+      const hostConfig = structuredClone(config);
+      Reflect.deleteProperty(hostConfig.network, "allowedDomains");
+      SandboxManager.updateConfig(hostConfig);
+    }
+    // SRT deliberately places loopback in NO_PROXY for proxy mode. Clear both
+    // spellings there so loopback/LAN/public destinations use proxy egress.
+    // Host mode receives no proxy variables because the helper's strict child
+    // environment excludes ambient deployment proxy settings.
     const command = networkMode === "allow_all_proxy"
       ? `export NO_PROXY='' no_proxy='';\n${request.command}`
       : request.command;
     const wrapped = await SandboxManager.wrapWithSandboxArgv(command, "/bin/bash", undefined, undefined, request.cwd);
+    if (networkMode === "host") {
+      const serializedArgv = wrapped.argv.join("\u0000");
+      if (serializedArgv.includes("--unshare-net")
+        || /(?:HTTP|HTTPS|ALL)_PROXY=|(?:http|https|all)_proxy=/.test(serializedArgv)) {
+        throw new Error("Host-network compatibility check failed closed");
+      }
+    }
     const child = spawn(wrapped.argv[0], wrapped.argv.slice(1), {
       cwd: request.cwd,
       env: buildRestrictedSandboxEnv(wrapped.env),
