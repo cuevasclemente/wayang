@@ -652,7 +652,7 @@ test("legacy Wren runtime authorizes provider extension loading before model res
   const project = createProject({ cwd, name: "Legacy Wren provider load", default_agent_profile_id: WREN_AGENT_PROFILE_ID });
   const row = createSession(cwd, {
     provider: "narwhal-horn",
-    model: "qwen3.8-27b",
+    model: "qwen3.8-flash-next",
     agentProfileId: WREN_AGENT_PROFILE_ID,
   });
 
@@ -1662,12 +1662,12 @@ function writeSyntheticNarwhalReviewedExtension(agentDir: string, moduleMarker: 
     '    apiKey: "synthetic-key",',
     '    api: "openai-completions",',
     '    models: [{',
-    '      id: "qwen3.8-27b",',
-    '      name: "Qwen 3.8 27B (UD-Q8_K_XL, Vulkan, experimental 512K)",',
+    '      id: "qwen3.8-flash-next",',
+    '      name: "Qwen 3.8 Flash Next (Unsloth IQ4_XS, ROCm/NVMe, native 262K)",',
     '      reasoning: true,',
     '      input: ["text", "image"],',
     '      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },',
-    '      contextWindow: 524288,',
+    '      contextWindow: 262144,',
     '      maxTokens: 32768,',
     '    }],',
     '  });',
@@ -1685,12 +1685,12 @@ function syntheticReviewedModel(extensionPath?: string) {
     credentialRelativeToHome: "src/mypi/secure_data/ruminant_key",
     model: {
       provider: "narwhal-horn",
-      id: "qwen3.8-27b",
-      name: "Qwen 3.8 27B (UD-Q8_K_XL, Vulkan, experimental 512K)",
+      id: "qwen3.8-flash-next",
+      name: "Qwen 3.8 Flash Next (Unsloth IQ4_XS, ROCm/NVMe, native 262K)",
       api: "openai-completions",
       reasoning: true,
       input: ["text", "image"],
-      contextWindow: 524288,
+      contextWindow: 262144,
     },
   }];
 }
@@ -1715,10 +1715,10 @@ test("listModels statically projects the reviewed Narwhal model without executin
       reviewedExternalModels: syntheticReviewedModel(extensionPath),
     });
     const narwhal = result.models.find(
-      (model) => model.provider === "narwhal-horn" && model.id === "qwen3.8-27b",
+      (model) => model.provider === "narwhal-horn" && model.id === "qwen3.8-flash-next",
     );
     assert.ok(narwhal, "reviewed Narwhal model descriptor must be listed");
-    assert.equal(narwhal?.contextWindow, 524288, "512K experimental tier window must be preserved");
+    assert.equal(narwhal?.contextWindow, 262144, "native Flash-Next context window must be preserved");
     assert.equal(narwhal?.available, true, "configured synthetic key must mark the model available");
     assert.ok(
       !result.error?.includes("Reviewed provider artifact"),

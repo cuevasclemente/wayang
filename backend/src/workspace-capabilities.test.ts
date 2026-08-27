@@ -5,10 +5,13 @@ import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import {
   close,
+  failNextHostExecutionPositiveProjectionForTests,
   flush,
   getStore,
   getWorkspaceCapabilityStoreProjectionPath,
   init,
+  MAX_HOST_EXECUTION_QUESTIONNAIRE_SUBMISSIONS,
+  observeNextHostExecutionProjectionDenialForTests,
   type SessionRow,
 } from "./db.js";
 import { createAgentProfile, deleteAgentProfile, updateAgentProfile } from "./agent-profiles.js";
@@ -22,6 +25,8 @@ import {
   revokeWorkspaceCapabilityAssociation,
 } from "./workspace-capabilities.js";
 import { capabilityPairRuntimeSessionIds } from "./runtime-impact.js";
+import { createOpenInterview, markDelivered, submitInterview } from "./interviews.js";
+import { WAYANG_WEBSOCKET_SUBMISSION_CONTEXT } from "./interview-provenance.js";
 
 let dataDir = "";
 let projectRoot = "";
@@ -59,6 +64,38 @@ function pair(capability_id: "wayang.host-execution.v1" | "wayang.standard-brows
     project_id: project.id,
     agent_profile_id: profile.id,
   } as const;
+}
+
+function syntheticSession(input: {
+  id: string;
+  projectId: string;
+  profileId: string;
+  cwd?: string;
+  quarantined?: boolean;
+}): SessionRow {
+  return {
+    id: input.id,
+    pi_session_file: null,
+    title: `Synthetic ${input.id}`,
+    title_source: "explicit",
+    cwd: input.cwd ?? projectRoot,
+    project_id: input.projectId,
+    provider: "synthetic-provider",
+    model: "synthetic-model",
+    agent_profile_id: input.profileId,
+    pending_agent_switch: null,
+    legacy_private_session_quarantine: input.quarantined ?? false,
+    legacy_capability_ineligible: input.quarantined ?? false,
+    created_at: 1,
+    last_active: 1,
+    archived: 0,
+    archived_at: null,
+    goal: null,
+    goal_status: null,
+    scheduled_job_id: null,
+    scheduled_run_id: null,
+    error: null,
+  };
 }
 
 test("fresh stores contain no capability authority", () => {
@@ -317,6 +354,310 @@ test("pair projection contains association revision and no tuple evidence", () =
   assert.equal(projection.includes("model"), false);
   assert.equal(projection.includes("operation_digest"), false);
   assert.equal(projection.includes("workspaceCapabilityApprovalEvents"), false);
+});
+
+test("host pair projection includes only canonical pair-owned questionnaire submissions and exact provenance", () => {
+  const input = pair();
+  const otherRoot = path.join(projectRoot, "unrelated-project");
+  fs.mkdirSync(otherRoot);
+  const otherProject = createProject({
+    cwd: otherRoot,
+    default_agent_profile_id: input.agent_profile_id,
+    access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [input.agent_profile_id] },
+  });
+  const otherProfile = createAgentProfile({ name: "Unrelated profile" });
+  getStore().sessions.push(
+    syntheticSession({ id: "pair-a", projectId: input.project_id, profileId: input.agent_profile_id }),
+    syntheticSession({ id: "pair-z", projectId: input.project_id, profileId: input.agent_profile_id }),
+    syntheticSession({ id: "wrong-project", projectId: otherProject.id, profileId: input.agent_profile_id, cwd: otherRoot }),
+    syntheticSession({ id: "wrong-profile", projectId: input.project_id, profileId: otherProfile.id }),
+    syntheticSession({ id: "quarantined", projectId: input.project_id, profileId: input.agent_profile_id, quarantined: true }),
+  );
+  flush();
+  commitWorkspaceCapabilityActivation({ ...input, operation_digest: digest() });
+
+  const questions = [{
+    id: "scope",
+    label: "Scope",
+    prompt: "Choose the synthetic scope",
+    options: [
+      { value: "small", label: "Small", description: "Synthetic small option" },
+      { value: "large", label: "Large" },
+    ],
+    allowOther: true,
+  }];
+  const createAndSubmit = (requestId: string, sessionId: string, value = "small", wasCustom = false) => {
+    createOpenInterview({
+      requestId,
+      sessionId,
+      toolName: "questionnaire",
+      toolCallId: `call-${requestId}`,
+      questions,
+    });
+    const result = submitInterview(sessionId, requestId, [{ id: "scope", value, wasCustom }], WAYANG_WEBSOCKET_SUBMISSION_CONTEXT);
+    assert.equal(result.ok, true);
+    return result;
+  };
+  createAndSubmit("z-request", "pair-z");
+  const custom = createAndSubmit("a-request", "pair-a", "Synthetic custom answer", true);
+  assert.equal(custom.ok, true);
+  markDelivered("z-request", "tool_result", "entry-z");
+  createAndSubmit("wrong-project-request", "wrong-project");
+  createAndSubmit("wrong-profile-request", "wrong-profile");
+  createAndSubmit("quarantined-request", "quarantined");
+  createOpenInterview({ requestId: "open-request", sessionId: "pair-a", toolName: "questionnaire", questions });
+  createOpenInterview({ requestId: "non-questionnaire", sessionId: "pair-a", toolName: "interview", questions });
+  assert.equal(submitInterview(
+    "pair-a",
+    "non-questionnaire",
+    [{ id: "scope", value: "large", wasCustom: false }],
+    WAYANG_WEBSOCKET_SUBMISSION_CONTEXT,
+  ).ok, true);
+
+  for (const requestId of ["z-request", "a-request"]) {
+    const record = getStore().interviews.find((candidate) => candidate.request_id === requestId)!;
+    record.created_at = 10;
+    record.submitted_at = 20;
+    if (record.status === "delivered") record.delivered_at = 30;
+  }
+  flush();
+
+  const projectionPath = getWorkspaceCapabilityStoreProjectionPath(input);
+  const projection = JSON.parse(fs.readFileSync(projectionPath, "utf8")) as Record<string, any>;
+  assert.equal(fs.statSync(projectionPath).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.dirname(projectionPath)).mode & 0o777, 0o700);
+  assert.equal(projection.schema_version, 3);
+  assert.equal(projection.questionnaire_submissions.schema_version, 1);
+  assert.equal(projection.questionnaire_submissions.available, true);
+  assert.deepEqual(
+    projection.questionnaire_submissions.records.map((record: Record<string, unknown>) => record.request_id),
+    ["a-request", "z-request"],
+  );
+  const [customProjection, deliveredProjection] = projection.questionnaire_submissions.records;
+  assert.deepEqual(Object.keys(customProjection).sort(), [
+    "answers", "authenticated_principal", "created_at", "origin_tool_call_id", "origin_tool_name",
+    "questions", "request_id", "session_id", "status", "submission_channel", "submission_id", "submitted_at",
+  ].sort());
+  assert.equal(customProjection.session_id, "pair-a");
+  assert.equal(customProjection.origin_tool_name, "questionnaire");
+  assert.equal(customProjection.origin_tool_call_id, "call-a-request");
+  assert.equal(customProjection.status, "submitted");
+  assert.equal(customProjection.created_at, 10);
+  assert.equal(customProjection.submitted_at, 20);
+  assert.equal(customProjection.submission_channel, "WAYANG_WEBSOCKET");
+  assert.equal(customProjection.authenticated_principal, "WAYANG_SINGLE_USER");
+  assert.equal(typeof customProjection.submission_id, "string");
+  assert.deepEqual(customProjection.answers, [{
+    id: "scope",
+    value: "Synthetic custom answer",
+    label: "Synthetic custom answer",
+    wasCustom: true,
+  }]);
+  assert.deepEqual(deliveredProjection.answers, [{ id: "scope", value: "small", label: "Small", wasCustom: false, index: 0 }]);
+  assert.equal(deliveredProjection.delivery_mode, "tool_result");
+  assert.equal(deliveredProjection.delivery_entry_id, "entry-z");
+  assert.equal(deliveredProjection.delivered_at, 30);
+  assert.deepEqual(deliveredProjection.questions, [{ ...questions[0], allowOther: true }]);
+  const questionnaireBytes = JSON.stringify(projection.questionnaire_submissions);
+  for (const excluded of [
+    "wrong-project-request", "wrong-profile-request", "quarantined-request", "open-request", "non-questionnaire",
+    "synthetic-provider", "synthetic-model", "operation_digest", "project_id", "agent_profile_id",
+  ]) assert.equal(questionnaireBytes.includes(excluded), false, excluded);
+
+  const browserInput = { ...input, capability_id: "wayang.standard-browser.v1" as const };
+  commitWorkspaceCapabilityActivation({ ...browserInput, operation_digest: digest("b") });
+  const browserProjection = fs.readFileSync(getWorkspaceCapabilityStoreProjectionPath(browserInput), "utf8");
+  assert.equal(browserProjection.includes("questionnaire_submissions"), false);
+  assert.equal(browserProjection.includes("a-request"), false);
+
+  revokeWorkspaceCapabilityAssociation({ ...input, expected_revision: 1 });
+  const revoked = JSON.parse(fs.readFileSync(projectionPath, "utf8")) as Record<string, unknown>;
+  assert.equal(revoked.schema_version, 3);
+  assert.equal(revoked.active, false);
+  assert.equal(revoked.available, false);
+  assert.equal(JSON.stringify(revoked).includes("a-request"), false);
+  assert.equal("questionnaire_submissions" in revoked, false);
+});
+
+test("host questionnaire projection fails closed for noncanonical provenance and bounded saturation", () => {
+  const input = pair();
+  getStore().sessions.push(syntheticSession({ id: "owner", projectId: input.project_id, profileId: input.agent_profile_id }));
+  flush();
+  commitWorkspaceCapabilityActivation({ ...input, operation_digest: digest() });
+  const questions = [{
+    id: "q",
+    label: "Question",
+    prompt: "Synthetic question?",
+    options: [{ value: "yes", label: "Yes" }],
+    allowOther: true,
+  }];
+  const answer = [{ id: "q", value: "yes", label: "Yes", wasCustom: false, index: 0 }];
+  getStore().interviews.push({
+    request_id: "legacy-provenance",
+    submission_id: "legacy-submission",
+    session_id: "owner",
+    origin_tool_name: "questionnaire",
+    origin_tool_call_id: "legacy-call",
+    questions,
+    answers: answer,
+    status: "submitted",
+    created_at: 1,
+    submitted_at: 2,
+  });
+  flush();
+  const projectionPath = getWorkspaceCapabilityStoreProjectionPath(input);
+  let projection = JSON.parse(fs.readFileSync(projectionPath, "utf8")) as Record<string, any>;
+  assert.deepEqual(projection.questionnaire_submissions, { schema_version: 1, available: false, records: [] });
+
+  getStore().interviews = [];
+  for (let index = 0; index <= MAX_HOST_EXECUTION_QUESTIONNAIRE_SUBMISSIONS; index += 1) {
+    getStore().interviews.push({
+      request_id: `bounded-${String(index).padStart(3, "0")}`,
+      submission_id: `submission-${index}`,
+      submission_channel: "WAYANG_WEBSOCKET",
+      authenticated_principal: "WAYANG_SINGLE_USER",
+      session_id: "owner",
+      origin_tool_name: "questionnaire",
+      origin_tool_call_id: `call-${index}`,
+      questions,
+      answers: answer,
+      status: "submitted",
+      created_at: index + 1,
+      submitted_at: index + 2,
+    });
+  }
+  flush();
+  projection = JSON.parse(fs.readFileSync(projectionPath, "utf8")) as Record<string, any>;
+  assert.deepEqual(projection.questionnaire_submissions, { schema_version: 1, available: false, records: [] });
+});
+
+test("host questionnaire projection fails closed on aggregate byte overflow", () => {
+  const input = pair();
+  getStore().sessions.push(syntheticSession({ id: "owner", projectId: input.project_id, profileId: input.agent_profile_id }));
+  flush();
+  commitWorkspaceCapabilityActivation({ ...input, operation_digest: digest() });
+  const prompt = "x".repeat(16_000);
+  const questions = [{
+    id: "q",
+    label: "Question",
+    prompt,
+    options: [{ value: "yes", label: "Yes" }],
+    allowOther: true,
+  }];
+  for (let index = 0; index < 80; index += 1) {
+    getStore().interviews.push({
+      request_id: `bytes-${String(index).padStart(3, "0")}`,
+      submission_id: `bytes-submission-${index}`,
+      submission_channel: "WAYANG_WEBSOCKET",
+      authenticated_principal: "WAYANG_SINGLE_USER",
+      session_id: "owner",
+      origin_tool_name: "questionnaire",
+      origin_tool_call_id: `bytes-call-${index}`,
+      questions,
+      answers: [{ id: "q", value: "yes", label: "Yes", wasCustom: false, index: 0 }],
+      status: "submitted",
+      created_at: index + 1,
+      submitted_at: index + 2,
+    });
+  }
+  flush();
+  const projection = JSON.parse(fs.readFileSync(getWorkspaceCapabilityStoreProjectionPath(input), "utf8"));
+  assert.deepEqual(projection.questionnaire_submissions, { schema_version: 1, available: false, records: [] });
+});
+
+test("host questionnaire publication is denial-first and positive failure leaves durable denial", () => {
+  const input = pair();
+  getStore().sessions.push(syntheticSession({ id: "owner", projectId: input.project_id, profileId: input.agent_profile_id }));
+  flush();
+  commitWorkspaceCapabilityActivation({ ...input, operation_digest: digest() });
+  const questions = [{
+    id: "q", label: "Question", prompt: "Synthetic question?",
+    options: [{ value: "yes", label: "Yes" }], allowOther: true,
+  }];
+  const first = createOpenInterview({ requestId: "first", sessionId: "owner", toolName: "questionnaire", questions });
+  assert.equal(submitInterview("owner", first.request_id, [{ id: "q", value: "yes", wasCustom: false }], WAYANG_WEBSOCKET_SUBMISSION_CONTEXT).ok, true);
+  const projectionPath = getWorkspaceCapabilityStoreProjectionPath(input);
+  assert.equal(JSON.parse(fs.readFileSync(projectionPath, "utf8")).questionnaire_submissions.records.length, 1);
+
+  const second = createOpenInterview({ requestId: "second", sessionId: "owner", toolName: "questionnaire", questions });
+  let observedDenial = false;
+  observeNextHostExecutionProjectionDenialForTests(() => {
+    const denied = JSON.parse(fs.readFileSync(projectionPath, "utf8"));
+    observedDenial = denied.available === false && !("questionnaire_submissions" in denied);
+  });
+  failNextHostExecutionPositiveProjectionForTests();
+  const submitted = submitInterview("owner", second.request_id, [{ id: "q", value: "yes", wasCustom: false }], WAYANG_WEBSOCKET_SUBMISSION_CONTEXT);
+  assert.equal(submitted.ok, true);
+  assert.equal(observedDenial, true);
+  const denied = JSON.parse(fs.readFileSync(projectionPath, "utf8"));
+  assert.equal(denied.available, false);
+  assert.equal("questionnaire_submissions" in denied, false);
+
+  flush();
+  const recovered = JSON.parse(fs.readFileSync(projectionPath, "utf8"));
+  assert.equal(recovered.available, true);
+  assert.deepEqual(recovered.questionnaire_submissions.records.map((record: any) => record.request_id), ["first", "second"]);
+});
+
+test("startup denial-first rebuild removes stale positive questionnaire evidence", () => {
+  const input = pair();
+  getStore().sessions.push(syntheticSession({ id: "owner", projectId: input.project_id, profileId: input.agent_profile_id }));
+  flush();
+  commitWorkspaceCapabilityActivation({ ...input, operation_digest: digest() });
+  const questions = [{
+    id: "q", label: "Question", prompt: "Synthetic question?",
+    options: [{ value: "yes", label: "Yes" }], allowOther: true,
+  }];
+  const opened = createOpenInterview({ requestId: "stale", sessionId: "owner", toolName: "questionnaire", questions });
+  assert.equal(submitInterview("owner", opened.request_id, [{ id: "q", value: "yes", wasCustom: false }], WAYANG_WEBSOCKET_SUBMISSION_CONTEXT).ok, true);
+  const projectionPath = getWorkspaceCapabilityStoreProjectionPath(input);
+  assert.equal(JSON.parse(fs.readFileSync(projectionPath, "utf8")).questionnaire_submissions.records.length, 1);
+
+  close();
+  const storePath = path.join(dataDir, "store.json");
+  const persisted = JSON.parse(fs.readFileSync(storePath, "utf8"));
+  persisted.interviews = [];
+  fs.writeFileSync(storePath, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+  init();
+  const rebuilt = JSON.parse(fs.readFileSync(projectionPath, "utf8"));
+  assert.equal(rebuilt.available, true);
+  assert.deepEqual(rebuilt.questionnaire_submissions.records, []);
+});
+
+test("unchanged association revision still reprojects profile and session eligibility changes", () => {
+  const input = pair();
+  getStore().sessions.push(syntheticSession({ id: "owner", projectId: input.project_id, profileId: input.agent_profile_id }));
+  flush();
+  commitWorkspaceCapabilityActivation({ ...input, operation_digest: digest() });
+  const questions = [{
+    id: "q", label: "Question", prompt: "Synthetic question?",
+    options: [{ value: "yes", label: "Yes" }], allowOther: true,
+  }];
+  const opened = createOpenInterview({ requestId: "eligibility", sessionId: "owner", toolName: "questionnaire", questions });
+  assert.equal(submitInterview("owner", opened.request_id, [{ id: "q", value: "yes", wasCustom: false }], WAYANG_WEBSOCKET_SUBMISSION_CONTEXT).ok, true);
+  const projectionPath = getWorkspaceCapabilityStoreProjectionPath(input);
+  assert.equal(JSON.parse(fs.readFileSync(projectionPath, "utf8")).association_revision, 1);
+
+  const replacementDefault = createAgentProfile({ name: "Replacement default", resource_mode: "standard" });
+  getStore().workspaceSettings.default_agent_profile_id = replacementDefault.id;
+  updateProject(input.project_id, {
+    default_agent_profile_id: replacementDefault.id,
+    access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: null },
+  });
+  updateAgentProfile(input.agent_profile_id, { enabled: false });
+  let projection = JSON.parse(fs.readFileSync(projectionPath, "utf8"));
+  assert.equal(projection.association_revision, 1);
+  assert.equal(projection.available, false);
+  updateAgentProfile(input.agent_profile_id, { enabled: true });
+  projection = JSON.parse(fs.readFileSync(projectionPath, "utf8"));
+  assert.equal(projection.association_revision, 1);
+  assert.equal(projection.questionnaire_submissions.records.length, 1);
+
+  getStore().sessions.find((session) => session.id === "owner")!.legacy_capability_ineligible = true;
+  flush();
+  projection = JSON.parse(fs.readFileSync(projectionPath, "utf8"));
+  assert.equal(projection.association_revision, 1);
+  assert.deepEqual(projection.questionnaire_submissions.records, []);
 });
 
 test("missing legacy eligibility state and quarantine fail closed", () => {
