@@ -40,6 +40,7 @@ import {
   isCuratedTogetherModel,
   isWayangProviderVisible,
   listModels,
+  listSlashCommandsForHandle,
   markClaimedQueuedBrowserTurnsReady,
   markManualCompactionMutationLeaseReleased,
   markQueuedBrowserMessageStarted,
@@ -499,6 +500,64 @@ test("settled lifecycle persists terminal assistant and compaction failures", ()
   } finally {
     f.cleanup();
   }
+});
+
+test("slash discovery discards stale async extension results before reading old skills", async () => {
+  const entered = deferred();
+  const release = deferred();
+  let current = true;
+  let skillReads = 0;
+  const handle = {
+    id: "synthetic-stale-slash-discovery",
+    session: {
+      promptTemplates: [{ name: "old-prompt", description: "old prompt" }],
+      _extensionRunner: {
+        getRegisteredCommands: () => [{
+          name: "old-extension",
+          description: "old extension",
+          async getArgumentCompletions() {
+            entered.resolve();
+            await release.promise;
+            return [{ value: "old-value" }];
+          },
+        }],
+      },
+      resourceLoader: {
+        getSkills() {
+          skillReads++;
+          return { skills: [{ name: "old-skill", description: "old skill" }] };
+        },
+      },
+    },
+  } as unknown as PiSessionHandle;
+
+  const listing = listSlashCommandsForHandle(handle.id, handle, () => current && !handle.capabilityAuthorityDenied);
+  await entered.promise;
+  current = false;
+  release.resolve();
+
+  assert.equal(await listing, null);
+  assert.equal(skillReads, 0, "stale discovery must not continue into the old resource loader");
+
+  const currentHandle = {
+    ...handle,
+    id: "synthetic-current-slash-discovery",
+    session: {
+      ...(handle.session as any),
+      promptTemplates: [{ name: "current-prompt", description: "current prompt" }],
+      _extensionRunner: {
+        getRegisteredCommands: () => [{
+          name: "current-extension",
+          async getArgumentCompletions() { return [{ value: "current-value" }]; },
+        }],
+      },
+      resourceLoader: { getSkills: () => ({ skills: [{ name: "current-skill", description: "current skill" }] }) },
+    },
+  } as unknown as PiSessionHandle;
+  const commands = await listSlashCommandsForHandle(currentHandle.id, currentHandle, () => true);
+  assert.ok(commands?.some((command) => command.name === "current-extension"
+    && command.argumentSuggestions?.[0]?.value === "current-value"));
+  assert.ok(commands?.some((command) => command.name === "skill:current-skill"));
 });
 
 test("Pi bridge stopped projections never infer host authority from durable identity", () => {

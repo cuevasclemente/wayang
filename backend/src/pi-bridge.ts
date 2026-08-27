@@ -3691,16 +3691,19 @@ async function collectArgumentSuggestions(command: any): Promise<SlashArgumentSu
   }
 }
 
-/**
- * Return the slash commands that make sense in wayang. Built-ins are limited
- * to commands this backend can faithfully execute; prompts, skills, and
- * extension commands are mirrored from the live AgentSession when available.
- */
-export async function listSlashCommands(id: string): Promise<WebSlashCommand[]> {
-  const handle = sessions.get(id);
-  const commands = new Map<string, WebSlashCommand>();
-  for (const command of WEB_SUPPORTED_BUILTIN_SLASH_COMMANDS) commands.set(command.name, { ...command });
-  if (!handle) return [...commands.values()].sort((a, b) => a.name.localeCompare(b.name));
+function builtinSlashCommands(): Map<string, WebSlashCommand> {
+  return new Map(WEB_SUPPORTED_BUILTIN_SLASH_COMMANDS.map((command) => [command.name, { ...command }]));
+}
+
+/** @internal Exact-handle seam for stale async discovery regressions. */
+export async function listSlashCommandsForHandle(
+  id: string,
+  handle: PiSessionHandle,
+  isCurrent: () => boolean = () => sessions.get(id) === handle
+    && !handle.capabilityAuthorityDenied && !handle.capabilityRefreshPending,
+): Promise<WebSlashCommand[] | null> {
+  const commands = builtinSlashCommands();
+  if (!isCurrent()) return null;
 
   for (const template of handle.session.promptTemplates) {
     if (!template?.name || commands.has(template.name)) continue;
@@ -3716,18 +3719,24 @@ export async function listSlashCommands(id: string): Promise<WebSlashCommand[]> 
   if (extensionRunner && typeof extensionRunner.getRegisteredCommands === "function") {
     const builtinNames = new Set(WEB_SUPPORTED_BUILTIN_SLASH_COMMANDS.map((command) => command.name));
     for (const command of extensionRunner.getRegisteredCommands()) {
+      if (!isCurrent()) return null;
       const name = command.invocationName || command.name;
       if (!name || builtinNames.has(name)) continue;
+      const argumentSuggestions = await collectArgumentSuggestions(command);
+      if (!isCurrent()) return null;
       commands.set(name, {
         name,
         description: command.description || sourceLabel(command.sourceInfo),
         source: "extension",
-        argumentSuggestions: await collectArgumentSuggestions(command),
+        argumentSuggestions,
       });
     }
   }
 
-  for (const skill of handle.session.resourceLoader.getSkills().skills) {
+  if (!isCurrent()) return null;
+  const skills = handle.session.resourceLoader.getSkills().skills;
+  if (!isCurrent()) return null;
+  for (const skill of skills) {
     const name = `skill:${skill.name}`;
     if (commands.has(name)) continue;
     commands.set(name, {
@@ -3737,7 +3746,21 @@ export async function listSlashCommands(id: string): Promise<WebSlashCommand[]> 
     });
   }
 
-  return [...commands.values()].sort((a, b) => a.name.localeCompare(b.name));
+  return isCurrent()
+    ? [...commands.values()].sort((a, b) => a.name.localeCompare(b.name))
+    : null;
+}
+
+/**
+ * Return the slash commands that make sense in wayang. Built-ins are limited
+ * to commands this backend can faithfully execute; prompts, skills, and
+ * extension commands are mirrored only from one still-current live handle.
+ */
+export async function listSlashCommands(id: string): Promise<WebSlashCommand[]> {
+  const handle = sessions.get(id);
+  const builtins = [...builtinSlashCommands().values()].sort((a, b) => a.name.localeCompare(b.name));
+  if (!handle) return builtins;
+  return await listSlashCommandsForHandle(id, handle) ?? builtins;
 }
 
 function getCommandGuardRegistry(): Map<string, CommandGuardBridgeController> | undefined {
