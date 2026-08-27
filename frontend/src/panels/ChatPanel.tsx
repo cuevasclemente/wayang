@@ -209,6 +209,7 @@ type InterviewSubmission = {
   answers: InterviewAnswer[];
   submittedAt: number;
   lastSentAt?: number;
+  lastSentMonotonicAt?: number;
   state: InterviewSubmissionState;
   message?: string;
 };
@@ -216,6 +217,7 @@ type InterviewSubmission = {
 type InterviewCancellation = {
   state: "cancelling" | "retry" | "rejected";
   lastSentAt?: number;
+  lastSentMonotonicAt?: number;
   message?: string;
 };
 
@@ -238,6 +240,8 @@ interface StoredInterviewSubmission {
 
 interface InterviewResponseAck extends ChatMessage {
   type: "interview_response_ack";
+  session_id?: unknown;
+  selection_id?: unknown;
   requestId?: unknown;
   sessionId?: unknown;
   status?: unknown;
@@ -248,6 +252,8 @@ interface InterviewResponseAck extends ChatMessage {
 
 interface InterviewCancelAck extends ChatMessage {
   type: "interview_cancel_ack";
+  session_id?: unknown;
+  selection_id?: unknown;
   requestId?: unknown;
   sessionId?: unknown;
   status?: unknown;
@@ -287,6 +293,7 @@ const FALLBACK_SLASH_COMMANDS: SlashCommandOption[] = [
 const CHAT_DRAFT_STORAGE_PREFIX = "wayang:chat-draft:";
 const INTERVIEW_SUBMISSION_STORAGE_PREFIX = "wayang:interview-submission:";
 const INTERVIEW_ACK_TIMEOUT_MS = 10_000;
+const INTERVIEW_RETRY_TIMEOUT_MS = 30_000;
 const EXTERNAL_ACTION_ACK_TIMEOUT_MS = 10_000;
 const MAX_RETAINED_EXTERNAL_ACTION_OUTCOMES = 20;
 // The backend permits only one pending external action per session. Keeping 64
@@ -3250,6 +3257,10 @@ export function ChatPanel({
   const connectRef = useRef<() => void>(() => {});
   const wsAttemptIdRef = useRef(0);
   const transportGenerationRef = useRef(0);
+  const pendingInterviewReconnectSyncRef = useRef<{
+    transportGeneration: number;
+    requestIds: Set<string>;
+  } | null>(null);
   const activeSessionErrorRef = useRef<string | null>(null);
   const activeSessionRuntimeStreamingRef = useRef(false);
   const activeSessionRuntimeCompactingRef = useRef(false);
@@ -3773,33 +3784,38 @@ export function ChatPanel({
     return false;
   }, []);
 
+  const requestInteractiveStateSync = useCallback((): boolean => {
+    const sessionId = activeSessionIdRef.current;
+    const selectionId = selectionIdRef.current;
+    if (!sessionId || !selectionId || document.visibilityState !== "visible") return false;
+    return sendWs({
+      type: "interactive_state_sync_request",
+      session_id: sessionId,
+      selection_id: selectionId,
+      known_interview_request_ids: interviewQueueRef.current
+        .filter((item) => item.sessionId === sessionId)
+        .map((item) => item.requestId)
+        .slice(0, 64),
+    });
+  }, [sendWs]);
+
   useEffect(() => {
     if (!activeSessionId) return;
-    const sync = () => {
-      const sessionId = activeSessionIdRef.current;
-      const selectionId = selectionIdRef.current;
-      if (!sessionId || !selectionId || document.visibilityState !== "visible") return;
-      sendWs({
-        type: "interactive_state_sync_request",
-        session_id: sessionId,
-        selection_id: selectionId,
-        known_interview_request_ids: interviewQueueRef.current
-          .filter((item) => item.sessionId === sessionId)
-          .map((item) => item.requestId)
-          .slice(0, 64),
-      });
-    };
-    const interval = window.setInterval(sync, 30_000);
+    const interval = window.setInterval(requestInteractiveStateSync, 30_000);
     return () => window.clearInterval(interval);
-  }, [activeSessionId, sendWs]);
+  }, [activeSessionId, requestInteractiveStateSync]);
 
   const sendQueuedInterviewSubmission = useCallback((requestId: string): boolean => {
     const sessionId = activeSessionIdRef.current;
     const interview = interviewQueueRef.current.find((item) => item.requestId === requestId && item.sessionId === sessionId);
     if (!interview?.submission || !sessionId) return false;
 
+    const selectionId = selectionIdRef.current;
+    if (!selectionId) return false;
     const sent = sendWs({
       type: "interview_response",
+      session_id: sessionId,
+      selection_id: selectionId,
       requestId: interview.requestId,
       answers: interview.submission.answers,
     });
@@ -3811,6 +3827,7 @@ export function ChatPanel({
           ...item.submission,
           state: sent ? "submitting" : "retry",
           lastSentAt: sent ? Date.now() : item.submission.lastSentAt,
+          lastSentMonotonicAt: sent ? performance.now() : item.submission.lastSentMonotonicAt,
           message: sent ? undefined : "Waiting for the WebSocket to reconnect before retrying.",
         },
       };
@@ -3818,13 +3835,16 @@ export function ChatPanel({
     return sent;
   }, [sendWs, setInterviewQueueSynced]);
 
-  const resendQueuedInterviewSubmissions = useCallback((sessionId: string) => {
-    for (const interview of interviewQueueRef.current) {
-      if (interview.sessionId === sessionId && interview.submission && interview.submission.state !== "rejected") {
-        sendQueuedInterviewSubmission(interview.requestId);
-      }
-    }
-  }, [sendQueuedInterviewSubmission]);
+  const pendingInterviewSyncKey = interviewQueue
+    .filter((item) => item.sessionId === activeSessionId && item.submission?.state === "submitting")
+    .map((item) => `${item.requestId}:${item.submission?.lastSentAt ?? 0}`)
+    .join("|");
+
+  useEffect(() => {
+    if (!pendingInterviewSyncKey) return;
+    const timers = [500, 1_500].map((delay) => window.setTimeout(requestInteractiveStateSync, delay));
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, [pendingInterviewSyncKey, requestInteractiveStateSync]);
 
   const sendQueuedInterviewCancellation = useCallback((requestId: string): boolean => {
     const sessionId = activeSessionIdRef.current;
@@ -3833,8 +3853,16 @@ export function ChatPanel({
     ));
     if (!interview || interview.submission || !sessionId) return false;
 
-    const sent = sendWs({ type: "interview_cancel", requestId });
+    const selectionId = selectionIdRef.current;
+    if (!selectionId) return false;
+    const sent = sendWs({
+      type: "interview_cancel",
+      session_id: sessionId,
+      selection_id: selectionId,
+      requestId,
+    });
     const lastSentAt = sent ? Date.now() : undefined;
+    const lastSentMonotonicAt = sent ? performance.now() : undefined;
     setInterviewQueueSynced((current) => current.map((item) => (
       item.requestId === requestId && item.sessionId === sessionId
         ? {
@@ -3842,6 +3870,7 @@ export function ChatPanel({
             cancellation: {
               state: sent ? "cancelling" : "retry",
               ...(lastSentAt === undefined ? {} : { lastSentAt }),
+              ...(lastSentMonotonicAt === undefined ? {} : { lastSentMonotonicAt }),
               ...(sent ? {} : { message: "Reconnect before retrying cancellation. The questionnaire remains available." }),
             },
           }
@@ -3967,22 +3996,22 @@ export function ChatPanel({
           });
           if (msg.session_id === activeSessionIdRef.current && msg.selection_id === selectionIdRef.current) {
             setWsStatus("connected");
+            const knownInterviewRequestIds = interviewQueueRef.current
+              .filter((item) => item.sessionId === msg.session_id)
+              .map((item) => item.requestId)
+              .slice(0, 64);
+            pendingInterviewReconnectSyncRef.current = {
+              transportGeneration,
+              requestIds: new Set(knownInterviewRequestIds),
+            };
             ws.send(JSON.stringify({
               type: "interactive_state_sync_request",
               session_id: msg.session_id,
               selection_id: msg.selection_id,
-              known_interview_request_ids: interviewQueueRef.current
-                .filter((item) => item.sessionId === msg.session_id)
-                .map((item) => item.requestId)
-                .slice(0, 64),
+              known_interview_request_ids: knownInterviewRequestIds,
             }));
-            // The backend has rebound this durable socket to the selected
-            // session. Resend only cached responses for that same session.
-            // Identical retries are safe once the durable backend transition
-            // is implemented, and no other session's request can leak here.
-            if (activeSessionIdRef.current) {
-              resendQueuedInterviewSubmissions(activeSessionIdRef.current);
-            }
+            // Reconcile durable status before resending any retained answer.
+            // An open authoritative snapshot below is the only resend gate.
           }
           return;
         }
@@ -5117,9 +5146,26 @@ export function ChatPanel({
           if (outcomes.some((outcome) => (
             (outcome.status === "open") !== incomingIds.has(outcome.requestId)
           ))) return;
+          const pendingReconnectSync = pendingInterviewReconnectSyncRef.current;
+          const isReconnectSync = Boolean(
+            pendingReconnectSync
+            && pendingReconnectSync.transportGeneration === transportGeneration
+            && [...pendingReconnectSync.requestIds].every((requestId) => (
+              outcomes.some((outcome) => outcome.requestId === requestId)
+            )),
+          );
+          if (isReconnectSync) pendingInterviewReconnectSyncRef.current = null;
           const terminalIds = new Set(outcomes
             .filter((outcome) => ["submitted", "cancelled", "delivered", "missing"].includes(outcome.status))
             .map((outcome) => outcome.requestId));
+          const retryOpenIds = (isReconnectSync ? outcomes : [])
+            .filter((outcome) => outcome.status === "open")
+            .map((outcome) => outcome.requestId)
+            .filter((requestId) => interviewQueueRef.current.some((item) => (
+              item.requestId === requestId
+              && item.sessionId === msg.session_id
+              && item.submission?.state === "retry"
+            )));
           for (const current of interviewQueueRef.current) {
             if (current.sessionId === msg.session_id && terminalIds.has(current.requestId)) {
               clearStoredInterviewSubmission(current.sessionId, current.requestId);
@@ -5129,6 +5175,21 @@ export function ChatPanel({
             current.filter((item) => item.sessionId !== msg.session_id || !terminalIds.has(item.requestId)),
             incoming,
           ));
+          const resendSessionId = msg.session_id;
+          const resendSelectionId = msg.selection_id;
+          for (const requestId of retryOpenIds) {
+            window.setTimeout(() => {
+              const retained = interviewQueueRef.current.find((item) => (
+                item.requestId === requestId && item.sessionId === resendSessionId
+              ));
+              if (
+                transportGenerationRef.current === transportGeneration
+                && activeSessionIdRef.current === resendSessionId
+                && selectionIdRef.current === resendSelectionId
+                && retained?.submission?.state === "retry"
+              ) sendQueuedInterviewSubmission(requestId);
+            }, 0);
+          }
           return;
         }
 
@@ -5170,6 +5231,8 @@ export function ChatPanel({
           if (
             !requestId
             || !sessionId
+            || ack.session_id !== activeSessionIdRef.current
+            || ack.selection_id !== selectionIdRef.current
             || sessionId !== activeSessionIdRef.current
             || ws !== wsRef.current
             || transportGeneration !== transportGenerationRef.current
@@ -5199,6 +5262,8 @@ export function ChatPanel({
           if (
             !requestId
             || !sessionId
+            || ack.session_id !== activeSessionIdRef.current
+            || ack.selection_id !== selectionIdRef.current
             || sessionId !== activeSessionIdRef.current
             || ws !== wsRef.current
             || transportGeneration !== transportGenerationRef.current
@@ -5690,25 +5755,40 @@ export function ChatPanel({
   useEffect(() => {
     const interval = window.setInterval(() => {
       const now = Date.now();
+      const monotonicNow = performance.now();
+      let shouldReconcile = false;
       setInterviewQueueSynced((current) => current.map((item) => {
-        if (
-          item.submission?.state === "submitting"
-          && item.submission.lastSentAt
-          && now - item.submission.lastSentAt >= INTERVIEW_ACK_TIMEOUT_MS
-        ) {
-          return {
-            ...item,
-            submission: {
-              ...item.submission,
-              state: "retry",
-              message: "No durable acknowledgement arrived yet. Retry when ready.",
-            },
-          };
+        if (item.submission?.state === "submitting" && item.submission.lastSentAt) {
+          const acknowledgementAge = item.submission.lastSentMonotonicAt === undefined
+            ? now - item.submission.lastSentAt
+            : monotonicNow - item.submission.lastSentMonotonicAt;
+          if (acknowledgementAge >= INTERVIEW_RETRY_TIMEOUT_MS) {
+            return {
+              ...item,
+              submission: {
+                ...item.submission,
+                state: "retry",
+                message: "Server receipt could not be confirmed. Retrying sends the same immutable response.",
+              },
+            };
+          }
+          if (acknowledgementAge >= INTERVIEW_ACK_TIMEOUT_MS && !item.submission.message) {
+            shouldReconcile = true;
+            return {
+              ...item,
+              submission: {
+                ...item.submission,
+                message: "Response sent — still checking durable server receipt.",
+              },
+            };
+          }
         }
         if (
           item.cancellation?.state === "cancelling"
           && item.cancellation.lastSentAt
-          && now - item.cancellation.lastSentAt >= INTERVIEW_ACK_TIMEOUT_MS
+          && (item.cancellation.lastSentMonotonicAt === undefined
+            ? now - item.cancellation.lastSentAt
+            : monotonicNow - item.cancellation.lastSentMonotonicAt) >= INTERVIEW_ACK_TIMEOUT_MS
         ) {
           return {
             ...item,
@@ -5721,9 +5801,10 @@ export function ChatPanel({
         }
         return item;
       }));
+      if (shouldReconcile) requestInteractiveStateSync();
     }, 1_000);
     return () => window.clearInterval(interval);
-  }, [setInterviewQueueSynced]);
+  }, [requestInteractiveStateSync, setInterviewQueueSynced]);
 
   // Expiry and acknowledgement uncertainty are browser-visible safety states,
   // not reasons to erase a request. The backend terminal event remains

@@ -38,10 +38,10 @@ export async function confirmInterviewToolResultDelivery(
   dependencies: InterviewDeliveryDependencies = DEFAULT_DELIVERY_DEPENDENCIES,
 ): Promise<boolean> {
   return enqueue(record.session_id, async () => {
-    const deadline = Date.now() + (options.timeoutMs ?? 30_000);
+    const deadline = performance.now() + (options.timeoutMs ?? 30_000);
     const pollMs = options.pollMs ?? 25;
     try {
-      while (Date.now() <= deadline) {
+      while (performance.now() <= deadline) {
         if (!dependencies.getBridge().hasToolResultHandoff(record.session_id, record.request_id)) return false;
         const entryId = await dependencies.findToolResultEntry(record.session_id, record);
         if (entryId) {

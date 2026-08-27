@@ -65,6 +65,26 @@ test("bridge persists before notifying and resolves only a matching live waiter"
   assert.equal(bridge.hasToolResultHandoff("session-1", requestId), false);
 }));
 
+test("terminal publication exposes only exact owner identity and durable status", async () => withStore(async () => {
+  const bridge = new PiInterviewBridge();
+  const events: unknown[] = [];
+  const stop = bridge.onTerminal((event) => events.push(event));
+  const waiting = bridge.createRequestWithOutcome("session-1", QUESTIONS, { timeoutMs: 1_000 });
+  const [request] = bridge.getPendingRequests("session-1");
+  const submitted = submitInterview("session-1", request!.requestId, [{ id: "q1", value: "a", wasCustom: false }]);
+  assert.equal(submitted.ok, true);
+  if (!submitted.ok) return;
+  bridge.publishTerminal(submitted.record);
+  assert.deepEqual(events, [{
+    requestId: request!.requestId,
+    sessionId: "session-1",
+    status: "submitted",
+  }]);
+  stop();
+  bridge.resolveSubmitted(submitted.record);
+  await waiting;
+}));
+
 test("session teardown releases an unresolved tool-result handoff for durable recovery", async () => withStore(async () => {
   const bridge = new PiInterviewBridge();
   const waiting = bridge.createRequestWithOutcome("session-1", QUESTIONS, { timeoutMs: 1_000 });

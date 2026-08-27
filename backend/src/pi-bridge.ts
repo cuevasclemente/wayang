@@ -4121,8 +4121,8 @@ export async function deliverInterviewSubmission(
 
   // When pi is streaming, sendCustomMessage queues steering work. Wait for the
   // SDK to persist its CustomMessageEntry before acknowledging delivery.
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + 30_000;
+  while (performance.now() < deadline) {
     const entryId = findInterviewSubmissionEntry(handle, record);
     if (entryId) return { entryId, alreadyPresent: false };
     await new Promise((resolve) => setTimeout(resolve, 50));
