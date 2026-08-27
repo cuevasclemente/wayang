@@ -138,6 +138,7 @@ interface SubmittedUserMessage {
   sessionId: string;
   content: string;
   draft: string;
+  draftRevision: number;
   attachments: PendingAttachment[];
   transportGeneration: number;
 }
@@ -771,8 +772,15 @@ function persistChatDraft(sessionId: string | null, draft: string) {
   }
 }
 
-function clearChatDraftIfUnchanged(sessionId: string, submittedDraft: string) {
-  if (loadChatDraft(sessionId) === submittedDraft) persistChatDraft(sessionId, "");
+function clearChatDraftIfUnchanged(
+  sessionId: string,
+  submittedDraft: string,
+  submittedRevision: number,
+  currentRevision: number,
+) {
+  if (currentRevision === submittedRevision && loadChatDraft(sessionId) === submittedDraft) {
+    persistChatDraft(sessionId, "");
+  }
 }
 
 function chatWsProfile(event: string, details: Record<string, unknown> = {}) {
@@ -3240,6 +3248,7 @@ export function ChatPanel({
   const lastProgrammaticScrollAtRef = useRef(0);
   const queuedUserMessagesRef = useRef<QueuedUserMessage[]>([]);
   const submittedUserMessagesRef = useRef(new Map<string, SubmittedUserMessage>());
+  const draftRevisionBySessionRef = useRef(new Map<string, number>());
   const attachmentDraftsBySessionRef = useRef(new Map<string, PendingAttachment[]>());
   const deferredUserMessagesRef = useRef<ChatMessage[]>([]);
   const seenUserMessageIdsRef = useRef(new Set<string>());
@@ -3335,7 +3344,16 @@ export function ChatPanel({
 
   useEffect(() => {
     isRestoringDraftRef.current = true;
-    setInputText(loadChatDraft(activeSessionId));
+    const storedDraft = loadChatDraft(activeSessionId);
+    const currentRevision = activeSessionId
+      ? draftRevisionBySessionRef.current.get(activeSessionId) ?? 0
+      : 0;
+    const pendingSubmissionOwnsStoredDraft = Boolean(activeSessionId && [...submittedUserMessagesRef.current.values()].some(
+      (submitted) => submitted.sessionId === activeSessionId
+        && submitted.draftRevision === currentRevision
+        && submitted.draft === storedDraft,
+    ));
+    setInputText(pendingSubmissionOwnsStoredDraft ? "" : storedDraft);
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -3520,11 +3538,19 @@ export function ChatPanel({
       attachmentDraftsBySessionRef.current.set(submitted.sessionId, restoredAttachments);
     }
 
-    if (activeSessionIdRef.current !== submitted.sessionId) return;
+    draftRevisionBySessionRef.current.set(
+      submitted.sessionId,
+      (draftRevisionBySessionRef.current.get(submitted.sessionId) ?? 0) + 1,
+    );
+    const mergeRejectedDraft = (current: string): string => current === submitted.draft
+      ? current
+      : [submitted.draft, current].filter((text) => text.trim().length > 0).join("\n\n");
+    if (activeSessionIdRef.current !== submitted.sessionId) {
+      persistChatDraft(submitted.sessionId, mergeRejectedDraft(loadChatDraft(submitted.sessionId)));
+      return;
+    }
     setInputText((current) => {
-      const next = current === submitted.draft
-        ? current
-        : [submitted.draft, current].filter((text) => text.trim().length > 0).join("\n\n");
+      const next = mergeRejectedDraft(current);
       persistChatDraft(submitted.sessionId, next);
       return next;
     });
@@ -3548,8 +3574,6 @@ export function ChatPanel({
 
     const queuedIndex = queuedUserMessagesRef.current.findIndex(matchesQueuedMessage);
     if (queuedIndex === -1) return false;
-    submittedUserMessagesRef.current.delete(queuedUserMessagesRef.current[queuedIndex].id);
-
     setQueuedMessagesSynced((prev) => {
       const index = prev.findIndex(matchesQueuedMessage);
       if (index === -1) return prev;
@@ -3567,12 +3591,23 @@ export function ChatPanel({
       .filter((content) => content.trim().length > 0)
       .join("\n\n");
     const queuedAttachments = queued.flatMap((message) => message.attachments ?? []);
+    const sessionId = activeSessionIdRef.current;
+    for (const message of queued) submittedUserMessagesRef.current.delete(message.id);
 
     if (queuedText) {
-      setInputText((prev) => [queuedText, prev].filter((text) => text.trim().length > 0).join("\n\n"));
+      if (sessionId) {
+        draftRevisionBySessionRef.current.set(
+          sessionId,
+          (draftRevisionBySessionRef.current.get(sessionId) ?? 0) + 1,
+        );
+      }
+      setInputText((prev) => {
+        const next = [queuedText, prev].filter((text) => text.trim().length > 0).join("\n\n");
+        persistChatDraft(sessionId, next);
+        return next;
+      });
     }
     if (queuedAttachments.length > 0) {
-      const sessionId = activeSessionIdRef.current;
       setPendingAttachments((prev) => {
         const next = mergePendingAttachments(queuedAttachments, prev);
         if (sessionId) attachmentDraftsBySessionRef.current.set(sessionId, next);
@@ -3953,7 +3988,12 @@ export function ChatPanel({
           const isSelectedSession = msg.session_id === activeSessionIdRef.current;
 
           if (msg.status === "accepted") {
-            if (submitted) clearChatDraftIfUnchanged(submitted.sessionId, submitted.draft);
+            if (submitted) clearChatDraftIfUnchanged(
+              submitted.sessionId,
+              submitted.draft,
+              submitted.draftRevision,
+              draftRevisionBySessionRef.current.get(submitted.sessionId) ?? 0,
+            );
             submittedUserMessagesRef.current.delete(msg.client_message_id);
             if (isSelectedSession) {
               setQueuedMessagesSynced((current) => current.filter((message) => message.id !== msg.client_message_id));
@@ -3961,7 +4001,12 @@ export function ChatPanel({
             return;
           }
           if (msg.status === "queued") {
-            if (submitted) clearChatDraftIfUnchanged(submitted.sessionId, submitted.draft);
+            if (submitted) clearChatDraftIfUnchanged(
+              submitted.sessionId,
+              submitted.draft,
+              submitted.draftRevision,
+              draftRevisionBySessionRef.current.get(submitted.sessionId) ?? 0,
+            );
             if (!isSelectedSession) return;
             setMessages((current) => current.filter((message) => !(
               message.__localPending === true && message.__localId === msg.client_message_id
@@ -4231,7 +4276,6 @@ export function ChatPanel({
               const content = getUserMessageText(historyMessage.message);
               const queuedIndex = remainingQueued.findIndex((queued) => queuedMessageMatchesContent(queued, content));
               if (queuedIndex === -1) return true;
-              submittedUserMessagesRef.current.delete(remainingQueued[queuedIndex].id);
               remainingQueued.splice(queuedIndex, 1);
               acceptedNextTurnMessages.push(historyMessage);
               return false;
@@ -4417,15 +4461,15 @@ export function ChatPanel({
             attemptId,
             elapsedMs: Math.round(performance.now() - connectStart),
           });
+          const currentSessionMessages = messagesOwnerSessionIdRef.current === activeSessionIdRef.current
+            ? messagesRef.current
+            : [];
+          const newHistoryUserOccurrences = new Set(
+            unmatchedHistoryUserOccurrences(historyMessages, currentSessionMessages),
+          );
           if (hasActiveAssistantOutput() && queuedUserMessagesRef.current.length > 0) {
             const remainingQueued = [...queuedUserMessagesRef.current];
             const acceptedNextTurnMessages: ChatMessage[] = [];
-            const currentSessionMessages = messagesOwnerSessionIdRef.current === activeSessionIdRef.current
-              ? messagesRef.current
-              : [];
-            const newHistoryUserOccurrences = new Set(
-              unmatchedHistoryUserOccurrences(historyMessages, currentSessionMessages),
-            );
             const visibleHistoryMessages = historyMessages.filter((historyMessage) => {
               const message = historyMessage?.message;
               if (historyMessage?.type !== "user" || !message || !newHistoryUserOccurrences.has(historyMessage)) return true;
@@ -5126,7 +5170,8 @@ export function ChatPanel({
                 ? messagesRef.current
                 : [];
               if (hasKnownDurableUserMessage(currentSessionMessages, userMessage)) return;
-              const wasQueuedForNextTurn = takeMatchingQueuedMessage(getUserMessageText(message));
+              const userText = getUserMessageText(message);
+              const wasQueuedForNextTurn = takeMatchingQueuedMessage(userText);
               if (hasActiveAssistantOutput() && wasQueuedForNextTurn) {
                 insertAcceptedUsersAfterActiveStreaming([userMessage]);
               } else {
@@ -5742,6 +5787,7 @@ export function ChatPanel({
       sessionId: activeSessionId,
       content: trimmed,
       draft: inputText,
+      draftRevision: draftRevisionBySessionRef.current.get(activeSessionId) ?? 0,
       attachments: queuedAttachments,
       transportGeneration: transportGenerationRef.current,
     });
@@ -5795,6 +5841,9 @@ export function ChatPanel({
     onSessionChange?.();
     window.setTimeout(() => onSessionChange?.(), 500);
     if (inputText !== "") {
+      // Keep the durable copy until an acknowledgement for this exact draft
+      // revision. Session switches suppress that in-flight copy from the
+      // visible composer, while reload/disconnect still retain recovery text.
       suppressedDraftPersistenceRef.current = { sessionId: activeSessionId, value: "" };
     }
     setInputText("");
@@ -5899,8 +5948,9 @@ export function ChatPanel({
   }, []);
 
   const handleInterrupt = useCallback(() => {
-    const restoredQueuedMessages = restoreQueuedMessagesToComposer();
-    sendWs({ type: "interrupt", clear_queue: restoredQueuedMessages });
+    const hasQueuedMessages = queuedUserMessagesRef.current.length > 0;
+    const sent = sendWs({ type: "interrupt", clear_queue: hasQueuedMessages });
+    if (sent && hasQueuedMessages) restoreQueuedMessagesToComposer();
   }, [restoreQueuedMessagesToComposer, sendWs]);
 
   const handleCommandGuardToggle = useCallback(() => {
@@ -6309,6 +6359,12 @@ export function ChatPanel({
 
   const handleInput = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+      if (activeSessionId) {
+        draftRevisionBySessionRef.current.set(
+          activeSessionId,
+          (draftRevisionBySessionRef.current.get(activeSessionId) ?? 0) + 1,
+        );
+      }
       setInputText(e.target.value);
       persistChatDraft(activeSessionId, e.target.value);
       const ta = e.target;

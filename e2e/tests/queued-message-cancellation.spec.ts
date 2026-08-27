@@ -6,8 +6,10 @@ async function installQueuedMessageSocket(
   initialQueued: Array<{ client_message_id: string; content: string; attachment_names: string[] }> = [],
   deferFirstAgentStart = false,
   rejectQueuedSend = false,
+  suppressQueuedAcknowledgement = false,
+  suppressFirstEcho = false,
 ): Promise<void> {
-  await page.addInitScript(({ queuedSnapshot, deferFirstStart, rejectQueued }) => {
+  await page.addInitScript(({ queuedSnapshot, deferFirstStart, rejectQueued, suppressQueuedAck, suppressInitialEcho }) => {
     type Handler<T> = ((event: T) => void) | null;
 
     class QueuedMessageWebSocket {
@@ -24,6 +26,9 @@ async function installQueuedMessageSocket(
       private selectionId: string | null;
       private messageCount = 0;
       private interruptCount = 0;
+      private firstClientMessageId: string | null = null;
+      private firstMessageContent: string | null = null;
+      private pendingQueuedAcceptance: { clientMessageId: string; content: string } | null = null;
 
       constructor(url: string) {
         const parsed = new URL(url, window.location.href);
@@ -38,6 +43,48 @@ async function installQueuedMessageSocket(
         (window as unknown as { startDeferredQueuedTurn: () => void }).startDeferredQueuedTurn = () => {
           this.emit({ type: "agent_start" });
           this.emit({ type: "text_delta", delta: "Synthetic deferred active response." });
+        };
+        (window as unknown as { acknowledgeFirstQueuedSend: () => void }).acknowledgeFirstQueuedSend = () => {
+          if (!this.firstClientMessageId) return;
+          this.emit({
+            type: "queued_message_ack",
+            session_id: this.sessionId,
+            client_message_id: this.firstClientMessageId,
+            status: "accepted",
+            cancellable: false,
+          });
+          this.firstClientMessageId = null;
+        };
+        (window as unknown as { acceptFirstSendWithHistory: () => void }).acceptFirstSendWithHistory = () => {
+          if (!this.firstMessageContent) return;
+          this.emit({
+            type: "history",
+            session_id: this.sessionId,
+            selection_id: this.selectionId,
+            messages: [{
+              type: "user",
+              id: "durable-first-user",
+              message: { role: "user", content: this.firstMessageContent },
+            }],
+          });
+          this.firstMessageContent = null;
+        };
+        (window as unknown as { acceptQueuedSendWithoutAck: () => void }).acceptQueuedSendWithoutAck = () => {
+          if (!this.pendingQueuedAcceptance) return;
+          this.emit({
+            type: "history",
+            session_id: this.sessionId,
+            selection_id: this.selectionId,
+            messages: [{
+              type: "user",
+              id: `durable-${this.pendingQueuedAcceptance.clientMessageId}`,
+              message: {
+                role: "user",
+                content: this.pendingQueuedAcceptance.content,
+              },
+            }],
+          });
+          this.pendingQueuedAcceptance = null;
         };
         window.setTimeout(() => {
           this.readyState = QueuedMessageWebSocket.OPEN;
@@ -97,7 +144,11 @@ async function installQueuedMessageSocket(
 
         this.messageCount++;
         if (this.messageCount === 1) {
-          this.emit({ type: "message_start", message: { role: "user", content: message.content } });
+          this.firstClientMessageId = message.client_message_id ?? null;
+          this.firstMessageContent = message.content;
+          if (!suppressInitialEcho) {
+            this.emit({ type: "message_start", message: { role: "user", content: message.content } });
+          }
           if (!deferFirstStart) {
             this.emit({ type: "agent_start" });
             this.emit({ type: "text_delta", delta: "Synthetic active response remains in progress." });
@@ -105,6 +156,13 @@ async function installQueuedMessageSocket(
           return;
         }
         if (message.client_message_id) {
+          if (suppressQueuedAck) {
+            this.pendingQueuedAcceptance = {
+              clientMessageId: message.client_message_id,
+              content: message.content,
+            };
+            return;
+          }
           const acknowledgement = {
             type: "queued_message_ack",
             session_id: this.sessionId,
@@ -134,6 +192,8 @@ async function installQueuedMessageSocket(
     queuedSnapshot: initialQueued,
     deferFirstStart: deferFirstAgentStart,
     rejectQueued: rejectQueuedSend,
+    suppressQueuedAck: suppressQueuedAcknowledgement,
+    suppressInitialEcho: suppressFirstEcho,
   });
 }
 
@@ -307,6 +367,116 @@ test("keeps an asynchronously prepared attachment bound to its source session", 
   await expect(page.getByText("source-session-only.txt", { exact: true })).toBeVisible();
 });
 
+test("does not resurrect a sent draft after switching away before acknowledgement", async ({ page, request }) => {
+  await installQueuedMessageSocket(page);
+  const first = await createE2eSession(request, "e2e sent draft first session");
+  const second = await createE2eSession(request, "e2e sent draft second session");
+  await openSessionInUi(page, first);
+
+  const sentText = "This successfully sent draft must not return to the composer.";
+  await page.getByTestId("chat-input").fill(sentText);
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-input")).toHaveValue("");
+
+  await page.getByText(second.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${second.id}$`));
+  await page.getByText(first.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${first.id}$`));
+  await expect(page.getByTestId("chat-input")).toHaveValue("");
+  await expect.poll(() => page.evaluate((sessionId) => (
+    window.localStorage.getItem(`wayang:chat-draft:${sessionId}`)
+  ), first.id)).toBe(sentText);
+});
+
+test("reload conservatively restores a sent draft whose delivery stayed uncertain", async ({ page, request }) => {
+  await installQueuedMessageSocket(page, [], false, false, false, true);
+  const session = await createE2eSession(request, "e2e uncertain sent draft");
+  await openSessionInUi(page, session);
+
+  const uncertainText = "Retain this recovery copy because no ACK or authoritative echo arrived.";
+  await page.getByTestId("chat-input").fill(uncertainText);
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-input")).toHaveValue("");
+  await page.reload();
+  await expect(page.getByTestId("chat-input")).toBeEnabled({ timeout: 30_000 });
+  await expect(page.getByTestId("chat-input")).toHaveValue(uncertainText);
+});
+
+test("content-only legacy history keeps unacknowledged recovery durable but hidden", async ({ page, request }) => {
+  await installQueuedMessageSocket(page, [], false, false, false, true);
+  const first = await createE2eSession(request, "e2e legacy history first session");
+  const second = await createE2eSession(request, "e2e legacy history second session");
+  await openSessionInUi(page, first);
+
+  const acceptedText = "Legacy content-only history cannot prove which browser submission was accepted.";
+  await page.getByTestId("chat-input").fill(acceptedText);
+  await page.getByTestId("chat-send-button").click();
+  await page.evaluate(() => (
+    window as unknown as { acceptFirstSendWithHistory: () => void }
+  ).acceptFirstSendWithHistory());
+  await expect.poll(() => page.evaluate((sessionId) => (
+    window.localStorage.getItem(`wayang:chat-draft:${sessionId}`)
+  ), first.id)).toBe(acceptedText);
+
+  await page.getByText(second.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${second.id}$`));
+  await page.getByText(first.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${first.id}$`));
+  await expect(page.getByTestId("chat-input")).toHaveValue("");
+});
+
+test("a delayed acknowledgement does not clear a newer identical draft", async ({ page, request }) => {
+  await installQueuedMessageSocket(page);
+  const first = await createE2eSession(request, "e2e delayed ack first session");
+  const second = await createE2eSession(request, "e2e delayed ack second session");
+  await openSessionInUi(page, first);
+
+  const repeatedText = "An identical new unsent draft must survive the old acknowledgement.";
+  await page.getByTestId("chat-input").fill(repeatedText);
+  await page.getByTestId("chat-send-button").click();
+  await page.getByTestId("chat-input").fill(repeatedText);
+  await page.evaluate(() => (
+    window as unknown as { acknowledgeFirstQueuedSend: () => void }
+  ).acknowledgeFirstQueuedSend());
+
+  await page.getByText(second.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${second.id}$`));
+  await page.getByText(first.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${first.id}$`));
+  await expect(page.getByTestId("chat-input")).toHaveValue(repeatedText);
+  await expect.poll(() => page.evaluate((sessionId) => (
+    window.localStorage.getItem(`wayang:chat-draft:${sessionId}`)
+  ), first.id)).toBe(repeatedText);
+});
+
+test("content-only queued history keeps ACK-loss recovery durable but hidden", async ({ page, request }) => {
+  await installQueuedMessageSocket(page, [], false, false, true);
+  const first = await createE2eSession(request, "e2e ack loss first session");
+  const second = await createE2eSession(request, "e2e ack loss second session");
+  await openSessionInUi(page, first);
+
+  await sendPrompt(page, "Start the synthetic active turn before ACK loss.");
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  const queuedText = "Content-only queued history cannot retire uncertain browser recovery.";
+  await page.getByTestId("chat-input").fill(queuedText);
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-queued-user-message")).toContainText(queuedText);
+
+  await page.evaluate(() => (
+    window as unknown as { acceptQueuedSendWithoutAck: () => void }
+  ).acceptQueuedSendWithoutAck());
+  await expect(page.getByTestId("chat-queued-user-message")).toHaveCount(0);
+  await expect.poll(() => page.evaluate((sessionId) => (
+    window.localStorage.getItem(`wayang:chat-draft:${sessionId}`)
+  ), first.id)).toBe(queuedText);
+
+  await page.getByText(second.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${second.id}$`));
+  await page.getByText(first.title, { exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${first.id}$`));
+  await expect(page.getByTestId("chat-input")).toHaveValue("");
+});
+
 test("restores text and attachments when a send is rejected after switching sessions", async ({ page, request }) => {
   await installStaleSelectionSocket(page);
   const first = await createE2eSession(request, "e2e stale send first session");
@@ -329,6 +499,8 @@ test("restores text and attachments when a send is rejected after switching sess
   await expect(secondSessionQueue).toContainText("Synthetic queue entry owned by the newly selected session.");
   await expect(secondSessionQueue).not.toContainText(rejectedText);
   await expect(secondSessionQueue).not.toContainText("stale-selection-note.txt");
+  await expect(page.getByTestId("chat-input")).toHaveValue("");
+  await expect(page.getByText("stale-selection-note.txt", { exact: true })).not.toBeVisible();
   await page.getByText(first.title, { exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/sessions/${first.id}$`));
 
@@ -378,6 +550,26 @@ test("keeps the composer intact when the socket closes before send", async ({ pa
   await expect(page.getByTestId("chat-input")).toHaveValue(unsentText);
   await expect(page.getByText("unsent-closing-socket.txt", { exact: true })).toBeVisible();
   await expect(page.locator('[data-testid="chat-message"][data-role="user"]')).toHaveCount(0);
+});
+
+test("failed interrupt send leaves queued recovery state unconsumed", async ({ page, request }) => {
+  await installQueuedMessageSocket(page);
+  const session = await createE2eSession(request, "e2e failed interrupt send");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Start active output before the failed interrupt.");
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  const queuedText = "Keep this queued draft until interrupt is actually sent.";
+  await page.getByTestId("chat-input").fill(queuedText);
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-queued-user-message")).toContainText(queuedText);
+
+  await page.evaluate(() => (
+    window as unknown as { forceQueuedSocketClosing: () => void }
+  ).forceQueuedSocketClosing());
+  await page.getByTestId("chat-composer-interrupt-button").click();
+  await expect(page.getByTestId("chat-queued-user-message")).toContainText(queuedText);
+  await expect(page.getByTestId("chat-input")).toHaveValue("");
 });
 
 test("keeps interrupted queued attachments in the source-session draft across switches", async ({ page, request }) => {
