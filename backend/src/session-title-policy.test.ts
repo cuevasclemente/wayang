@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   AUTO_TITLE_TOTAL_INPUT_CODE_POINTS,
+  acceptedTurnTitleProjection,
   buildBoundedTitleInput,
   extractCompletedTitleExchanges,
   isSafeLegacyInteractiveUserText,
@@ -33,6 +34,15 @@ test("title policy counts only marked terminal exchanges and sends only first-th
   assert.deepEqual(projection.firstThree.map((exchange) => exchange.userText), ["raw user 1", "raw user 3", "raw user 4"]);
   assert.match(projection.boundedInput, /part 1\s+done 1/);
   assert.doesNotMatch(projection.boundedInput, /private|never|raw user 5|decorated user/);
+});
+
+test("accepted browser text builds the standard bounded title request before settlement", () => {
+  const projection = acceptedTurnTitleProjection("browser-message-1", "first accepted browser request");
+  assert.ok(projection);
+  assert.equal(projection.completedExchangeCount, 0);
+  assert.deepEqual(projection.firstThree.map((exchange) => exchange.userText), ["first accepted browser request"]);
+  assert.match(projection.boundedInput, /Exchange 1 user:\nfirst accepted browser request/);
+  assert.equal(acceptedTurnTitleProjection("browser-message-2", "   "), null);
 });
 
 test("bounded title input truncates by Unicode code points with a hard total ceiling", () => {

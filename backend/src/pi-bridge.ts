@@ -81,7 +81,7 @@ export { curateTogetherModelRecords, isCuratedTogetherModel } from "./together-m
 import { getSudoBridge } from "./sudo-bridge.js";
 import { getCommandGuardIdentityBridge } from "./command-guard-bridge.js";
 import {
-  scheduleWayangAutoTitle,
+  scheduleWayangAutoTitleOnAcceptedTurn,
   scheduleWayangAutoTitleOnInteraction,
   type AutoTitleActivationSnapshot,
 } from "./session-title-service.js";
@@ -918,30 +918,60 @@ function settleInteractiveTurnsQuietly(handle: PiSessionHandle): BrowserTurnProv
   catch { return []; /* source-marker persistence must never change source-turn settlement */ }
 }
 
+function acceptedTitleTurnRemainsValid(handle: PiSessionHandle, turn: BrowserTurnProvenance): boolean {
+  const current = interactiveTurnLedger(handle).get(turn.token);
+  return Boolean(current
+    && current.clientMessageId === turn.clientMessageId
+    && current.piUserEntryId === turn.piUserEntryId
+    && current.contentSha256 === turn.contentSha256
+    && current.rawUserText === turn.rawUserText
+    && current.runtimeGeneration === turn.runtimeGeneration);
+}
+
+function deferWayangAutoTitleAfterPersistedAcceptance(
+  handle: PiSessionHandle,
+  turn: BrowserTurnProvenance,
+): void {
+  setImmediate(() => {
+    try {
+      const ledger = interactiveTurnLedger(handle);
+      if (!ledger.has(turn.token)) return;
+      const persisted = resolveTurnAgainstCurrentBranch(handle, turn);
+      if (!persisted) return;
+      ledger.set(persisted.token, persisted);
+      const stillAccepted = () => acceptedTitleTurnRemainsValid(handle, persisted);
+      const historical = scheduleWayangAutoTitleOnInteraction(handle.id, persisted.clientMessageId, {
+        stillAccepted,
+        acceptedTurn: persisted,
+        onCommitted: invalidateSessionFileSnapshot,
+      });
+      if (!historical) {
+        scheduleWayangAutoTitleOnAcceptedTurn(handle.id, persisted, {
+          stillAccepted,
+          onCommitted: invalidateSessionFileSnapshot,
+        });
+      }
+    } catch {
+      // Title repair/generation never changes source-message acceptance.
+    }
+  });
+}
+
 function deferWayangAutoTitleAfterInteraction(
   handle: PiSessionHandle,
   turns: readonly BrowserTurnProvenance[],
 ): void {
-  const interactionIds = turns.map((turn) => turn.clientMessageId);
+  const settledTurns = [...turns];
   setImmediate(() => {
-    for (const interactionId of interactionIds) {
+    for (const turn of settledTurns) {
       try {
-        scheduleWayangAutoTitleOnInteraction(handle.id, interactionId, {
+        scheduleWayangAutoTitleOnInteraction(handle.id, turn.clientMessageId, {
+          acceptedTurn: turn,
           onCommitted: invalidateSessionFileSnapshot,
         });
       } catch {
         // Title repair/generation never changes source-turn success.
       }
-    }
-  });
-}
-
-function deferWayangAutoTitle(handle: PiSessionHandle): void {
-  setImmediate(() => {
-    try {
-      scheduleWayangAutoTitle(handle.id, { onCommitted: invalidateSessionFileSnapshot });
-    } catch {
-      // Title generation never changes settlement success.
     }
   });
 }
@@ -3075,13 +3105,16 @@ export async function createPiSession(
         const settledBrowserTurns = settleInteractiveTurnsQuietly(handle);
         if (settledBrowserTurns.length > 0) {
           deferWayangAutoTitleAfterInteraction(handle, settledBrowserTurns);
-        } else if (interactiveTurnLedger(handle).size === 0) {
-          deferWayangAutoTitle(handle);
         }
         schedulePiSessionCapabilityRefreshRetirement(handle);
       }
       if (event.type === "message_start" || event.type === "message_update") {
-        if (event.type === "message_start") markQueuedBrowserMessageStarted(handle, event.message);
+        if (event.type === "message_start") {
+          markQueuedBrowserMessageStarted(handle, event.message);
+          for (const turn of interactiveTurnLedger(handle).values()) {
+            deferWayangAutoTitleAfterPersistedAcceptance(handle, turn);
+          }
+        }
         handle.liveStreamingMessage = event.message;
         return;
       }
@@ -4666,6 +4699,7 @@ export async function sendBrowserMessageTurn(
         // state plus the provenance ledger protect this accepted old work.
         const steering = handle.session.steer(content, images);
         const capture = captureQueuedChatMessage(handle.session, queueBefore);
+        deferWayangAutoTitleAfterPersistedAcceptance(handle, turn);
         if (capture) {
           if (clientMessageId) queuedBrowserClientMessageIds.set(capture.message, clientMessageId);
           handle.queuedBrowserMessages.set(queueRecordId, {
@@ -4698,10 +4732,12 @@ export async function sendBrowserMessageTurn(
 
     try {
       // The lease spans the complete idle prompt and result/title settlement.
-      await handle.session.prompt(content, {
+      const prompting = handle.session.prompt(content, {
         expandPromptTemplates: true,
         images,
       });
+      deferWayangAutoTitleAfterPersistedAcceptance(handle, turn);
+      await prompting;
       const completedTurn = Object.freeze({
         ...turn,
         provisionalTitleAccepted: true,
@@ -4709,10 +4745,12 @@ export async function sendBrowserMessageTurn(
       });
       interactiveTurnLedger(handle).set(turn.token, completedTurn);
       persistAcceptedProvisionalTitle(handle, completedTurn);
-      settleInteractiveTurnsQuietly(handle);
+      const settledBrowserTurns = settleInteractiveTurnsQuietly(handle);
       // agent_settled fires before prompt() resolves, so idle browser sends do
       // not have their source marker yet in the lifecycle listener above.
-      deferWayangAutoTitleAfterInteraction(handle, [completedTurn]);
+      if (settledBrowserTurns.length > 0) {
+        deferWayangAutoTitleAfterInteraction(handle, settledBrowserTurns);
+      }
       return { queued: false, cancellable: false };
     } catch (error) {
       retireInteractiveTurn(handle, turn.token);

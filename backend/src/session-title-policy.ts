@@ -80,6 +80,28 @@ export function earlyExchangeDigest(boundedInput: string): string {
   return createHash("sha256").update(boundedInput, "utf8").digest("hex");
 }
 
+/** Build the standard bounded request from one exact accepted browser message. */
+export function acceptedTurnTitleProjection(
+  interactionId: string,
+  rawUserText: string,
+): TitleSourceProjection | null {
+  if (!rawUserText.trim()) return null;
+  const firstThree = [{
+    userEntryId: `accepted:${interactionId}`,
+    userText: rawUserText,
+    assistantText: "",
+  }];
+  const boundedInput = buildBoundedTitleInput(firstThree);
+  if (!boundedInput.replace(/^Exchange \d+ (?:user|assistant):$/gmu, "").trim()) return null;
+  return {
+    completedExchangeCount: 0,
+    firstThree,
+    boundedInput,
+    digest: earlyExchangeDigest(boundedInput),
+    legacySourceUsed: false,
+  };
+}
+
 /**
  * Extract browser-authored exchanges from one physical active branch.
  * Markers bind exact user entry IDs. Legacy fallback is deliberately opt-in and
@@ -122,7 +144,7 @@ export function extractCompletedTitleExchanges(
     }
   }
 
-  if (completed.length < 3) return null;
+  if (completed.length < 1) return null;
   const firstThree = completed.slice(0, 3);
   const boundedInput = buildBoundedTitleInput(firstThree);
   if (!boundedInput.replace(/^Exchange \d+ (?:user|assistant):$/gmu, "").trim()) return null;

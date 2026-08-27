@@ -3,14 +3,17 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { close as closeStore } from "../db.js";
-import type { SessionRow } from "../sessions.js";
+import { close as closeStore, init } from "../db.js";
+import { createAgentProfile } from "../agent-profiles.js";
+import { createProject } from "../projects.js";
+import { createSession, updateSessionError, type SessionRow } from "../sessions.js";
 import { serializeSession } from "./sessions.js";
 import { serializeSessionRuntimeState } from "./ws.js";
 
 const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-session-runtime-state-"));
 const previousDataDir = process.env.WAYANG_DATA_DIR;
 process.env.WAYANG_DATA_DIR = path.join(fixtureRoot, "data");
+init();
 
 test.after(() => {
   closeStore();
@@ -57,6 +60,26 @@ test("session HTTP projection classifies terminal context overflow without expos
   const serialized = serializeSession(row);
   assert.equal(serialized.error_kind, "context_overflow");
   assert.equal(serializeSession(stoppedSessionRow("slice-c-no-error")).error_kind, null);
+});
+
+test("Protected session HTTP projection never exposes raw persisted failure content", () => {
+  const cwd = path.join(fixtureRoot, "protected-project");
+  fs.mkdirSync(cwd, { recursive: true });
+  const profile = createAgentProfile({ name: "Protected scheduled error profile" });
+  createProject({
+    cwd,
+    default_agent_profile_id: profile.id,
+    access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [profile.id] },
+  });
+  const row = createSession(cwd, {
+    agentProfileId: profile.id,
+    scheduledJobId: "protected-error-job",
+    scheduledRunId: "protected-error-run",
+  });
+  updateSessionError(row.id, "PRIVATE_PROVIDER_FAILURE_CANARY");
+  const serialized = serializeSession({ ...row, error: "PRIVATE_PROVIDER_FAILURE_CANARY" });
+  assert.equal(serialized.error, "Protected session error; open the Protected session for details");
+  assert.equal(JSON.stringify(serialized).includes("PRIVATE_PROVIDER_FAILURE_CANARY"), false);
 });
 
 test("session runtime WebSocket projection is selection-scoped and fail-closed", () => {

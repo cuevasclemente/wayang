@@ -55,18 +55,20 @@ test("central policy applies allowlists in standard mode and protected actor inv
     updateProject(project.id, {
       access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [allowedProfile.id] },
     });
-    for (const actor of ["scheduled", "dream", "subagent", "indexer"] as const) {
+    assert.equal(authorizeProjectAction({ cwd, actor: "interactive", agentProfileId: allowedProfile.id }).allowed, true);
+    assert.equal(authorizeProjectAction({ cwd, actor: "scheduled", agentProfileId: allowedProfile.id }).allowed, true);
+    assert.equal(authorizeProjectAction({ cwd, actor: "scheduled", agentProfileId: null }).allowed, false);
+    for (const actor of ["dream", "subagent", "indexer"] as const) {
       const decision = authorizeProjectAction({ cwd, actor, agentProfileId: allowedProfile.id });
       assert.equal(decision.allowed, false, actor);
       assert.equal(decision.code, "protected_actor_denied");
     }
-    assert.equal(authorizeProjectAction({ cwd, actor: "interactive", agentProfileId: allowedProfile.id }).allowed, true);
 
     const projection = buildProjectPolicyProjection();
     const entry = projection.projects.find((candidate) => candidate.cwd === fs.realpathSync(cwd));
     assert.deepEqual(
       { dream: entry?.dream, scheduled: entry?.scheduled, subagents: entry?.subagents, global_index: entry?.global_index },
-      { dream: false, scheduled: false, subagents: false, global_index: false },
+      { dream: false, scheduled: true, subagents: false, global_index: false },
     );
   });
 });

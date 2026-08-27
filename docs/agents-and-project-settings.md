@@ -111,10 +111,10 @@ Profile, project-policy, default, or `AGENTS.md` edits still refuse to interrupt
 
 Protected is one fixed v1 policy with explicit capability exceptions, not a label whose name implies isolation. Its defaults enforce:
 
-- explicit interactive-agent allowlist;
+- explicit agent allowlist for interactive and scheduled runs;
 - no host execution;
 - no generic browser authority unless the exact pair receives `wayang.protected-browser.v1`;
-- no Wayang scheduled/background agent runs;
+- scheduled agents run only as an exact allowed profile, with Protected session/output handling;
 - no Dream transcript processing;
 - no subagents in that project;
 - no global transcript search/catalog body indexing.
@@ -133,7 +133,7 @@ Browser-enabled jobs use a persistent exact Project/Profile/Job realm through bo
 
 ## Scheduler, Dream, and Agent Teams
 
-Scheduled Agent Jobs store an optional agent profile and are retained—but visibly blocked—when their project becomes Protected. Backend policy is checked during create/update, manual run, timer fire, and immediately before Pi runtime creation. Protected Automation Jobs are a separate deterministic domain and do not weaken or reuse this model-driven scheduled-agent path. Capability revocation, profile disable, allowlist exclusion, incompatible project privacy, or source revision change durably blocks affected automation work and terminates active runs/leases; regrant requires explicit `rebind_job` and a separate enable and never adopts or resumes an old run.
+Scheduled Agent Jobs may run in a Protected project only with a persisted non-null exact allowed Agent Profile; they never follow a later project-default profile change implicitly. Backend policy is checked during create/update, manual run, timer fire, and immediately before Pi runtime creation, and the executor uses the freshly reloaded job prompt/model/timeout/guard fields. The resulting session, transcript, and attachments retain Protected classification; global body indexing and legacy whole-transcript scanning remain denied. Assistant result summaries, raw Protected failure details, and memory mutations are withheld from shared surfaces, so output is written inside the project and opened through the linked Protected session. Scheduled sessions receive no interactive browser tools. Protected Automation Jobs remain a separate deterministic no-Pi domain with their own capability, snapshot, browser, and lifecycle rules. Capability revocation, profile disable, allowlist exclusion, incompatible project privacy, or source revision change durably blocks affected deterministic automation work and terminates active runs/leases; regrant requires explicit `rebind_job` and a separate enable and never adopts or resumes an old run.
 
 Protected automation uses a Wayang-owned host-local five-field-cron scheduler. It persists a cursor and local wall-minute occurrence key, deduplicates the repeated DST fall-back minute, skips nonexistent spring-forward minutes, atomically pairs cursor advancement with a queued scheduled claim, and implements explicit `skip | run_once` downtime behavior. Startup dispatches recovered queued claims once, marks recovered running claims `interrupted` without retry, and then evaluates missed work. Overlap is skipped; no automatic retry/backoff is performed.
 
@@ -158,9 +158,9 @@ Wayang sessions replace Pi's bash backend with a fresh per-command OS sandbox un
 - permits ordinary Standard restricted writes inside the current project and shared host temporary storage; Protected runtimes persist writes only inside their current project; exact Wren Standard compatibility permits ordinary host writes while protected host backing remains hidden and unmodifiable;
 - gives sandboxed shells a strict non-secret process environment rather than forwarding provider keys, OAuth/AWS credentials, proxy credentials, loader hooks, or arbitrary deployment variables;
 - blocks Unix-domain sockets for ordinary restricted profiles, permits them for exact eligible Wren Standard-project compatibility, and blocks raw `sudo` for all profiles;
-- allows every outbound TCP destination through sandbox-runtime's HTTP/SOCKS proxies, including public Internet, loopback, LAN, and VPN services.
+- on Linux, retains the host network namespace, including unrestricted TCP/UDP destinations, public Internet, loopback, LAN and VPN services, non-proxy-aware protocols, and local listeners available to the Wayang OS user; macOS retains proxy-mediated egress pending a supported filesystem-only host-network implementation.
 
-This networking supports proxy-aware tools such as `curl`, package managers, Git HTTPS/SSH, and most web/API clients. It does not provide raw sockets, inbound listeners, UDP-dependent protocols, or transparent networking for programs that ignore proxy settings.
+Unix-domain sockets remain a separate boundary: ordinary restricted profiles cannot reach the user bus, Docker socket, or other Unix IPC merely because Linux host TCP/UDP networking is enabled. Protected mode constrains filesystem, memory, credential, and reviewed connector access; it is not a network-isolation or data-loss-prevention mode.
 
 If sandbox prerequisites are unavailable, bash is removed rather than replaced with command-string parsing. Run `make doctor` to check prerequisites.
 

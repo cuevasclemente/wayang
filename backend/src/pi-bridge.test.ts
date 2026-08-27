@@ -1545,6 +1545,126 @@ test("idle browser prompt completion schedules title generation after its marker
   }
 });
 
+test("the first accepted browser message starts title generation before assistant settlement", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-accepted-title-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: durableRow.id });
+  manager.materialize();
+  updatePiSessionFile(durableRow.id, manager.getSessionFile()!);
+  const promptGate = deferred();
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    async prompt(content: string) {
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      await promptGate.promise;
+      manager.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "answer after title" }],
+        provider: "synthetic",
+        model: "synthetic",
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as any);
+    },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "accepted-title-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  const previousFlag = process.env.WAYANG_AUTO_SESSION_TITLE;
+  const previousProtectedFlag = process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED;
+  process.env.WAYANG_AUTO_SESSION_TITLE = "on";
+  process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED = "on";
+  let dispatchCalls = 0;
+  setAutoTitleProviderForTests({
+    async prepare() {
+      return { dispatch: async () => { dispatchCalls++; return "Immediate first-message title"; } };
+    },
+  });
+  try {
+    const sending = sendBrowserMessageTurn(handle, "first accepted message", undefined, "accepted-first");
+    const deadline = Date.now() + 2_000;
+    while (SessionManager.open(manager.getSessionFile()!, undefined, f.cwd).getSessionName() !== "Immediate first-message title") {
+      if (Date.now() >= deadline) throw new Error("title generation waited for assistant settlement");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(dispatchCalls, 1);
+    promptGate.resolve();
+    await sending;
+  } finally {
+    promptGate.resolve();
+    setAutoTitleProviderForTests(null);
+    if (previousFlag === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE;
+    else process.env.WAYANG_AUTO_SESSION_TITLE = previousFlag;
+    if (previousProtectedFlag === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED;
+    else process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED = previousProtectedFlag;
+    f.cleanup();
+  }
+});
+
+test("rejected prompt admission never discloses accepted title text", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-rejected-accepted-title-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: durableRow.id });
+  manager.materialize();
+  updatePiSessionFile(durableRow.id, manager.getSessionFile()!);
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    async prompt() {
+      throw new Error("synthetic prompt rejection");
+    },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "rejected-accepted-title",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  const previousFlag = process.env.WAYANG_AUTO_SESSION_TITLE;
+  const previousProtectedFlag = process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED;
+  process.env.WAYANG_AUTO_SESSION_TITLE = "on";
+  process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED = "on";
+  let prepareCalls = 0;
+  setAutoTitleProviderForTests({
+    async prepare() {
+      prepareCalls++;
+      return { dispatch: async () => "Must not title" };
+    },
+  });
+  try {
+    await assert.rejects(
+      sendBrowserMessageTurn(handle, "rejected first message", undefined, "rejected-first"),
+      /synthetic prompt rejection/,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(prepareCalls, 0);
+    assert.equal(SessionManager.open(manager.getSessionFile()!, undefined, f.cwd).getSessionName(), undefined);
+  } finally {
+    setAutoTitleProviderForTests(null);
+    if (previousFlag === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE;
+    else process.env.WAYANG_AUTO_SESSION_TITLE = previousFlag;
+    if (previousProtectedFlag === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED;
+    else process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED = previousProtectedFlag;
+    f.cleanup();
+  }
+});
+
 test("an accepted browser interaction retries title generation for an older unnamed session", async () => {
   const f = currentTurnFixture("wayang-pi-bridge-older-title-retry-");
   const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });

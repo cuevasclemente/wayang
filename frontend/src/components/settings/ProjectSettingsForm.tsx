@@ -309,7 +309,7 @@ export function ProjectSettingsForm({ project, profiles, models, onSaved }: Proj
             <span>
               <span className="block text-sm font-semibold text-neutral-100">Protected project</span>
               <span className="mt-1 block text-xs leading-relaxed text-neutral-400">
-                Requires an explicit interactive-agent allowlist and excludes Dream, scheduled/background agents, subagents, and global transcript indexing. These effects cannot be individually re-enabled.
+                Requires an explicit agent allowlist and excludes Dream, subagents, and global transcript indexing. Scheduled agents may run only as an exact allowed profile under the same Protected filesystem, memory, credential, and transcript policy.
               </span>
             </span>
           </label>

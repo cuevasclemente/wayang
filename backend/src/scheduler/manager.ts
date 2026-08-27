@@ -146,6 +146,7 @@ export class SchedulerManager {
 
   private async executeRun(job: ScheduledJobRow, run: ScheduledRunRow): Promise<void> {
     let sessionId: string | null = null;
+    let protectRunDetails = false;
     try {
       // Re-fetch after dispatch so edits between timer/manual trigger and the
       // asynchronous executor cannot retain stale authority.
@@ -156,6 +157,7 @@ export class SchedulerManager {
         actor: "scheduled",
         agentProfileId: latest.agent_profile_id,
       });
+      protectRunDetails = authorization.project?.access_policy.privacy_mode === "protected";
       if (!authorization.allowed || !authorization.project || !authorization.agentProfile) {
         throw new Error(authorization.reason ?? "Scheduled project access denied");
       }
@@ -187,10 +189,10 @@ export class SchedulerManager {
         session.pi_session_file,
       );
       if (handle.sessionFile) updatePiSessionFile(session.id, handle.sessionFile);
-      applyScheduledCommandGuardMode(session.id, job);
+      applyScheduledCommandGuardMode(session.id, latest);
 
-      const result = await runPromptAndWait(session.id, job.prompt, {
-        timeoutMs: job.timeout_ms,
+      const result = await runPromptAndWait(session.id, latest.prompt, {
+        timeoutMs: latest.timeout_ms,
       });
       touchSession(session.id);
 
@@ -199,17 +201,19 @@ export class SchedulerManager {
         status: "completed",
         finished_at: finishedAt,
         error_message: null,
-        result_summary: result.resultSummary,
+        // Protected assistant output stays only in its linked Protected session.
+        // The shared scheduler row remains content-free for cross-project views.
+        result_summary: scheduledRunResultSummary(protectRunDetails, result.resultSummary),
       });
-      setJobScheduleMetadata(job.id, {
+      setJobScheduleMetadata(latest.id, {
         last_run_at: run.scheduled_for ?? run.started_at,
-        next_run_at: nextCronOccurrence(job.cron_expr, finishedAt),
+        next_run_at: nextCronOccurrence(latest.cron_expr, finishedAt),
       });
     } catch (err) {
       updateScheduledRun(run.id, {
         status: "failed",
         finished_at: Date.now(),
-        error_message: err instanceof Error ? err.message : String(err),
+        error_message: scheduledRunErrorMessage(protectRunDetails, err),
       });
       if (run.trigger === "schedule") {
         setJobScheduleMetadata(job.id, { last_run_at: run.scheduled_for ?? run.started_at });
@@ -225,6 +229,15 @@ export class SchedulerManager {
     if (timer) clearTimeout(timer);
     this.timers.delete(jobId);
   }
+}
+
+export function scheduledRunResultSummary(protectedProject: boolean, summary: string | null): string | null {
+  return protectedProject ? null : summary;
+}
+
+export function scheduledRunErrorMessage(protectedProject: boolean, error: unknown): string {
+  if (protectedProject) return "Protected scheduled run failed; inspect the linked Protected session";
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function assertScheduledRuntimeAuthorized(cwd: string, agentProfileId: string | null): void {
