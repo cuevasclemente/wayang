@@ -54,6 +54,7 @@ import {
   reconcilePendingAgentSwitch,
   resolveInteractiveBrowserAuthority,
   resolveInteractiveTurn,
+  retirePiSessionCapabilityRefreshIfIdle,
   sendBrowserMessageTurn,
   sealSessionModelProviderRegistry,
   serializeEvent,
@@ -70,7 +71,7 @@ import {
 import { createAgentProfile } from "./agent-profiles.js";
 import { close, commitStoreMutation, getStore, init } from "./db.js";
 import { createProject } from "./projects.js";
-import { beginAgentSwitch, createSession, getSessionById, updatePiSessionFile } from "./sessions.js";
+import { archiveSession, beginAgentSwitch, createSession, getSessionById, updatePiSessionFile } from "./sessions.js";
 import { browserTurnContentHash } from "./interactive-turn-provenance.js";
 import { createHostBashOperations } from "./host-execution.js";
 import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability, revokeWorkspaceCapabilityAssociation } from "./workspace-capabilities.js";
@@ -887,6 +888,22 @@ test("starting runtime revocation fences privileged loading and publication, whi
     await assert.rejects(destroyedCreation, /creation was revoked/);
     await destroyed;
     assert.equal(getPiSessionRuntimeState(row.id).runtime_status, "stopped", "destroy fences an unpublished creation");
+
+    const archiveEntered = deferred();
+    const archiveRelease = deferred();
+    const archivedCreation = createPiSession(row.id, cwd, row.provider, row.model, null, {
+      testHooks: {
+        async afterStandardResourcesResolution() {
+          archiveEntered.resolve();
+          await archiveRelease.promise;
+        },
+      },
+    });
+    await archiveEntered.promise;
+    archiveSession(row.id);
+    archiveRelease.resolve();
+    await assert.rejects(archivedCreation, /runtime identity changed during construction/);
+    assert.equal(getPiSession(row.id), undefined, "an archived session cannot publish after an overlapping creation");
   } finally {
     release.resolve();
     await cleanupPiSessionCapabilityDenial([row.id]);
@@ -1896,7 +1913,7 @@ test("queued browser ledger persists distinct source markers exactly once and ex
   }
 });
 
-test("marker append failure retains the exact resolved ledger item for retry", () => {
+test("marker append failure retains the exact resolved ledger item for refresh retirement retry", async () => {
   const f = currentTurnFixture("wayang-pi-bridge-source-append-retry-");
   const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
   const manager = SessionManager.create(f.cwd, f.sessionDir);
@@ -1918,6 +1935,11 @@ test("marker append failure retains the exact resolved ledger item for retry", (
     const turn = Object.freeze({ ...pendingTurn, settlementReady: true });
     handle.interactiveTurns.set(turn.token, turn);
     manager.appendMessage({ role: "user", content: "retryable exact content", timestamp: Date.now() } as any);
+    handle.capabilityRefreshPending = true;
+    handle.acceptedTopLevelWorkCount = 0;
+    (handle.session as any).isStreaming = false;
+    (handle.session as any).isCompacting = false;
+    (handle.session as any).pendingMessageCount = 0;
     const exactUserId = manager.getLeafId();
     let fail = true;
     manager.appendCustomEntry = ((...args: Parameters<typeof manager.appendCustomEntry>) => {
@@ -1928,10 +1950,14 @@ test("marker append failure retains the exact resolved ledger item for retry", (
       return originalAppend(...args);
     }) as typeof manager.appendCustomEntry;
 
-    assert.throws(() => settleInteractiveTurns(handle), /synthetic append failure/);
+    const lookup = new Map([[handle.id, handle]]);
+    const retired: string[] = [];
+    const retire = async (id: string) => { retired.push(id); };
+    assert.equal(await retirePiSessionCapabilityRefreshIfIdle(handle, { lookup, retire }), false);
     assert.equal(handle.interactiveTurns.has(turn.token), true, "resolvable failed marker remains retryable");
     assert.equal(handle.interactiveTurns.get(turn.token)?.piUserEntryId, exactUserId);
-    assert.equal(settleInteractiveTurns(handle).length, 1);
+    assert.equal(await retirePiSessionCapabilityRefreshIfIdle(handle, { lookup, retire }), true);
+    assert.deepEqual(retired, [handle.id]);
     assert.equal(handle.interactiveTurns.size, 0);
     const markers = manager.getEntries().filter((entry: any) => entry.customType === "wayang-interactive-turn-source.v1") as any[];
     assert.equal(markers.length, 1);

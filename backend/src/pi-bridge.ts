@@ -346,6 +346,8 @@ const sessionCapabilityDenialGenerations = new Map<string, bigint>();
 const sessionCapabilityActivationGenerations = new Map<string, bigint>();
 /** Refresh retirement is best effort; lazy creation remains the fallback. */
 const capabilityRefreshRetirementScheduled = new WeakSet<object>();
+const capabilityRefreshSettlementRetryCounts = new WeakMap<object, number>();
+const MAX_CAPABILITY_REFRESH_SETTLEMENT_RETRIES = 8;
 /** Strongest browser teardown requested for one exact denial generation. */
 interface SessionBrowserTeardownIntent {
   generation: bigint;
@@ -2042,6 +2044,7 @@ function resolveAuthorizedRuntimeIdentity(
 ): { row: SessionRow; project: ProjectRow; agentProfile: AgentProfileRow } {
   let row = getSessionById(id);
   if (!row) throw new WorkspaceStoreError("Session not found", 404);
+  if (row.archived) throw new WorkspaceStoreError("Archived sessions are runtime-ineligible", 409);
   if (row.legacy_private_session_quarantine !== false) {
     throw new WorkspaceStoreError("Quarantined legacy sessions are runtime-ineligible", 403);
   }
@@ -2421,7 +2424,14 @@ export async function createPiSession(
     }
     assertCreationCurrent();
     const runtimeIdentity = resolveAuthorizedRuntimeIdentity(id, cwd, runtimeOptions.profileOverride);
-    assertCreationCurrent();
+    const assertRuntimeIdentityCurrent = () => {
+      assertCreationCurrent();
+      const current = getSessionById(id);
+      if (!current || current.archived || current.legacy_private_session_quarantine !== false || current.cwd !== cwd) {
+        throw new WorkspaceStoreError("Session runtime identity changed during construction", 409);
+      }
+    };
+    assertRuntimeIdentityCurrent();
 
     const extensionsStartedAt = performance.now();
     const standardResourcesWitness = resolveCurrentStandardResourcesWitness({
@@ -2432,9 +2442,9 @@ export async function createPiSession(
     assertCreationCurrent();
     if (runtimeOptions.testHooks?.afterStandardResourcesResolution) {
       await runtimeOptions.testHooks.afterStandardResourcesResolution(Boolean(standardResourcesWitness));
-      assertCreationCurrent();
+      assertRuntimeIdentityCurrent();
     }
-    assertCreationCurrent();
+    assertRuntimeIdentityCurrent();
     runtimeOptions.testHooks?.onPrivilegedEffect?.("resource_loader");
     assertCreationCurrent();
     const runtimeResources = await buildAgentResourceLoader({
@@ -2445,7 +2455,7 @@ export async function createPiSession(
       sourceSessionId: id,
       forceInMemorySettings: runtimeOptions.forceInMemorySettings,
     });
-    assertCreationCurrent();
+    assertRuntimeIdentityCurrent();
     recordLatencyMetric("lazy_extensions_ms", performance.now() - extensionsStartedAt);
 
     const settingsModelStartedAt = performance.now();
@@ -3088,8 +3098,8 @@ export async function createPiSession(
       });
     });
 
-    // No await is permitted between this final fence and publication.
-    assertCreationCurrent();
+    // No await is permitted between this final identity/generation fence and publication.
+    assertRuntimeIdentityCurrent();
     assertPendingBrowserCatalogCurrent();
     runtimeOptions.testHooks?.onPrivilegedEffect?.("handle_publication");
     assertCreationCurrent();
@@ -3962,6 +3972,17 @@ export function piSessionHandleCanRetireCapabilityRefresh(
     && handle.queuedBrowserMessages.size === 0;
 }
 
+function refreshSettlementRetryIsEligible(handle: PiSessionHandle): boolean {
+  return Boolean(handle.capabilityRefreshPending)
+    && (handle.acceptedTopLevelWorkCount ?? 0) === 0
+    && !handle.manualCompactionMessageQueue
+    && !isSessionRuntimeMutationLocked(handle.id)
+    && !handle.session.isStreaming
+    && !handle.session.isCompacting
+    && handle.session.pendingMessageCount === 0
+    && [...interactiveTurnLedger(handle).values()].some((turn) => turn.settlementReady);
+}
+
 /** Synthetic seam plus best-effort production retirement implementation. */
 export async function retirePiSessionCapabilityRefreshIfIdle(
   handle: PiSessionHandle,
@@ -3971,8 +3992,13 @@ export async function retirePiSessionCapabilityRefreshIfIdle(
   } = {},
 ): Promise<boolean> {
   const lookup = options.lookup ?? sessions;
-  if (lookup.get(handle.id) !== handle || !piSessionHandleCanRetireCapabilityRefresh(handle)) return false;
+  if (lookup.get(handle.id) !== handle) return false;
+  // A transient source-marker append failure leaves its exact ready ledger item
+  // for retry. Retry it before deciding the stale handle cannot retire.
+  if (refreshSettlementRetryIsEligible(handle)) settleInteractiveTurnsQuietly(handle);
+  if (!piSessionHandleCanRetireCapabilityRefresh(handle)) return false;
   await (options.retire ?? ((runtimeId) => destroyPiSession(runtimeId)))(handle.id);
+  capabilityRefreshSettlementRetryCounts.delete(handle);
   return true;
 }
 
@@ -3981,7 +4007,17 @@ function schedulePiSessionCapabilityRefreshRetirement(handle: PiSessionHandle): 
   capabilityRefreshRetirementScheduled.add(handle);
   setImmediate(() => {
     capabilityRefreshRetirementScheduled.delete(handle);
-    void retirePiSessionCapabilityRefreshIfIdle(handle).catch((error) => {
+    void retirePiSessionCapabilityRefreshIfIdle(handle).then((retired) => {
+      if (retired || !refreshSettlementRetryIsEligible(handle)) {
+        capabilityRefreshSettlementRetryCounts.delete(handle);
+        return;
+      }
+      const attempt = (capabilityRefreshSettlementRetryCounts.get(handle) ?? 0) + 1;
+      if (attempt > MAX_CAPABILITY_REFRESH_SETTLEMENT_RETRIES) return;
+      capabilityRefreshSettlementRetryCounts.set(handle, attempt);
+      const retry = setTimeout(() => schedulePiSessionCapabilityRefreshRetirement(handle), Math.min(250, attempt * 25));
+      retry.unref?.();
+    }).catch((error) => {
       console.warn(`[pi-bridge] Deferred capability refresh retirement failed for session ${handle.id}:`, error);
     });
   });
@@ -4095,6 +4131,9 @@ export async function destroyPiSession(
   // extension hooks. This is deliberately safe even when no live handle exists
   // (for example a stop/archive racing a just-finished session).
   getActionApprovalBridge().cancelSession(id, "session destroyed");
+  getInterviewBridge().cancelSession(id);
+  getSudoBridge().cancelSession(id);
+  getCommandGuardIdentityBridge().cancelSession(id);
   const pendingCreation = sessionCreations.get(id);
   if (pendingCreation) {
     const generation = getPiSessionCapabilityDenialGeneration(id) + 1n;
@@ -4135,9 +4174,6 @@ export async function destroyPiSession(
   } catch {
     // ignore
   }
-  getInterviewBridge().cancelSession(id);
-  getSudoBridge().cancelSession(id);
-  getCommandGuardIdentityBridge().cancelSession(id);
   handle.events.removeAllListeners();
   if (handle.sessionFile) invalidateSessionFileSnapshot(handle.sessionFile);
   // Concurrent best-effort refresh retirement and lazy creation may both wait

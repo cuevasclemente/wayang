@@ -58,6 +58,7 @@ import {
   getPiSession,
   getPiSessionBashMode,
   assertPiSessionAcceptsNewWork,
+  beginPiSessionTopLevelWork,
   beginManualCompactionMessageQueue,
   drainManualCompactionMessageQueue,
   isManualCompactionMessageQueueActive,
@@ -2068,10 +2069,15 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
       }
       const provider = modelRef.slice(0, slashIndex);
       const model = modelRef.slice(slashIndex + 1);
-      const selected = await setSessionModel(sessionId, provider, model);
-      sendCommandNotice(ws, `Model set to ${selected.provider}/${selected.model}`);
-      sendSafe(ws, { type: "command_guard_state", ...getCommandGuardState(sessionId) });
-      return true;
+      const releaseTopLevelWork = beginPiSessionTopLevelWork(handle);
+      try {
+        const selected = await setSessionModel(sessionId, provider, model);
+        sendCommandNotice(ws, `Model set to ${selected.provider}/${selected.model}`);
+        sendSafe(ws, { type: "command_guard_state", ...getCommandGuardState(sessionId) });
+        return true;
+      } finally {
+        releaseTopLevelWork();
+      }
     }
 
     case "name": {
@@ -2149,19 +2155,28 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
     }
 
     case "export": {
-      const outputPath = parsed.args.trim() || undefined;
-      const exportedPath = outputPath?.endsWith(".jsonl")
-        ? handle.session.exportToJsonl(outputPath)
-        : await handle.session.exportToHtml(outputPath);
-      sendCommandNotice(ws, `Exported session to ${exportedPath}`);
-      return true;
+      const releaseTopLevelWork = beginPiSessionTopLevelWork(handle);
+      try {
+        const outputPath = parsed.args.trim() || undefined;
+        const exportedPath = outputPath?.endsWith(".jsonl")
+          ? handle.session.exportToJsonl(outputPath)
+          : await handle.session.exportToHtml(outputPath);
+        sendCommandNotice(ws, `Exported session to ${exportedPath}`);
+        return true;
+      } finally {
+        releaseTopLevelWork();
+      }
     }
 
     case "reload": {
-      assertPiSessionAcceptsNewWork(handle);
-      await handle.session.reload();
-      sendCommandNotice(ws, "Reloaded settings, extensions, skills, prompts, and context files.");
-      return true;
+      const releaseTopLevelWork = beginPiSessionTopLevelWork(handle);
+      try {
+        await handle.session.reload();
+        sendCommandNotice(ws, "Reloaded settings, extensions, skills, prompts, and context files.");
+        return true;
+      } finally {
+        releaseTopLevelWork();
+      }
     }
 
     default:
