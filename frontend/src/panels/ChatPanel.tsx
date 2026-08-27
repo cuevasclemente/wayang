@@ -4351,22 +4351,14 @@ export function ChatPanel({
           }
 
           let remainingQueued = queuedUserMessagesRef.current;
-          const acceptedNextTurnMessages: ChatMessage[] = [];
           if (hasActiveAssistantOutput() && remainingQueued.length > 0 && newWindowUserOccurrences.size > 0) {
             remainingQueued = [...remainingQueued];
-            windowMessages = rawWindowMessages.filter((historyMessage) => {
-              if (
-                historyMessage?.type !== "user"
-                || !historyMessage.message
-                || !newWindowUserOccurrences.has(historyMessage)
-              ) return true;
+            for (const historyMessage of newWindowUserOccurrences) {
+              if (historyMessage.type !== "user" || !historyMessage.message) continue;
               const content = getUserMessageText(historyMessage.message);
               const queuedIndex = remainingQueued.findIndex((queued) => queuedMessageMatchesContent(queued, content));
-              if (queuedIndex === -1) return true;
-              remainingQueued.splice(queuedIndex, 1);
-              acceptedNextTurnMessages.push(historyMessage);
-              return false;
-            });
+              if (queuedIndex !== -1) remainingQueued.splice(queuedIndex, 1);
+            }
           }
           if (msg.reason === "initial" || msg.reason === "reset" || transcriptStateRef.current.mode !== "window-v1") {
             windowMessages = mergeHistoryWithLocalPending(windowMessages, currentSessionMessages);
@@ -4425,9 +4417,8 @@ export function ChatPanel({
             setIsStreaming(msg.streaming_at_snapshot);
           }
           if (typeof msg.compacting_at_snapshot === "boolean") setIsCompacting(msg.compacting_at_snapshot);
-          if (acceptedNextTurnMessages.length > 0) {
+          if (remainingQueued !== queuedUserMessagesRef.current) {
             setQueuedMessagesSynced(() => remainingQueued);
-            insertAcceptedUsersAfterActiveStreaming(acceptedNextTurnMessages);
           } else if (msg.reason === "initial" || msg.reason === "reset") {
             clearQueuedAndDeferredUserMessages();
           }
