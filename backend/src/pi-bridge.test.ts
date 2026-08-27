@@ -22,6 +22,7 @@ import {
   getPiSession,
   getPiSessionBashMode,
   getPiSessionRuntimeState,
+  getQueuedBrowserMessages,
   getSessionFileMessageHistory,
   getSessionFileSnapshot,
   invalidateSessionFileSnapshot,
@@ -31,6 +32,7 @@ import {
   interviewSubmissionContent,
   listModels,
   markClaimedQueuedBrowserTurnsReady,
+  markQueuedBrowserMessageStarted,
   onPiSessionRuntimeEvent,
   persistSettledSessionError,
   trackOverflowRecovery,
@@ -41,6 +43,7 @@ import {
   resolveInteractiveBrowserAuthority,
   resolveInteractiveTurn,
   sendBrowserMessageTurn,
+  serializeEvent,
   settleInteractiveTurns,
   setSessionDefaultModel,
   setSessionModel,
@@ -1240,6 +1243,58 @@ test("non-browser interview steering preserves an accepted queued browser source
     assert.equal(settleInteractiveTurns(handle).length, 1);
     assert.equal(handle.interactiveTurns.size, 0);
     assert.equal(manager.getEntries().some((entry: any) => entry.customType === "wayang-interactive-turn-source.v1"), true);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("queued browser message_start hides the exact queue item and projects its client ID", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-queued-start-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const queuedMessage = { role: "user", content: "accepted queued browser turn" };
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: true,
+    _steeringMessages: [],
+    _emitQueueUpdate() {},
+    agent: { steeringQueue: { messages: [] as any[] } },
+    steer(content: string) {
+      this._steeringMessages.push(content);
+      this.agent.steeringQueue.messages.push(queuedMessage);
+      return Promise.resolve();
+    },
+    getSteeringMessages() { return [...this._steeringMessages]; },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "queued-start-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    const result = await sendBrowserMessageTurn(
+      handle,
+      "accepted queued browser turn",
+      undefined,
+      "accepted-client-message",
+      { content: "accepted queued browser turn" },
+    );
+    assert.deepEqual(result, { queued: true, cancellable: true });
+    assert.equal(getQueuedBrowserMessages(handle.id).length, 0,
+      "unregistered synthetic handle is not visible through the process registry");
+    assert.equal([...handle.queuedBrowserMessages.values()][0]?.clientVisible, true);
+
+    assert.equal(markQueuedBrowserMessageStarted(handle, queuedMessage), "accepted-client-message");
+    assert.equal([...handle.queuedBrowserMessages.values()][0]?.clientVisible, false);
+    const serialized = serializeEvent({ type: "message_start", message: queuedMessage } as any);
+    assert.equal(serialized?.client_message_id, "accepted-client-message");
   } finally {
     f.cleanup();
   }

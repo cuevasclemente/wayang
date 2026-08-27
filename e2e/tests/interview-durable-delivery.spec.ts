@@ -4,14 +4,21 @@ import { createE2eSession, openSessionInUi } from "./helpers/sessions";
 const firstRequestId = "e2e-interview-first";
 const secondRequestId = "e2e-interview-second";
 
-async function installInterviewSocketMock(page: import("@playwright/test").Page): Promise<void> {
-  await page.addInitScript(() => {
+async function installInterviewSocketMock(
+  page: import("@playwright/test").Page,
+  replayOnSync: { requestId: string; prompt: string } | null = null,
+): Promise<void> {
+  await page.addInitScript(({ replay }) => {
     type SocketEventHandler = ((event: Event) => void) | null;
     type SocketMessageHandler = ((event: MessageEvent) => void) | null;
 
     const state = {
       sockets: [] as MockWebSocket[],
       sent: [] as Array<Record<string, unknown>>,
+      replay,
+      replayRequestId: replay?.requestId ?? null,
+      terminalReplayStatus: null as "cancelled" | null,
+      openInterviewRequests: new Map<string, Record<string, unknown>>(),
     };
 
     class MockWebSocket {
@@ -45,7 +52,51 @@ async function installInterviewSocketMock(page: import("@playwright/test").Page)
 
       send(data: string): void {
         try {
-          state.sent.push(JSON.parse(data) as Record<string, unknown>);
+          const message = JSON.parse(data) as Record<string, unknown>;
+          state.sent.push(message);
+          if (message.type === "interactive_state_sync_request") {
+            const knownIds = Array.isArray(message.known_interview_request_ids)
+              ? message.known_interview_request_ids.filter((id): id is string => typeof id === "string")
+              : [];
+            this.emit({
+              type: "interview_snapshot",
+              session_id: this.sessionId,
+              selection_id: this.selectionId,
+              sessionId: this.sessionId,
+              requests: [
+                ...(state.replay ? [{
+                  requestId: state.replay.requestId,
+                  sessionId: this.sessionId,
+                  createdAt: 5,
+                  questions: [{
+                    id: "replayed",
+                    label: "Replayed",
+                    prompt: state.replay.prompt,
+                    options: [{ value: "ok", label: "OK" }],
+                    allowOther: true,
+                  }],
+                }] : []),
+                ...state.openInterviewRequests.values(),
+              ],
+              outcomes: knownIds.map((requestId) => ({
+                requestId,
+                status: state.replay?.requestId === requestId || state.openInterviewRequests.has(requestId)
+                  ? "open"
+                  : state.replayRequestId === requestId && state.terminalReplayStatus
+                    ? state.terminalReplayStatus
+                    : "missing",
+              })),
+              syncComplete: true,
+            });
+            this.emit({
+              type: "sudo_snapshot",
+              session_id: this.sessionId,
+              selection_id: this.selectionId,
+              sessionId: this.sessionId,
+              requests: [],
+              syncComplete: true,
+            });
+          }
         } catch {
           // The production client only sends JSON over this socket.
         }
@@ -66,16 +117,147 @@ async function installInterviewSocketMock(page: import("@playwright/test").Page)
     (window as unknown as { __interviewSocketTest: typeof state & {
       emit: (payload: Record<string, unknown>) => void;
       closeLatest: () => void;
+      clearReplay: () => void;
     } }).__interviewSocketTest = Object.assign(state, {
       emit(payload: Record<string, unknown>) {
+        const currentSocket = state.sockets.at(-1);
+        if (
+          payload.type === "interview_request"
+          && typeof payload.requestId === "string"
+          && (payload.session_id === undefined || payload.session_id === currentSocket?.sessionId)
+        ) {
+          state.openInterviewRequests.set(payload.requestId, {
+            requestId: payload.requestId,
+            sessionId: payload.sessionId,
+            questions: payload.questions,
+            createdAt: payload.createdAt,
+          });
+        }
+        if (
+          ((payload.type === "interview_response_ack" && payload.status !== "rejected")
+            || (payload.type === "interview_cancel_ack" && payload.status === "cancelled"))
+          && typeof payload.requestId === "string"
+        ) state.openInterviewRequests.delete(payload.requestId);
         state.sockets.at(-1)?.emit(payload);
       },
       closeLatest() {
         state.sockets.at(-1)?.close();
       },
+      clearReplay() {
+        state.replay = null;
+        state.terminalReplayStatus = "cancelled";
+      },
+    });
+  }, { replay: replayOnSync });
+}
+
+test("authoritative interview sync replays a missed open questionnaire idempotently", async ({ page, request }) => {
+  const session = await createE2eSession(request, "e2e interview sync replay");
+  await installInterviewSocketMock(page, {
+    requestId: "e2e-interview-replayed",
+    prompt: "Replayed durable questionnaire",
+  });
+  await openSessionInUi(page, session);
+
+  await expect(page.getByTestId("interview-form")).toContainText("Replayed durable questionnaire");
+  await page.evaluate((sessionId) => {
+    const state = (window as unknown as { __interviewSocketTest: {
+      sockets: Array<{ selectionId: string | null }>;
+      emit: (payload: Record<string, unknown>) => void;
+    } }).__interviewSocketTest;
+    state.emit({
+      type: "interview_request",
+      session_id: "stale-other-session",
+      selection_id: state.sockets.at(-1)?.selectionId,
+      requestId: "stale-replayed-interview",
+      sessionId,
+      createdAt: 6,
+      questions: [{
+        id: "stale",
+        label: "Stale",
+        prompt: "Stale questionnaire must not appear",
+        options: [],
+        allowOther: true,
+      }],
+    });
+  }, session.id);
+  await expect(page.getByText("Stale questionnaire must not appear", { exact: true })).toHaveCount(0);
+  await expect.poll(() => page.evaluate((sessionId) => {
+    const state = (window as unknown as { __interviewSocketTest: { sent: Array<{ type?: string; session_id?: string; selection_id?: string }> } }).__interviewSocketTest;
+    return state.sent.filter((message) => (
+      message.type === "interactive_state_sync_request"
+      && message.session_id === sessionId
+      && typeof message.selection_id === "string"
+    )).length;
+  }, session.id)).toBeGreaterThanOrEqual(1);
+  await page.evaluate(() => {
+    const state = (window as unknown as { __interviewSocketTest: {
+      sockets: Array<{ sessionId: string; selectionId: string | null }>;
+      emit: (payload: Record<string, unknown>) => void;
+    } }).__interviewSocketTest;
+    const socket = state.sockets.at(-1)!;
+    state.emit({
+      type: "session_ready",
+      session_id: socket.sessionId,
+      selection_id: socket.selectionId,
     });
   });
-}
+  await expect(page.getByTestId("interview-form")).toHaveCount(1);
+  await expect(page.getByTestId("interview-queue")).not.toContainText("Questionnaire 1 of 2");
+
+  await page.evaluate(() => {
+    const state = (window as unknown as { __interviewSocketTest: {
+      sockets: Array<{ sessionId: string; selectionId: string | null }>;
+      emit: (payload: Record<string, unknown>) => void;
+      clearReplay: () => void;
+    } }).__interviewSocketTest;
+    state.clearReplay();
+    const socket = state.sockets.at(-1)!;
+    state.emit({ type: "session_ready", session_id: socket.sessionId, selection_id: socket.selectionId });
+  });
+  await expect(page.getByTestId("interview-form")).toHaveCount(0);
+
+  await page.evaluate(() => {
+    const state = (window as unknown as { __interviewSocketTest: {
+      sockets: Array<{ sessionId: string; selectionId: string | null }>;
+      emit: (payload: Record<string, unknown>) => void;
+    } }).__interviewSocketTest;
+    const socket = state.sockets.at(-1)!;
+    state.emit({
+      type: "sudo_snapshot",
+      session_id: socket.sessionId,
+      selection_id: socket.selectionId,
+      sessionId: socket.sessionId,
+      requests: [{
+        type: "sudo_request",
+        session_id: socket.sessionId,
+        selection_id: socket.selectionId,
+        requestId: "replayed-sudo-request",
+        sessionId: socket.sessionId,
+        prompt: "Replayed pending sudo request",
+        kind: "approval",
+      }],
+      syncComplete: true,
+    });
+  });
+  await expect(page.getByText("Replayed pending sudo request", { exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    const state = (window as unknown as { __interviewSocketTest: {
+      sockets: Array<{ sessionId: string; selectionId: string | null }>;
+      emit: (payload: Record<string, unknown>) => void;
+    } }).__interviewSocketTest;
+    const socket = state.sockets.at(-1)!;
+    state.emit({
+      type: "sudo_snapshot",
+      session_id: socket.sessionId,
+      selection_id: socket.selectionId,
+      sessionId: socket.sessionId,
+      requests: [],
+      syncComplete: true,
+    });
+  });
+  await expect(page.getByText("Replayed pending sudo request", { exact: true })).toHaveCount(0);
+});
 
 test("retains an immutable interview response through reconnect and advances the session queue only after its ack", async ({ page, request }) => {
   await installInterviewSocketMock(page);

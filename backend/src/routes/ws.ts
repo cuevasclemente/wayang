@@ -1423,6 +1423,8 @@ function handleConnection(
           deliveredInterviewRequestIds.add(req.requestId);
           sendSafe(ws, {
             type: "interview_request",
+            session_id: currentSessionId,
+            ...(currentSelectionId ? { selection_id: currentSelectionId } : {}),
             requestId: req.requestId,
             sessionId: req.sessionId,
             questions: req.questions,
@@ -1449,6 +1451,8 @@ function handleConnection(
           deliveredSudoRequestIds.add(req.requestId);
           sendSafe(ws, {
             type: "sudo_request",
+            session_id: currentSessionId,
+            ...(currentSelectionId ? { selection_id: currentSelectionId } : {}),
             requestId: req.requestId,
             sessionId: req.sessionId,
             prompt: req.prompt,
@@ -1784,6 +1788,54 @@ function handleConnection(
     // Route extension UI bridge responses directly to their bridges.
     if (msg.type === "external_action_response") {
       void handleExternalActionResponse(ws, currentSessionId, currentSelectionId, msg);
+      return;
+    }
+
+    if (msg.type === "interactive_state_sync_request") {
+      if (
+        typeof msg.session_id !== "string"
+        || typeof msg.selection_id !== "string"
+        || msg.session_id !== currentSessionId
+        || msg.selection_id !== currentSelectionId
+        || !Array.isArray(msg.known_interview_request_ids)
+        || msg.known_interview_request_ids.length > 64
+        || !msg.known_interview_request_ids.every((id: unknown) => (
+          typeof id === "string" && id.length > 0 && Buffer.byteLength(id, "utf8") <= 256
+        ))
+      ) return;
+      const knownInterviewRequestIds = [...new Set(msg.known_interview_request_ids as string[])];
+      const interviewRequests = getInterviewBridge().getPendingRequests(currentSessionId);
+      sendSafe(ws, {
+        type: "interview_snapshot",
+        session_id: currentSessionId,
+        selection_id: currentSelectionId,
+        sessionId: currentSessionId,
+        requests: interviewRequests.map((request) => ({
+          requestId: request.requestId,
+          sessionId: request.sessionId,
+          questions: request.questions,
+          createdAt: request.createdAt,
+        })),
+        outcomes: knownInterviewRequestIds.map((requestId) => ({
+          requestId,
+          status: getInterviewForSession(currentSessionId, requestId)?.status ?? "missing",
+        })),
+        syncComplete: true,
+      });
+      const sudoRequests = getSudoBridge().getPendingRequests(currentSessionId).slice(0, 1);
+      sendSafe(ws, {
+        type: "sudo_snapshot",
+        session_id: currentSessionId,
+        selection_id: currentSelectionId,
+        sessionId: currentSessionId,
+        requests: sudoRequests.map((request) => ({
+          type: "sudo_request",
+          session_id: currentSessionId,
+          selection_id: currentSelectionId,
+          ...request,
+        })),
+        syncComplete: true,
+      });
       return;
     }
 

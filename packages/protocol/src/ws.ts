@@ -150,6 +150,14 @@ export interface CommandGuardPinResponse {
   cancelled?: boolean;
 }
 
+/** Request authoritative replay of still-open interactive controls for this selection. */
+export interface InteractiveStateSyncRequestMessage {
+  type: "interactive_state_sync_request";
+  session_id: string;
+  selection_id: string;
+  known_interview_request_ids: string[];
+}
+
 /** Submit answers for an `interview_request`. */
 export interface InterviewResponseMessage {
   type: "interview_response";
@@ -189,6 +197,7 @@ export type ChatClientMessage =
   | SubagentSpawn
   | ExternalActionResponse
   | CommandGuardPinResponse
+  | InteractiveStateSyncRequestMessage
   | InterviewResponseMessage
   | InterviewCancelMessage
   | SudoResponseMessage;
@@ -340,6 +349,8 @@ export interface MessageStartMessage {
   type: "message_start";
   session_id: string;
   selection_id?: string;
+  /** Exact browser queue correlation when Pi starts the captured queued object. */
+  client_message_id?: string;
   message: unknown;
 }
 
@@ -629,10 +640,30 @@ export type InterviewStatus = "open" | "submitted" | "cancelled" | "delivered";
 
 export interface InterviewRequestMessage {
   type: "interview_request";
+  session_id: string;
+  selection_id?: string;
   requestId: string;
   sessionId: string;
   questions: unknown;
   createdAt: number;
+}
+
+export interface InterviewSnapshotMessage {
+  type: "interview_snapshot";
+  session_id: string;
+  selection_id: string;
+  sessionId: string;
+  requests: Array<{
+    requestId: string;
+    sessionId: string;
+    questions: unknown;
+    createdAt: number;
+  }>;
+  outcomes: Array<{
+    requestId: string;
+    status: InterviewStatus | "missing";
+  }>;
+  syncComplete: true;
 }
 
 export type InterviewResponseAckErrorCode =
@@ -681,6 +712,8 @@ export interface SudoRequestOrigin {
 
 export interface SudoRequestMessage {
   type: "sudo_request";
+  session_id: string;
+  selection_id?: string;
   requestId: string;
   sessionId: string;
   prompt: string;
@@ -692,6 +725,15 @@ export interface SudoRequestMessage {
   cwd?: string;
   timeoutMs?: number;
   origin?: SudoRequestOrigin;
+}
+
+export interface SudoSnapshotMessage {
+  type: "sudo_snapshot";
+  session_id: string;
+  selection_id: string;
+  sessionId: string;
+  requests: SudoRequestMessage[];
+  syncComplete: true;
 }
 
 export interface CommandGuardPinRequestMessage {
@@ -776,9 +818,11 @@ export type ChatServerMessage =
   | ExternalActionTerminalMessage
   | ExternalActionSnapshotMessage
   | InterviewRequestMessage
+  | InterviewSnapshotMessage
   | InterviewResponseAckMessage
   | InterviewCancelAckMessage
   | SudoRequestMessage
+  | SudoSnapshotMessage
   | CommandGuardPinRequestMessage
   | CommandGuardStateMessage
   | CustomMessage;

@@ -81,6 +81,8 @@ function safeRequestMetadata(options: SudoRequestOptions): SudoRequestOptions {
 }
 
 type RequestCallback = (req: SudoRequest) => void;
+// The owner UI intentionally renders one exact sudo gate at a time.
+const MAX_PENDING_SUDO_REQUESTS_PER_SESSION = 1;
 
 class PiSudoBridge {
   private pending = new Map<string, PendingSudoRequest>();
@@ -96,6 +98,7 @@ class PiSudoBridge {
     timeoutMs = 120_000,
     options: SudoRequestOptions = {},
   ): Promise<string | null> {
+    if (this.getPendingCount(sessionId) >= MAX_PENDING_SUDO_REQUESTS_PER_SESSION) return Promise.resolve(null);
     return new Promise<string | null>((resolve) => {
       const requestId = randomUUID();
       const timer = setTimeout(() => {
@@ -125,6 +128,7 @@ class PiSudoBridge {
     timeoutMs = 120_000,
     options: SudoRequestOptions = {},
   ): Promise<boolean> {
+    if (this.getPendingCount(sessionId) >= MAX_PENDING_SUDO_REQUESTS_PER_SESSION) return Promise.resolve(false);
     return new Promise<boolean>((resolve) => {
       const requestId = randomUUID();
       const timer = setTimeout(() => {

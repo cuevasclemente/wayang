@@ -29,6 +29,7 @@ async function installQueuedMessageSocket(
       private firstClientMessageId: string | null = null;
       private firstMessageContent: string | null = null;
       private pendingQueuedAcceptance: { clientMessageId: string; content: string } | null = null;
+      private nextCancelNotFound = false;
 
       constructor(url: string) {
         const parsed = new URL(url, window.location.href);
@@ -39,6 +40,9 @@ async function installQueuedMessageSocket(
         });
         (window as unknown as { forceQueuedSocketClosing: () => void }).forceQueuedSocketClosing = () => {
           this.readyState = QueuedMessageWebSocket.CLOSING;
+        };
+        (window as unknown as { forceNextQueuedCancelNotFound: () => void }).forceNextQueuedCancelNotFound = () => {
+          this.nextCancelNotFound = true;
         };
         (window as unknown as { startDeferredQueuedTurn: () => void }).startDeferredQueuedTurn = () => {
           this.emit({ type: "agent_start" });
@@ -68,6 +72,52 @@ async function installQueuedMessageSocket(
             }],
           });
           this.firstMessageContent = null;
+        };
+        (window as unknown as { acceptQueuedSendLiveThenReplayStaleSnapshot: () => void }).acceptQueuedSendLiveThenReplayStaleSnapshot = () => {
+          if (!this.pendingQueuedAcceptance) return;
+          const accepted = this.pendingQueuedAcceptance;
+          this.emit({
+            type: "message_start",
+            client_message_id: accepted.clientMessageId,
+            message: {
+              role: "user",
+              content: accepted.content,
+            },
+          });
+          this.emit({
+            type: "queued_message_snapshot",
+            session_id: this.sessionId,
+            selection_id: this.selectionId,
+            messages: [{
+              client_message_id: accepted.clientMessageId,
+              content: accepted.content,
+              attachment_names: [],
+            }],
+          });
+          this.emit({
+            type: "queued_message_ack",
+            session_id: this.sessionId,
+            client_message_id: accepted.clientMessageId,
+            status: "queued",
+            cancellable: true,
+          });
+          this.pendingQueuedAcceptance = null;
+        };
+        (window as unknown as { acceptQueuedSendAfterLocalQueueLoss: () => void }).acceptQueuedSendAfterLocalQueueLoss = () => {
+          if (!this.pendingQueuedAcceptance) return;
+          const accepted = this.pendingQueuedAcceptance;
+          this.emit({
+            type: "queued_message_snapshot",
+            session_id: this.sessionId,
+            selection_id: this.selectionId,
+            messages: [],
+          });
+          this.emit({
+            type: "message_start",
+            client_message_id: accepted.clientMessageId,
+            message: { role: "user", content: accepted.content },
+          });
+          this.pendingQueuedAcceptance = null;
         };
         (window as unknown as { acceptQueuedSendWithoutAck: () => void }).acceptQueuedSendWithoutAck = () => {
           if (!this.pendingQueuedAcceptance) return;
@@ -136,8 +186,9 @@ async function installQueuedMessageSocket(
             type: "queued_message_cancel_ack",
             session_id: this.sessionId,
             client_message_id: message.client_message_id,
-            status: "cancelled",
+            status: this.nextCancelNotFound ? "not_found" : "cancelled",
           });
+          this.nextCancelNotFound = false;
           return;
         }
         if (message.type !== "message" || typeof message.content !== "string") return;
@@ -156,13 +207,11 @@ async function installQueuedMessageSocket(
           return;
         }
         if (message.client_message_id) {
-          if (suppressQueuedAck) {
-            this.pendingQueuedAcceptance = {
-              clientMessageId: message.client_message_id,
-              content: message.content,
-            };
-            return;
-          }
+          this.pendingQueuedAcceptance = {
+            clientMessageId: message.client_message_id,
+            content: message.content,
+          };
+          if (suppressQueuedAck) return;
           const acknowledgement = {
             type: "queued_message_ack",
             session_id: this.sessionId,
@@ -380,12 +429,17 @@ test("does not resurrect a sent draft after switching away before acknowledgemen
 
   await page.getByText(second.title, { exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/sessions/${second.id}$`));
+  const secondDraft = "A different unsent draft owned by the second session.";
+  await page.getByTestId("chat-input").fill(secondDraft);
   await page.getByText(first.title, { exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/sessions/${first.id}$`));
   await expect(page.getByTestId("chat-input")).toHaveValue("");
   await expect.poll(() => page.evaluate((sessionId) => (
     window.localStorage.getItem(`wayang:chat-draft:${sessionId}`)
   ), first.id)).toBe(sentText);
+  await expect.poll(() => page.evaluate((sessionId) => (
+    window.localStorage.getItem(`wayang:chat-draft:${sessionId}`)
+  ), second.id)).toBe(secondDraft);
 });
 
 test("reload conservatively restores a sent draft whose delivery stayed uncertain", async ({ page, request }) => {
@@ -449,6 +503,41 @@ test("a delayed acknowledgement does not clear a newer identical draft", async (
   ), first.id)).toBe(repeatedText);
 });
 
+test("in-flight submission bounds leave the next draft unsent", async ({ page, request }) => {
+  await installQueuedMessageSocket(page);
+  const session = await createE2eSession(request, "e2e in-flight submission bound");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Start active output while submissions remain unresolved.");
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  for (let index = 0; index < 15; index++) {
+    await page.getByTestId("chat-input").fill(`queued unresolved ${index}`);
+    await page.getByTestId("chat-send-button").click();
+  }
+  await expect(page.getByTestId("chat-queued-user-message")).toHaveCount(15);
+  const blockedDraft = "This seventeenth unresolved submission must stay unsent.";
+  await page.getByTestId("chat-input").fill(blockedDraft);
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-input")).toHaveValue(blockedDraft);
+  await expect(page.getByTestId("chat-runtime-error")).toContainText("Too many messages are still awaiting delivery acknowledgement");
+});
+
+test("queued acknowledgement retains recovery text across runtime loss", async ({ page, request }) => {
+  await installQueuedMessageSocket(page);
+  const session = await createE2eSession(request, "e2e queued ack recovery");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Start active output before queued ACK recovery.");
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  const queuedText = "Retain this queued recovery until exact acceptance.";
+  await page.getByTestId("chat-input").fill(queuedText);
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-queued-user-message")).toContainText(queuedText);
+  await page.reload();
+  await expect(page.getByTestId("chat-input")).toBeEnabled({ timeout: 30_000 });
+  await expect(page.getByTestId("chat-input")).toHaveValue(queuedText);
+});
+
 test("content-only queued history keeps ACK-loss recovery durable but hidden", async ({ page, request }) => {
   await installQueuedMessageSocket(page, [], false, false, true);
   const first = await createE2eSession(request, "e2e ack loss first session");
@@ -475,6 +564,53 @@ test("content-only queued history keeps ACK-loss recovery durable but hidden", a
   await page.getByText(first.title, { exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/sessions/${first.id}$`));
   await expect(page.getByTestId("chat-input")).toHaveValue("");
+});
+
+test("exact live acceptance prevents a stale queue snapshot from re-adding the sent message", async ({ page, request }) => {
+  await installQueuedMessageSocket(page, [], false, false, true);
+  const session = await createE2eSession(request, "e2e accepted stale queue snapshot");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Start active output before exact queued acceptance.");
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  const queuedText = "Remove this exact accepted turn even if a stale queue snapshot follows.";
+  await page.getByTestId("chat-input").fill(queuedText);
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-queued-user-message")).toContainText(queuedText);
+
+  await page.evaluate(() => (
+    window as unknown as { acceptQueuedSendLiveThenReplayStaleSnapshot: () => void }
+  ).acceptQueuedSendLiveThenReplayStaleSnapshot());
+  await expect(page.getByTestId("chat-queued-user-message")).toHaveCount(0);
+  await expect(page.locator('[data-testid="chat-message"][data-role="user"]').filter({ hasText: queuedText })).toBeVisible();
+  await expect.poll(() => page.evaluate((sessionId) => (
+    window.localStorage.getItem(`wayang:chat-draft:${sessionId}`)
+  ), session.id)).toBeNull();
+});
+
+test("exact acceptance renders a temporary user row after local queue state was lost", async ({ page, request }) => {
+  await installQueuedMessageSocket(page);
+  const session = await createE2eSession(request, "e2e accepted missing local queue");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Start active output before local queue loss.");
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  const queuedText = "Render this accepted message even after its local queue row disappeared.";
+  await page.getByTestId("chat-input").fill(queuedText);
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-queued-user-message")).toContainText(queuedText);
+
+  await page.evaluate(() => (
+    window as unknown as { acceptQueuedSendAfterLocalQueueLoss: () => void }
+  ).acceptQueuedSendAfterLocalQueueLoss());
+  await expect(page.getByTestId("chat-queued-user-message")).toHaveCount(0);
+  const acceptedUser = page.locator('[data-testid="chat-message"][data-role="user"]').filter({ hasText: queuedText });
+  const priorAssistant = page.locator('[data-testid="chat-message"][data-role="assistant"]').filter({ hasText: "Synthetic active response remains in progress." });
+  await expect(acceptedUser).toBeVisible();
+  await expect(priorAssistant).toBeVisible();
+  expect(await priorAssistant.evaluate((assistant, user) => (
+    Boolean(assistant.compareDocumentPosition(user as Node) & Node.DOCUMENT_POSITION_FOLLOWING)
+  ), await acceptedUser.elementHandle())).toBe(true);
 });
 
 test("restores text and attachments when a send is rejected after switching sessions", async ({ page, request }) => {
@@ -506,6 +642,29 @@ test("restores text and attachments when a send is rejected after switching sess
 
   await expect(page.getByTestId("chat-input")).toHaveValue(rejectedText);
   await expect(page.getByText("stale-selection-note.txt", { exact: true })).toBeVisible();
+});
+
+test("attachment-only rejection preserves another unresolved text recovery draft", async ({ page, request }) => {
+  await installQueuedMessageSocket(page, [], false, true);
+  const session = await createE2eSession(request, "e2e attachment rejection recovery owner");
+  await openSessionInUi(page, session);
+
+  const unresolvedText = "Keep this unresolved first-send recovery text.";
+  await page.getByTestId("chat-input").fill(unresolvedText);
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "attachment-only-rejected.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("synthetic attachment-only rejection"),
+  });
+  await page.getByTestId("chat-send-button").click();
+
+  await expect(page.getByTestId("chat-input")).toHaveValue(unresolvedText);
+  await expect(page.getByText("attachment-only-rejected.txt", { exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate((sessionId) => (
+    window.localStorage.getItem(`wayang:chat-draft:${sessionId}`)
+  ), session.id)).toBe(unresolvedText);
 });
 
 test("removes a rejected queue item after restoring its text and attachment", async ({ page, request }) => {
@@ -602,6 +761,29 @@ test("keeps interrupted queued attachments in the source-session draft across sw
   await expect(page).toHaveURL(new RegExp(`/sessions/${first.id}$`));
   await expect(page.getByTestId("chat-input")).toHaveValue(restoredText);
   await expect(page.getByText("interrupted-queue-note.txt", { exact: true })).toBeVisible();
+});
+
+test("already-accepted cancel result removes the stale outbox card", async ({ page, request }) => {
+  await installQueuedMessageSocket(page);
+  const session = await createE2eSession(request, "e2e already accepted cancel");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Start active output before accepted cancellation.");
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  const queuedText = "This accepted message must not remain as an unavailable outbox card.";
+  await page.getByTestId("chat-input").fill(queuedText);
+  await page.getByTestId("chat-send-button").click();
+  const queued = page.getByTestId("chat-queued-user-message");
+  await expect(queued).toContainText(queuedText);
+  await page.evaluate(() => (
+    window as unknown as { forceNextQueuedCancelNotFound: () => void }
+  ).forceNextQueuedCancelNotFound());
+  await queued.getByTestId("chat-cancel-queued-message").click();
+  await expect(queued).toHaveCount(0);
+  await expect(page.getByText("already accepted and can no longer be cancelled")).toHaveCount(0);
+  await expect.poll(() => page.evaluate((sessionId) => (
+    window.localStorage.getItem(`wayang:chat-draft:${sessionId}`)
+  ), session.id)).toBeNull();
 });
 
 test("cancels one queued message without interrupting the active turn or removing its neighbor", async ({ page, request }) => {

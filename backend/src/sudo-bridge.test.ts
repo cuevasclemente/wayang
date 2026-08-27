@@ -81,6 +81,17 @@ test("sudo bridge cancellation resolves with null", async () => {
   assert.equal(await pending, null);
 });
 
+test("sudo bridge permits one pending owner gate per session", async () => {
+  const bridge = new PiSudoBridge();
+  const pending = bridge.requestPassword("bounded-session", "first", 10_000);
+  assert.equal(bridge.getPendingRequests("bounded-session").length, 1);
+  assert.equal(await bridge.requestPassword("bounded-session", "overflow", 10_000), null);
+  assert.equal(await bridge.requestApproval("bounded-session", "overflow", 10_000), false);
+  assert.equal(bridge.getPendingRequests("bounded-session").length, 1);
+  bridge.cancelSession("bounded-session");
+  assert.equal(await pending, null);
+});
+
 test("sudo bridge session cleanup cancels matching pending requests", async () => {
   const bridge = new PiSudoBridge();
   const seen: string[] = [];

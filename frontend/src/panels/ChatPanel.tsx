@@ -143,6 +143,17 @@ interface SubmittedUserMessage {
   transportGeneration: number;
 }
 
+const MAX_IN_FLIGHT_SUBMISSIONS = 16;
+// A permitted 50 MiB raw attachment expands to about 67 MiB as base64.
+// Keep a bounded aggregate while allowing one maximum-size submission.
+const MAX_IN_FLIGHT_SUBMISSION_BYTES = 128 * 1024 * 1024;
+
+function submittedUserMessageBytes(submitted: SubmittedUserMessage): number {
+  return new TextEncoder().encode(submitted.content).byteLength
+    + new TextEncoder().encode(submitted.draft).byteLength
+    + submitted.attachments.reduce((total, attachment) => total + attachment.data.length, 0);
+}
+
 function mergePendingAttachments(
   restored: PendingAttachment[],
   current: PendingAttachment[],
@@ -3248,6 +3259,7 @@ export function ChatPanel({
   const lastProgrammaticScrollAtRef = useRef(0);
   const queuedUserMessagesRef = useRef<QueuedUserMessage[]>([]);
   const submittedUserMessagesRef = useRef(new Map<string, SubmittedUserMessage>());
+  const acceptedClientMessageIdsRef = useRef(new Set<string>());
   const draftRevisionBySessionRef = useRef(new Map<string, number>());
   const attachmentDraftsBySessionRef = useRef(new Map<string, PendingAttachment[]>());
   const deferredUserMessagesRef = useRef<ChatMessage[]>([]);
@@ -3265,7 +3277,7 @@ export function ChatPanel({
   const wsStatusRef = useRef<WsStatus>(wsStatus);
   const isSessionHistoryLoadingRef = useRef(isSessionHistoryLoading);
   const identityPinReturnFocusRef = useRef<HTMLButtonElement | null>(null);
-  const isRestoringDraftRef = useRef(false);
+  const draftRestoreRef = useRef<{ sessionId: string | null; value: string } | null>(null);
   const suppressedDraftPersistenceRef = useRef<{ sessionId: string; value: string } | null>(null);
   activeSessionErrorRef.current = activeSession?.error ?? null;
   activeSessionRuntimeStreamingRef.current = Boolean(activeSession?.runtime_is_streaming);
@@ -3343,7 +3355,6 @@ export function ChatPanel({
   }, [activeSession?.runtime_mutation_locked, activeSessionId]);
 
   useEffect(() => {
-    isRestoringDraftRef.current = true;
     const storedDraft = loadChatDraft(activeSessionId);
     const currentRevision = activeSessionId
       ? draftRevisionBySessionRef.current.get(activeSessionId) ?? 0
@@ -3353,7 +3364,9 @@ export function ChatPanel({
         && submitted.draftRevision === currentRevision
         && submitted.draft === storedDraft,
     ));
-    setInputText(pendingSubmissionOwnsStoredDraft ? "" : storedDraft);
+    const restoredValue = pendingSubmissionOwnsStoredDraft ? "" : storedDraft;
+    draftRestoreRef.current = { sessionId: activeSessionId, value: restoredValue };
+    setInputText(restoredValue);
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -3364,8 +3377,9 @@ export function ChatPanel({
   }, [inputText]);
 
   useEffect(() => {
-    if (isRestoringDraftRef.current) {
-      isRestoringDraftRef.current = false;
+    const restore = draftRestoreRef.current;
+    if (restore && restore.sessionId === activeSessionId) {
+      if (restore.value === inputText) draftRestoreRef.current = null;
       return;
     }
     const suppressed = suppressedDraftPersistenceRef.current;
@@ -3542,9 +3556,12 @@ export function ChatPanel({
       submitted.sessionId,
       (draftRevisionBySessionRef.current.get(submitted.sessionId) ?? 0) + 1,
     );
-    const mergeRejectedDraft = (current: string): string => current === submitted.draft
-      ? current
-      : [submitted.draft, current].filter((text) => text.trim().length > 0).join("\n\n");
+    const durableDraft = loadChatDraft(submitted.sessionId);
+    const mergeRejectedDraft = (current: string): string => {
+      const base = current.trim().length > 0 ? current : durableDraft;
+      if (submitted.draft.trim().length === 0 || base === submitted.draft) return base;
+      return [submitted.draft, base].filter((text) => text.trim().length > 0).join("\n\n");
+    };
     if (activeSessionIdRef.current !== submitted.sessionId) {
       persistChatDraft(submitted.sessionId, mergeRejectedDraft(loadChatDraft(submitted.sessionId)));
       return;
@@ -3562,6 +3579,34 @@ export function ChatPanel({
       });
     }
   }, []);
+
+  const acceptedClientMessageKey = useCallback((sessionId: string, clientMessageId: string) => (
+    `${sessionId}\0${clientMessageId}`
+  ), []);
+
+  const markClientMessageAccepted = useCallback((sessionId: string, clientMessageId: string) => {
+    const accepted = acceptedClientMessageIdsRef.current;
+    accepted.add(acceptedClientMessageKey(sessionId, clientMessageId));
+    while (accepted.size > 512) {
+      const oldest = accepted.values().next().value as string | undefined;
+      if (!oldest) break;
+      accepted.delete(oldest);
+    }
+  }, [acceptedClientMessageKey]);
+
+  const acceptSubmittedUserMessage = useCallback((sessionId: string, clientMessageId: string): boolean => {
+    const submitted = submittedUserMessagesRef.current.get(clientMessageId);
+    if (!submitted || submitted.sessionId !== sessionId) return false;
+    clearChatDraftIfUnchanged(
+      submitted.sessionId,
+      submitted.draft,
+      submitted.draftRevision,
+      draftRevisionBySessionRef.current.get(submitted.sessionId) ?? 0,
+    );
+    submittedUserMessagesRef.current.delete(clientMessageId);
+    markClientMessageAccepted(sessionId, clientMessageId);
+    return true;
+  }, [markClientMessageAccepted]);
 
   const queuedMessageMatchesContent = useCallback((message: QueuedUserMessage, content: string) => (
     message.content === content ||
@@ -3727,6 +3772,26 @@ export function ChatPanel({
     }
     return false;
   }, []);
+
+  useEffect(() => {
+    if (!activeSessionId) return;
+    const sync = () => {
+      const sessionId = activeSessionIdRef.current;
+      const selectionId = selectionIdRef.current;
+      if (!sessionId || !selectionId || document.visibilityState !== "visible") return;
+      sendWs({
+        type: "interactive_state_sync_request",
+        session_id: sessionId,
+        selection_id: selectionId,
+        known_interview_request_ids: interviewQueueRef.current
+          .filter((item) => item.sessionId === sessionId)
+          .map((item) => item.requestId)
+          .slice(0, 64),
+      });
+    };
+    const interval = window.setInterval(sync, 30_000);
+    return () => window.clearInterval(interval);
+  }, [activeSessionId, sendWs]);
 
   const sendQueuedInterviewSubmission = useCallback((requestId: string): boolean => {
     const sessionId = activeSessionIdRef.current;
@@ -3902,6 +3967,15 @@ export function ChatPanel({
           });
           if (msg.session_id === activeSessionIdRef.current && msg.selection_id === selectionIdRef.current) {
             setWsStatus("connected");
+            ws.send(JSON.stringify({
+              type: "interactive_state_sync_request",
+              session_id: msg.session_id,
+              selection_id: msg.selection_id,
+              known_interview_request_ids: interviewQueueRef.current
+                .filter((item) => item.sessionId === msg.session_id)
+                .map((item) => item.requestId)
+                .slice(0, 64),
+            }));
             // The backend has rebound this durable socket to the selected
             // session. Resend only cached responses for that same session.
             // Identical retries are safe once the durable backend transition
@@ -3941,6 +4015,9 @@ export function ChatPanel({
             if (!candidate || typeof candidate !== "object") return [];
             const record = candidate as Record<string, unknown>;
             if (typeof record.client_message_id !== "string" || typeof record.content !== "string") return [];
+            if (acceptedClientMessageIdsRef.current.has(
+              acceptedClientMessageKey(msg.session_id, record.client_message_id),
+            )) return [];
             return [{
               id: record.client_message_id,
               content: record.content,
@@ -3986,6 +4063,9 @@ export function ChatPanel({
           const submitted = submittedUserMessagesRef.current.get(msg.client_message_id);
           if (submitted && submitted.sessionId !== msg.session_id) return;
           const isSelectedSession = msg.session_id === activeSessionIdRef.current;
+          const alreadyAccepted = acceptedClientMessageIdsRef.current.has(
+            acceptedClientMessageKey(msg.session_id, msg.client_message_id),
+          );
 
           if (msg.status === "accepted") {
             if (submitted) clearChatDraftIfUnchanged(
@@ -3995,18 +4075,19 @@ export function ChatPanel({
               draftRevisionBySessionRef.current.get(submitted.sessionId) ?? 0,
             );
             submittedUserMessagesRef.current.delete(msg.client_message_id);
+            markClientMessageAccepted(msg.session_id, msg.client_message_id);
             if (isSelectedSession) {
               setQueuedMessagesSynced((current) => current.filter((message) => message.id !== msg.client_message_id));
             }
             return;
           }
           if (msg.status === "queued") {
-            if (submitted) clearChatDraftIfUnchanged(
-              submitted.sessionId,
-              submitted.draft,
-              submitted.draftRevision,
-              draftRevisionBySessionRef.current.get(submitted.sessionId) ?? 0,
-            );
+            if (alreadyAccepted) {
+              if (isSelectedSession) {
+                setQueuedMessagesSynced((current) => current.filter((message) => message.id !== msg.client_message_id));
+              }
+              return;
+            }
             if (!isSelectedSession) return;
             setMessages((current) => current.filter((message) => !(
               message.__localPending === true && message.__localId === msg.client_message_id
@@ -4043,24 +4124,30 @@ export function ChatPanel({
         }
 
         if (msg.type === "queued_message_cancel_ack") {
-          if (msg.session_id !== activeSessionIdRef.current || typeof msg.client_message_id !== "string") return;
-          if (msg.status === "cancelled") {
+          if (typeof msg.session_id !== "string" || typeof msg.client_message_id !== "string") return;
+          const submitted = submittedUserMessagesRef.current.get(msg.client_message_id);
+          if (submitted && submitted.sessionId !== msg.session_id) return;
+          const isSelectedSession = msg.session_id === activeSessionIdRef.current;
+          if (msg.status === "cancelled" || msg.status === "not_found") {
+            if (submitted) clearChatDraftIfUnchanged(
+              submitted.sessionId,
+              submitted.draft,
+              submitted.draftRevision,
+              draftRevisionBySessionRef.current.get(submitted.sessionId) ?? 0,
+            );
             submittedUserMessagesRef.current.delete(msg.client_message_id);
-            setQueuedMessagesSynced((current) => current.filter((message) => message.id !== msg.client_message_id));
-          } else {
+            if (msg.status === "not_found") markClientMessageAccepted(msg.session_id, msg.client_message_id);
+            if (isSelectedSession) {
+              setQueuedMessagesSynced((current) => current.filter((message) => message.id !== msg.client_message_id));
+            }
+          } else if (isSelectedSession) {
             setQueuedMessagesSynced((current) => current.map((message) => (
               message.id === msg.client_message_id
-                ? msg.status === "error"
-                  ? {
-                      ...message,
-                      cancelStatus: "ready",
-                      cancelError: typeof msg.error === "string" ? msg.error : "Could not cancel this message. Try again.",
-                    }
-                  : {
-                      ...message,
-                      cancelStatus: "unavailable",
-                      cancelError: "This message was already accepted and can no longer be cancelled.",
-                    }
+                ? {
+                    ...message,
+                    cancelStatus: "ready",
+                    cancelError: typeof msg.error === "string" ? msg.error : "Could not cancel this message. Try again.",
+                  }
                 : message
             )));
           }
@@ -4996,6 +5083,64 @@ export function ChatPanel({
           return;
         }
 
+        if (msg.type === "interview_snapshot") {
+          if (
+            msg.session_id !== activeSessionIdRef.current
+            || msg.selection_id !== selectionIdRef.current
+            || msg.sessionId !== activeSessionIdRef.current
+            || msg.syncComplete !== true
+            || !Array.isArray(msg.requests)
+            || !Array.isArray(msg.outcomes)
+            || ws !== wsRef.current
+            || transportGeneration !== transportGenerationRef.current
+          ) return;
+          const incoming = msg.requests.flatMap((request: unknown) => {
+            if (!request || typeof request !== "object") return [];
+            const value = request as Record<string, unknown>;
+            if (
+              typeof value.requestId !== "string"
+              || value.sessionId !== msg.session_id
+              || typeof value.createdAt !== "number"
+              || !Array.isArray(value.questions)
+              || !value.questions.every(isInterviewQuestion)
+            ) return [];
+            return [{
+              requestId: value.requestId,
+              sessionId: msg.session_id,
+              questions: value.questions,
+              createdAt: value.createdAt,
+            }];
+          });
+          if (incoming.length !== msg.requests.length) return;
+          const outcomes = msg.outcomes.flatMap((outcome: unknown) => {
+            if (!outcome || typeof outcome !== "object") return [];
+            const value = outcome as Record<string, unknown>;
+            if (
+              typeof value.requestId !== "string"
+              || !["open", "submitted", "cancelled", "delivered", "missing"].includes(String(value.status))
+            ) return [];
+            return [{ requestId: value.requestId, status: String(value.status) }];
+          });
+          if (outcomes.length !== msg.outcomes.length) return;
+          const incomingIds = new Set(incoming.map((request) => request.requestId));
+          if (outcomes.some((outcome) => (
+            (outcome.status === "open") !== incomingIds.has(outcome.requestId)
+          ))) return;
+          const terminalIds = new Set(outcomes
+            .filter((outcome) => ["submitted", "cancelled", "delivered", "missing"].includes(outcome.status))
+            .map((outcome) => outcome.requestId));
+          for (const current of interviewQueueRef.current) {
+            if (current.sessionId === msg.session_id && terminalIds.has(current.requestId)) {
+              clearStoredInterviewSubmission(current.sessionId, current.requestId);
+            }
+          }
+          setInterviewQueueSynced((current) => mergeInterviewQueue(
+            current.filter((item) => item.sessionId !== msg.session_id || !terminalIds.has(item.requestId)),
+            incoming,
+          ));
+          return;
+        }
+
         // Durable interview requests are session-scoped and queued in creation
         // order. A replay refreshes the question schema but cannot overwrite a
         // locally retained final response for the same immutable request id.
@@ -5006,6 +5151,12 @@ export function ChatPanel({
             ? msg.questions
             : null;
           if (!requestId || !sessionId || !questions) return;
+          if (
+            (typeof msg.session_id === "string" && msg.session_id !== activeSessionIdRef.current)
+            || (typeof msg.selection_id === "string" && msg.selection_id !== selectionIdRef.current)
+            || ws !== wsRef.current
+            || transportGeneration !== transportGenerationRef.current
+          ) return;
           const createdAt = typeof msg.createdAt === "number"
             ? msg.createdAt
             : typeof msg.created_at === "number"
@@ -5120,8 +5271,55 @@ export function ChatPanel({
           return;
         }
 
+        if (msg.type === "sudo_snapshot") {
+          if (
+            msg.session_id !== activeSessionIdRef.current
+            || msg.selection_id !== selectionIdRef.current
+            || msg.sessionId !== activeSessionIdRef.current
+            || msg.syncComplete !== true
+            || !Array.isArray(msg.requests)
+            || ws !== wsRef.current
+            || transportGeneration !== transportGenerationRef.current
+          ) return;
+          if (!msg.requests.every((request) => (
+            request
+            && request.type === "sudo_request"
+            && request.session_id === msg.session_id
+            && request.selection_id === msg.selection_id
+            && request.sessionId === msg.session_id
+            && typeof request.requestId === "string"
+          ))) return;
+          const request = msg.requests[0];
+          if (!request) {
+            setActiveSudoPrompt(null);
+            return;
+          }
+          setActiveSudoPrompt({
+            requestId: request.requestId,
+            sessionId: request.sessionId,
+            prompt: request.prompt || "Sudo password required",
+            kind: request.kind === "approval" ? "approval" : "password",
+            command: typeof request.command === "string" ? request.command : undefined,
+            executable: typeof request.executable === "string" ? request.executable : undefined,
+            argv: Array.isArray(request.argv) && request.argv.every((arg: unknown) => typeof arg === "string") ? request.argv : undefined,
+            cwd: typeof request.cwd === "string" ? request.cwd : undefined,
+            timeoutMs: typeof request.timeoutMs === "number" ? request.timeoutMs : undefined,
+            origin: request.origin && ["parent", "long-lived", "one-shot"].includes(request.origin.mode) && Array.isArray(request.origin.lineage)
+              ? { mode: request.origin.mode, lineage: request.origin.lineage.filter((item: unknown) => typeof item === "string") }
+              : undefined,
+          });
+          return;
+        }
+
         // Sudo password requests
         if (msg.type === "sudo_request") {
+          if (
+            (typeof msg.sessionId === "string" && msg.sessionId !== activeSessionIdRef.current)
+            || (typeof msg.session_id === "string" && msg.session_id !== activeSessionIdRef.current)
+            || (typeof msg.selection_id === "string" && msg.selection_id !== selectionIdRef.current)
+            || ws !== wsRef.current
+            || transportGeneration !== transportGenerationRef.current
+          ) return;
           setActiveSudoPrompt({
             requestId: msg.requestId,
             sessionId: msg.sessionId || activeSessionIdRef.current,
@@ -5163,7 +5361,28 @@ export function ChatPanel({
                   : {}),
               };
               const userId = userMessageId(userMessage);
-              if (requiresExactTranscriptCorrelation && !userId) return;
+              const exactClientMessageId = typeof msg.client_message_id === "string"
+                ? msg.client_message_id
+                : null;
+              if (exactClientMessageId) {
+                markClientMessageAccepted(activeSessionIdRef.current!, exactClientMessageId);
+                acceptSubmittedUserMessage(activeSessionIdRef.current!, exactClientMessageId);
+                setQueuedMessagesSynced((current) => current.filter((queued) => queued.id !== exactClientMessageId));
+              }
+              if (requiresExactTranscriptCorrelation && !userId) {
+                // Pi has accepted this exact queued object, but has not exposed
+                // its durable transcript event ID yet. Show a temporary accepted
+                // row so the message moves visibly out of the queue; the next
+                // authoritative window replaces it by content.
+                if (exactClientMessageId) {
+                  insertAcceptedUsersAfterActiveStreaming([{
+                    ...userMessage,
+                    __localPending: true,
+                    __localId: exactClientMessageId,
+                  }]);
+                }
+                return;
+              }
               if (userId && seenUserMessageIdsRef.current.has(userId)) return;
               if (userId) seenUserMessageIdsRef.current.add(userId);
               const currentSessionMessages = messagesOwnerSessionIdRef.current === activeSessionIdRef.current
@@ -5171,7 +5390,9 @@ export function ChatPanel({
                 : [];
               if (hasKnownDurableUserMessage(currentSessionMessages, userMessage)) return;
               const userText = getUserMessageText(message);
-              const wasQueuedForNextTurn = takeMatchingQueuedMessage(userText);
+              const wasQueuedForNextTurn = exactClientMessageId
+                ? true
+                : takeMatchingQueuedMessage(userText);
               if (hasActiveAssistantOutput() && wasQueuedForNextTurn) {
                 insertAcceptedUsersAfterActiveStreaming([userMessage]);
               } else {
@@ -5783,14 +6004,24 @@ export function ChatPanel({
     const queuedMessageId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const queuedAttachments: PendingAttachment[] = attachments;
     const turnAnchorText = trimmed || (attachments.length > 0 ? "File attachment" : "");
-    submittedUserMessagesRef.current.set(queuedMessageId, {
+    const submitted: SubmittedUserMessage = {
       sessionId: activeSessionId,
       content: trimmed,
       draft: inputText,
       draftRevision: draftRevisionBySessionRef.current.get(activeSessionId) ?? 0,
       attachments: queuedAttachments,
       transportGeneration: transportGenerationRef.current,
-    });
+    };
+    const inFlight = [...submittedUserMessagesRef.current.values()];
+    const inFlightBytes = inFlight.reduce((total, item) => total + submittedUserMessageBytes(item), 0);
+    if (
+      inFlight.length >= MAX_IN_FLIGHT_SUBMISSIONS
+      || inFlightBytes + submittedUserMessageBytes(submitted) > MAX_IN_FLIGHT_SUBMISSION_BYTES
+    ) {
+      appendRuntimeError("Too many messages are still awaiting delivery acknowledgement. Reconnect or wait before sending another; this draft remains unsent.");
+      return;
+    }
+    submittedUserMessagesRef.current.set(queuedMessageId, submitted);
 
     if (hasActiveAssistantOutput()) {
       setQueuedMessagesSynced((prev) => [

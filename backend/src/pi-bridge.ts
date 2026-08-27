@@ -289,6 +289,7 @@ const MAX_SESSIONS = 50;
 const SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SESSION_IDLE_CHECK_INTERVAL_MS = 30 * 1000;
 const sessions = new Map<string, PiSessionHandle>();
+const queuedBrowserClientMessageIds = new WeakMap<object, string>();
 const sessionCreations = new Map<string, Promise<PiSessionHandle>>();
 /** Monotonic process-local denial epoch. A creation may publish only while the
  * exact epoch captured before its first await remains current. */
@@ -816,6 +817,16 @@ export function settleInteractiveTurns(handle: PiSessionHandle): BrowserTurnProv
 function settleInteractiveTurnsQuietly(handle: PiSessionHandle): void {
   try { settleInteractiveTurns(handle); }
   catch { /* source-marker persistence must never change source-turn settlement */ }
+}
+
+/** Mark one exact queued object accepted as soon as Pi starts its user turn. */
+export function markQueuedBrowserMessageStarted(handle: PiSessionHandle, message: unknown): string | undefined {
+  if (!message || typeof message !== "object") return undefined;
+  const clientMessageId = queuedBrowserClientMessageIds.get(message);
+  for (const record of handle.queuedBrowserMessages.values()) {
+    if (record.capture.message === message) record.clientVisible = false;
+  }
+  return clientMessageId;
 }
 
 /** @internal Synthetic lifecycle seam: mark exact claimed queued objects before settlement. */
@@ -2807,6 +2818,7 @@ export async function createPiSession(
         scheduleWayangAutoTitle(handle.id, { onCommitted: invalidateSessionFileSnapshot });
       }
       if (event.type === "message_start" || event.type === "message_update") {
+        if (event.type === "message_start") markQueuedBrowserMessageStarted(handle, event.message);
         handle.liveStreamingMessage = event.message;
         return;
       }
@@ -3990,6 +4002,7 @@ export async function sendBrowserMessageTurn(
       const steering = handle.session.steer(content, images);
       const capture = captureQueuedChatMessage(handle.session, queueBefore);
       if (capture) {
+        if (clientMessageId) queuedBrowserClientMessageIds.set(capture.message, clientMessageId);
         handle.queuedBrowserMessages.set(queueRecordId, {
           capture,
           content: queuedDisplay?.content ?? content,
@@ -4535,7 +4548,12 @@ export function subscribeToSession(
 export function serializeEvent(event: AgentSessionEvent): SerializedMessage | null {
   switch (event.type) {
     case "message_start": {
-      return serializeMessage("message_start", (event as any).message);
+      const message = (event as any).message;
+      const serialized = serializeMessage("message_start", message);
+      const clientMessageId = message && typeof message === "object"
+        ? queuedBrowserClientMessageIds.get(message)
+        : undefined;
+      return clientMessageId ? { ...serialized, client_message_id: clientMessageId } : serialized;
     }
     case "message_update": {
       const e = event as any;
