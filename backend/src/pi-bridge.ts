@@ -4102,6 +4102,13 @@ export function latchPiSessionCapabilityDenial(
     } catch { /* the durable denial remains authoritative */ }
   }
   for (const id of new Set(runtimeIds)) {
+    // Cancel every human-input continuation synchronously, including for a
+    // starting runtime with no published handle. A late UI response must not
+    // wake tool work after durable capability denial.
+    getActionApprovalBridge().cancelSession(id, "runtime capability authority revoked");
+    getInterviewBridge().cancelSession(id);
+    getSudoBridge().cancelSession(id);
+    getCommandGuardIdentityBridge().cancelSession(id);
     // Advance first and without awaiting or requiring a published handle. This
     // is the authoritative starting-runtime revocation latch.
     const generation = getPiSessionCapabilityDenialGeneration(id) + 1n;
@@ -4115,7 +4122,6 @@ export function latchPiSessionCapabilityDenial(
     sessionBrowserTeardownIntents.set(id, { generation, action: effectiveTeardown });
     const handle = lookup.get(id);
     if (handle) latchPiSessionHandleCapabilityDenial(handle, effectiveTeardown);
-    else getActionApprovalBridge().cancelSession(id, "runtime capability authority revoked");
   }
 }
 
