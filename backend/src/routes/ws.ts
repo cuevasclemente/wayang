@@ -1433,10 +1433,37 @@ function handleConnection(
         };
 
         const interviewBridge = getInterviewBridge();
-        interviewBridgeUnsub = interviewBridge.onRequest((req) => {
+        const stopInterviewRequests = interviewBridge.onRequest((req) => {
           if (!alive || version !== setupVersion) return;
           sendInterviewRequest(req);
         });
+        const stopInterviewTerminals = interviewBridge.onTerminal((event) => {
+          if (
+            !alive
+            || version !== setupVersion
+            || event.sessionId !== currentSessionId
+            || !currentSelectionId
+          ) return;
+          const pendingRequests = interviewBridge.getPendingRequests(currentSessionId);
+          sendSafe(ws, {
+            type: "interview_snapshot",
+            session_id: currentSessionId,
+            selection_id: currentSelectionId,
+            sessionId: currentSessionId,
+            requests: pendingRequests.map((request) => ({
+              requestId: request.requestId,
+              sessionId: request.sessionId,
+              questions: request.questions,
+              createdAt: request.createdAt,
+            })),
+            outcomes: [{ requestId: event.requestId, status: event.status }],
+            syncComplete: true,
+          });
+        });
+        interviewBridgeUnsub = () => {
+          stopInterviewRequests();
+          stopInterviewTerminals();
+        };
         for (const req of interviewBridge.getPendingRequests(currentSessionId)) {
           sendInterviewRequest(req);
         }
@@ -1840,12 +1867,12 @@ function handleConnection(
     }
 
     if (msg.type === "interview_response") {
-      handleInterviewResponse(ws, currentSessionId, msg, submissionContext);
+      handleInterviewResponse(ws, currentSessionId, currentSelectionId, msg, submissionContext);
       return;
     }
 
     if (msg.type === "interview_cancel") {
-      handleInterviewCancel(ws, currentSessionId, msg);
+      handleInterviewCancel(ws, currentSessionId, currentSelectionId, msg);
       return;
     }
 
@@ -2479,16 +2506,22 @@ function normalizeCommandGuardMode(value: unknown): CommandGuardMode | null {
 export function handleInterviewResponse(
   ws: WebSocket,
   sessionId: string,
+  selectionId: string | null,
   msg: any,
   submissionContext: InterviewSubmissionContext,
 ): void {
   const requestId = typeof msg?.requestId === "string" ? msg.requestId : "";
+  const correlation = { session_id: sessionId, selection_id: selectionId ?? "" };
+  if (!selectionId || msg?.session_id !== sessionId || msg?.selection_id !== selectionId) {
+    sendSafe(ws, { type: "interview_response_ack", ...correlation, requestId: requestId || null, sessionId, status: "rejected", errorCode: "selection_mismatch", error: "Questionnaire response belongs to a stale session selection" });
+    return;
+  }
   if (getRuntimeMutationSessionState(sessionId).mutation_locked) {
-    sendSafe(ws, { type: "interview_response_ack", requestId: requestId || null, sessionId, status: "rejected", errorCode: "session_busy", error: "Session is reserved for a headless turn" });
+    sendSafe(ws, { type: "interview_response_ack", ...correlation, requestId: requestId || null, sessionId, status: "rejected", errorCode: "session_busy", error: "Session is reserved for a headless turn" });
     return;
   }
   if (!requestId || !Array.isArray(msg?.answers)) {
-    sendSafe(ws, { type: "interview_response_ack", requestId: requestId || null, sessionId, status: "rejected", errorCode: "invalid_answers", error: "requestId and answers are required" });
+    sendSafe(ws, { type: "interview_response_ack", ...correlation, requestId: requestId || null, sessionId, status: "rejected", errorCode: "invalid_answers", error: "requestId and answers are required" });
     return;
   }
 
@@ -2498,6 +2531,7 @@ export function handleInterviewResponse(
   } catch {
     sendSafe(ws, {
       type: "interview_response_ack",
+      ...correlation,
       requestId,
       sessionId,
       status: "rejected",
@@ -2507,12 +2541,14 @@ export function handleInterviewResponse(
     return;
   }
   if (!submitted.ok) {
-    sendSafe(ws, { type: "interview_response_ack", requestId, sessionId, status: "rejected", errorCode: submitted.code, error: submitted.message });
+    sendSafe(ws, { type: "interview_response_ack", ...correlation, requestId, sessionId, status: "rejected", errorCode: submitted.code, error: submitted.message });
     return;
   }
 
   const record = submitted.record;
-  const resolvedLiveWaiter = getInterviewBridge().resolveSubmitted(record);
+  const interviewBridge = getInterviewBridge();
+  interviewBridge.publishTerminal(record);
+  const resolvedLiveWaiter = interviewBridge.resolveSubmitted(record);
   if (resolvedLiveWaiter) {
     void (async () => {
       try {
@@ -2537,6 +2573,7 @@ export function handleInterviewResponse(
   const currentStatus = record.status;
   sendSafe(ws, {
     type: "interview_response_ack",
+    ...correlation,
     requestId,
     sessionId,
     submissionId: record.submission_id,
@@ -2546,14 +2583,19 @@ export function handleInterviewResponse(
 }
 
 /** @internal Exported for focused exact cancellation-ack contract tests. */
-export function handleInterviewCancel(ws: WebSocket, sessionId: string, msg: any): void {
+export function handleInterviewCancel(ws: WebSocket, sessionId: string, selectionId: string | null, msg: any): void {
   const requestId = typeof msg?.requestId === "string" ? msg.requestId : "";
+  const correlation = { session_id: sessionId, selection_id: selectionId ?? "" };
+  if (!selectionId || msg?.session_id !== sessionId || msg?.selection_id !== selectionId) {
+    sendSafe(ws, { type: "interview_cancel_ack", ...correlation, requestId: requestId || null, sessionId, status: "rejected", errorCode: "selection_mismatch", error: "Questionnaire cancellation belongs to a stale session selection" });
+    return;
+  }
   if (getRuntimeMutationSessionState(sessionId).mutation_locked) {
-    sendSafe(ws, { type: "interview_cancel_ack", requestId: requestId || null, sessionId, status: "rejected", errorCode: "session_busy" });
+    sendSafe(ws, { type: "interview_cancel_ack", ...correlation, requestId: requestId || null, sessionId, status: "rejected", errorCode: "session_busy" });
     return;
   }
   if (!requestId) {
-    sendSafe(ws, { type: "interview_cancel_ack", requestId: null, sessionId, status: "rejected", errorCode: "not_found", error: "Interview request was not found or is no longer open" });
+    sendSafe(ws, { type: "interview_cancel_ack", ...correlation, requestId: null, sessionId, status: "rejected", errorCode: "not_found", error: "Interview request was not found or is no longer open" });
     return;
   }
   let cancelled: ReturnType<typeof cancelInterview>;
@@ -2564,6 +2606,7 @@ export function handleInterviewCancel(ws: WebSocket, sessionId: string, msg: any
     // not expose store paths or persistence diagnostics over the transport.
     sendSafe(ws, {
       type: "interview_cancel_ack",
+      ...correlation,
       requestId,
       sessionId,
       status: "rejected",
@@ -2575,14 +2618,16 @@ export function handleInterviewCancel(ws: WebSocket, sessionId: string, msg: any
   if (!cancelled) {
     const existing = getInterviewForSession(sessionId, requestId);
     if (existing?.status === "cancelled") {
-      sendSafe(ws, { type: "interview_cancel_ack", requestId, sessionId, status: "cancelled", duplicate: true });
+      sendSafe(ws, { type: "interview_cancel_ack", ...correlation, requestId, sessionId, status: "cancelled", duplicate: true });
       return;
     }
-    sendSafe(ws, { type: "interview_cancel_ack", requestId, sessionId, status: "rejected", errorCode: "not_found", error: "Interview request was not found or is no longer open" });
+    sendSafe(ws, { type: "interview_cancel_ack", ...correlation, requestId, sessionId, status: "rejected", errorCode: "not_found", error: "Interview request was not found or is no longer open" });
     return;
   }
-  getInterviewBridge().cancel(requestId);
-  sendSafe(ws, { type: "interview_cancel_ack", requestId, sessionId, status: "cancelled", duplicate: false });
+  const interviewBridge = getInterviewBridge();
+  interviewBridge.publishTerminal(cancelled);
+  interviewBridge.cancel(requestId);
+  sendSafe(ws, { type: "interview_cancel_ack", ...correlation, requestId, sessionId, status: "cancelled", duplicate: false });
 }
 
 /**

@@ -18,6 +18,7 @@ async function installInterviewSocketMock(
       replay,
       replayRequestId: replay?.requestId ?? null,
       terminalReplayStatus: null as "cancelled" | null,
+      terminalInterviewStatuses: new Map<string, "submitted" | "delivered" | "cancelled">(),
       openInterviewRequests: new Map<string, Record<string, unknown>>(),
     };
 
@@ -82,9 +83,10 @@ async function installInterviewSocketMock(
                 requestId,
                 status: state.replay?.requestId === requestId || state.openInterviewRequests.has(requestId)
                   ? "open"
-                  : state.replayRequestId === requestId && state.terminalReplayStatus
-                    ? state.terminalReplayStatus
-                    : "missing",
+                  : state.terminalInterviewStatuses.get(requestId)
+                    ?? (state.replayRequestId === requestId && state.terminalReplayStatus
+                      ? state.terminalReplayStatus
+                      : "missing"),
               })),
               syncComplete: true,
             });
@@ -118,9 +120,20 @@ async function installInterviewSocketMock(
       emit: (payload: Record<string, unknown>) => void;
       closeLatest: () => void;
       clearReplay: () => void;
+      markSubmitted: (requestId: string) => void;
     } }).__interviewSocketTest = Object.assign(state, {
       emit(payload: Record<string, unknown>) {
         const currentSocket = state.sockets.at(-1);
+        if (
+          (payload.type === "interview_response_ack" || payload.type === "interview_cancel_ack")
+          && currentSocket
+        ) {
+          payload = {
+            session_id: currentSocket.sessionId,
+            selection_id: currentSocket.selectionId,
+            ...payload,
+          };
+        }
         if (
           payload.type === "interview_request"
           && typeof payload.requestId === "string"
@@ -137,7 +150,15 @@ async function installInterviewSocketMock(
           ((payload.type === "interview_response_ack" && payload.status !== "rejected")
             || (payload.type === "interview_cancel_ack" && payload.status === "cancelled"))
           && typeof payload.requestId === "string"
-        ) state.openInterviewRequests.delete(payload.requestId);
+        ) {
+          state.openInterviewRequests.delete(payload.requestId);
+          state.terminalInterviewStatuses.set(
+            payload.requestId,
+            payload.type === "interview_response_ack"
+              ? payload.status === "delivered" ? "delivered" : "submitted"
+              : "cancelled",
+          );
+        }
         state.sockets.at(-1)?.emit(payload);
       },
       closeLatest() {
@@ -146,6 +167,10 @@ async function installInterviewSocketMock(
       clearReplay() {
         state.replay = null;
         state.terminalReplayStatus = "cancelled";
+      },
+      markSubmitted(requestId: string) {
+        state.openInterviewRequests.delete(requestId);
+        state.terminalInterviewStatuses.set(requestId, "submitted");
       },
     });
   }, { replay: replayOnSync });
@@ -257,6 +282,68 @@ test("authoritative interview sync replays a missed open questionnaire idempoten
     });
   });
   await expect(page.getByText("Replayed pending sudo request", { exact: true })).toHaveCount(0);
+});
+
+test("a dropped response ack converges through an immediate authoritative status check", async ({ page, request }) => {
+  await installInterviewSocketMock(page);
+  const session = await createE2eSession(request, "e2e immediate durable interview convergence");
+  await openSessionInUi(page, session);
+
+  await page.evaluate(({ sessionId, requestId }) => {
+    const state = (window as unknown as { __interviewSocketTest: {
+      emit: (payload: Record<string, unknown>) => void;
+    } }).__interviewSocketTest;
+    state.emit({
+      type: "interview_request",
+      requestId,
+      sessionId,
+      createdAt: 10,
+      questions: [{
+        id: "durable",
+        label: "Durable",
+        prompt: "Dropped acknowledgement question",
+        options: [{ value: "yes", label: "Yes" }],
+        allowOther: false,
+      }],
+    });
+  }, { sessionId: session.id, requestId: firstRequestId });
+
+  await expect(page.getByTestId("interview-form")).toContainText("Dropped acknowledgement question");
+  await page.getByRole("button", { name: /Yes/ }).click();
+  await expect.poll(() => page.evaluate((requestId) => {
+    const state = (window as unknown as { __interviewSocketTest: {
+      sent: Array<Record<string, unknown>>;
+    } }).__interviewSocketTest;
+    return state.sent.filter((message) => (
+      message.type === "interview_response" && message.requestId === requestId
+    )).length;
+  }, firstRequestId)).toBe(1);
+
+  await page.evaluate((requestId) => {
+    (window as unknown as { __interviewSocketTest: {
+      markSubmitted: (id: string) => void;
+    } }).__interviewSocketTest.markSubmitted(requestId);
+  }, firstRequestId);
+
+  await expect.poll(() => page.evaluate((requestId) => {
+    const state = (window as unknown as { __interviewSocketTest: {
+      sent: Array<Record<string, unknown>>;
+    } }).__interviewSocketTest;
+    return state.sent.filter((message) => (
+      message.type === "interactive_state_sync_request"
+      && Array.isArray(message.known_interview_request_ids)
+      && message.known_interview_request_ids.includes(requestId)
+    )).length;
+  }, firstRequestId), { timeout: 4_000 }).toBeGreaterThanOrEqual(1);
+  await expect(page.getByTestId("interview-form")).toHaveCount(0, { timeout: 4_000 });
+  await expect.poll(() => page.evaluate((requestId) => {
+    const state = (window as unknown as { __interviewSocketTest: {
+      sent: Array<Record<string, unknown>>;
+    } }).__interviewSocketTest;
+    return state.sent.filter((message) => (
+      message.type === "interview_response" && message.requestId === requestId
+    )).length;
+  }, firstRequestId)).toBe(1);
 });
 
 test("retains an immutable interview response through reconnect and advances the session queue only after its ack", async ({ page, request }) => {

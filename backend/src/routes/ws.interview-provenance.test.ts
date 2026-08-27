@@ -133,7 +133,8 @@ test("authorized questionnaire WebSocket derives omitted provenance and ignores 
       server!.listen(port, "127.0.0.1", resolve);
     });
 
-    const wsUrl = `ws://127.0.0.1:${port}/ws/chat?session_id=${encodeURIComponent(session.id)}`;
+    const selectionId = "interview-provenance-selection";
+    const wsUrl = `ws://127.0.0.1:${port}/ws/chat?session_id=${encodeURIComponent(session.id)}&selection_id=${selectionId}`;
     await expectRejectedUpgrade(wsUrl, { Origin: baseUrl });
     assert.equal(getInterviewForSession(session.id, requestIds[0]!)?.status, "open");
 
@@ -154,6 +155,8 @@ test("authorized questionnaire WebSocket derives omitted provenance and ignores 
 
     ws.send(JSON.stringify({
       type: "interview_response",
+      session_id: session.id,
+      selection_id: selectionId,
       requestId: requestIds[0],
       answers: [{ id: "q1", value: "small", wasCustom: false }],
     }));
@@ -163,6 +166,8 @@ test("authorized questionnaire WebSocket derives omitted provenance and ignores 
 
     ws.send(JSON.stringify({
       type: "interview_response",
+      session_id: session.id,
+      selection_id: selectionId,
       requestId: requestIds[1],
       answers: [{ id: "q1", value: "small", wasCustom: false }],
       submission_channel: "FORGED_CLIENT_CHANNEL",

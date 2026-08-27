@@ -104,6 +104,8 @@ Wayang projects a curated current Together serverless chat catalog from Together
 
 OpenRouter models are intentionally unavailable in Wayang's picker and model-switch API. The OpenRouter credential and pi provider are not deleted, so this is reversible and does not affect other pi clients. Wayang may still consult OpenRouter's public, unauthenticated model catalog to derive current direct Anthropic identifiers; no prompt, transcript, credential, or private content is sent in that metadata-only request.
 
+Provider/model availability is deployment-global and does not depend on Project privacy, Agent Profile resource mode, or a Project–Agent capability association. Declarative pi providers are present in every fresh per-session model context. Exact extension-backed providers admitted to Wayang's reviewed external catalog are no-follow/hash-verified, copied from the verified descriptor into private temporary storage, and loaded through a provider-only bootstrap for restricted and Standard runtimes alike. That bootstrap retains only provider registrations; it does not attach the extension's tools, hooks, commands, prompts, skills, renderers, or resource paths. After model resolution, resource-extension provider mutations are ignored for that session. Static picker listing never executes provider extension code, and project-local extensions cannot pre-populate or overwrite another session's provider registry.
+
 Credential resolution in pi prefers a CLI override, then pi `auth.json`, then environment variables, then a custom provider key. Wayang does not accept provider keys in browser storage or URLs.
 
 ### Automatic Terra session titles
