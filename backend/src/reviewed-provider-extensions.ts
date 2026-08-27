@@ -24,12 +24,12 @@ export interface ReviewedExternalModelEntry {
 export const REVIEWED_EXTERNAL_MODELS: readonly ReviewedExternalModelEntry[] = Object.freeze([
   Object.freeze({
     extensionPath: "narwhal-horn/index.ts",
-    sha256: "67bf45debd9d019da672770164b28832aa9e7a660db6ba16d1d7c0b4eb4c936f",
+    sha256: "40b5461de830744a488b54f0c8c6632aa92cfdabde17b59b767d5115b2c0f1e5",
     credentialRelativeToHome: "src/mypi/secure_data/ruminant_key",
     model: Object.freeze({
       provider: "narwhal-horn",
-      id: "qwen3.8-27b",
-      name: "Qwen 3.8 27B (UD-Q8_K_XL, Vulkan, experimental 512K)",
+      id: "qwen3.8-flash-next",
+      name: "Qwen 3.8 Flash Next (Unsloth IQ4_XS, ROCm/NVMe, experimental 512K)",
       api: "openai-completions",
       reasoning: true,
       input: Object.freeze(["text", "image"]),
