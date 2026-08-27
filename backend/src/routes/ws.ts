@@ -57,6 +57,7 @@ import {
   createPiSession,
   getPiSession,
   getPiSessionBashMode,
+  assertPiSessionAcceptsNewWork,
   beginManualCompactionMessageQueue,
   drainManualCompactionMessageQueue,
   isManualCompactionMessageQueueActive,
@@ -2157,6 +2158,7 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
     }
 
     case "reload": {
+      assertPiSessionAcceptsNewWork(handle);
       await handle.session.reload();
       sendCommandNotice(ws, "Reloaded settings, extensions, skills, prompts, and context files.");
       return true;

@@ -1,9 +1,9 @@
 import * as path from "node:path";
 import type { Config } from "./config.js";
 import type { AuthService } from "./auth/service.js";
-import * as piBridge from "./pi-bridge.js";
 import {
   cleanupPiSessionCapabilityDenial,
+  latchPiSessionCapabilityActivation,
   latchPiSessionCapabilityDenial,
 } from "./pi-bridge.js";
 import type { WorkspaceCapabilitiesRouterOptions } from "./routes/workspace-capabilities.js";
@@ -33,13 +33,7 @@ class ProductionCapabilityRuntimeLifecycle implements WorkspaceCapabilityRuntime
   private readonly cleanupTasks = new Set<Promise<void>>();
 
   latchActivation(input: { intent: CapabilityActivationIntent; runtimeIds: readonly string[] }): void {
-    // Temporary cross-branch seam: the runtime owner supplies this synchronous
-    // generation latch. Fail closed before persistence until that export exists.
-    const latch = (piBridge as unknown as {
-      latchPiSessionCapabilityActivation?: (runtimeIds: readonly string[]) => void;
-    }).latchPiSessionCapabilityActivation;
-    if (typeof latch !== "function") throw new Error("Pi capability activation lifecycle latch is unavailable");
-    latch(input.runtimeIds);
+    latchPiSessionCapabilityActivation(input.runtimeIds);
   }
 
   latchDenied(input: { association: CapabilityAssociationRecord; runtimeIds: readonly string[] }): void {
