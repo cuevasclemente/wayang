@@ -98,6 +98,12 @@ Inside the pinned local pi CLI, run `/login`, choose the provider, complete the 
 
 The bundled pi release also supports additional providers, including Azure OpenAI (`AZURE_OPENAI_API_KEY` plus endpoint/resource settings), Cloudflare, Vercel AI Gateway, ZAI, OpenCode, Hugging Face, Kimi, MiniMax, Xiaomi MiMo, Amazon Bedrock/AWS credentials, and Google Vertex application-default credentials. Configure specialized providers through pi `/login`, pi's provider documentation, and model settings rather than extending the wizard with unreviewed cloud fields. Do not use CLI `--api-key` arguments.
 
+### Wayang model catalog policy
+
+Wayang projects a curated current Together serverless chat catalog from Together's authenticated `/v1/models` endpoint. Live metadata refreshes display names, context windows, and token prices, while a reviewed local allowlist supplies conservative reasoning, modality, and output-limit capabilities. Legacy priced Together endpoints remain usable by other clients but do not clutter Wayang's picker. If the live fetch fails, the pinned pi catalog remains available only for models in the same curated allowlist.
+
+OpenRouter models are intentionally unavailable in Wayang's picker and model-switch API. The OpenRouter credential and pi provider are not deleted, so this is reversible and does not affect other pi clients. Wayang may still consult OpenRouter's public, unauthenticated model catalog to derive current direct Anthropic identifiers; no prompt, transcript, credential, or private content is sent in that metadata-only request.
+
 Credential resolution in pi prefers a CLI override, then pi `auth.json`, then environment variables, then a custom provider key. Wayang does not accept provider keys in browser storage or URLs.
 
 ### Automatic Terra session titles
