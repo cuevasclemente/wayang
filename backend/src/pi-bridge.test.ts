@@ -34,6 +34,7 @@ import {
   invalidateSessionFileSnapshot,
   installInteractiveBrowserSessionLifecyclePort,
   installWayangRawSudoFailClosedGuard,
+  latchPiSessionCapabilityActivation,
   latchPiSessionCapabilityDenial,
   interviewSubmissionContent,
   isCuratedTogetherModel,
@@ -45,6 +46,7 @@ import {
   onPiSessionRuntimeEvent,
   persistSettledSessionError,
   trackOverflowRecovery,
+  piSessionHandleCanRetireCapabilityRefresh,
   piSessionHandleRequiresFreshRuntime,
   previewSessionAgentSwitch,
   protectedBrowserIdleRetentionIsRequired,
@@ -293,6 +295,73 @@ test("manual compaction queue releases before FIFO drain, projects/cancels recor
     await drain;
     assert.equal(handle.manualCompactionMessageQueue, undefined);
     await new Promise<void>((resolve) => setImmediate(resolve));
+  } finally {
+    releaseSessionRuntimeMutationLock(row.id);
+    f.cleanup();
+  }
+});
+
+test("capability activation preserves pre-accepted manual-compaction FIFO and rejects later queue admission", async () => {
+  const f = currentTurnFixture("wayang-manual-compaction-activation-");
+  const row = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: row.id });
+  const dispatched: string[] = [];
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    isCompacting: true,
+    pendingMessageCount: 0,
+    async prompt(content: string) {
+      dispatched.push(content);
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      manager.appendMessage({
+        role: "assistant",
+        content: "accepted old work completed",
+        provider: "synthetic",
+        model: "synthetic",
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as any);
+    },
+    async waitForIdle() {},
+  };
+  const handle = {
+    id: row.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "manual-compaction-activation",
+    capabilityActivationGeneration: 0n,
+    acceptedTopLevelWorkCount: 0,
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    events: new EventEmitter(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    assert.equal(acquireSessionRuntimeMutationLock(row.id), true);
+    beginManualCompactionMessageQueue(handle);
+    deferBrowserMessageDuringManualCompaction(handle, "accepted before activation", undefined, "before", { content: "before" });
+
+    latchPiSessionCapabilityActivation([row.id], new Map([[row.id, handle]]));
+
+    assert.equal(handle.capabilityRefreshPending, true);
+    assert.equal(piSessionHandleCanRetireCapabilityRefresh(handle), false);
+    assert.throws(
+      () => deferBrowserMessageDuringManualCompaction(handle, "offered after activation", undefined, "after", { content: "after" }),
+      /refresh is pending/,
+    );
+
+    fakeSession.isCompacting = false;
+    releaseSessionRuntimeMutationLock(row.id);
+    markManualCompactionMutationLeaseReleased(handle);
+    await drainManualCompactionMessageQueue(handle, { isRuntimeCurrent: () => true });
+
+    assert.deepEqual(dispatched, ["accepted before activation"]);
+    assert.equal(handle.manualCompactionMessageQueue, undefined);
+    assert.equal(piSessionHandleCanRetireCapabilityRefresh(handle), true);
   } finally {
     releaseSessionRuntimeMutationLock(row.id);
     f.cleanup();
