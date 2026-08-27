@@ -57,6 +57,13 @@ import {
   createPiSession,
   getPiSession,
   getPiSessionBashMode,
+  beginManualCompactionMessageQueue,
+  drainManualCompactionMessageQueue,
+  isManualCompactionMessageQueueActive,
+  markManualCompactionMutationLeaseReleased,
+  manualCompactionCanCancelQueuedBrowserMessage,
+  manualCompactionCanDeferBrowserMessage,
+  manualCompactionCanInterrupt,
   piSessionHandleRequiresFreshRuntime,
   getRuntimeMutationSessionState,
   sendMessage,
@@ -1012,6 +1019,10 @@ function handleConnection(
       streamingMessage?: SerializedMessage | null,
     ): Promise<void> => {
       const authorized = await buildBoundedLiveWindow(reason, intent, anchorId, compactingOverride, streamingMessage);
+      // A deferred post-compaction prompt may start while an asynchronous
+      // tail window is loading. Never let that older idle snapshot overwrite
+      // the newer live turn; its agent_settled reconciliation will replace it.
+      if (authorized?.window.streaming_at_snapshot !== Boolean(liveHandle.session.isStreaming)) return;
       if (authorized) sendUiAuthorizedTranscriptWindow({
         window: authorized.window,
         witness: authorized.witness,
@@ -2091,10 +2102,22 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
     }
 
     case "compact": {
+      if (handle.session.isStreaming || handle.session.pendingMessageCount > 0) {
+        sendSafe(ws, { type: "error", error: "Manual compaction requires an idle session" });
+        return true;
+      }
       const releaseCompactionLease = beginSessionCompactionMutationLease(sessionId);
       if (!releaseCompactionLease) {
         sendSafe(ws, { type: "error", error: "Session transcript mutation is in progress" });
         return true;
+      }
+      try {
+        // Admission must become visible while the exact compaction lease is
+        // already held, but before compact() can emit or synchronously fail.
+        beginManualCompactionMessageQueue(handle);
+      } catch (error) {
+        releaseCompactionLease();
+        throw error;
       }
       sendCommandNotice(ws, "Compacting session context…");
       let compaction: Promise<unknown>;
@@ -2102,6 +2125,8 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
         compaction = Promise.resolve(handle.session.compact(parsed.args.trim() || undefined));
       } catch {
         releaseCompactionLease();
+        markManualCompactionMutationLeaseReleased(handle);
+        void drainManualCompactionMessageQueue(handle).catch(() => undefined);
         throw new Error("Session compaction could not start");
       }
       compaction
@@ -2112,7 +2137,13 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
         // AgentSession emits the authoritative structured compaction_end event,
         // including a bounded failure message. Avoid a second generic error.
         .catch(() => {})
-        .finally(releaseCompactionLease);
+        .finally(() => {
+          // Transcript exclusion ends before the first deferred prompt begins.
+          // Keep the phase alive during the serial drain so new work joins its tail.
+          releaseCompactionLease();
+          markManualCompactionMutationLeaseReleased(handle);
+          void drainManualCompactionMessageQueue(handle).catch(() => undefined);
+        });
       return true;
     }
 
@@ -2265,9 +2296,22 @@ async function handleClientMessage(
     if (isLegacyPrivateSessionQuarantined(row)) {
       throw new Error("Quarantined legacy sessions are view-only");
     }
-    if (!isSessionClientMutationAllowed(sessionId)) {
-      for (const response of serializeMutationLockedRejection(sessionId, selectionId, msg)) sendSafe(ws, response);
-      return;
+    if (!isSessionClientMutationAllowed(sessionId) || isManualCompactionMessageQueueActive(sessionId)) {
+      const manualCompactionAdmission = msg?.type === "message"
+        ? manualCompactionCanDeferBrowserMessage(
+            sessionId,
+            msg.content,
+            Array.isArray(msg.attachments) && msg.attachments.length > 0,
+          )
+        : msg?.type === "cancel_queued_message"
+          ? manualCompactionCanCancelQueuedBrowserMessage(sessionId, msg.client_message_id)
+          : msg?.type === "interrupt"
+            ? manualCompactionCanInterrupt(sessionId)
+            : false;
+      if (!manualCompactionAdmission) {
+        for (const response of serializeMutationLockedRejection(sessionId, selectionId, msg)) sendSafe(ws, response);
+        return;
+      }
     }
     const authorization = authorizeProjectAction({
       cwd: row.cwd,

@@ -4574,7 +4574,10 @@ export function ChatPanel({
           const newHistoryUserOccurrences = new Set(
             unmatchedHistoryUserOccurrences(historyMessages, currentSessionMessages),
           );
-          if (hasActiveAssistantOutput() && queuedUserMessagesRef.current.length > 0) {
+          if (
+            (hasActiveAssistantOutput() || msg.reason === "compaction_end_reconciliation")
+            && queuedUserMessagesRef.current.length > 0
+          ) {
             const remainingQueued = [...queuedUserMessagesRef.current];
             const acceptedNextTurnMessages: ChatMessage[] = [];
             const visibleHistoryMessages = historyMessages.filter((historyMessage) => {
@@ -6070,7 +6073,7 @@ export function ChatPanel({
   const handleSend = useCallback(async () => {
     const trimmed = inputText.trim();
     const attachments = pendingAttachments;
-    if (isCompacting || (!trimmed && attachments.length === 0) || wsStatus !== "connected" || !activeSessionId) return;
+    if ((!trimmed && attachments.length === 0) || wsStatus !== "connected" || !activeSessionId) return;
 
     clearRuntimeError();
     const queuedMessageId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
@@ -6095,7 +6098,7 @@ export function ChatPanel({
     }
     submittedUserMessagesRef.current.set(queuedMessageId, submitted);
 
-    if (hasActiveAssistantOutput()) {
+    if (hasActiveAssistantOutput() || isCompacting) {
       setQueuedMessagesSynced((prev) => [
         ...prev,
         {
@@ -7701,7 +7704,7 @@ export function ChatPanel({
                 ? "bg-amber-700 hover:bg-amber-600"
                 : "bg-blue-700 hover:bg-blue-600"
             }`}
-            disabled={isCompacting || (!inputText.trim() && pendingAttachments.length === 0) || wsStatus !== "connected"}
+            disabled={(!inputText.trim() && pendingAttachments.length === 0) || wsStatus !== "connected"}
             onClick={handleSend}
           >
             {isAgentRunning ? "Queue" : "Send"}
