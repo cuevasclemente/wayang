@@ -5,11 +5,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { close, failNextCommitStoreMutationPersistenceForTests, flush, getStore, init } from "./db.js";
-import { createSession, getSessionById, updatePiSessionFile } from "./sessions.js";
+import { createSession, getSessionById, setProvisionalSessionTitle, updatePiSessionFile } from "./sessions.js";
 import { WAYANG_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE } from "./interactive-turn-provenance.js";
 import {
   scheduleWayangAutoTitle,
   scheduleWayangAutoTitleFromActivation,
+  scheduleWayangAutoTitleOnInteraction,
   setAutoTitleProviderForTests,
   type TitleProvider,
 } from "./session-title-service.js";
@@ -174,6 +175,124 @@ test("same-count failure is suppressed and the next completed exchange permits o
     assert.equal(SessionManager.open(f.manager.getSessionFile()!, undefined, f.cwd).getSessionName(), "Retry title");
   } finally {
     f.cleanup();
+  }
+});
+
+test("each distinct accepted interaction can retry a failed unchanged-history attempt", async () => {
+  const f = fixture();
+  try {
+    let calls = 0;
+    const fake = new FakeProvider(() => {
+      calls++;
+      if (calls < 3) throw new Error("synthetic unavailable");
+      return "Interaction retry title";
+    });
+    setAutoTitleProviderForTests(fake);
+    for (let index = 1; index <= 3; index++) appendExchange(f.manager, index);
+    persistFile(f);
+
+    await scheduleWayangAutoTitle(f.rowId);
+    assert.equal(scheduleWayangAutoTitle(f.rowId), null, "ordinary same-history triggers remain suppressed");
+    await scheduleWayangAutoTitleOnInteraction(f.rowId, "accepted-interaction-one");
+    assert.equal(fake.dispatchCalls, 2);
+    assert.equal(scheduleWayangAutoTitleOnInteraction(f.rowId, "accepted-interaction-one"), null);
+    assert.equal(fake.dispatchCalls, 2, "one accepted interaction cannot retry itself");
+
+    await scheduleWayangAutoTitleOnInteraction(f.rowId, "accepted-interaction-two");
+    assert.equal(fake.dispatchCalls, 3);
+    assert.equal(SessionManager.open(f.manager.getSessionFile()!, undefined, f.cwd).getSessionName(), "Interaction retry title");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("in-flight title work coalesces across a newly completed interaction", async () => {
+  const f = fixture();
+  try {
+    const response = deferred<string>();
+    const dispatched = deferred<void>();
+    let dispatchCalls = 0;
+    setAutoTitleProviderForTests({
+      async prepare() {
+        return {
+          dispatch() {
+            dispatchCalls++;
+            dispatched.resolve();
+            return response.promise;
+          },
+        };
+      },
+    });
+    for (let index = 1; index <= 3; index++) appendExchange(f.manager, index);
+    persistFile(f);
+
+    const first = scheduleWayangAutoTitleOnInteraction(f.rowId, "interaction-before-new-exchange");
+    assert.ok(first);
+    await dispatched.promise;
+    appendExchange(f.manager, 4);
+    const second = scheduleWayangAutoTitleOnInteraction(f.rowId, "interaction-after-new-exchange");
+    assert.equal(second, first, "the same bounded first-three projection has only one provider request");
+    response.resolve("Coalesced title");
+    await first;
+
+    assert.equal(dispatchCalls, 1);
+    assert.equal(SessionManager.open(f.manager.getSessionFile()!, undefined, f.cwd).getSessionName(), "Coalesced title");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("interaction repairs a canonical Pi title without another provider request", async () => {
+  const f = fixture();
+  try {
+    const fake = new FakeProvider(() => "Canonical automatic title");
+    setAutoTitleProviderForTests(fake);
+    for (let index = 1; index <= 3; index++) appendExchange(f.manager, index);
+    persistFile(f);
+    failNextCommitStoreMutationPersistenceForTests();
+    await scheduleWayangAutoTitle(f.rowId);
+    assert.equal(fake.dispatchCalls, 1);
+    assert.equal(getSessionById(f.rowId)?.title_source, "provisional");
+
+    assert.equal(scheduleWayangAutoTitleOnInteraction(f.rowId, "repair-interaction"), null);
+    assert.equal(fake.dispatchCalls, 1, "a physical session_info must suppress another title-model call");
+    assert.deepEqual(
+      [getSessionById(f.rowId)?.title, getSessionById(f.rowId)?.title_source],
+      ["Canonical automatic title", "pi"],
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("interaction preserves authored and deliberately cleared physical titles", () => {
+  for (const physicalName of ["Agent-authored title", ""] as const) {
+    const f = fixture();
+    try {
+      const fake = new FakeProvider(() => "Must not generate");
+      setAutoTitleProviderForTests(fake);
+      appendExchange(f.manager, 1);
+      persistFile(f);
+      if (!physicalName) setProvisionalSessionTitle(f.rowId, "Old provisional fallback");
+      f.manager.appendSessionInfo(physicalName, { origin: "human" });
+
+      assert.equal(scheduleWayangAutoTitleOnInteraction(f.rowId, `interaction-${physicalName || "clear"}`), null);
+      assert.equal(fake.dispatchCalls, 0);
+      if (physicalName) {
+        assert.deepEqual(
+          [getSessionById(f.rowId)?.title, getSessionById(f.rowId)?.title_source],
+          [physicalName, "pi"],
+        );
+      } else {
+        assert.deepEqual(
+          [getSessionById(f.rowId)?.title, getSessionById(f.rowId)?.title_source],
+          ["", "pi"],
+          "a deliberate blank session_info clears stale fallback display and blocks automation",
+        );
+      }
+    } finally {
+      f.cleanup();
+    }
   }
 });
 

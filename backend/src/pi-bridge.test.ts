@@ -14,6 +14,7 @@ import {
   beginNonBrowserTurn,
   classifyScheduledPromptResult,
   cleanupPiSessionCapabilityDenial,
+  curateTogetherModelRecords,
   closePiSessionAuthorities,
   composeRuntimeActiveTools,
   createPiSession,
@@ -30,6 +31,8 @@ import {
   installWayangRawSudoFailClosedGuard,
   latchPiSessionCapabilityDenial,
   interviewSubmissionContent,
+  isCuratedTogetherModel,
+  isWayangProviderVisible,
   listModels,
   markClaimedQueuedBrowserTurnsReady,
   markQueuedBrowserMessageStarted,
@@ -65,7 +68,7 @@ import { WREN_AGENT_PROFILE_ID, type PendingAgentSwitch } from "./workspace-type
 import type { ProtectedBrowserToolRuntime } from "./browser/protected-tools.js";
 import type { ProtectedBrowserBinding } from "./browser/types.js";
 import { getActionApprovalBridge } from "./action-approval-bridge.js";
-import { setAutoTitleProviderForTests } from "./session-title-service.js";
+import { scheduleWayangAutoTitle, setAutoTitleProviderForTests } from "./session-title-service.js";
 import { extractCompletedTitleExchanges } from "./session-title-policy.js";
 
 function syntheticProtectedRuntime(
@@ -1194,6 +1197,92 @@ test("idle browser prompt completion schedules title generation after its marker
   }
 });
 
+test("an accepted browser interaction retries title generation for an older unnamed session", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-older-title-retry-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: durableRow.id });
+  for (let index = 1; index <= 3; index++) {
+    const userEntryId = manager.appendMessage({ role: "user", content: `decorated old ${index}`, timestamp: Date.now() } as any);
+    manager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: `old answer ${index}` }],
+      provider: "synthetic",
+      model: "synthetic",
+      stopReason: "stop",
+      timestamp: Date.now(),
+    } as any);
+    manager.appendCustomEntry("wayang-interactive-turn-source.v1", {
+      user_entry_id: userEntryId,
+      raw_user_text: `raw old ${index}`,
+      accepted_at: index,
+      client_message_id: `old-${index}`,
+    });
+  }
+  updatePiSessionFile(durableRow.id, manager.getSessionFile()!);
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    async prompt(content: string) {
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      manager.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "new answer" }],
+        provider: "synthetic",
+        model: "synthetic",
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as any);
+    },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "older-title-retry",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  const previousFlag = process.env.WAYANG_AUTO_SESSION_TITLE;
+  const previousProtectedFlag = process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED;
+  process.env.WAYANG_AUTO_SESSION_TITLE = "on";
+  process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED = "on";
+  let dispatchCalls = 0;
+  setAutoTitleProviderForTests({
+    async prepare() {
+      return {
+        dispatch: async () => {
+          dispatchCalls++;
+          if (dispatchCalls === 1) throw new Error("synthetic prior failure");
+          return "Recovered older title";
+        },
+      };
+    },
+  });
+  try {
+    await scheduleWayangAutoTitle(durableRow.id);
+    assert.equal(dispatchCalls, 1);
+    await sendBrowserMessageTurn(handle, "new interaction", undefined, "new-interaction");
+    assert.equal(dispatchCalls, 1, "older-session parsing and provider dispatch are deferred past turn acknowledgement");
+    const deadline = Date.now() + 2_000;
+    while (SessionManager.open(manager.getSessionFile()!, undefined, f.cwd).getSessionName() !== "Recovered older title") {
+      if (Date.now() >= deadline) throw new Error("older title generation was not triggered by the accepted interaction");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(dispatchCalls, 2);
+  } finally {
+    setAutoTitleProviderForTests(null);
+    if (previousFlag === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE;
+    else process.env.WAYANG_AUTO_SESSION_TITLE = previousFlag;
+    if (previousProtectedFlag === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED;
+    else process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED = previousProtectedFlag;
+    f.cleanup();
+  }
+});
+
 test("non-browser interview steering preserves an accepted queued browser source until its own settlement", () => {
   const f = currentTurnFixture("wayang-pi-bridge-interview-queued-source-");
   const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
@@ -1752,6 +1841,38 @@ test("overflow retry provenance persists without a browser subscriber", () => {
   assert.equal(leaf.customType, "wayang-overflow-retry-v1");
   assert.equal(leaf.data.compactionEntryId, manager.getBranch().find((entry: any) => entry.type === "compaction")?.id);
   assert.equal(leaf.data.overflowEntryId, overflowId);
+});
+
+test("Wayang exposes only the curated Together catalog and hides OpenRouter", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-provider-catalog-policy-"));
+  const cwd = path.join(dir, "project");
+  const agentDir = path.join(dir, "agent");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(agentDir, { recursive: true });
+
+  try {
+    assert.equal(isWayangProviderVisible("openrouter"), false);
+    assert.equal(isWayangProviderVisible("together"), true);
+    assert.equal(isCuratedTogetherModel("zai-org/GLM-5.3-Flash"), true);
+    assert.equal(isCuratedTogetherModel("mistralai/Mistral-7B-Instruct-v0.1"), false);
+
+    const curated = curateTogetherModelRecords([
+      { id: "zai-org/GLM-5.3-Flash", type: "chat" },
+      { id: "zai-org/GLM-5.3-Flash", type: "image" },
+      { id: "mistralai/Mistral-7B-Instruct-v0.1", type: "chat" },
+      null,
+    ]);
+    assert.deepEqual(curated, [{ id: "zai-org/GLM-5.3-Flash", type: "chat" }]);
+
+    const result = await listModels({ cwd, agentDir, includeDynamicModels: false });
+    assert.equal(result.models.some((model) => model.provider === "openrouter"), false);
+    assert.equal(
+      result.models.filter((model) => model.provider === "together").every((model) => isCuratedTogetherModel(model.id)),
+      true,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("listModels does not execute an unrelated installed extension factory", async () => {

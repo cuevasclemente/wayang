@@ -278,6 +278,37 @@ export function reconcileSessionTitleFromCatalog(
   return true;
 }
 
+/**
+ * Targeted Pi-to-Wayang repair when the caller has proven a physical
+ * session_info revision exists. Unlike a catalog projection, this preserves a
+ * deliberate blank name as canonical rather than substituting a fallback.
+ */
+export function reconcileSessionTitleFromPhysicalNameById(
+  id: string,
+  projection: CatalogSessionTitleProjection,
+): SessionRow | undefined {
+  const reconcile = (row: Pick<SessionRow, "title" | "title_source">): boolean => {
+    if (projection.piName?.trim()) return reconcileSessionTitleFromCatalog(row, projection);
+    if (row.title_source === "explicit") return false;
+    if (row.title_source === "pi" && !row.title) return false;
+    row.title = "";
+    row.title_source = "pi";
+    return true;
+  };
+  const current = getStore().sessions.find((row) => row.id === id);
+  if (!current) return undefined;
+  const preview = { title: current.title, title_source: current.title_source };
+  if (!reconcile(preview)) return cloneSession(current);
+  const committed = commitStoreMutation((draft) => {
+    const row = draft.sessions.find((candidate) => candidate.id === id);
+    if (!row || !reconcile(row)) return row ? cloneSession(row) : undefined;
+    incrementDirectMutation(row);
+    return cloneSession(row);
+  });
+  if (committed) publishDirectMutation(false);
+  return committed;
+}
+
 function rowMutationVersion(row: SessionRow): number {
   return row.catalog_mutation_version ?? 0;
 }
