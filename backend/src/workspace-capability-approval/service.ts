@@ -79,6 +79,9 @@ export class WorkspaceCapabilityApprovalService {
     }
     const result = await this.workspace.previewActivation(intent);
     if (result.status === "conflict") throw new CapabilityApprovalError("state_conflict", "Workspace state changed; retry the preview", 409);
+    if (result.status === "runtime_limit") {
+      throw new CapabilityApprovalError("runtime_limit", `Capability review can display at most ${result.limit} affected runtimes`, 409);
+    }
     if (result.status === "denied" && result.reason === "activation_history_full") {
       throw new CapabilityApprovalError("history_full", "Capability activation history is full", 409);
     }

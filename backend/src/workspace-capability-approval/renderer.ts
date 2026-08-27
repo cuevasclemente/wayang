@@ -4,13 +4,21 @@ import type {
   CapabilityActivationPreview,
   CapabilityApprovalBinding,
   CapabilityAssociationState,
+  AffectedRuntimeStatus,
   RenderedCapabilityChallenge,
 } from "./types.js";
 
 const MAX_ID_LENGTH = 256;
 const MAX_LABEL_LENGTH = 160;
 const MAX_CWD_LENGTH = 4_096;
-const MAX_AFFECTED_RUNTIMES = 64;
+export const MAX_AFFECTED_RUNTIMES = 64;
+const AFFECTED_RUNTIME_STATUSES = new Set<AffectedRuntimeStatus>([
+  "idle",
+  "streaming",
+  "queued",
+  "starting",
+  "mutation_locked",
+]);
 
 function boundedText(value: string, name: string, max: number): string {
   if (typeof value !== "string" || value.length < 1 || value.length > max || /[\u0000-\u001f\u007f]/u.test(value)) {
@@ -126,11 +134,9 @@ export function validateActivationPreview(preview: CapabilityActivationPreview):
   const runtimeIds = new Set<string>();
   for (const runtime of preview.affectedRuntimes) {
     boundedText(runtime.runtimeId, "runtime id", MAX_ID_LENGTH);
+    if (!AFFECTED_RUNTIME_STATUSES.has(runtime.status)) throw new Error("invalid affected runtime status");
     if (runtimeIds.has(runtime.runtimeId)) throw new Error("duplicate affected runtime");
     runtimeIds.add(runtime.runtimeId);
-  }
-  if (preview.affectedRuntimes.some((runtime) => runtime.status !== "idle")) {
-    throw new Error("widening is blocked while an affected runtime is active or mutation-locked");
   }
 }
 

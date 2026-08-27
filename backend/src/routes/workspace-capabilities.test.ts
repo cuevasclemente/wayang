@@ -74,8 +74,8 @@ function workspace(): WorkspaceCapabilityMutationPort {
   };
 }
 
-async function start(t: TestContext, pins = new Pins()) {
-  const service = new WorkspaceCapabilityApprovalService({ workspace: workspace(), pinAttempts: pins, randomId: () => "request" });
+async function start(t: TestContext, pins = new Pins(), workspacePort = workspace()) {
+  const service = new WorkspaceCapabilityApprovalService({ workspace: workspacePort, pinAttempts: pins, randomId: () => "request" });
   const app = express();
   app.use("/api", createWorkspaceCapabilitiesRouter({
     service,
@@ -119,6 +119,58 @@ test("request API accepts compiled IDs and rejects provider/model extras", async
   assert.equal("provider" in challenge, false);
   assert.equal("model" in challenge, false);
   assert.match(created.headers.get("cache-control") ?? "", /no-store/);
+});
+
+test("request API accepts and displays busy affected-runtime statuses", async (t) => {
+  const busy = workspace();
+  busy.previewActivation = async (intent) => {
+    const preview = {
+      intent,
+      projectLabel: "Synthetic Project",
+      projectCwd: "/synthetic/project",
+      agentProfileLabel: "Synthetic Profile",
+      privacyMode: "standard" as const,
+      profileAllowed: true,
+      profileEnabled: true,
+      associationBefore: null,
+      associationAfter: { active: true, revision: 1 },
+      previewStateDigest: "",
+      affectedRuntimes: [
+        { runtimeId: "streaming-runtime", status: "streaming" as const },
+        { runtimeId: "queued-runtime", status: "queued" as const },
+        { runtimeId: "starting-runtime", status: "starting" as const },
+        { runtimeId: "locked-runtime", status: "mutation_locked" as const },
+      ],
+    };
+    preview.previewStateDigest = capabilityPreviewStateDigest(preview);
+    return { status: "ok", preview };
+  };
+  const { base } = await start(t, new Pins(), busy);
+  const response = await fetch(`${base}/workspace-capabilities/requests`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(INTENT),
+  });
+  assert.equal(response.status, 201);
+  const body = await response.json() as { affectedRuntimes: Array<{ status: string }> };
+  assert.deepEqual(body.affectedRuntimes.map((runtime) => runtime.status), [
+    "streaming", "queued", "starting", "mutation_locked",
+  ]);
+});
+
+test("busy-runtime display saturation returns a distinct bounded contract", async (t) => {
+  const saturated = workspace();
+  saturated.previewActivation = async () => ({ status: "runtime_limit", limit: 64 });
+  const { base } = await start(t, new Pins(), saturated);
+  const response = await fetch(`${base}/workspace-capabilities/requests`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(INTENT),
+  });
+  assert.equal(response.status, 409);
+  const body = await response.json() as { code?: string; error?: string };
+  assert.equal(body.code, "runtime_limit");
+  assert.match(body.error ?? "", /at most 64 affected runtimes/);
 });
 
 test("cooldown returns the typed 429 contract and Retry-After without creating a challenge", async (t) => {

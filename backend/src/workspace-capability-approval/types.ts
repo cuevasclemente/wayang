@@ -134,6 +134,7 @@ export interface CapabilityRevokeIntent extends CapabilityActivationIntent {
 export type PreviewActivationResult =
   | { status: "ok"; preview: CapabilityActivationPreview }
   | { status: "denied"; reason: string }
+  | { status: "runtime_limit"; limit: number }
   | { status: "conflict" };
 
 export type CommitActivationResult =

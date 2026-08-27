@@ -129,10 +129,12 @@ test("expiry consumes the exact reserved attempt and releases the realm", async 
   assert.equal((await authority.create(OWNER, preview())).requestId, "request-2");
 });
 
-test("incompatible privacy and non-idle widening fail before PIN reservation", async () => {
+test("incompatible privacy fails before PIN reservation while non-idle runtimes remain reviewable", async () => {
   const pins = new SyntheticPinAttempts();
   const authority = new CapabilityApprovalAuthority({ pinAttempts: pins, commitVerified: async () => "ok" });
   await assert.rejects(authority.create(OWNER, preview({ privacyMode: "standard" })), /incompatible/);
-  await assert.rejects(authority.create(OWNER, preview({ affectedRuntimes: [{ runtimeId: "busy", status: "streaming" }] })), /widening is blocked/);
   assert.equal(pins.reservations.length, 0);
+  const challenge = await authority.create(OWNER, preview({ affectedRuntimes: [{ runtimeId: "busy", status: "streaming" }] }));
+  assert.deepEqual(challenge.affectedRuntimes, [{ runtimeId: "busy", status: "streaming" }]);
+  assert.equal(pins.reservations.length, 1);
 });

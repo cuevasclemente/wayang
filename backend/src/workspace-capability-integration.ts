@@ -14,11 +14,13 @@ import {
 import {
   capabilityPairRuntimeSessionIds,
   previewRuntimeMutationImpact,
-  runtimeImpactService,
-  type RuntimeMutationImpactLease,
 } from "./runtime-impact.js";
 import { WorkspaceStoreError, type WorkspaceCapabilityApprovalEventRow, type WorkspaceCapabilityAssociationRow } from "./workspace-types.js";
-import { capabilityOperationDigest, capabilityPreviewStateDigest } from "./workspace-capability-approval/renderer.js";
+import {
+  MAX_AFFECTED_RUNTIMES,
+  capabilityOperationDigest,
+  capabilityPreviewStateDigest,
+} from "./workspace-capability-approval/renderer.js";
 import { WorkspaceCapabilityApprovalService } from "./workspace-capability-approval/service.js";
 import type {
   AffectedRuntimePreview,
@@ -63,6 +65,18 @@ export interface WorkspaceCapabilityRuntimeDenialPort {
   }): void;
   /** Best-effort process/browser/download teardown after durable denial. */
   cleanupDeniedRuntimeIds(runtimeIds: readonly string[]): Promise<void>;
+}
+
+/**
+ * Temporary lifecycle seam for the runtime-owner branch. Activation is a
+ * widening-only generation latch and must not reuse denial behavior.
+ */
+export interface WorkspaceCapabilityRuntimeLifecyclePort extends WorkspaceCapabilityRuntimeDenialPort {
+  /** Synchronously refresh-fences every exact affected runtime before persistence. */
+  latchActivation(input: {
+    intent: CapabilityActivationIntent;
+    runtimeIds: readonly string[];
+  }): void;
 }
 
 function associationRecord(row: WorkspaceCapabilityAssociationRow): CapabilityAssociationRecord {
@@ -116,24 +130,17 @@ function sameIntent(left: CapabilityActivationIntent, right: CapabilityActivatio
     && left.agentProfileId === right.agentProfileId;
 }
 
-function sameRuntimePreview(left: readonly AffectedRuntimePreview[], right: readonly AffectedRuntimePreview[]): boolean {
-  return left.length === right.length && left.every((value, index) => {
-    const candidate = right[index];
-    return candidate?.runtimeId === value.runtimeId && candidate.status === value.status;
-  });
-}
-
 function sameAuthorityPreview(left: CapabilityActivationPreview, right: CapabilityActivationPreview): boolean {
   return sameIntent(left.intent, right.intent)
     && left.previewStateDigest === right.previewStateDigest
     && left.associationBefore?.active === right.associationBefore?.active
     && left.associationBefore?.revision === right.associationBefore?.revision
     && left.associationAfter.active === right.associationAfter.active
-    && left.associationAfter.revision === right.associationAfter.revision
-    && sameRuntimePreview(left.affectedRuntimes, right.affectedRuntimes);
+    && left.associationAfter.revision === right.associationAfter.revision;
 }
 
-function buildActivationPreview(
+/** @internal Synthetic seam for bounded runtime-status preview regressions. */
+export function buildWorkspaceCapabilityActivationPreview(
   intent: CapabilityActivationIntent,
   affectedRuntimes?: readonly AffectedRuntimePreview[],
 ): PreviewActivationResult {
@@ -160,7 +167,9 @@ function buildActivationPreview(
   }
 
   const runtimes = affectedRuntimes ?? runtimePreview(capabilityPairRuntimeSessionIds(project.id, profile.id));
-  if (runtimes.length > 64 || runtimes.some((runtime) => runtime.status !== "idle")) return { status: "conflict" };
+  if (runtimes.length > MAX_AFFECTED_RUNTIMES) {
+    return { status: "runtime_limit", limit: MAX_AFFECTED_RUNTIMES };
+  }
   const preview: CapabilityActivationPreview = {
     intent: { ...intent },
     projectLabel: project.name,
@@ -180,10 +189,10 @@ function buildActivationPreview(
 
 /** Exact approval-subsystem adapter; ordinary workspace services never receive activation authority. */
 export class WorkspaceCapabilityIntegration implements WorkspaceCapabilityMutationPort, CapabilityRuntimeCleanupPort {
-  constructor(private readonly denial: WorkspaceCapabilityRuntimeDenialPort) {}
+  constructor(private readonly lifecycle: WorkspaceCapabilityRuntimeLifecyclePort) {}
 
   async previewActivation(intent: CapabilityActivationIntent): Promise<PreviewActivationResult> {
-    return buildActivationPreview(intent);
+    return buildWorkspaceCapabilityActivationPreview(intent);
   }
 
   async commitActivation(input: Parameters<WorkspaceCapabilityMutationPort["commitActivation"]>[0]): Promise<CommitActivationResult> {
@@ -193,24 +202,26 @@ export class WorkspaceCapabilityIntegration implements WorkspaceCapabilityMutati
     if (input.approvalDigest !== expectedDigest) return { status: "denied", reason: "invalid_approval_digest" };
     if (input.approvedAt > input.approvalBinding.expiresAt) return { status: "conflict" };
 
-    let lease: RuntimeMutationImpactLease | null = null;
     try {
-      lease = runtimeImpactService.acquireCapabilityPair(
-        input.preview.intent.projectId,
-        input.preview.intent.agentProfileId,
-      );
-      const affected = lease.affected_session_ids.map((runtimeId) => ({ runtimeId, status: "idle" as const }));
-      const current = buildActivationPreview(input.preview.intent, affected);
+      // Runtime list and status are owner information, not association
+      // authority. Revalidate only the exact digest-bound project/profile/
+      // privacy/allowlist/association state reviewed by the owner.
+      const current = buildWorkspaceCapabilityActivationPreview(input.preview.intent, []);
       if (current.status === "denied" && current.reason === "activation_history_full") {
-        lease.release();
-        lease = null;
         return { status: "history_full" };
       }
       if (current.status !== "ok" || !sameAuthorityPreview(input.preview, current.preview)) {
-        lease.release();
-        lease = null;
         return { status: "conflict" };
       }
+
+      const runtimeIds = capabilityPairRuntimeSessionIds(
+        input.preview.intent.projectId,
+        input.preview.intent.agentProfileId,
+      );
+      // This latch and the durable mutation are deliberately adjacent. No await
+      // may appear between them: construction that began before activation must
+      // be refresh-fenced before the store can expose the widening association.
+      this.lifecycle.latchActivation({ intent: { ...input.preview.intent }, runtimeIds });
       const association = commitWorkspaceCapabilityActivation({
         capability_id: input.preview.intent.capabilityId,
         project_id: input.preview.intent.projectId,
@@ -225,15 +236,12 @@ export class WorkspaceCapabilityIntegration implements WorkspaceCapabilityMutati
         && row.agent_profile_id === association.agent_profile_id
         && row.association_revision === association.revision);
       if (!approvalEvent) throw new Error("Committed capability approval event is unavailable");
-      await lease.commitAndStopIdle();
-      lease = null;
       return {
         status: "committed",
         result: { association: associationRecord(association), approvalEvent: approvalEventRecord(approvalEvent) },
         idleRuntimeIds: [],
       };
     } catch (error) {
-      lease?.release();
       if (error instanceof WorkspaceStoreError && error.statusCode === 409 && /history is full/u.test(error.message)) {
         return { status: "history_full" };
       }
@@ -266,7 +274,7 @@ export class WorkspaceCapabilityIntegration implements WorkspaceCapabilityMutati
       // Durable denial is already published. No await may precede this latch;
       // an idempotent retry also relatches in case the first process failed
       // after publishing the tombstone but before completing live denial.
-      this.denial.latchDenied({ association, runtimeIds });
+      this.lifecycle.latchDenied({ association, runtimeIds });
       if (result.status === "already_revoked") return { status: "already_revoked", association, cleanupRuntimeIds: runtimeIds };
       return { status: "revoked", association, cleanupRuntimeIds: runtimeIds };
     } catch (error) {
@@ -292,11 +300,12 @@ export class WorkspaceCapabilityIntegration implements WorkspaceCapabilityMutati
   }
 
   async stopAfterActivation(_runtimeIds: readonly string[]): Promise<void> {
-    // commitActivation owns the lease through stop.
+    // Deferred activation refreshes stale handles through the lifecycle latch;
+    // it must not stop already-accepted work after commit.
   }
 
   async cleanupAfterRevocation(runtimeIds: readonly string[]): Promise<void> {
-    await this.denial.cleanupDeniedRuntimeIds(runtimeIds);
+    await this.lifecycle.cleanupDeniedRuntimeIds(runtimeIds);
   }
 
   latchDenied(input: {
@@ -308,12 +317,12 @@ export class WorkspaceCapabilityIntegration implements WorkspaceCapabilityMutati
       throw new Error("Capability invalidation was not durably denied before runtime latching");
     }
     for (const association of input.associations) {
-      this.denial.latchDenied({ association, runtimeIds: input.runtimeIds });
+      this.lifecycle.latchDenied({ association, runtimeIds: input.runtimeIds });
     }
   }
 
   async cleanupAfterDenial(input: { runtimeIds: readonly string[] }): Promise<void> {
-    await this.denial.cleanupDeniedRuntimeIds(input.runtimeIds);
+    await this.lifecycle.cleanupDeniedRuntimeIds(input.runtimeIds);
   }
 }
 
@@ -584,7 +593,7 @@ export class HardenedSettingsPinAttemptAdapter implements SettingsPinAttemptPort
 }
 
 export function createWorkspaceCapabilityApprovalIntegration(options: {
-  denial: WorkspaceCapabilityRuntimeDenialPort;
+  lifecycle: WorkspaceCapabilityRuntimeLifecyclePort;
   pinAttemptStatePath?: string;
   pinAttemptReady?: boolean;
 }): {
@@ -592,7 +601,7 @@ export function createWorkspaceCapabilityApprovalIntegration(options: {
   service: WorkspaceCapabilityApprovalService;
   pinAttempts: HardenedSettingsPinAttemptAdapter;
 } {
-  const integration = new WorkspaceCapabilityIntegration(options.denial);
+  const integration = new WorkspaceCapabilityIntegration(options.lifecycle);
   const pinAttempts = new HardenedSettingsPinAttemptAdapter(options.pinAttemptStatePath, options.pinAttemptReady ?? true);
   const service = new WorkspaceCapabilityApprovalService({ workspace: integration, pinAttempts, cleanup: integration });
   return { integration, service, pinAttempts };
