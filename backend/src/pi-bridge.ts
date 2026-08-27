@@ -72,6 +72,12 @@ import {
   REVIEWED_EXTERNAL_MODELS,
   type ReviewedExternalModelEntry,
 } from "./reviewed-provider-extensions.js";
+import {
+  CURATED_TOGETHER_MODELS,
+  curateTogetherModelRecords,
+  isCuratedTogetherModel,
+} from "./together-model-catalog.js";
+export { curateTogetherModelRecords, isCuratedTogetherModel } from "./together-model-catalog.js";
 import { getSudoBridge } from "./sudo-bridge.js";
 import { getCommandGuardIdentityBridge } from "./command-guard-bridge.js";
 import {
@@ -1105,14 +1111,20 @@ const DEFAULT_MODELS: Record<string, string> = {
   anthropic: "claude-sonnet-4-5",
   openai: "gpt-5.5",
   "openai-codex": "gpt-5.6-sol",
-  openrouter: "deepseek/deepseek-v4-pro",
+  together: "zai-org/GLM-5.3-Flash",
   deepseek: "deepseek-v4-pro",
   "github-copilot": "claude-sonnet-4-5",
 };
 
+/** Providers intentionally unavailable through Wayang, without deleting pi auth. */
+const WAYANG_HIDDEN_PROVIDERS = new Set(["openrouter"]);
+
+export function isWayangProviderVisible(provider: string): boolean {
+  return !WAYANG_HIDDEN_PROVIDERS.has(provider);
+}
+
 /** Provider → env var name(s) mapping for auto-detection */
 const PROVIDER_ENV_MAP: Record<string, string[]> = {
-  openrouter: ["OPENROUTER_API_KEY"],
   anthropic: ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"],
   openai: ["OPENAI_API_KEY"],
   deepseek: ["DEEPSEEK_API_KEY"],
@@ -1122,6 +1134,7 @@ const PROVIDER_ENV_MAP: Record<string, string[]> = {
   xai: ["XAI_API_KEY"],
   mistral: ["MISTRAL_API_KEY"],
   fireworks: ["FIREWORKS_API_KEY"],
+  together: ["TOGETHER_API_KEY"],
   "github-copilot": ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
 };
 
@@ -1166,7 +1179,7 @@ const STORED_AUTH_PROVIDER_PREFERENCE = [
   "openai-codex",
   "openai",
   "anthropic",
-  "openrouter",
+  "together",
   "github-copilot",
   "deepseek",
   "google",
@@ -1178,6 +1191,7 @@ const STORED_AUTH_PROVIDER_PREFERENCE = [
 ];
 
 function providerHasConfiguredModel(registry: ModelRegistry, provider: string): boolean {
+  if (!isWayangProviderVisible(provider)) return false;
   return registry.getAll().some((model) => String(model.provider) === provider && registry.hasConfiguredAuth(model));
 }
 
@@ -1188,7 +1202,7 @@ function resolveUsableModel(
 ): Model<Api> | undefined {
   if (!provider || !modelId) return undefined;
   const model = resolveModelFromRegistry(registry, provider, modelId);
-  return model && registry.hasConfiguredAuth(model) ? model : undefined;
+  return model && isWayangProviderVisible(String(model.provider)) && registry.hasConfiguredAuth(model) ? model : undefined;
 }
 
 function resolveSettingsDefaultModel(settingsManager: SettingsManager, registry: ModelRegistry): Model<Api> | undefined {
@@ -1201,7 +1215,7 @@ async function resolveWebDefaultModel(settingsManager: SettingsManager, context:
   const provider = await detectDefaultProvider(context);
   if (!provider) return undefined;
   return resolveUsableModel(context.registry, provider, DEFAULT_MODELS[provider])
-    || context.registry.getAll().find((model) => String(model.provider) === provider && context.registry.hasConfiguredAuth(model));
+    || context.registry.getAll().find((model) => isWayangProviderVisible(String(model.provider)) && String(model.provider) === provider && context.registry.hasConfiguredAuth(model));
 }
 
 function firstConfiguredProvider(registry: ModelRegistry, providers: Iterable<string>): string | null {
@@ -1494,6 +1508,80 @@ function openRouterModelToModel(registry: ModelRegistry, raw: Record<string, unk
   };
 }
 
+function togetherModelToModel(registry: ModelRegistry, raw: Record<string, unknown>): Model<Api> | null {
+  const id = typeof raw.id === "string" ? raw.id : "";
+  const spec = CURATED_TOGETHER_MODELS[id];
+  if (!id || !spec || (raw.type !== "chat" && raw.type !== "code")) return null;
+
+  const existing = registry.find("together", id);
+  const template = existing
+    || findProviderTemplate(registry, "together", "zai-org/GLM-5.2")
+    || findProviderTemplate(registry, "together");
+  if (!template) return null;
+
+  const pricing = (raw.pricing && typeof raw.pricing === "object" ? raw.pricing : {}) as Record<string, unknown>;
+  const inputPrice = parseFiniteNumber(pricing.input);
+  const outputPrice = parseFiniteNumber(pricing.output);
+  const cacheReadPrice = parseFiniteNumber(pricing.cached_input);
+
+  return {
+    ...template,
+    id,
+    name: typeof raw.display_name === "string" && raw.display_name ? raw.display_name : id,
+    provider: "together",
+    baseUrl: "https://api.together.ai/v1",
+    reasoning: existing?.reasoning ?? spec.reasoning,
+    thinkingLevelMap: spec.thinkingLevelMap ?? existing?.thinkingLevelMap,
+    input: existing?.input ?? spec.input,
+    cost: {
+      input: inputPrice ?? existing?.cost.input ?? 0,
+      output: outputPrice ?? existing?.cost.output ?? 0,
+      cacheRead: cacheReadPrice ?? existing?.cost.cacheRead ?? 0,
+      cacheWrite: 0,
+    },
+    contextWindow: parseFiniteNumber(raw.context_length) ?? existing?.contextWindow ?? template.contextWindow,
+    maxTokens: existing?.maxTokens ?? spec.maxTokens,
+    compat: {
+      ...template.compat,
+      ...existing?.compat,
+      supportsStore: false,
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: spec.reasoning,
+      maxTokensField: "max_tokens",
+      thinkingFormat: "together",
+      supportsStrictMode: false,
+      supportsLongCacheRetention: false,
+    },
+  } as Model<Api>;
+}
+
+async function fetchTogetherDynamicModels(registry: ModelRegistry): Promise<Model<Api>[]> {
+  const template = findProviderTemplate(registry, "together", "zai-org/GLM-5.2")
+    || findProviderTemplate(registry, "together");
+  if (!template || !registry.hasConfiguredAuth(template)) return [];
+
+  const auth = await registry.getApiKeyAndHeaders(template);
+  if (!auth.ok || !auth.apiKey) return [];
+  const headers: Record<string, string> = {
+    accept: "application/json",
+    ...(auth.headers ?? {}),
+  };
+  if (!Object.keys(headers).some((key) => key.toLowerCase() === "authorization")) {
+    headers.Authorization = `Bearer ${auth.apiKey}`;
+  }
+
+  const json = await fetchJsonWithTimeout("https://api.together.ai/v1/models", { headers });
+  const data = Array.isArray(json)
+    ? json
+    : json && typeof json === "object" && Array.isArray((json as { data?: unknown }).data)
+      ? (json as { data: unknown[] }).data
+      : [];
+
+  return curateTogetherModelRecords(data)
+    .map((entry) => togetherModelToModel(registry, entry))
+    .filter((model): model is Model<Api> => !!model);
+}
+
 function anthropicModelFromOpenRouterModel(registry: ModelRegistry, openRouterModel: Model<Api>): Model<Api> | null {
   const match = /^anthropic\/claude-(opus|sonnet|haiku)-(\d+)\.(\d+)$/.exec(openRouterModel.id);
   if (!match) return null;
@@ -1594,6 +1682,10 @@ async function refreshDynamicModels(registry: ModelRegistry, force = false): Pro
   _dynamicModelRefreshPromise = (async () => {
     const errors: string[] = [];
     const modelGroups = await Promise.all([
+      fetchTogetherDynamicModels(registry).catch((error) => {
+        errors.push(`Together live model list failed: ${error instanceof Error ? error.message : String(error)}`);
+        return [] as Model<Api>[];
+      }),
       fetchOpenRouterDynamicModels(registry).catch((error) => {
         errors.push(`OpenRouter live model list failed: ${error instanceof Error ? error.message : String(error)}`);
         return [] as Model<Api>[];
@@ -1605,7 +1697,8 @@ async function refreshDynamicModels(registry: ModelRegistry, force = false): Pro
     ]);
     const builtInKeys = new Set(registry.getAll().map((model) => dynamicModelKey(String(model.provider), model.id)));
     const dynamic = uniqueModels(modelGroups.flat()).filter(
-      (model) => !builtInKeys.has(dynamicModelKey(String(model.provider), model.id)),
+      (model) => String(model.provider) === "together"
+        || !builtInKeys.has(dynamicModelKey(String(model.provider), model.id)),
     );
     _dynamicModelCache = {
       fetchedAt: Date.now(),
@@ -1621,9 +1714,10 @@ async function refreshDynamicModels(registry: ModelRegistry, force = false): Pro
 }
 
 function resolveModelFromRegistry(registry: ModelRegistry, provider: string, modelId: string): Model<Api> | undefined {
+  if (!isWayangProviderVisible(provider)) return undefined;
   return (
-    registry.find(provider, modelId) ||
     getCachedDynamicModel(provider, modelId) ||
+    registry.find(provider, modelId) ||
     (getModel(provider as any, modelId as any) as Model<Api> | undefined)
   );
 }
@@ -1638,10 +1732,10 @@ function resolveRestrictedDefaultModel(settingsManager: SettingsManager, registr
   for (const provider of STORED_AUTH_PROVIDER_PREFERENCE) {
     const preferred = resolveModelFromRegistry(registry, provider, DEFAULT_MODELS[provider] ?? "");
     if (preferred && registry.hasConfiguredAuth(preferred)) return preferred;
-    const fallback = registry.getAll().find((model) => String(model.provider) === provider && registry.hasConfiguredAuth(model));
+    const fallback = registry.getAll().find((model) => isWayangProviderVisible(String(model.provider)) && String(model.provider) === provider && registry.hasConfiguredAuth(model));
     if (fallback) return fallback;
   }
-  return registry.getAll().find((model) => registry.hasConfiguredAuth(model));
+  return registry.getAll().find((model) => isWayangProviderVisible(String(model.provider)) && registry.hasConfiguredAuth(model));
 }
 
 function combineModelErrors(...errors: Array<string | undefined>): string | undefined {
@@ -1690,7 +1784,10 @@ export async function listModels(options: {
     options.agentDir ?? getAgentDirPath(),
     options.reviewedExternalModels ?? REVIEWED_EXTERNAL_MODELS,
   );
-  const models = uniqueModels([...registry.getAll(), ...dynamicModels.models]).map((model) => modelToWebInfo(registry, model));
+  const models = uniqueModels([...dynamicModels.models, ...registry.getAll()])
+    .filter((model) => isWayangProviderVisible(String(model.provider)))
+    .filter((model) => String(model.provider) !== "together" || isCuratedTogetherModel(model.id))
+    .map((model) => modelToWebInfo(registry, model));
   const seenModelKeys = new Set(models.map((model) => dynamicModelKey(model.provider, model.id)));
   for (const model of reviewed.models) {
     const key = dynamicModelKey(model.provider, model.id);

@@ -14,6 +14,7 @@ import {
   beginNonBrowserTurn,
   classifyScheduledPromptResult,
   cleanupPiSessionCapabilityDenial,
+  curateTogetherModelRecords,
   closePiSessionAuthorities,
   composeRuntimeActiveTools,
   createPiSession,
@@ -30,6 +31,8 @@ import {
   installWayangRawSudoFailClosedGuard,
   latchPiSessionCapabilityDenial,
   interviewSubmissionContent,
+  isCuratedTogetherModel,
+  isWayangProviderVisible,
   listModels,
   markClaimedQueuedBrowserTurnsReady,
   markQueuedBrowserMessageStarted,
@@ -1838,6 +1841,38 @@ test("overflow retry provenance persists without a browser subscriber", () => {
   assert.equal(leaf.customType, "wayang-overflow-retry-v1");
   assert.equal(leaf.data.compactionEntryId, manager.getBranch().find((entry: any) => entry.type === "compaction")?.id);
   assert.equal(leaf.data.overflowEntryId, overflowId);
+});
+
+test("Wayang exposes only the curated Together catalog and hides OpenRouter", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-provider-catalog-policy-"));
+  const cwd = path.join(dir, "project");
+  const agentDir = path.join(dir, "agent");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(agentDir, { recursive: true });
+
+  try {
+    assert.equal(isWayangProviderVisible("openrouter"), false);
+    assert.equal(isWayangProviderVisible("together"), true);
+    assert.equal(isCuratedTogetherModel("zai-org/GLM-5.3-Flash"), true);
+    assert.equal(isCuratedTogetherModel("mistralai/Mistral-7B-Instruct-v0.1"), false);
+
+    const curated = curateTogetherModelRecords([
+      { id: "zai-org/GLM-5.3-Flash", type: "chat" },
+      { id: "zai-org/GLM-5.3-Flash", type: "image" },
+      { id: "mistralai/Mistral-7B-Instruct-v0.1", type: "chat" },
+      null,
+    ]);
+    assert.deepEqual(curated, [{ id: "zai-org/GLM-5.3-Flash", type: "chat" }]);
+
+    const result = await listModels({ cwd, agentDir, includeDynamicModels: false });
+    assert.equal(result.models.some((model) => model.provider === "openrouter"), false);
+    assert.equal(
+      result.models.filter((model) => model.provider === "together").every((model) => isCuratedTogetherModel(model.id)),
+      true,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("listModels does not execute an unrelated installed extension factory", async () => {
