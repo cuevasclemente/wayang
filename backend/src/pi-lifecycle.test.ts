@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { serializeEvent, serializeHistoryEntries } from "./pi-bridge.js";
-import { shouldReconcileLiveSessionState } from "./routes/ws.js";
+import { canHandleClientMessageBeforeSessionReady, shouldReconcileLiveSessionState } from "./routes/ws.js";
 
 test("serializes the settled lifecycle event used for final context accounting", () => {
   assert.deepEqual(
@@ -114,6 +114,18 @@ test("refreshes live history and context only at authoritative lifecycle boundar
   assert.equal(shouldReconcileLiveSessionState({ type: "agent_settled" }), true);
   assert.equal(shouldReconcileLiveSessionState({ type: "compaction_end", succeeded: true }), true);
   assert.equal(shouldReconcileLiveSessionState({ type: "compaction_end", succeeded: false }), false);
+});
+
+test("durable interactive responses bypass slow live-session attachment", () => {
+  for (const type of [
+    "interactive_state_sync_request",
+    "interview_response",
+    "interview_cancel",
+    "sudo_response",
+  ]) assert.equal(canHandleClientMessageBeforeSessionReady(type), true, type);
+  for (const type of ["message", "transcript_page_request", "command_guard_pin_response", undefined]) {
+    assert.equal(canHandleClientMessageBeforeSessionReady(type), false, String(type));
+  }
 });
 
 test("serializes successful compaction estimates and agent retry intent", () => {

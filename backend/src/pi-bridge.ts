@@ -165,6 +165,7 @@ interface QueuedBrowserMessageRecord {
   attachmentNames: string[];
   turnToken: string;
   clientVisible: boolean;
+  startCorrelated: boolean;
 }
 
 export interface PiSessionHandle {
@@ -819,13 +820,57 @@ function settleInteractiveTurnsQuietly(handle: PiSessionHandle): void {
   catch { /* source-marker persistence must never change source-turn settlement */ }
 }
 
-/** Mark one exact queued object accepted as soon as Pi starts its user turn. */
+function queuedUserMessageText(message: unknown): string | undefined {
+  if (!message || typeof message !== "object" || (message as any).role !== "user") return undefined;
+  const content = (message as any).content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  return content
+    .filter((part: any) => part && part.type === "text" && typeof part.text === "string")
+    .map((part: any) => part.text)
+    .join("");
+}
+
+/**
+ * Mark a queued browser message accepted as soon as Pi starts its user turn.
+ * Identity is authoritative when preserved. Pi 0.84.1 clones steering messages
+ * before message_start, so the fallback mirrors the SDK's own FIFO exact-text
+ * queue removal and considers only captures already claimed from Pi's queue.
+ */
 export function markQueuedBrowserMessageStarted(handle: PiSessionHandle, message: unknown): string | undefined {
   if (!message || typeof message !== "object") return undefined;
-  const clientMessageId = queuedBrowserClientMessageIds.get(message);
-  for (const record of handle.queuedBrowserMessages.values()) {
-    if (record.capture.message === message) record.clientVisible = false;
+  let clientMessageId = queuedBrowserClientMessageIds.get(message);
+  let matchedRecord: QueuedBrowserMessageRecord | undefined;
+  if (clientMessageId) {
+    const candidate = handle.queuedBrowserMessages.get(clientMessageId);
+    if (candidate && !candidate.startCorrelated) matchedRecord = candidate;
   }
+  if (!matchedRecord) {
+    for (const [candidateId, record] of handle.queuedBrowserMessages) {
+      if (record.startCorrelated || record.capture.message !== message) continue;
+      clientMessageId = queuedBrowserClientMessageIds.get(record.capture.message)
+        ?? (record.clientVisible ? candidateId : undefined);
+      matchedRecord = record;
+      break;
+    }
+  }
+  if (!matchedRecord) {
+    const startedText = queuedUserMessageText(message);
+    if (startedText !== undefined) {
+      for (const [candidateId, record] of handle.queuedBrowserMessages) {
+        if (record.startCorrelated || queuedChatMessageState(record.capture) !== "claimed") continue;
+        if (queuedUserMessageText(record.capture.message) !== startedText) continue;
+        clientMessageId = queuedBrowserClientMessageIds.get(record.capture.message)
+          ?? (record.clientVisible ? candidateId : undefined);
+        matchedRecord = record;
+        break;
+      }
+    }
+  }
+  if (!matchedRecord) return undefined;
+  matchedRecord.startCorrelated = true;
+  matchedRecord.clientVisible = false;
+  if (clientMessageId) queuedBrowserClientMessageIds.set(message, clientMessageId);
   return clientMessageId;
 }
 
@@ -4009,6 +4054,7 @@ export async function sendBrowserMessageTurn(
           attachmentNames: [...(queuedDisplay?.attachmentNames ?? [])],
           turnToken: turn.token,
           clientVisible: Boolean(clientMessageId),
+          startCorrelated: false,
         });
       }
       await steering;

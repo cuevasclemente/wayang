@@ -1229,6 +1229,7 @@ test("non-browser interview steering preserves an accepted queued browser source
       attachmentNames: [],
       turnToken: turn.token,
       clientVisible: true,
+      startCorrelated: false,
     } as any);
     beginNonBrowserTurn(handle, "interview_submission");
     assert.equal(handle.interactiveTurns.has(turn.token), true);
@@ -1295,6 +1296,140 @@ test("queued browser message_start hides the exact queue item and projects its c
     assert.equal([...handle.queuedBrowserMessages.values()][0]?.clientVisible, false);
     const serialized = serializeEvent({ type: "message_start", message: queuedMessage } as any);
     assert.equal(serialized?.client_message_id, "accepted-client-message");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("cloned repeated steering starts consume browser queue IDs in claimed FIFO order", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-cloned-queued-start-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: true,
+    _steeringMessages: [] as string[],
+    _emitQueueUpdate() {},
+    agent: { steeringQueue: { messages: [] as any[] } },
+    steer(content: string) {
+      this._steeringMessages.push(content);
+      this.agent.steeringQueue.messages.push({
+        role: "user",
+        content: [{ type: "text", text: content }],
+      });
+      return Promise.resolve();
+    },
+    getSteeringMessages() { return [...this._steeringMessages]; },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "cloned-queued-start-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    assert.deepEqual(await sendBrowserMessageTurn(
+      handle,
+      "same repeated turn",
+      undefined,
+      "first-client-message",
+      { content: "same repeated turn" },
+    ), { queued: true, cancellable: true });
+    assert.deepEqual(await sendBrowserMessageTurn(
+      handle,
+      "same repeated turn",
+      undefined,
+      "second-client-message",
+      { content: "same repeated turn" },
+    ), { queued: true, cancellable: true });
+
+    fakeSession._steeringMessages.splice(0, 1);
+    fakeSession.agent.steeringQueue.messages.splice(0, 1);
+    const firstClone = { role: "user", content: [{ type: "text", text: "same repeated turn" }] };
+    assert.equal(markQueuedBrowserMessageStarted(handle, firstClone), "first-client-message");
+    assert.equal(handle.queuedBrowserMessages.get("first-client-message")?.clientVisible, false);
+    assert.equal(handle.queuedBrowserMessages.get("second-client-message")?.clientVisible, true);
+    assert.equal(serializeEvent({ type: "message_start", message: firstClone } as any)?.client_message_id,
+      "first-client-message");
+
+    fakeSession._steeringMessages.splice(0, 1);
+    fakeSession.agent.steeringQueue.messages.splice(0, 1);
+    const secondClone = { role: "user", content: [{ type: "text", text: "same repeated turn" }] };
+    assert.equal(markQueuedBrowserMessageStarted(handle, secondClone), "second-client-message");
+    assert.equal(handle.queuedBrowserMessages.get("second-client-message")?.clientVisible, false);
+    assert.equal(serializeEvent({ type: "message_start", message: secondClone } as any)?.client_message_id,
+      "second-client-message");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("claimed cloned starts consume legacy and modern identical captures in FIFO order", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-mixed-cloned-queued-start-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: true,
+    _steeringMessages: [] as string[],
+    _emitQueueUpdate() {},
+    agent: { steeringQueue: { messages: [] as any[] } },
+    steer(content: string) {
+      this._steeringMessages.push(content);
+      this.agent.steeringQueue.messages.push({
+        role: "user",
+        content: [{ type: "text", text: content }],
+      });
+      return Promise.resolve();
+    },
+    getSteeringMessages() { return [...this._steeringMessages]; },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "mixed-cloned-queued-start-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    assert.deepEqual(await sendBrowserMessageTurn(handle, "mixed repeated turn"),
+      { queued: true, cancellable: false });
+    assert.deepEqual(await sendBrowserMessageTurn(
+      handle,
+      "mixed repeated turn",
+      undefined,
+      "modern-client-message",
+      { content: "mixed repeated turn" },
+    ), { queued: true, cancellable: true });
+    const [legacyRecord, modernRecord] = [...handle.queuedBrowserMessages.values()];
+    assert.ok(legacyRecord);
+    assert.ok(modernRecord);
+
+    fakeSession._steeringMessages.splice(0);
+    fakeSession.agent.steeringQueue.messages.splice(0);
+    const legacyClone = { role: "user", content: [{ type: "text", text: "mixed repeated turn" }] };
+    assert.equal(markQueuedBrowserMessageStarted(handle, legacyClone), undefined);
+    assert.equal(legacyRecord.startCorrelated, true);
+    assert.equal(modernRecord.startCorrelated, false);
+    assert.equal(modernRecord.clientVisible, true);
+
+    const modernClone = { role: "user", content: [{ type: "text", text: "mixed repeated turn" }] };
+    assert.equal(markQueuedBrowserMessageStarted(handle, modernClone), "modern-client-message");
+    assert.equal(modernRecord.startCorrelated, true);
+    assert.equal(modernRecord.clientVisible, false);
+    assert.equal(serializeEvent({ type: "message_start", message: modernClone } as any)?.client_message_id,
+      "modern-client-message");
   } finally {
     f.cleanup();
   }

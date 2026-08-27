@@ -1693,7 +1693,7 @@ function handleConnection(
       return;
     }
 
-    if (!ready) {
+    if (!ready && !canHandleClientMessageBeforeSessionReady(msg.type)) {
       if (msg.type === "transcript_page_request") {
         sendSafe(ws, serializeTranscriptPageGateFailure({
           sessionId: currentSessionId,
@@ -2696,6 +2696,13 @@ function handleCommandGuardPinResponse(
   }
 
   bridge.resolveForSession(sessionId, requestId, typeof msg.pin === "string" ? msg.pin : null);
+}
+
+export function canHandleClientMessageBeforeSessionReady(type: unknown): boolean {
+  return type === "interactive_state_sync_request"
+    || type === "interview_response"
+    || type === "interview_cancel"
+    || type === "sudo_response";
 }
 
 export function shouldReconcileLiveSessionState(msg: SerializedMessage): boolean {
