@@ -308,6 +308,194 @@ test("exact Wren loads standard resources for interactive and scheduled Standard
   } finally { f.cleanup(); }
 });
 
+test("captured legacy-Wren standard resources survive first widening activation but fail closed on drift", async () => {
+  const f = fixture("wayang-runtime-legacy-wren-widening-");
+  try {
+    const now = Date.now();
+    commitStoreMutation((draft) => {
+      draft.agentProfiles.push({
+        id: WREN_AGENT_PROFILE_ID,
+        name: "Synthetic continuity Wren",
+        description: null,
+        builtin_kind: "wren",
+        deletable: false,
+        enabled: true,
+        resource_mode: "standard",
+        instructions: null,
+        memory_access: "read_write",
+        default_provider: null,
+        default_model: null,
+        allowed_tools: null,
+        allowed_extensions: null,
+        created_at: now,
+        updated_at: now,
+      });
+    });
+    const profile = getAgentProfile(WREN_AGENT_PROFILE_ID)!;
+    const project = createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
+    const roles = ["continuity", "generation", "eligibility", "revision"] as const;
+    const rows = new Map(roles.map((role) => [role, createSession(f.cwd, { agentProfileId: profile.id })]));
+    const guarded = new Map<(typeof roles)[number], {
+      tool: any;
+      active: string[];
+      executions: () => number;
+      setGenerationCurrent(value: boolean): void;
+      activate(): void;
+    }>();
+    let releaseAcceptedContinuityTool!: () => void;
+    const acceptedContinuityGate = new Promise<void>((resolve) => { releaseAcceptedContinuityTool = resolve; });
+    const continuityUpdates: unknown[] = [];
+    let acceptedContinuityExecution: Promise<unknown> | undefined;
+
+    for (const role of roles) {
+      const row = rows.get(role)!;
+      const loaded = await buildAgentResourceLoader({
+        cwd: f.cwd,
+        agentDir: f.agentDir,
+        agentProfile: profile,
+        project,
+        sourceSessionId: row.id,
+      });
+      assert.ok(loaded.standardResourcesWitness);
+      assert.equal(loaded.standardResourcesWitness.authoritySource, "legacy-wren");
+      assert.equal(loaded.standardResourcesWitness.durableAssociationRevision, undefined);
+      let generationCurrent = true;
+      let executions = 0;
+      let active = ["bash"];
+      const tool: any = {
+        name: "bash",
+        async execute(_id: string, _params: unknown, _signal?: unknown, onUpdate?: (value: unknown) => void) {
+          executions++;
+          if (role === "continuity" && executions === 1) {
+            await acceptedContinuityGate;
+            onUpdate?.({ content: [{ type: "text", text: "accepted-update" }] });
+          }
+          return { content: [{ type: "text", text: "accepted-result" }] };
+        },
+      };
+      const session: any = {
+        _toolRegistry: new Map([["bash", tool]]),
+        getActiveToolNames: () => active,
+        setActiveToolsByName(names: string[]) { active = [...names]; },
+        agent: { state: { tools: [tool] }, async beforeToolCall() {} },
+      };
+      installAgentToolPolicyGuard(session, row.id, {
+        standardResourcesWitness: loaded.standardResourcesWitness,
+        standardResourcesRuntimeFence: {
+          runtimeGeneration: `${role}-generation`,
+          processBootNonce: "synthetic-boot",
+          isCurrent: () => generationCurrent,
+        },
+      });
+      if (role === "continuity") {
+        acceptedContinuityExecution = tool.execute(
+          "accepted-before-widening",
+          {},
+          undefined,
+          (update: unknown) => continuityUpdates.push(update),
+        );
+      } else {
+        await tool.execute(`before-${role}`, {});
+      }
+      guarded.set(role, {
+        tool,
+        get active() { return active; },
+        executions: () => executions,
+        setGenerationCurrent(value) { generationCurrent = value; },
+        activate() { session.setActiveToolsByName(["bash"]); },
+      });
+    }
+
+    const pair = {
+      capability_id: "wayang.standard-resources.v1" as const,
+      project_id: project.id,
+      agent_profile_id: profile.id,
+    };
+    const association = commitWorkspaceCapabilityActivation({ ...pair, operation_digest: "e".repeat(64) });
+    assert.equal(association.revision, 1);
+    for (const runtime of guarded.values()) {
+      runtime.activate();
+      assert.deepEqual(runtime.active, ["bash"], "first durable activation must preserve captured legacy tools");
+    }
+    releaseAcceptedContinuityTool();
+    assert.ok(acceptedContinuityExecution);
+    assert.deepEqual(await acceptedContinuityExecution, {
+      content: [{ type: "text", text: "accepted-result" }],
+    });
+    assert.deepEqual(continuityUpdates, [{ content: [{ type: "text", text: "accepted-update" }] }],
+      "widening activation must not suppress accepted legacy-Wren updates");
+    await guarded.get("continuity")!.tool.execute("after-widening", {});
+    assert.equal(guarded.get("continuity")!.executions(), 2);
+
+    guarded.get("generation")!.setGenerationCurrent(false);
+    await assert.rejects(
+      () => guarded.get("generation")!.tool.execute("generation-drift", {}),
+      /runtime generation is stale/,
+    );
+    commitStoreMutation((draft) => {
+      const eligibility = draft.sessions.find((candidate) => candidate.id === rows.get("eligibility")!.id)!;
+      eligibility.legacy_capability_ineligible = true;
+    });
+    await assert.rejects(
+      () => guarded.get("eligibility")!.tool.execute("eligibility-drift", {}),
+      /authority was revoked or changed/,
+    );
+
+    const revoked = revokeWorkspaceCapabilityAssociation({ ...pair, expected_revision: association.revision });
+    assert.equal(revoked.association.revision, 2);
+    await assert.rejects(
+      () => guarded.get("continuity")!.tool.execute("revoked", {}),
+      /authority was revoked or changed/,
+    );
+
+    const reactivationRow = createSession(f.cwd, { agentProfileId: profile.id });
+    const reactivationLoaded = await buildAgentResourceLoader({
+      cwd: f.cwd,
+      agentDir: f.agentDir,
+      agentProfile: profile,
+      project,
+      sourceSessionId: reactivationRow.id,
+    });
+    assert.equal(reactivationLoaded.standardResourcesWitness?.authoritySource, "legacy-wren");
+    assert.equal(reactivationLoaded.standardResourcesWitness?.durableAssociationRevision, 2);
+    let reactivationExecutions = 0;
+    const reactivationTool: any = {
+      name: "bash",
+      async execute() { reactivationExecutions++; return { content: [] }; },
+    };
+    const reactivationSession: any = {
+      _toolRegistry: new Map([["bash", reactivationTool]]),
+      getActiveToolNames: () => ["bash"],
+      setActiveToolsByName() {},
+      agent: { state: { tools: [reactivationTool] }, async beforeToolCall() {} },
+    };
+    installAgentToolPolicyGuard(reactivationSession, reactivationRow.id, {
+      standardResourcesWitness: reactivationLoaded.standardResourcesWitness,
+      standardResourcesRuntimeFence: {
+        runtimeGeneration: "reactivation-generation",
+        processBootNonce: "synthetic-boot",
+        isCurrent: () => true,
+      },
+    });
+    await reactivationTool.execute("accepted-before-reactivation", {});
+
+    const regranted = commitWorkspaceCapabilityActivation({ ...pair, operation_digest: "f".repeat(64) });
+    assert.equal(regranted.revision, 3);
+    await reactivationTool.execute("settling-after-reactivation", {});
+    assert.equal(reactivationExecutions, 2);
+    await assert.rejects(
+      () => guarded.get("revision")!.tool.execute("revision-drift", {}),
+      /authority was revoked or changed/,
+    );
+    assert.equal(guarded.get("revision")!.executions(), 1);
+    revokeWorkspaceCapabilityAssociation({ ...pair, expected_revision: regranted.revision });
+    await assert.rejects(
+      () => reactivationTool.execute("later-revision-drift", {}),
+      /authority was revoked or changed/,
+    );
+  } finally { f.cleanup(); }
+});
+
 test("revoked standard-resources witness permanently latches stale tools denied", async () => {
   const f = fixture("wayang-runtime-standard-latch-");
   try {
