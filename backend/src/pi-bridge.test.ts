@@ -17,6 +17,7 @@ import {
   curateTogetherModelRecords,
   closePiSessionAuthorities,
   composeRuntimeActiveTools,
+  createModelContext,
   createPiSession,
   destroyPiSession,
   fileAudioExperimentRuntimeIsEligible,
@@ -46,6 +47,7 @@ import {
   resolveInteractiveBrowserAuthority,
   resolveInteractiveTurn,
   sendBrowserMessageTurn,
+  sealSessionModelProviderRegistry,
   serializeEvent,
   settleInteractiveTurns,
   setSessionDefaultModel,
@@ -625,7 +627,7 @@ test("starting runtime revocation fences privileged loading and publication, whi
   }
 });
 
-test("legacy Wren runtime authorizes provider extension loading before model resolution", async () => {
+test("legacy Wren runtime still resolves its Standard-resource witness independently of providers", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-legacy-wren-provider-load-"));
   const cwd = path.join(dir, "project");
   const previousDataDir = process.env.WAYANG_DATA_DIR;
@@ -670,7 +672,7 @@ test("legacy Wren runtime authorizes provider extension loading before model res
       },
     }), /synthetic stop before provider discovery/);
     assert.equal(authorized, true,
-      "the same legacy Wren witness used by resource loading must authorize reviewed provider discovery");
+      "legacy Wren Standard-resource authority remains unchanged by provider isolation");
     assert.equal(project.access_policy.privacy_mode, "standard");
   } finally {
     await cleanupPiSessionCapabilityDenial([row.id]);
@@ -1910,7 +1912,7 @@ function writeSyntheticNarwhalReviewedExtension(agentDir: string, moduleMarker: 
   const extensionPath = path.join(extensionDir, "index.ts");
   fs.writeFileSync(extensionPath, [
     'import * as fs from "node:fs";',
-    `fs.writeFileSync(${JSON.stringify(moduleMarker)}, "executed");`,
+    `fs.writeFileSync(${JSON.stringify(moduleMarker)}, import.meta.url);`,
     'export default function narwhalHornSynthetic(pi: any) {',
     '  pi.registerProvider("narwhal-horn", {',
     '    name: "Narwhal Horn (LAN)",',
@@ -1985,6 +1987,99 @@ test("listModels statically projects the reviewed Narwhal model without executin
       result.models.every((model) => !model.id.includes("heretic")),
       "no stale qwen3.6-35b-a3b-heretic entry may appear in the catalog",
     );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("restricted model contexts load a reviewed provider in an isolated registry", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-provider-runtime-"));
+  const homeDir = path.join(dir, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const moduleMarker = path.join(dir, "reviewed-extension-executed");
+  const extensionPath = writeSyntheticNarwhalReviewedExtension(agentDir, moduleMarker);
+
+  try {
+    fs.appendFileSync(extensionPath, [
+      "",
+      "// Resource registrations are deliberately not projected into a model context.",
+    ].join("\n"));
+    const reviewed = syntheticReviewedModel(extensionPath);
+    const context = await createModelContext({
+      agentDir,
+      includeReviewedProviders: true,
+      reviewedExternalModels: reviewed,
+    });
+    const model = context.registry.find("narwhal-horn", "qwen3.8-flash-next");
+    assert.ok(model, "reviewed provider model must be resolvable in an isolated context");
+    assert.equal(context.registry.hasConfiguredAuth(model!), true);
+    assert.equal(context.error, undefined);
+    assert.equal(fs.existsSync(moduleMarker), true, "runtime provider registration executes the reviewed artifact");
+    const executedUrl = fs.readFileSync(moduleMarker, "utf8");
+    assert.match(executedUrl, /wayang-reviewed-provider-load-/,
+      "the loader must execute the private verified-byte copy");
+    assert.notEqual(executedUrl, new URL(`file://${extensionPath}`).href,
+      "the installed provider pathname must not be reopened for execution");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sealed session registries ignore provider overrides from resource extensions", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-provider-seal-"));
+  const homeDir = path.join(dir, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const extensionPath = writeSyntheticNarwhalReviewedExtension(
+    agentDir,
+    path.join(dir, "reviewed-extension-executed"),
+  );
+
+  try {
+    const context = await createModelContext({
+      agentDir,
+      includeReviewedProviders: true,
+      reviewedExternalModels: syntheticReviewedModel(extensionPath),
+    });
+    const before = context.registry.find("narwhal-horn", "qwen3.8-flash-next");
+    assert.ok(before);
+    sealSessionModelProviderRegistry(context.runtime);
+    context.registry.registerProvider("narwhal-horn", {
+      baseUrl: "https://unreviewed.invalid/v1",
+      headers: { "x-unreviewed": "true" },
+    });
+    context.runtime.unregisterProvider("narwhal-horn");
+    const after = context.registry.find("narwhal-horn", "qwen3.8-flash-next");
+    assert.equal(after?.baseUrl, before?.baseUrl, "resource extension cannot reroute the reviewed endpoint");
+    assert.equal(after?.headers?.["x-unreviewed"], undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("reviewed provider runtime rejects unreviewed provider registrations from the same artifact", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-provider-extra-"));
+  const homeDir = path.join(dir, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const extensionDir = path.join(agentDir, "extensions", "narwhal-horn");
+  const extensionPath = path.join(extensionDir, "index.ts");
+  fs.mkdirSync(extensionDir, { recursive: true });
+  fs.writeFileSync(extensionPath, [
+    "export default function synthetic(pi: any) {",
+    "  const model = { id: 'qwen3.8-flash-next', name: 'Synthetic', reasoning: true, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 262144, maxTokens: 32768 };",
+    "  pi.registerProvider('narwhal-horn', { baseUrl: 'http://127.0.0.1:9/v1', apiKey: 'synthetic', api: 'openai-completions', models: [model] });",
+    "  pi.registerProvider('unexpected-provider', { baseUrl: 'http://127.0.0.1:9/v1', apiKey: 'synthetic', api: 'openai-completions', models: [{ ...model, id: 'unexpected' }] });",
+    "}",
+  ].join("\n"));
+
+  try {
+    const context = await createModelContext({
+      agentDir,
+      includeReviewedProviders: true,
+      reviewedExternalModels: syntheticReviewedModel(extensionPath),
+    });
+    assert.equal(context.registry.find("narwhal-horn", "qwen3.8-flash-next"), undefined);
+    assert.equal(context.registry.find("unexpected-provider", "unexpected"), undefined);
+    assert.match(context.error ?? "", /registered an unreviewed provider/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

@@ -18,8 +18,9 @@ export interface ReviewedExternalModelEntry {
  *
  * Model listing must never execute an installed extension. The backend verifies
  * the exact regular-file hash and credential-file metadata, then projects only
- * this compile-time descriptor. The provider extension is loaded later through
- * the normal Standard-session resource path after Project-Agent authorization.
+ * this compile-time descriptor. Runtime model contexts separately execute a
+ * private copy of the exact verified bytes and retain only provider registration;
+ * Project/Profile resource authority is not an input to provider availability.
  */
 export const REVIEWED_EXTERNAL_MODELS: readonly ReviewedExternalModelEntry[] = Object.freeze([
   Object.freeze({

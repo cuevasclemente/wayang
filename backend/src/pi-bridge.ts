@@ -10,7 +10,6 @@ import type { AgentSession, AgentSessionEvent, LoadExtensionsResult, ToolDefinit
 import {
   createAgentSession,
   DefaultResourceLoader,
-  discoverAndLoadExtensions,
   getAgentDir,
   ModelRegistry,
   ModelRuntime,
@@ -72,6 +71,7 @@ import {
   REVIEWED_EXTERNAL_MODELS,
   type ReviewedExternalModelEntry,
 } from "./reviewed-provider-extensions.js";
+import { registerReviewedProviders } from "./reviewed-provider-runtime.js";
 import {
   CURATED_TOGETHER_MODELS,
   curateTogetherModelRecords,
@@ -351,13 +351,7 @@ const piSessionManagerToWebSessionId = new WeakMap<object, string>();
 (globalThis as any).__pi_action_session_files = piSessionFileToWebSessionId;
 
 // Lazy-initialized singletons
-let _modelRuntime: ModelRuntime | null = null;
-let _modelRuntimePromise: Promise<ModelRuntime> | null = null;
-let _modelRegistry: ModelRegistry | null = null;
 let _agentDir: string | null = null;
-let _extensionProviderLoadPromise: Promise<void> | null = null;
-let _extensionProviderLoadError: string | undefined;
-let _extensionProvidersLoaded = false;
 let _modelListingRuntime: ModelRuntime | null = null;
 let _modelListingRegistry: ModelRegistry | null = null;
 let _modelListingRegistryPromise: Promise<{ runtime: ModelRuntime; registry: ModelRegistry; error?: string }> | null = null;
@@ -612,49 +606,52 @@ export function installWayangRawSudoFailClosedGuard(session: AgentSession, sessi
   };
 }
 
-export type ModelContext = { runtime: ModelRuntime; registry: ModelRegistry };
+export type ModelContext = { runtime: ModelRuntime; registry: ModelRegistry; error?: string };
 
 /** @internal Exported for synthetic provider-isolation regression tests. */
-export async function createModelContext(options: { agentDir?: string } = {}): Promise<ModelContext> {
+export async function createModelContext(options: {
+  agentDir?: string;
+  includeReviewedProviders?: boolean;
+  reviewedExternalModels?: readonly ReviewedExternalModelEntry[];
+} = {}): Promise<ModelContext> {
   const agentDir = options.agentDir ?? getAgentDirPath();
   const runtime = await ModelRuntime.create({
     authPath: path.join(agentDir, "auth.json"),
     modelsPath: path.join(agentDir, "models.json"),
     allowModelNetwork: false,
   });
-  return { runtime, registry: new ModelRegistry(runtime) };
+  const context: ModelContext = { runtime, registry: new ModelRegistry(runtime) };
+  if (options.includeReviewedProviders) {
+    const errors = await registerReviewedProviders(
+      context,
+      agentDir,
+      options.reviewedExternalModels ?? REVIEWED_EXTERNAL_MODELS,
+    );
+    context.error = errors.length > 0 ? errors.join("\n") : undefined;
+  }
+  return context;
 }
 
-async function getModelRuntime(): Promise<ModelRuntime> {
-  if (_modelRuntime) return _modelRuntime;
-  _modelRuntimePromise ??= createModelContext().then(({ runtime, registry }) => {
-    _modelRuntime = runtime;
-    _modelRegistry = registry;
-    return runtime;
-  }).finally(() => {
-    _modelRuntimePromise = null;
+/**
+ * Freeze one per-session provider surface after Wayang resolves the selected
+ * model. Resource extensions may still register tools, hooks, commands, and
+ * other session resources, but their provider mutations are deliberately
+ * ignored so project/global resource loading cannot reroute model traffic.
+ */
+export function sealSessionModelProviderRegistry(runtime: ModelRuntime): void {
+  const ignoredProviderMutation = () => undefined;
+  Object.defineProperties(runtime, {
+    registerProvider: { value: ignoredProviderMutation, writable: false, configurable: false },
+    registerNativeProvider: { value: ignoredProviderMutation, writable: false, configurable: false },
+    unregisterProvider: { value: ignoredProviderMutation, writable: false, configurable: false },
   });
-  return _modelRuntimePromise;
 }
 
-async function getModelContext(): Promise<ModelContext> {
-  const runtime = await getModelRuntime();
-  if (!_modelRegistry) throw new Error("Model runtime initialized without a registry");
-  return { runtime, registry: _modelRegistry };
-}
-
-async function getModelRegistry(): Promise<ModelRegistry> {
-  return (await getModelContext()).registry;
-}
-
-/** Refresh model/auth snapshots after an external credential write. */
+/** Refresh the side-effect-free listing/auth snapshot after an external credential write. */
 export function reloadAuthStorage(): void {
-  // Keep the runtime object: extension providers are registered on it and must
-  // survive credential refresh. Refresh is deliberately backgrounded because
-  // the key-mode route historically treats this notification as synchronous;
-  // new requests still resolve auth through the runtime's file-backed store.
-  if (_modelRuntime) void _modelRuntime.refresh({ allowNetwork: false }).catch(() => undefined);
-  if (_modelListingRuntime && _modelListingRuntime !== _modelRuntime) {
+  // Live sessions own fresh model runtimes. New sessions reopen the file-backed
+  // auth store; the cached listing registry is the only shared snapshot here.
+  if (_modelListingRuntime) {
     void _modelListingRuntime.refresh({ allowNetwork: false }).catch(() => undefined);
   }
 }
@@ -1262,50 +1259,6 @@ function formatLoadErrors(errors: string[]): string | undefined {
   return errors.length > 0 ? errors.join("\n") : undefined;
 }
 
-async function ensureExtensionProvidersLoaded(cwd = process.cwd()): Promise<void> {
-  if (_extensionProvidersLoaded) return;
-  if (!_extensionProviderLoadPromise) {
-    _extensionProviderLoadPromise = (async () => {
-      const { runtime, registry } = await getModelContext();
-      const errors: string[] = [];
-      try {
-        const result = await discoverAndLoadExtensions([], cwd, getAgentDirPath());
-        for (const error of result.errors) {
-          errors.push(`Extension "${error.path}" failed to load: ${error.error}`);
-        }
-        for (const { name, config, extensionPath } of result.runtime.pendingProviderRegistrations) {
-          try {
-            registry.registerProvider(name, config);
-          } catch (error) {
-            errors.push(
-              `Extension "${extensionPath}" failed to register provider "${name}": ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        }
-        result.runtime.pendingProviderRegistrations = [];
-        for (const { provider, extensionPath } of result.runtime.pendingNativeProviderRegistrations) {
-          try {
-            runtime.registerNativeProvider(provider);
-          } catch (error) {
-            errors.push(
-              `Extension "${extensionPath}" failed to register native provider "${provider.id}": ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        }
-        result.runtime.pendingNativeProviderRegistrations = [];
-      } catch (error) {
-        errors.push(`Failed to load extension providers: ${error instanceof Error ? error.message : String(error)}`);
-      } finally {
-        _extensionProviderLoadError = formatLoadErrors(errors);
-        _extensionProvidersLoaded = true;
-      }
-    })().finally(() => {
-      _extensionProviderLoadPromise = null;
-    });
-  }
-  await _extensionProviderLoadPromise;
-}
-
 export function resolveReviewedExternalModels(
   agentDir: string,
   entries: readonly ReviewedExternalModelEntry[] = REVIEWED_EXTERNAL_MODELS,
@@ -1834,34 +1787,17 @@ export async function listModels(options: {
 }
 
 async function getSessionModelSelectionRegistry(id: string): Promise<ModelRegistry> {
-  const row = getSessionById(id);
-  if (!row) throw new WorkspaceStoreError("Session not found", 404);
-  const profile = row.agent_profile_id ? getAgentProfile(row.agent_profile_id) : undefined;
-  const project = getProjectByCwd(row.cwd);
-  // Provider/model selection may use standard resource providers only when the
-  // durable Project-Agent pair has that association. The selected model is not
-  // an authority input.
-  const standardResourcesWitness = project && profile
-    ? resolveCurrentStandardResourcesWitness({
-        sourceSessionId: row.id,
-        project,
-        agentProfile: profile,
-      })
-    : null;
-  // The read-only model catalog can advertise statically reviewed external
-  // providers without executing them. Selecting one is a deliberate mutation:
-  // after reauthorizing the exact session, load the same provider extensions the
-  // subsequent runtime will use. This also covers legacy Wren Standard access,
-  // whose witness is intentionally equivalent to standard-resources authority.
-  if (standardResourcesWitness) {
-    await ensureExtensionProvidersLoaded(row.cwd);
-    return getModelRegistry();
-  }
-  return (await getModelListingRegistry()).registry;
+  if (!getSessionById(id)) throw new WorkspaceStoreError("Session not found", 404);
+  // Provider/model availability is independent of Project/Profile authority.
+  // Every selection uses the same declarative + reviewed provider bootstrap in
+  // a fresh registry; resource extensions never pre-populate this surface.
+  return (await createModelContext({ includeReviewedProviders: true })).registry;
 }
 
-async function getSessionModelContext(restricted: boolean): Promise<ModelContext> {
-  return restricted ? createModelContext() : getModelContext();
+async function getSessionModelContext(_restricted: boolean): Promise<ModelContext> {
+  // Per-session runtimes prevent one Project's trusted resource extensions from
+  // changing provider routing for a later session in another Project.
+  return createModelContext({ includeReviewedProviders: true });
 }
 
 /** Deny the old runtime synchronously, then wait until every old surface and
@@ -2040,16 +1976,9 @@ async function resolveAgentSwitchTarget(sessionRow: SessionRow, targetProfileId:
   if (!profile.enabled) throw new WorkspaceStoreError("Target agent profile is disabled", 409);
   const effective = resolveEffectiveSessionConfig({ project, agentProfile: profile, purpose: "switch" });
 
-  const standard = resolveWorkspaceCapability({
-    capability_id: "wayang.standard-resources.v1",
-    project_id: project.id,
-    agent_profile_id: profile.id,
-  });
-  // Preview never discovers arbitrary extensions. Only a current pair association
-  // may consult an already-loaded global provider registry.
-  const registry = standard.authorized && _extensionProvidersLoaded
-    ? await getModelRegistry()
-    : (await getModelListingRegistry()).registry;
+  // Model choice is not Project/Profile authority. Agent-switch preview uses
+  // the same isolated deployment-global provider registry as runtime startup.
+  const registry = (await createModelContext({ includeReviewedProviders: true })).registry;
   let model: Model<Api> | undefined;
   if (effective.provider && effective.model) {
     model = resolveModelFromRegistry(registry, effective.provider, effective.model);
@@ -2124,7 +2053,6 @@ export function fileAudioExperimentRuntimeIsEligible(input: {
 }
 
 export type PiSessionCreationPrivilegedEffect =
-  | "extension_provider_load"
   | "resource_loader"
   | "restricted_mcp_runtime"
   | "protected_browser_runtime"
@@ -2363,13 +2291,6 @@ export async function createPiSession(
       await runtimeOptions.testHooks.afterStandardResourcesResolution(Boolean(standardResourcesWitness));
       assertCreationCurrent();
     }
-    if (standardResourcesWitness) {
-      assertCreationCurrent();
-      runtimeOptions.testHooks?.onPrivilegedEffect?.("extension_provider_load");
-      assertCreationCurrent();
-      await ensureExtensionProvidersLoaded(cwd);
-      assertCreationCurrent();
-    }
     assertCreationCurrent();
     runtimeOptions.testHooks?.onPrivilegedEffect?.("resource_loader");
     assertCreationCurrent();
@@ -2411,7 +2332,10 @@ export async function createPiSession(
         assertCreationCurrent();
         model = resolveModelFromRegistry(modelRegistry, provider, modelId);
       }
-      if (!model) throw new Error(`Unknown model: ${provider}/${modelId}`);
+      if (!model) {
+        const providerError = modelContext.error ? `\n${modelContext.error}` : "";
+        throw new Error(`Unknown model: ${provider}/${modelId}${providerError}`);
+      }
       if (!modelRegistry.hasConfiguredAuth(model)) throw new Error(`No API key for ${model.provider}/${model.id}`);
     } else if (provider) {
       const preferred = resolveModelFromRegistry(modelRegistry, provider, DEFAULT_MODELS[provider] ?? "");
@@ -2802,6 +2726,11 @@ export async function createPiSession(
     // Restricted profiles already carry an explicit reviewed list, so only
     // that case is widened by the exact backend-owned companion names.
     const activeTools = composeRuntimeActiveTools(configuredActiveTools, companionActiveTools);
+
+    // Provider/model routing is deployment-global and was fully resolved above.
+    // Seal this fresh per-session runtime before the SDK binds project/global
+    // resource extensions, preventing them from overwriting reviewed endpoints.
+    sealSessionModelProviderRegistry(modelContext.runtime);
 
     assertCreationCurrent();
     assertPendingBrowserCatalogCurrent();
