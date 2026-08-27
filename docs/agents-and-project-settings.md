@@ -154,9 +154,9 @@ Wayang sessions replace Pi's bash backend with a fresh per-command OS sandbox un
 - permits ordinary Standard restricted writes inside the current project and shared host temporary storage; Protected runtimes persist writes only inside their current project; exact Wren Standard compatibility permits ordinary host writes while protected host backing remains hidden and unmodifiable;
 - gives sandboxed shells a strict non-secret process environment rather than forwarding provider keys, OAuth/AWS credentials, proxy credentials, loader hooks, or arbitrary deployment variables;
 - blocks Unix-domain sockets for ordinary restricted profiles, permits them for exact eligible Wren Standard-project compatibility, and blocks raw `sudo` for all profiles;
-- allows every outbound TCP destination through sandbox-runtime's HTTP/SOCKS proxies, including public Internet, loopback, LAN, and VPN services.
+- on Linux, retains the host network namespace, including unrestricted TCP/UDP destinations, public Internet, loopback, LAN and VPN services, non-proxy-aware protocols, and local listeners available to the Wayang OS user; macOS retains proxy-mediated egress pending a supported filesystem-only host-network implementation.
 
-This networking supports proxy-aware tools such as `curl`, package managers, Git HTTPS/SSH, and most web/API clients. It does not provide raw sockets, inbound listeners, UDP-dependent protocols, or transparent networking for programs that ignore proxy settings.
+Unix-domain sockets remain a separate boundary: ordinary restricted profiles cannot reach the user bus, Docker socket, or other Unix IPC merely because Linux host TCP/UDP networking is enabled. Protected mode constrains filesystem, memory, credential, and reviewed connector access; it is not a network-isolation or data-loss-prevention mode.
 
 If sandbox prerequisites are unavailable, bash is removed rather than replaced with command-string parsing. Run `make doctor` to check prerequisites.
 
