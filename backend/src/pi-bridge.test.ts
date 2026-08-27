@@ -11,7 +11,9 @@ import {
   abortInteractiveTurn,
   appendStreamingMessageToHistory,
   beginInteractiveTurn,
+  beginManualCompactionMessageQueue,
   beginNonBrowserTurn,
+  cancelQueuedBrowserMessageForHandle,
   classifyScheduledPromptResult,
   cleanupPiSessionCapabilityDenial,
   curateTogetherModelRecords,
@@ -20,6 +22,8 @@ import {
   createModelContext,
   createPiSession,
   destroyPiSession,
+  drainManualCompactionMessageQueue,
+  deferBrowserMessageDuringManualCompaction,
   fileAudioExperimentRuntimeIsEligible,
   getPiSession,
   getPiSessionBashMode,
@@ -36,6 +40,7 @@ import {
   isWayangProviderVisible,
   listModels,
   markClaimedQueuedBrowserTurnsReady,
+  markManualCompactionMutationLeaseReleased,
   markQueuedBrowserMessageStarted,
   onPiSessionRuntimeEvent,
   persistSettledSessionError,
@@ -43,6 +48,7 @@ import {
   piSessionHandleRequiresFreshRuntime,
   previewSessionAgentSwitch,
   protectedBrowserIdleRetentionIsRequired,
+  projectQueuedBrowserMessages,
   reconcilePendingAgentSwitch,
   resolveInteractiveBrowserAuthority,
   resolveInteractiveTurn,
@@ -72,6 +78,10 @@ import type { ProtectedBrowserBinding } from "./browser/types.js";
 import { getActionApprovalBridge } from "./action-approval-bridge.js";
 import { scheduleWayangAutoTitle, setAutoTitleProviderForTests } from "./session-title-service.js";
 import { extractCompletedTitleExchanges } from "./session-title-policy.js";
+import {
+  acquireSessionRuntimeMutationLock,
+  releaseSessionRuntimeMutationLock,
+} from "./session-runtime-mutation-lock.js";
 
 function syntheticProtectedRuntime(
   mode: "agent" | "user" | "paused",
@@ -193,6 +203,197 @@ function currentTurnFixture(name: string) {
     },
   };
 }
+
+test("manual compaction queue releases before FIFO drain, projects/cancels records, and admits new tail work", async () => {
+  const f = currentTurnFixture("wayang-manual-compaction-fifo-");
+  const row = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: row.id });
+  updatePiSessionFile(row.id, manager.getSessionFile()!);
+  const starts = [deferred(), deferred(), deferred()];
+  const finishes = [deferred(), deferred(), deferred()];
+  const dispatched: string[] = [];
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    async prompt(content: string) {
+      const index = dispatched.length;
+      this.isStreaming = true;
+      dispatched.push(content);
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      starts[index]!.resolve();
+      await finishes[index]!.promise;
+      manager.appendMessage({
+        role: "assistant",
+        content: `answer ${index}`,
+        provider: "synthetic",
+        model: "synthetic",
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as any);
+      this.isStreaming = false;
+    },
+    async waitForIdle() {},
+  };
+  const handle = {
+    id: row.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "manual-compaction-fifo",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    events: new EventEmitter(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    assert.equal(acquireSessionRuntimeMutationLock(row.id), true);
+    beginManualCompactionMessageQueue(handle);
+    assert.deepEqual(deferBrowserMessageDuringManualCompaction(
+      handle, "A decorated", undefined, "A", { content: "A", attachmentNames: ["a.txt"] },
+    ), { queued: true, cancellable: true });
+    deferBrowserMessageDuringManualCompaction(handle, "B decorated", undefined, "B", { content: "B" });
+    assert.deepEqual(projectQueuedBrowserMessages(handle), [
+      { client_message_id: "A", content: "A", attachment_names: ["a.txt"] },
+      { client_message_id: "B", content: "B", attachment_names: [] },
+    ]);
+    assert.equal(cancelQueuedBrowserMessageForHandle(handle, "B"), true);
+    assert.deepEqual(projectQueuedBrowserMessages(handle).map((message) => message.client_message_id), ["A"]);
+    deferBrowserMessageDuringManualCompaction(handle, "B decorated", undefined, "B", { content: "B" });
+    assert.throws(
+      () => deferBrowserMessageDuringManualCompaction(handle, "/name unsafe", undefined, "slash", { content: "/name unsafe" }),
+      /mutation is in progress/,
+    );
+
+    assert.deepEqual(dispatched, [], "the compaction lease prevents early dispatch");
+    releaseSessionRuntimeMutationLock(row.id);
+    markManualCompactionMutationLeaseReleased(handle);
+    assert.equal(acquireSessionRuntimeMutationLock(row.id), true);
+    assert.throws(
+      () => cancelQueuedBrowserMessageForHandle(handle, "A"),
+      /runtime is rebuilding/,
+      "a later generic mutation lease does not inherit the compaction exception",
+    );
+    releaseSessionRuntimeMutationLock(row.id);
+    const drain = drainManualCompactionMessageQueue(handle, { isRuntimeCurrent: () => true });
+    await starts[0]!.promise;
+    assert.deepEqual(dispatched, ["A decorated"]);
+    const startedMessage = { role: "user", content: "A decorated" };
+    assert.equal(markQueuedBrowserMessageStarted(handle, startedMessage), "A");
+    assert.equal(serializeEvent({ type: "message_start", message: startedMessage } as any)?.client_message_id, "A");
+    deferBrowserMessageDuringManualCompaction(handle, "C decorated", undefined, "C", { content: "C" });
+    finishes[0]!.resolve();
+    await starts[1]!.promise;
+    assert.deepEqual(dispatched, ["A decorated", "B decorated"]);
+    finishes[1]!.resolve();
+    await starts[2]!.promise;
+    assert.deepEqual(dispatched, ["A decorated", "B decorated", "C decorated"]);
+    finishes[2]!.resolve();
+    await drain;
+    assert.equal(handle.manualCompactionMessageQueue, undefined);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  } finally {
+    releaseSessionRuntimeMutationLock(row.id);
+    f.cleanup();
+  }
+});
+
+test("manual compaction queue is bounded, continues after a failed record, and stops on authority loss", async () => {
+  const f = currentTurnFixture("wayang-manual-compaction-failure-");
+  const row = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: row.id });
+  const secondStarted = deferred();
+  const secondFinished = deferred();
+  const dispatched: string[] = [];
+  let current = true;
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    async prompt(content: string) {
+      dispatched.push(content);
+      if (content === "failed") throw new Error("synthetic failure");
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      secondStarted.resolve();
+      await secondFinished.promise;
+      manager.appendMessage({ role: "assistant", content: "done", provider: "synthetic", model: "synthetic", stopReason: "stop", timestamp: Date.now() } as any);
+    },
+    async waitForIdle() {},
+  };
+  const handle = {
+    id: row.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "manual-compaction-failure",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    events: new EventEmitter(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    beginManualCompactionMessageQueue(handle);
+    markManualCompactionMutationLeaseReleased(handle);
+    for (let index = 0; index < 32; index++) {
+      deferBrowserMessageDuringManualCompaction(handle, `bounded ${index}`, undefined, `bounded-${index}`, { content: `bounded ${index}` });
+    }
+    assert.throws(
+      () => deferBrowserMessageDuringManualCompaction(handle, "overflow", undefined, "overflow", { content: "overflow" }),
+      /queue is full/,
+    );
+    handle.manualCompactionMessageQueue!.records.length = 0;
+    handle.manualCompactionMessageQueue!.retainedBytes = 0;
+    deferBrowserMessageDuringManualCompaction(handle, "failed", undefined, "failed", { content: "failed" });
+    deferBrowserMessageDuringManualCompaction(handle, "second", undefined, "second", { content: "second" });
+    deferBrowserMessageDuringManualCompaction(handle, "must not dispatch", undefined, "third", { content: "third" });
+    const errors: any[] = [];
+    handle.events.on("message", (message) => errors.push(message));
+    const drain = drainManualCompactionMessageQueue(handle, { isRuntimeCurrent: () => current });
+    await secondStarted.promise;
+    assert.deepEqual(dispatched, ["failed", "second"], "a failed head is removed before the next FIFO record starts");
+    assert.equal(errors.find((message) => message.type === "queued_message_ack")?.status, "rejected");
+    assert.equal(errors.find((message) => message.type === "error")?.code, "queued_message_dispatch_failed");
+    current = false;
+    secondFinished.resolve();
+    await drain;
+    assert.deepEqual(dispatched, ["failed", "second"], "authority loss prevents later dispatch");
+    assert.equal(handle.manualCompactionMessageQueue, undefined);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("interrupt queue clearing drops manual-compaction work before aborting", async () => {
+  let compactionAborts = 0;
+  let aborts = 0;
+  const handle = {
+    id: "synthetic-manual-compaction-interrupt",
+    session: {
+      isCompacting: true,
+      clearQueue: () => ({ steering: ["pi queued"], followUp: [] }),
+      abortCompaction: () => { compactionAborts++; },
+      abort: async () => { aborts++; },
+    },
+    runtimeGeneration: "manual-compaction-interrupt",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    events: new EventEmitter(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+
+  beginManualCompactionMessageQueue(handle);
+  deferBrowserMessageDuringManualCompaction(handle, "deferred", undefined, "deferred", { content: "deferred" });
+  const cleared = await abortInteractiveTurn(handle, { clearQueue: true });
+
+  assert.deepEqual(cleared, { steering: ["pi queued"], followUp: [] });
+  assert.equal(handle.manualCompactionMessageQueue, undefined);
+  assert.equal(compactionAborts, 1);
+  assert.equal(aborts, 1);
+});
 
 test("settled lifecycle persists terminal assistant and compaction failures", () => {
   const f = currentTurnFixture("wayang-settled-error-");

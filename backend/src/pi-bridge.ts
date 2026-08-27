@@ -178,6 +178,33 @@ interface QueuedBrowserMessageRecord {
   startCorrelated: boolean;
 }
 
+interface DeferredBrowserMessageRecord {
+  queueRecordId: string;
+  clientMessageId?: string;
+  content: string;
+  images?: ImageContent[];
+  queuedDisplay: {
+    content: string;
+    attachmentNames: string[];
+    rawUserText?: string;
+    provisionalTitleText?: string;
+    acceptedAt?: number;
+  };
+  retainedBytes: number;
+  clientVisible: boolean;
+  startCorrelated: boolean;
+}
+
+export interface ManualCompactionMessageQueue {
+  readonly runtimeGeneration: string;
+  compactionLeaseHeld: boolean;
+  records: DeferredBrowserMessageRecord[];
+  dispatching?: DeferredBrowserMessageRecord;
+  retainedBytes: number;
+  draining: boolean;
+  waitForUnlockUnsubscribe?: () => void;
+}
+
 export interface PiSessionHandle {
   id: string; // Same as our DB session ID
   session: AgentSession;
@@ -208,6 +235,8 @@ export interface PiSessionHandle {
   interactiveMutationTurnToken?: string;
   /** Browser-local IDs bound to exact pending pi steering message objects. */
   queuedBrowserMessages: Map<string, QueuedBrowserMessageRecord>;
+  /** Bounded FIFO admitted only while this exact runtime owns manual compaction. */
+  manualCompactionMessageQueue?: ManualCompactionMessageQueue;
   /** Latest in-progress Pi message, retained across the pre-persistence message_end gap. */
   liveStreamingMessage?: any;
   /** Successful overflow compaction awaiting a successful SDK continuation. */
@@ -297,6 +326,8 @@ interface CommandGuardBridgeController {
 // ---------------------------------------------------------------------------
 
 const MAX_SESSIONS = 50;
+const MAX_MANUAL_COMPACTION_DEFERRED_MESSAGES = 32;
+const MAX_MANUAL_COMPACTION_DEFERRED_BYTES = 32 * 1024 * 1024;
 const SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SESSION_IDLE_CHECK_INTERVAL_MS = 30 * 1000;
 const sessions = new Map<string, PiSessionHandle>();
@@ -874,6 +905,13 @@ function queuedUserMessageText(message: unknown): string | undefined {
  */
 export function markQueuedBrowserMessageStarted(handle: PiSessionHandle, message: unknown): string | undefined {
   if (!message || typeof message !== "object") return undefined;
+  const deferred = manualCompactionQueueForHandle(handle)?.dispatching;
+  if (deferred && !deferred.startCorrelated && (message as any).role === "user") {
+    deferred.startCorrelated = true;
+    deferred.clientVisible = false;
+    if (deferred.clientMessageId) queuedBrowserClientMessageIds.set(message, deferred.clientMessageId);
+    return deferred.clientMessageId;
+  }
   let clientMessageId = queuedBrowserClientMessageIds.get(message);
   let matchedRecord: QueuedBrowserMessageRecord | undefined;
   if (clientMessageId) {
@@ -992,11 +1030,15 @@ export interface RuntimeMutationSessionState {
 
 export function getRuntimeMutationSessionState(id: string): RuntimeMutationSessionState {
   const handle = sessions.get(id);
+  const manualQueue = handle ? manualCompactionQueueForHandle(handle) : undefined;
   return {
     session_id: id,
     runtime_status: handle ? "active" : sessionCreations.has(id) ? "starting" : "stopped",
     streaming: Boolean(handle?.session.isStreaming),
-    queued: Boolean((handle?.session.pendingMessageCount ?? 0) > 0),
+    queued: Boolean(
+      (handle?.session.pendingMessageCount ?? 0) > 0
+      || (manualQueue && (manualQueue.records.length > 0 || manualQueue.dispatching)),
+    ),
     mutation_locked: isSessionRuntimeMutationLocked(id),
   };
 }
@@ -1019,7 +1061,8 @@ export async function stopPiSessionIfIdle(id: string): Promise<boolean> {
   if (sessionCreations.has(id)) return false;
   const handle = sessions.get(id);
   if (!handle) return true;
-  if (handle.session.isStreaming || handle.session.pendingMessageCount > 0) return false;
+  if (handle.session.isStreaming || handle.session.pendingMessageCount > 0
+    || manualCompactionQueueForHandle(handle)) return false;
   await destroyPiSession(id);
   return true;
 }
@@ -1086,7 +1129,7 @@ export function protectedBrowserIdleRetentionIsRequired(
 export async function stopIdlePiSessions(now = Date.now()): Promise<string[]> {
   const stopped: string[] = [];
   for (const [id, handle] of [...sessions]) {
-    if (handle.session.isStreaming) continue;
+    if (handle.session.isStreaming || manualCompactionQueueForHandle(handle)) continue;
     // Protected human handoff intentionally spans chat turns and may take
     // longer than the ordinary idle timeout. Explicit denial, stop, model or
     // agent change, and shutdown paths still revoke it directly.
@@ -1818,7 +1861,11 @@ async function stopRuntimeForModelChange(
   );
   if (row.provider === targetProvider && row.model === targetModel && liveModelMatches
     && !(forceLiveStop && (sessions.has(id) || sessionCreations.has(id)))) return false;
-  if (handle?.session.isStreaming || (handle?.session.pendingMessageCount ?? 0) > 0) {
+  if (handle && (
+    handle.session.isStreaming
+    || (handle.session.pendingMessageCount ?? 0) > 0
+    || manualCompactionQueueForHandle(handle)
+  )) {
     throw new WorkspaceStoreError("Live model changes require an idle session; stop the session and retry", 409);
   }
   const browserTeardown: PiSessionBrowserTeardown = { kind: "detach", reason: "model_or_agent_switch" };
@@ -1829,7 +1876,11 @@ async function stopRuntimeForModelChange(
 
 function assertModelSwitchIdle(id: string): void {
   const handle = sessions.get(id);
-  if (handle?.session.isStreaming || (handle?.session.pendingMessageCount ?? 0) > 0) {
+  if (handle && (
+    handle.session.isStreaming
+    || (handle.session.pendingMessageCount ?? 0) > 0
+    || manualCompactionQueueForHandle(handle)
+  )) {
     throw new WorkspaceStoreError("Live model changes require an idle session; stop the session and retry", 409);
   }
 }
@@ -3030,7 +3081,11 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
     if (sessionCreations.has(id)) throw new WorkspaceStoreError("Session runtime is still starting", 409);
 
     const currentHandle = sessions.get(id);
-    if (currentHandle?.session.isStreaming || (currentHandle?.session.pendingMessageCount ?? 0) > 0) {
+    if (currentHandle && (
+      currentHandle.session.isStreaming
+      || (currentHandle.session.pendingMessageCount ?? 0) > 0
+      || manualCompactionQueueForHandle(currentHandle)
+    )) {
       throw new WorkspaceStoreError("Agent switching is allowed only while the session is idle", 409);
     }
 
@@ -3755,6 +3810,7 @@ function latchPiSessionHandleCapabilityDenial(
   }
   handle.bashMode = "unavailable";
   handle.trustedHostBashTool = undefined;
+  dropManualCompactionMessageQueue(handle);
   retireInteractiveTurn(handle);
 
   const browserToolNames = handle.protectedBrowserRuntime?.tools?.map((tool) => tool.name) ?? [];
@@ -4059,6 +4115,258 @@ export async function deliverInterviewSubmission(
   throw new Error("Interview submission was queued but not persisted before delivery timeout");
 }
 
+function manualCompactionQueueForHandle(handle: PiSessionHandle): ManualCompactionMessageQueue | undefined {
+  const queue = handle.manualCompactionMessageQueue;
+  return queue && queue.runtimeGeneration === handle.runtimeGeneration && !handle.capabilityAuthorityDenied
+    ? queue
+    : undefined;
+}
+
+function dropManualCompactionMessageQueue(handle: PiSessionHandle): void {
+  const queue = handle.manualCompactionMessageQueue;
+  if (!queue) return;
+  queue.waitForUnlockUnsubscribe?.();
+  queue.waitForUnlockUnsubscribe = undefined;
+  queue.records.length = 0;
+  queue.dispatching = undefined;
+  queue.retainedBytes = 0;
+  handle.manualCompactionMessageQueue = undefined;
+}
+
+/** Start only after the caller owns the existing transcript mutation lease. */
+export function beginManualCompactionMessageQueue(handle: PiSessionHandle): void {
+  assertCapabilityAuthorityAvailable(handle);
+  if (handle.manualCompactionMessageQueue) {
+    throw new WorkspaceStoreError("Manual compaction message admission is already active", 409);
+  }
+  handle.manualCompactionMessageQueue = {
+    runtimeGeneration: handle.runtimeGeneration,
+    compactionLeaseHeld: true,
+    records: [],
+    retainedBytes: 0,
+    draining: false,
+  };
+}
+
+export function isManualCompactionMessageQueueActive(id: string): boolean {
+  const handle = sessions.get(id);
+  return Boolean(handle && manualCompactionQueueForHandle(handle));
+}
+
+/** Call synchronously after releasing the exact manual-compaction mutation lease. */
+export function markManualCompactionMutationLeaseReleased(handle: PiSessionHandle): void {
+  const queue = manualCompactionQueueForHandle(handle);
+  if (queue) queue.compactionLeaseHeld = false;
+}
+
+export function manualCompactionCanDeferBrowserMessage(
+  id: string,
+  rawContent: unknown,
+  hasAttachments: boolean,
+): boolean {
+  const handle = sessions.get(id);
+  const queue = handle && manualCompactionQueueForHandle(handle);
+  if (!handle || !queue || typeof rawContent !== "string") return false;
+  if (isSessionRuntimeMutationLocked(id) && !queue.compactionLeaseHeld) return false;
+  const trimmed = rawContent.trim();
+  return !trimmed.startsWith("/") && (trimmed.length > 0 || hasAttachments);
+}
+
+export function manualCompactionCanCancelQueuedBrowserMessage(id: string, clientMessageId: unknown): boolean {
+  if (typeof clientMessageId !== "string") return false;
+  const handle = sessions.get(id);
+  const queue = handle && manualCompactionQueueForHandle(handle);
+  if (!handle || !queue || (isSessionRuntimeMutationLocked(id) && !queue.compactionLeaseHeld)) return false;
+  if (queue.dispatching?.clientMessageId === clientMessageId
+    || queue.records.some((record) => record.clientMessageId === clientMessageId)) return true;
+  const captured = handle.queuedBrowserMessages.get(clientMessageId);
+  return Boolean(captured && isQueuedChatMessagePending(captured.capture));
+}
+
+export function manualCompactionCanInterrupt(id: string): boolean {
+  const handle = sessions.get(id);
+  const queue = handle && manualCompactionQueueForHandle(handle);
+  return Boolean(queue && (!isSessionRuntimeMutationLocked(id) || queue.compactionLeaseHeld));
+}
+
+function deferredBrowserMessageBytes(
+  content: string,
+  images: readonly ImageContent[] | undefined,
+  display: DeferredBrowserMessageRecord["queuedDisplay"],
+): number {
+  let bytes = Buffer.byteLength(content, "utf8")
+    + Buffer.byteLength(display.content, "utf8")
+    + Buffer.byteLength(display.rawUserText ?? "", "utf8")
+    + Buffer.byteLength(display.provisionalTitleText ?? "", "utf8");
+  for (const name of display.attachmentNames) bytes += Buffer.byteLength(name, "utf8");
+  for (const image of images ?? []) {
+    bytes += Buffer.byteLength(image.mimeType, "utf8") + Buffer.byteLength(image.data, "utf8");
+  }
+  return bytes;
+}
+
+/** @internal Exact handle seam used by focused FIFO tests. */
+export function deferBrowserMessageDuringManualCompaction(
+  handle: PiSessionHandle,
+  content: string,
+  images?: ImageContent[],
+  clientMessageId?: string,
+  queuedDisplay: {
+    content: string;
+    attachmentNames?: string[];
+    rawUserText?: string;
+    provisionalTitleText?: string;
+    acceptedAt?: number;
+  } = { content },
+): BrowserMessageTurnResult {
+  assertCapabilityAuthorityAvailable(handle);
+  const queue = manualCompactionQueueForHandle(handle);
+  if (!queue || queuedDisplay.content.trim().startsWith("/")) {
+    throw new WorkspaceStoreError("Session transcript mutation is in progress", 409);
+  }
+  const queueRecordId = clientMessageId ?? randomUUID();
+  if (clientMessageId && (
+    queue.records.some((record) => record.clientMessageId === clientMessageId)
+    || queue.dispatching?.clientMessageId === clientMessageId
+    || handle.queuedBrowserMessages.has(clientMessageId)
+    || [...interactiveTurnLedger(handle).values()].some((turn) => turn.clientMessageId === clientMessageId)
+  )) throw new Error("Duplicate browser message ID");
+  const display: DeferredBrowserMessageRecord["queuedDisplay"] = {
+    content: queuedDisplay.content,
+    attachmentNames: [...(queuedDisplay.attachmentNames ?? [])],
+    ...(queuedDisplay.rawUserText !== undefined ? { rawUserText: queuedDisplay.rawUserText } : {}),
+    ...(queuedDisplay.provisionalTitleText !== undefined
+      ? { provisionalTitleText: queuedDisplay.provisionalTitleText }
+      : {}),
+    ...(queuedDisplay.acceptedAt !== undefined ? { acceptedAt: queuedDisplay.acceptedAt } : {}),
+  };
+  const retainedBytes = deferredBrowserMessageBytes(content, images, display);
+  const retainedCount = queue.records.length + (queue.dispatching ? 1 : 0);
+  if (retainedCount >= MAX_MANUAL_COMPACTION_DEFERRED_MESSAGES
+    || retainedBytes > MAX_MANUAL_COMPACTION_DEFERRED_BYTES - queue.retainedBytes) {
+    throw new WorkspaceStoreError("Manual compaction message queue is full", 409);
+  }
+  queue.records.push({
+    queueRecordId,
+    ...(clientMessageId ? { clientMessageId } : {}),
+    content,
+    ...(images && images.length > 0 ? { images: [...images] } : {}),
+    queuedDisplay: display,
+    retainedBytes,
+    clientVisible: Boolean(clientMessageId),
+    startCorrelated: false,
+  });
+  queue.retainedBytes += retainedBytes;
+  markSessionActivity(handle.id);
+  return { queued: true, cancellable: Boolean(clientMessageId) };
+}
+
+function boundedDeferredDispatchError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const safe = raw.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, " ").trim()
+    || "Queued message dispatch failed";
+  if (Buffer.byteLength(safe, "utf8") <= 448) return safe;
+  let bounded = "";
+  for (const character of safe) {
+    if (Buffer.byteLength(`${bounded}${character}…`, "utf8") > 448) break;
+    bounded += character;
+  }
+  return `${bounded}…`;
+}
+
+function manualCompactionRuntimeIsCurrent(handle: PiSessionHandle, queue: ManualCompactionMessageQueue): boolean {
+  return sessions.get(handle.id) === handle
+    && !handle.capabilityAuthorityDenied
+    && handle.runtimeGeneration === queue.runtimeGeneration
+    && handle.manualCompactionMessageQueue === queue;
+}
+
+/** Release the mutation lease before calling this; the phase remains active until its FIFO empties. */
+export async function drainManualCompactionMessageQueue(
+  handle: PiSessionHandle,
+  options: { isRuntimeCurrent?: () => boolean } = {},
+): Promise<void> {
+  const queue = manualCompactionQueueForHandle(handle);
+  if (!queue || queue.draining) return;
+  const isCurrent = options.isRuntimeCurrent ?? (() => manualCompactionRuntimeIsCurrent(handle, queue));
+  if (!isCurrent()) {
+    dropManualCompactionMessageQueue(handle);
+    return;
+  }
+  if (isSessionRuntimeMutationLocked(handle.id)) {
+    if (!queue.waitForUnlockUnsubscribe) {
+      const retry = () => {
+        if (isSessionRuntimeMutationLocked(handle.id)) return;
+        queue.waitForUnlockUnsubscribe?.();
+        queue.waitForUnlockUnsubscribe = undefined;
+        void drainManualCompactionMessageQueue(handle, options).catch(() => undefined);
+      };
+      queue.waitForUnlockUnsubscribe = onSessionRuntimeMutationLockChanged((sessionId) => {
+        if (sessionId === handle.id) retry();
+      });
+      queueMicrotask(retry);
+    }
+    return;
+  }
+
+  queue.draining = true;
+  try {
+    while (queue.records.length > 0) {
+      if (!isCurrent()) {
+        dropManualCompactionMessageQueue(handle);
+        return;
+      }
+      if (isSessionRuntimeMutationLocked(handle.id)) {
+        queue.draining = false;
+        await drainManualCompactionMessageQueue(handle, options);
+        return;
+      }
+      const record = queue.records.shift()!;
+      queue.dispatching = record;
+      try {
+        await sendBrowserMessageTurn(
+          handle,
+          record.content,
+          record.images,
+          record.clientMessageId,
+          record.queuedDisplay,
+        );
+      } catch (error) {
+        const bounded = boundedDeferredDispatchError(error);
+        const errorMessage = `Queued message dispatch failed: ${bounded}`;
+        try { updateSessionError(handle.id, errorMessage); } catch { /* runtime authority below remains decisive */ }
+        if (record.clientMessageId) {
+          try {
+            handle.events.emit("message", {
+              type: "queued_message_ack",
+              client_message_id: record.clientMessageId,
+              status: "rejected",
+              error: errorMessage,
+            } satisfies SerializedMessage);
+          } catch { /* a failing observer cannot reorder or stop the FIFO */ }
+        }
+        try {
+          handle.events.emit("message", {
+            type: "error",
+            code: "queued_message_dispatch_failed",
+            ...(record.clientMessageId ? { client_message_id: record.clientMessageId } : {}),
+            error: errorMessage,
+          } satisfies SerializedMessage);
+        } catch { /* a failing observer cannot reorder or stop the FIFO */ }
+        try { await handle.session.waitForIdle(); } catch { /* authority/current checks below remain decisive */ }
+      } finally {
+        if (queue.dispatching === record) queue.dispatching = undefined;
+        queue.retainedBytes = Math.max(0, queue.retainedBytes - record.retainedBytes);
+      }
+    }
+  } finally {
+    if (handle.manualCompactionMessageQueue === queue) {
+      queue.draining = false;
+      if (queue.records.length === 0 && !queue.dispatching) dropManualCompactionMessageQueue(handle);
+    }
+  }
+}
+
 export interface BrowserMessageTurnResult {
   queued: boolean;
   cancellable: boolean;
@@ -4173,17 +4481,29 @@ export async function sendMessage(
     acceptedAt?: number;
   },
 ): Promise<BrowserMessageTurnResult> {
-  assertRuntimeMutationUnlocked(id);
   const handle = sessions.get(id);
   if (!handle) throw new Error(`Session ${id} not found`);
   assertCapabilityAuthorityAvailable(handle);
+  const manualQueue = manualCompactionQueueForHandle(handle);
+  if (manualQueue) {
+    if (isSessionRuntimeMutationLocked(id) && !manualQueue.compactionLeaseHeld) {
+      assertRuntimeMutationUnlocked(id);
+    }
+    return deferBrowserMessageDuringManualCompaction(
+      handle,
+      content,
+      images,
+      clientMessageId,
+      queuedDisplay ?? { content },
+    );
+  }
+  assertRuntimeMutationUnlocked(id);
   markSessionActivity(id);
   return sendBrowserMessageTurn(handle, content, images, clientMessageId, queuedDisplay);
 }
 
-export function getQueuedBrowserMessages(id: string): QueuedBrowserMessageProjection[] {
-  const handle = sessions.get(id);
-  if (!handle) return [];
+/** @internal Shared projection seam for live reconnect and focused queue tests. */
+export function projectQueuedBrowserMessages(handle: PiSessionHandle): QueuedBrowserMessageProjection[] {
   const messages: QueuedBrowserMessageProjection[] = [];
   for (const [clientMessageId, record] of handle.queuedBrowserMessages) {
     const state = queuedChatMessageState(record.capture);
@@ -4199,14 +4519,44 @@ export function getQueuedBrowserMessages(id: string): QueuedBrowserMessageProjec
       });
     }
   }
+  const deferred = manualCompactionQueueForHandle(handle);
+  const deferredRecords = deferred
+    ? [...(deferred.dispatching?.clientVisible ? [deferred.dispatching] : []), ...deferred.records]
+    : [];
+  for (const record of deferredRecords) {
+    if (!record.clientVisible || !record.clientMessageId) continue;
+    messages.push({
+      client_message_id: record.clientMessageId,
+      content: record.queuedDisplay.content,
+      attachment_names: [...record.queuedDisplay.attachmentNames],
+    });
+  }
   return messages;
 }
 
-export function cancelQueuedBrowserMessage(id: string, clientMessageId: string): boolean {
-  assertRuntimeMutationUnlocked(id);
+export function getQueuedBrowserMessages(id: string): QueuedBrowserMessageProjection[] {
   const handle = sessions.get(id);
-  if (!handle) throw new Error(`Session ${id} not found`);
+  return handle ? projectQueuedBrowserMessages(handle) : [];
+}
+
+/** @internal Exact handle seam used by focused deferred-cancellation tests. */
+export function cancelQueuedBrowserMessageForHandle(handle: PiSessionHandle, clientMessageId: string): boolean {
   assertCapabilityAuthorityAvailable(handle);
+  const id = handle.id;
+  const deferred = manualCompactionQueueForHandle(handle);
+  if (deferred && isSessionRuntimeMutationLocked(id) && !deferred.compactionLeaseHeld) {
+    assertRuntimeMutationUnlocked(id);
+  }
+  if (deferred?.dispatching?.clientMessageId === clientMessageId) return false;
+  const deferredIndex = deferred?.records.findIndex((record) => record.clientMessageId === clientMessageId) ?? -1;
+  if (deferred && deferredIndex >= 0) {
+    const [cancelled] = deferred.records.splice(deferredIndex, 1);
+    if (!cancelled) return false;
+    deferred.retainedBytes = Math.max(0, deferred.retainedBytes - cancelled.retainedBytes);
+    markSessionActivity(id);
+    return true;
+  }
+  if (!deferred) assertRuntimeMutationUnlocked(id);
   const record = handle.queuedBrowserMessages.get(clientMessageId);
   if (!record) return false;
   const cancelled = cancelCapturedQueuedChatMessage(record.capture);
@@ -4224,6 +4574,12 @@ export function cancelQueuedBrowserMessage(id: string, clientMessageId: string):
     return false;
   }
   throw new Error("The pi queued-message layout changed; cancellation was refused without changing the queue");
+}
+
+export function cancelQueuedBrowserMessage(id: string, clientMessageId: string): boolean {
+  const handle = sessions.get(id);
+  if (!handle) throw new Error(`Session ${id} not found`);
+  return cancelQueuedBrowserMessageForHandle(handle, clientMessageId);
 }
 
 function extractReplayPayloadFromUserContent(content: unknown): { text: string; images: ImageContent[] } {
@@ -4543,6 +4899,7 @@ export async function abortInteractiveTurn(
   const clearedQueue = options.clearQueue
     ? handle.session.clearQueue()
     : { steering: [], followUp: [] };
+  if (options.clearQueue) dropManualCompactionMessageQueue(handle);
   if (handle.session.isCompacting) handle.session.abortCompaction();
   await handle.session.abort();
   return clearedQueue;
@@ -4642,9 +4999,14 @@ export function subscribeToSession(
       onMessage(serialized);
     }
   });
+  const onRuntimeMessage = (message: SerializedMessage) => {
+    if (!handle.capabilityAuthorityDenied) onMessage(message);
+  };
+  handle.events.on("message", onRuntimeMessage);
 
   return () => {
     handle.subscriberCount = Math.max(0, handle.subscriberCount - 1);
+    handle.events.off("message", onRuntimeMessage);
     unsub();
   };
 }
