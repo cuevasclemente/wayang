@@ -161,6 +161,8 @@ export interface InteractiveStateSyncRequestMessage {
 /** Submit answers for an `interview_request`. */
 export interface InterviewResponseMessage {
   type: "interview_response";
+  session_id: string;
+  selection_id: string;
   requestId: string;
   answers: InterviewAnswer[];
 }
@@ -168,6 +170,8 @@ export interface InterviewResponseMessage {
 /** Dismiss an `interview_request` without answering. */
 export interface InterviewCancelMessage {
   type: "interview_cancel";
+  session_id: string;
+  selection_id: string;
   requestId: string;
 }
 
@@ -667,6 +671,7 @@ export interface InterviewSnapshotMessage {
 }
 
 export type InterviewResponseAckErrorCode =
+  | "selection_mismatch"
   | "session_busy"
   | "invalid_answers"
   | "unauthorized_submission"
@@ -679,6 +684,8 @@ export type InterviewResponseAckErrorCode =
 /** Durable receipt boundary for `interview_response`; also sent for retries. */
 export interface InterviewResponseAckMessage {
   type: "interview_response_ack";
+  session_id: string;
+  selection_id: string;
   requestId: string | null;
   sessionId: string;
   submissionId?: string;
@@ -689,12 +696,15 @@ export interface InterviewResponseAckMessage {
 }
 
 export type InterviewCancelAckErrorCode =
+  | "selection_mismatch"
   | "session_busy"
   | "not_found"
   | "persistence_failed";
 
 export interface InterviewCancelAckMessage {
   type: "interview_cancel_ack";
+  session_id: string;
+  selection_id: string;
   requestId: string | null;
   sessionId: string;
   status: "cancelled" | "rejected";

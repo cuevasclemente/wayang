@@ -53,6 +53,12 @@ interface PendingInterview {
 }
 
 type RequestCallback = (req: InterviewRequest) => void;
+export interface InterviewTerminalEvent {
+  requestId: string;
+  sessionId: string;
+  status: "submitted" | "delivered" | "cancelled";
+}
+type TerminalCallback = (event: InterviewTerminalEvent) => void;
 
 interface InterviewBridgeStore {
   getInterviewForSession: typeof getInterviewForSession;
@@ -74,6 +80,7 @@ function requestFrom(record: InterviewRecord): InterviewRequest {
 export class PiInterviewBridge {
   private pending = new Map<string, PendingInterview>();
   private listeners = new Set<RequestCallback>();
+  private terminalListeners = new Set<TerminalCallback>();
   private toolResultHandoffs = new Map<string, string>();
 
   constructor(private readonly store: InterviewBridgeStore = DEFAULT_INTERVIEW_BRIDGE_STORE) {}
@@ -187,6 +194,24 @@ export class PiInterviewBridge {
   onRequest(callback: RequestCallback): () => void {
     this.listeners.add(callback);
     return () => this.listeners.delete(callback);
+  }
+
+  /** Publish only terminal identity/status after the durable store transition. */
+  publishTerminal(record: InterviewRecord): void {
+    if (record.status !== "submitted" && record.status !== "delivered" && record.status !== "cancelled") return;
+    const event: InterviewTerminalEvent = {
+      requestId: record.request_id,
+      sessionId: record.session_id,
+      status: record.status,
+    };
+    for (const listener of this.terminalListeners) {
+      try { listener(event); } catch { /* listener isolation */ }
+    }
+  }
+
+  onTerminal(callback: TerminalCallback): () => void {
+    this.terminalListeners.add(callback);
+    return () => this.terminalListeners.delete(callback);
   }
 
   /** Durable replay source for WebSocket reconnects, ordered by creation. */

@@ -52,9 +52,11 @@ test("interview cancellation acknowledges only the exact open session/request", 
   });
 
   const wrong = wire();
-  handleInterviewCancel(wrong.ws, "other-session", { requestId: "cancel-exact" });
+  handleInterviewCancel(wrong.ws, "other-session", "selection-owner", { session_id: "other-session", selection_id: "selection-owner", requestId: "cancel-exact" });
   assert.deepEqual(wrong.messages, [{
     type: "interview_cancel_ack",
+    session_id: "other-session",
+    selection_id: "selection-owner",
     requestId: "cancel-exact",
     sessionId: "other-session",
     status: "rejected",
@@ -64,9 +66,11 @@ test("interview cancellation acknowledges only the exact open session/request", 
   assert.equal(getInterviewForSession("owner-session", "cancel-exact")?.status, "open");
 
   const exact = wire();
-  handleInterviewCancel(exact.ws, "owner-session", { requestId: "cancel-exact" });
+  handleInterviewCancel(exact.ws, "owner-session", "selection-owner", { session_id: "owner-session", selection_id: "selection-owner", requestId: "cancel-exact" });
   assert.deepEqual(exact.messages, [{
     type: "interview_cancel_ack",
+    session_id: "owner-session",
+    selection_id: "selection-owner",
     requestId: "cancel-exact",
     sessionId: "owner-session",
     status: "cancelled",
@@ -75,15 +79,53 @@ test("interview cancellation acknowledges only the exact open session/request", 
   assert.equal(getInterviewForSession("owner-session", "cancel-exact")?.status, "cancelled");
 
   const replay = wire();
-  handleInterviewCancel(replay.ws, "owner-session", { requestId: "cancel-exact" });
+  handleInterviewCancel(replay.ws, "owner-session", "selection-owner", { session_id: "owner-session", selection_id: "selection-owner", requestId: "cancel-exact" });
   assert.deepEqual(replay.messages, [{
     type: "interview_cancel_ack",
+    session_id: "owner-session",
+    selection_id: "selection-owner",
     requestId: "cancel-exact",
     sessionId: "owner-session",
     status: "cancelled",
     duplicate: true,
   }]);
   assert.equal(getInterviewForSession("owner-session", "cancel-exact")?.status, "cancelled");
+}));
+
+test("stale same-session selections cannot submit or cancel questionnaires", () => withStore(() => {
+  createOpenInterview({
+    requestId: "stale-response",
+    sessionId: "owner-session",
+    toolName: "questionnaire",
+    questions: QUESTIONS,
+  });
+  createOpenInterview({
+    requestId: "stale-cancel",
+    sessionId: "owner-session",
+    toolName: "questionnaire",
+    questions: QUESTIONS,
+  });
+
+  const response = wire();
+  handleInterviewResponse(response.ws, "owner-session", "new-selection", {
+    session_id: "owner-session",
+    selection_id: "old-selection",
+    requestId: "stale-response",
+    answers: [{ id: "q1", value: "yes", label: "Yes", wasCustom: false }],
+  }, WAYANG_WEBSOCKET_SUBMISSION_CONTEXT);
+  assert.equal((response.messages[0] as any)?.errorCode, "selection_mismatch");
+  assert.equal((response.messages[0] as any)?.selection_id, "new-selection");
+  assert.equal(getInterviewForSession("owner-session", "stale-response")?.status, "open");
+
+  const cancellation = wire();
+  handleInterviewCancel(cancellation.ws, "owner-session", "new-selection", {
+    session_id: "owner-session",
+    selection_id: "old-selection",
+    requestId: "stale-cancel",
+  });
+  assert.equal((cancellation.messages[0] as any)?.errorCode, "selection_mismatch");
+  assert.equal((cancellation.messages[0] as any)?.selection_id, "new-selection");
+  assert.equal(getInterviewForSession("owner-session", "stale-cancel")?.status, "open");
 }));
 
 test("interview response rejects persistence failure without resolving the gate", () => withStore(() => {
@@ -96,12 +138,16 @@ test("interview response rejects persistence failure without resolving the gate"
   failNextCommitStoreMutationPersistenceForTests(new Error("private synthetic path detail"));
 
   const response = wire();
-  assert.doesNotThrow(() => handleInterviewResponse(response.ws, "owner-session", {
+  assert.doesNotThrow(() => handleInterviewResponse(response.ws, "owner-session", "selection-owner", {
+    session_id: "owner-session",
+    selection_id: "selection-owner",
     requestId: "response-persistence-failure",
     answers: [{ id: "q1", value: "yes", label: "Yes", wasCustom: false }],
   }, WAYANG_WEBSOCKET_SUBMISSION_CONTEXT));
   assert.deepEqual(response.messages, [{
     type: "interview_response_ack",
+    session_id: "owner-session",
+    selection_id: "selection-owner",
     requestId: "response-persistence-failure",
     sessionId: "owner-session",
     status: "rejected",
@@ -121,11 +167,15 @@ test("interview cancellation rejects persistence failure without resolving the g
   failNextCommitStoreMutationPersistenceForTests(new Error("private synthetic path detail"));
 
   const response = wire();
-  assert.doesNotThrow(() => handleInterviewCancel(response.ws, "owner-session", {
+  assert.doesNotThrow(() => handleInterviewCancel(response.ws, "owner-session", "selection-owner", {
+    session_id: "owner-session",
+    selection_id: "selection-owner",
     requestId: "cancel-persistence-failure",
   }));
   assert.deepEqual(response.messages, [{
     type: "interview_cancel_ack",
+    session_id: "owner-session",
+    selection_id: "selection-owner",
     requestId: "cancel-persistence-failure",
     sessionId: "owner-session",
     status: "rejected",
