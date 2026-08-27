@@ -1544,6 +1544,12 @@ function writePrivateProjection(destination: string, projection: unknown): void 
     fd = null;
     fs.renameSync(tempPath, destination);
     fs.chmodSync(destination, 0o600);
+    const directoryFd = fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0));
+    try {
+      fs.fsyncSync(directoryFd);
+    } finally {
+      fs.closeSync(directoryFd);
+    }
   } finally {
     if (fd !== null) {
       try { fs.closeSync(fd); } catch { /* best effort */ }
@@ -1552,6 +1558,268 @@ function writePrivateProjection(destination: string, projection: unknown): void 
       try { fs.unlinkSync(tempPath); } catch { /* best effort */ }
     }
   }
+}
+
+export const HOST_EXECUTION_PAIR_PROJECTION_SCHEMA_VERSION = 3;
+export const HOST_EXECUTION_QUESTIONNAIRE_PROJECTION_SCHEMA_VERSION = 1;
+export const MAX_HOST_EXECUTION_QUESTIONNAIRE_SUBMISSIONS = 256;
+export const MAX_HOST_EXECUTION_QUESTIONNAIRE_PROJECTION_BYTES = 1024 * 1024;
+const MAX_PROJECTED_QUESTIONS_PER_SUBMISSION = 32;
+const MAX_PROJECTED_OPTIONS_PER_QUESTION = 64;
+const MAX_PROJECTED_SUBMISSION_BYTES = 128 * 1024;
+
+export interface HostExecutionQuestionnaireOptionProjection {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+export interface HostExecutionQuestionnaireQuestionProjection {
+  id: string;
+  label: string;
+  prompt: string;
+  options: HostExecutionQuestionnaireOptionProjection[];
+  allowOther: boolean;
+}
+
+export interface HostExecutionQuestionnaireAnswerProjection {
+  id: string;
+  value: string;
+  label: string;
+  wasCustom: boolean;
+  index?: number;
+}
+
+export interface HostExecutionQuestionnaireSubmissionProjection {
+  request_id: string;
+  session_id: string;
+  origin_tool_name: "questionnaire";
+  origin_tool_call_id: string | null;
+  questions: HostExecutionQuestionnaireQuestionProjection[];
+  status: "submitted" | "delivered";
+  created_at: number;
+  submitted_at: number;
+  answers: HostExecutionQuestionnaireAnswerProjection[];
+  submission_id: string;
+  submission_channel: typeof WAYANG_WEBSOCKET_SUBMISSION_CHANNEL;
+  authenticated_principal: typeof WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL;
+  delivered_at?: number;
+  delivery_mode?: "tool_result" | "custom_message";
+  delivery_entry_id?: string;
+}
+
+export interface HostExecutionQuestionnaireProjection {
+  schema_version: typeof HOST_EXECUTION_QUESTIONNAIRE_PROJECTION_SCHEMA_VERSION;
+  available: boolean;
+  records: HostExecutionQuestionnaireSubmissionProjection[];
+}
+
+function projectionString(value: unknown, maxBytes: number, allowEmpty = false): value is string {
+  return typeof value === "string"
+    && (allowEmpty || value.length > 0)
+    && !value.includes("\u0000")
+    && Buffer.byteLength(value, "utf8") <= maxBytes;
+}
+
+function projectionTimestamp(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+/**
+ * Convert only a canonical, WebSocket-authenticated questionnaire submission.
+ * Every object is rebuilt from an allowlist so future store fields cannot leak
+ * into the agent-readable projection.
+ */
+function projectQuestionnaireSubmission(record: InterviewRecord): HostExecutionQuestionnaireSubmissionProjection | null {
+  if (
+    record.origin_tool_name !== "questionnaire"
+    || (record.status !== "submitted" && record.status !== "delivered")
+    || record.submission_channel !== WAYANG_WEBSOCKET_SUBMISSION_CHANNEL
+    || record.authenticated_principal !== WAYANG_SINGLE_USER_AUTHENTICATED_PRINCIPAL
+    || !projectionString(record.request_id, 256)
+    || !projectionString(record.submission_id, 256)
+    || !projectionString(record.session_id, 256)
+    || !(record.origin_tool_call_id === null || projectionString(record.origin_tool_call_id, 256))
+    || !projectionTimestamp(record.created_at)
+    || !projectionTimestamp(record.submitted_at)
+    || record.submitted_at < record.created_at
+    || record.cancelled_at !== undefined
+    || !Array.isArray(record.questions) || record.questions.length === 0
+    || record.questions.length > MAX_PROJECTED_QUESTIONS_PER_SUBMISSION
+    || !Array.isArray(record.answers) || record.answers.length !== record.questions.length
+  ) return null;
+
+  const questions: HostExecutionQuestionnaireQuestionProjection[] = [];
+  const answers: HostExecutionQuestionnaireAnswerProjection[] = [];
+  const questionIds = new Set<string>();
+  for (let index = 0; index < record.questions.length; index += 1) {
+    const rawQuestion = record.questions[index];
+    const rawAnswer = record.answers[index];
+    if (!rawQuestion || typeof rawQuestion !== "object" || Array.isArray(rawQuestion)
+      || !rawAnswer || typeof rawAnswer !== "object" || Array.isArray(rawAnswer)) return null;
+    const question = rawQuestion as Record<string, unknown>;
+    const answer = rawAnswer as Record<string, unknown>;
+    if (!projectionString(question.id, 256) || questionIds.has(question.id)
+      || !projectionString(question.label, 4_096) || !projectionString(question.prompt, 16_384)
+      || !Array.isArray(question.options) || question.options.length > MAX_PROJECTED_OPTIONS_PER_QUESTION
+      || typeof question.allowOther !== "boolean" || answer.id !== question.id
+      || !projectionString(answer.value, 16_384) || !projectionString(answer.label, 16_384)
+      || typeof answer.wasCustom !== "boolean") return null;
+
+    const optionValues = new Set<string>();
+    const options: HostExecutionQuestionnaireOptionProjection[] = [];
+    for (const rawOption of question.options) {
+      if (!rawOption || typeof rawOption !== "object" || Array.isArray(rawOption)) return null;
+      const option = rawOption as Record<string, unknown>;
+      if (!projectionString(option.value, 16_384) || optionValues.has(option.value)
+        || !projectionString(option.label, 4_096)
+        || !(option.description === undefined || projectionString(option.description, 8_192))) return null;
+      optionValues.add(option.value);
+      options.push({
+        value: option.value,
+        label: option.label,
+        ...(option.description === undefined ? {} : { description: option.description }),
+      });
+    }
+
+    const projectedAnswer: HostExecutionQuestionnaireAnswerProjection = {
+      id: answer.id as string,
+      value: answer.value,
+      label: answer.label,
+      wasCustom: answer.wasCustom,
+    };
+    if (answer.wasCustom) {
+      if (answer.label !== answer.value || answer.index !== undefined) return null;
+    } else {
+      if (!Number.isSafeInteger(answer.index) || (answer.index as number) < 0 || (answer.index as number) >= options.length) return null;
+      const answerIndex = answer.index as number;
+      const selected = options[answerIndex]!;
+      if (answer.value !== selected.value || answer.label !== selected.label) return null;
+      projectedAnswer.index = answerIndex;
+    }
+    questionIds.add(question.id);
+    questions.push({
+      id: question.id,
+      label: question.label,
+      prompt: question.prompt,
+      options,
+      allowOther: question.allowOther,
+    });
+    answers.push(projectedAnswer);
+  }
+
+  const projected: HostExecutionQuestionnaireSubmissionProjection = {
+    request_id: record.request_id,
+    session_id: record.session_id,
+    origin_tool_name: "questionnaire",
+    origin_tool_call_id: record.origin_tool_call_id,
+    questions,
+    status: record.status,
+    created_at: record.created_at,
+    submitted_at: record.submitted_at,
+    answers,
+    submission_id: record.submission_id,
+    submission_channel: record.submission_channel,
+    authenticated_principal: record.authenticated_principal,
+  };
+  if (record.status === "delivered") {
+    if (!projectionTimestamp(record.delivered_at) || record.delivered_at < record.submitted_at
+      || (record.delivery_mode !== "tool_result" && record.delivery_mode !== "custom_message")
+      || !(record.delivery_entry_id === undefined || projectionString(record.delivery_entry_id, 256))) return null;
+    projected.delivered_at = record.delivered_at;
+    projected.delivery_mode = record.delivery_mode;
+    if (record.delivery_entry_id !== undefined) projected.delivery_entry_id = record.delivery_entry_id;
+  } else if (record.delivered_at !== undefined || record.delivery_mode !== undefined || record.delivery_entry_id !== undefined) {
+    return null;
+  }
+
+  return Buffer.byteLength(JSON.stringify({ record: projected }, null, 2), "utf8") <= MAX_PROJECTED_SUBMISSION_BYTES
+    ? projected : null;
+}
+
+function buildHostExecutionQuestionnaireProjection(
+  data: StoreData,
+  eligibleSessionIds: ReadonlySet<string>,
+): HostExecutionQuestionnaireProjection {
+  const records: HostExecutionQuestionnaireSubmissionProjection[] = [];
+  const requestIds = new Set<string>();
+  const submissionIds = new Set<string>();
+  for (const interview of data.interviews) {
+    if (!eligibleSessionIds.has(interview.session_id)
+      || interview.origin_tool_name !== "questionnaire"
+      || (interview.status !== "submitted" && interview.status !== "delivered")) continue;
+    const projected = projectQuestionnaireSubmission(interview);
+    const requestId = projected?.request_id;
+    const submissionId = projected?.submission_id;
+    // An eligible but noncanonical or multiply-owned submission is ambiguity,
+    // not evidence that no submission exists.
+    if (!projected || !requestId || !submissionId || requestIds.has(requestId) || submissionIds.has(submissionId)) return {
+      schema_version: HOST_EXECUTION_QUESTIONNAIRE_PROJECTION_SCHEMA_VERSION,
+      available: false,
+      records: [],
+    };
+    requestIds.add(requestId);
+    submissionIds.add(submissionId);
+    records.push(projected);
+  }
+  records.sort((left, right) => {
+    const created = left.created_at - right.created_at;
+    if (created !== 0) return created;
+    const leftRequest = left.request_id;
+    const rightRequest = right.request_id;
+    if (leftRequest !== rightRequest) return leftRequest < rightRequest ? -1 : 1;
+    const leftSubmission = left.submission_id;
+    const rightSubmission = right.submission_id;
+    return leftSubmission === rightSubmission ? 0 : leftSubmission < rightSubmission ? -1 : 1;
+  });
+  const availableProjection: HostExecutionQuestionnaireProjection = {
+    schema_version: HOST_EXECUTION_QUESTIONNAIRE_PROJECTION_SCHEMA_VERSION,
+    available: true,
+    records,
+  };
+  if (records.length > MAX_HOST_EXECUTION_QUESTIONNAIRE_SUBMISSIONS
+    || Buffer.byteLength(
+      JSON.stringify({ questionnaire_submissions: availableProjection }, null, 2),
+      "utf8",
+    ) > MAX_HOST_EXECUTION_QUESTIONNAIRE_PROJECTION_BYTES) {
+    return {
+      schema_version: HOST_EXECUTION_QUESTIONNAIRE_PROJECTION_SCHEMA_VERSION,
+      available: false,
+      records: [],
+    };
+  }
+  return availableProjection;
+}
+
+function writeHostExecutionProjectionDenials(data: StoreData): void {
+  for (const association of data.workspaceCapabilityAssociations) {
+    if (association.capability_id !== "wayang.host-execution.v1") continue;
+    const binding: WorkspaceCapabilityProjectionBinding = {
+      capability_id: association.capability_id,
+      project_id: association.project_id,
+      agent_profile_id: association.agent_profile_id,
+    };
+    writePrivateProjection(getWorkspaceCapabilityStoreProjectionPath(binding), {
+      schema_version: HOST_EXECUTION_PAIR_PROJECTION_SCHEMA_VERSION,
+      binding,
+      association_revision: association.revision,
+      active: association.active,
+      available: false,
+    });
+  }
+}
+
+let pendingHostExecutionPositiveProjectionFailureForTests: Error | null = null;
+let hostExecutionProjectionDenialObserverForTests: (() => void) | null = null;
+
+export function failNextHostExecutionPositiveProjectionForTests(
+  error = new Error("Synthetic host-execution positive projection failure"),
+): void {
+  pendingHostExecutionPositiveProjectionFailureForTests = error;
+}
+
+export function observeNextHostExecutionProjectionDenialForTests(observer: () => void): void {
+  hostExecutionProjectionDenialObserverForTests = observer;
 }
 
 function writeWorkspaceCapabilityStoreProjections(data: StoreData): void {
@@ -1564,7 +1832,8 @@ function writeWorkspaceCapabilityStoreProjections(data: StoreData): void {
     const destination = getWorkspaceCapabilityStoreProjectionPath(binding);
     if (!association.active) {
       writePrivateProjection(destination, {
-        schema_version: 2,
+        schema_version: association.capability_id === "wayang.host-execution.v1"
+          ? HOST_EXECUTION_PAIR_PROJECTION_SCHEMA_VERSION : 2,
         binding,
         association_revision: association.revision,
         active: false,
@@ -1577,7 +1846,8 @@ function writeWorkspaceCapabilityStoreProjections(data: StoreData): void {
     if (!project || !profile) continue; // current-store validation rejects this state
     if (!profile.enabled) {
       writePrivateProjection(destination, {
-        schema_version: 2,
+        schema_version: association.capability_id === "wayang.host-execution.v1"
+          ? HOST_EXECUTION_PAIR_PROJECTION_SCHEMA_VERSION : 2,
         binding,
         association_revision: association.revision,
         active: true,
@@ -1589,10 +1859,12 @@ function writeWorkspaceCapabilityStoreProjections(data: StoreData): void {
       session.project_id === project.id
       && session.cwd === project.cwd
       && session.agent_profile_id === profile.id
-      && !session.legacy_private_session_quarantine
-      && !session.legacy_capability_ineligible);
+      && session.legacy_private_session_quarantine === false
+      && session.legacy_capability_ineligible === false);
+    const eligibleSessionIds = new Set(sessions.map((session) => session.id));
     const projection = {
-      schema_version: 2,
+      schema_version: association.capability_id === "wayang.host-execution.v1"
+        ? HOST_EXECUTION_PAIR_PROJECTION_SCHEMA_VERSION : 2,
       binding,
       association_revision: association.revision,
       active: true,
@@ -1624,9 +1896,17 @@ function writeWorkspaceCapabilityStoreProjections(data: StoreData): void {
         goal: session.goal,
         goal_status: session.goal_status,
       })),
+      ...(association.capability_id === "wayang.host-execution.v1"
+        ? { questionnaire_submissions: buildHostExecutionQuestionnaireProjection(data, eligibleSessionIds) }
+        : {}),
     };
     // Deliberately excludes provider/model, approval history/digests/timestamps,
     // other profiles, defaults, and every instruction body.
+    if (association.capability_id === "wayang.host-execution.v1" && pendingHostExecutionPositiveProjectionFailureForTests) {
+      const failure = pendingHostExecutionPositiveProjectionFailureForTests;
+      pendingHostExecutionPositiveProjectionFailureForTests = null;
+      throw failure;
+    }
     writePrivateProjection(destination, projection);
   }
 }
@@ -1663,6 +1943,16 @@ function saveStoreAtPath(data: StoreData, storePath: string, browserProfilesEnab
   const persisted = persistedStoreForBrowserMode(data, browserProfilesEnabled);
   const dataDir = path.dirname(storePath);
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  // Questionnaire projections can confer downstream authority. Replace every
+  // affected host-execution pair with a durable denial before publishing the
+  // store mutation. If store publication or the later positive refresh fails,
+  // consumers see unavailable state rather than stale positive evidence.
+  writeHostExecutionProjectionDenials(data);
+  if (hostExecutionProjectionDenialObserverForTests) {
+    const observer = hostExecutionProjectionDenialObserverForTests;
+    hostExecutionProjectionDenialObserverForTests = null;
+    observer();
+  }
   const tempPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
   let fd: number | null = null;
   let created = false;
@@ -1782,6 +2072,11 @@ export function getStore(): StoreData {
     const acquiredHere = ensureStoreLock(storePath);
     try {
       _store = loadStore(storePath);
+      // Current-schema startup does not rewrite store.json. Deny first, then
+      // rebuild from the just-validated store so a crash from an older process
+      // cannot leave a stale positive questionnaire projection in service.
+      writeHostExecutionProjectionDenials(_store);
+      writeWorkspaceCapabilityStoreProjections(_store);
       _storePath = storePath;
     } catch (error) {
       if (acquiredHere) releaseStoreLock();
@@ -1831,6 +2126,8 @@ export function init(options: { browserProfilesEnabled?: boolean } = {}): void {
   const acquiredHere = ensureStoreLock(storePath);
   try {
     const loaded = loadStore(storePath, _browserProfilesEnabled);
+    writeHostExecutionProjectionDenials(loaded);
+    writeWorkspaceCapabilityStoreProjections(loaded);
     _store = loaded;
     _storePath = storePath;
     console.log(`[db] Store initialized at ${storePath}`);
@@ -1850,6 +2147,8 @@ export function close(): void {
     _browserProfilesEnabled = false;
     commitStoreMutationPersistenceFailureForTests = null;
     storeMigrationPersistenceObserverForTests = null;
+    pendingHostExecutionPositiveProjectionFailureForTests = null;
+    hostExecutionProjectionDenialObserverForTests = null;
     releaseStoreLock();
   }
 }
