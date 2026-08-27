@@ -23,7 +23,7 @@ import {
 } from "./agent-runtime.js";
 import { commandGuardIdentityPinPath } from "./command-guard-pin.js";
 import { close, commitStoreMutation, init } from "./db.js";
-import { createProject } from "./projects.js";
+import { createProject, updateProject } from "./projects.js";
 import { commitWorkspaceCapabilityActivation, revokeWorkspaceCapabilityAssociation } from "./workspace-capabilities.js";
 import { createSession, updatePiSessionFile } from "./sessions.js";
 import {
@@ -634,6 +634,34 @@ test("memory capability registry and filesystem policy implement none/read/read_
       toolName: "agent_team_spawn_parallel",
       params: {},
     }).allowed, false);
+
+    const protectedProject = updateProject(project.id, {
+      access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [writeProfile.id] },
+    });
+    const scheduled = createSession(f.cwd, {
+      agentProfileId: writeProfile.id,
+      scheduledJobId: "synthetic-protected-job",
+      scheduledRunId: "synthetic-protected-run",
+    });
+    const scheduledDecide = (toolName: string, target: string) => authorizeAgentToolCall({
+      cwd: f.cwd,
+      project: protectedProject,
+      agentProfile: writeProfile,
+      toolName,
+      params: { path: target },
+      memoryRoots: [memoryRoot],
+      sourceSessionId: scheduled.id,
+    });
+    assert.equal(scheduledDecide("edit", path.join(memoryRoot, "note.md")).allowed, false);
+    assert.equal(scheduledDecide("write", path.join(f.cwd, "scheduled-output.md")).allowed, true);
+    assert.equal(authorizeAgentToolCall({
+      cwd: f.cwd,
+      project: protectedProject,
+      agentProfile: writeProfile,
+      toolName: "mempalace_diary_write",
+      params: {},
+      sourceSessionId: scheduled.id,
+    }).allowed, false);
   } finally {
     f.cleanup();
   }
@@ -1111,12 +1139,16 @@ test("restricted MCP guard checks post-hook params and execute-time revocation",
   }
 });
 
-test("restricted MCP guard explicitly denies scheduled sources", async () => {
+test("restricted MCP guard permits complete scheduled sources under the same exact runtime", async () => {
   const f = fixture("wayang-runtime-mcp-scheduled-");
   try {
-    const profile = createAgentProfile({ name: "Restricted MCP scheduled denial" });
+    const profile = createAgentProfile({ name: "Restricted MCP scheduled access" });
     createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
-    const row = createSession(f.cwd, { agentProfileId: profile.id, scheduledJobId: "synthetic-job" });
+    const row = createSession(f.cwd, {
+      agentProfileId: profile.id,
+      scheduledJobId: "synthetic-job",
+      scheduledRunId: "synthetic-run",
+    });
     let activeNames: string[] = [RESTRICTED_MCP_TOOL_NAME];
     let executions = 0;
     const tool: any = {
@@ -1137,15 +1169,14 @@ test("restricted MCP guard explicitly denies scheduled sources", async () => {
     };
     installAgentToolPolicyGuard(fakeSession, row.id, { restrictedMcpRuntime: runtime });
 
-    assert.deepEqual(activeNames, []);
-    const decision = await fakeSession.agent.beforeToolCall({
+    assert.deepEqual(activeNames, [RESTRICTED_MCP_TOOL_NAME]);
+    const params = {};
+    assert.equal(await fakeSession.agent.beforeToolCall({
       toolCall: { name: RESTRICTED_MCP_TOOL_NAME },
-      args: {},
-    });
-    assert.equal(decision.block, true);
-    assert.match(decision.reason, /scheduled sessions/);
-    await assert.rejects(() => tool.execute("scheduled", {}), /scheduled sessions/);
-    assert.equal(executions, 0);
+      args: params,
+    }), undefined);
+    await tool.execute("scheduled", params);
+    assert.equal(executions, 1);
   } finally {
     f.cleanup();
   }

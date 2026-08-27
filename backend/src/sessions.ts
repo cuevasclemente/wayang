@@ -20,6 +20,7 @@ import {
 import {
   ensureProjectForCwd,
   ensureProjectForCwdDraft,
+  listProjects,
   resolveEffectiveSessionDefaults,
 } from "./projects.js";
 import { authorizeProjectAction } from "./policy.js";
@@ -657,6 +658,9 @@ export async function syncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
 }
 
 async function legacySyncPiSessionFiles(): Promise<SyncPiSessionFilesResult> {
+  if (listProjects().some((project) => project.access_policy.privacy_mode === "protected")) {
+    throw new Error("Legacy whole-transcript session scanning is unavailable while Protected projects are registered");
+  }
   const syncStart = nowMs();
   syncProfile("sync_start");
   const listStart = nowMs();

@@ -208,6 +208,12 @@ export function authorizeAgentToolCall(options: {
   const { agentProfile, project } = options;
   const toolName = normalizeToolName(options.toolName);
   const restricted = options.standardResourcesAuthorized !== true;
+  const sourceSession = project.access_policy.privacy_mode === "protected" && options.sourceSessionId
+    ? getSessionById(options.sourceSessionId)
+    : undefined;
+  const protectedScheduled = project.access_policy.privacy_mode === "protected"
+    && sourceSession?.scheduled_job_id !== null && sourceSession?.scheduled_job_id !== undefined
+    && sourceSession?.scheduled_run_id !== null && sourceSession?.scheduled_run_id !== undefined;
 
   if (project.access_policy.privacy_mode === "protected" && isSubagentToolName(toolName)) {
     return { allowed: false, reason: "Subagent tools are unavailable in protected projects" };
@@ -253,6 +259,9 @@ export function authorizeAgentToolCall(options: {
   const memoryCapability = classifyMemoryTool(toolName);
   if (memoryCapability) {
     if (agentProfile.memory_access === "none") return { allowed: false, reason: "Memory tools are disabled for this agent" };
+    if (memoryCapability === "mutation" && protectedScheduled) {
+      return { allowed: false, reason: "Protected scheduled output may be written only inside its project" };
+    }
     if (memoryCapability === "mutation" && agentProfile.memory_access !== "read_write") {
       return { allowed: false, reason: "Memory mutations are disabled for this agent" };
     }
@@ -314,6 +323,9 @@ export function authorizeAgentToolCall(options: {
   if (memoryRoot) {
     if (agentProfile.memory_access === "none") {
       return { allowed: false, reason: "This agent cannot access registered memory roots", canonicalPath };
+    }
+    if (isMutation && protectedScheduled) {
+      return { allowed: false, reason: "Protected scheduled output may be written only inside its project", canonicalPath };
     }
     if (isMutation && agentProfile.memory_access !== "read_write") {
       return { allowed: false, reason: "This agent has read-only memory access", canonicalPath };
@@ -405,17 +417,23 @@ function liveToolDecision(
   if (!row) return { allowed: false, reason: "Wayang session no longer exists" };
   const normalizedToolName = normalizeToolName(toolName);
   const scheduled = row.scheduled_job_id !== null || row.scheduled_run_id !== null;
+  const completeScheduledIdentity = row.scheduled_job_id !== null && row.scheduled_run_id !== null;
   const workspaceControl = normalizedToolName === WAYANG_WORKSPACE_READ_TOOL_NAME || normalizedToolName === WAYANG_WORKSPACE_CHANGE_TOOL_NAME;
   if (workspaceControl && scheduled) {
     return { allowed: false, reason: "Workspace control tools are unavailable for scheduled sessions" };
   }
-  if (normalizedToolName === RESTRICTED_MCP_TOOL_NAME && scheduled && options.restrictedMcpRuntime) {
-    return { allowed: false, reason: "The restricted MCP proxy is unavailable for scheduled sessions" };
+  if (normalizedToolName === RESTRICTED_MCP_TOOL_NAME && scheduled
+    && options.restrictedMcpRuntime && !completeScheduledIdentity) {
+    return { allowed: false, reason: "The restricted MCP proxy requires complete scheduled job/run identity" };
   }
   if (workspaceControl && (typeof row.agent_profile_id !== "string" || !row.agent_profile_id)) {
     return { allowed: false, reason: "Workspace control source profile is missing" };
   }
-  const authorization = authorizeProjectAction({ cwd: row.cwd, actor: "interactive", agentProfileId: row.agent_profile_id });
+  const authorization = authorizeProjectAction({
+    cwd: row.cwd,
+    actor: scheduled ? "scheduled" : "interactive",
+    agentProfileId: row.agent_profile_id,
+  });
   if (!authorization.allowed || !authorization.project || !authorization.agentProfile) {
     return { allowed: false, reason: authorization.reason ?? "Session is no longer authorized" };
   }

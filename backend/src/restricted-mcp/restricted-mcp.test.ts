@@ -158,14 +158,20 @@ test("strict private parser accepts reviewed subsets and rejects extension field
   } finally { f.cleanup(); }
 });
 
-test("eligibility requires the exact live protected interactive project-only read profile", () => {
+test("eligibility requires the exact live protected project-only read profile and complete scheduling identity", () => {
   const f = fixture();
   try {
     const config = loadRestrictedMcpConfig(f.configPath);
     const eligible = liveContext(f.project);
     assert.ok(resolveRestrictedMcpGrant(config, eligible));
     assert.equal(resolveRestrictedMcpGrant(config, { ...eligible, isSubagent: true }), null);
+    assert.ok(resolveRestrictedMcpGrant(config, {
+      ...eligible,
+      scheduledJobId: "job-1",
+      scheduledRunId: "run-1",
+    }));
     assert.equal(resolveRestrictedMcpGrant(config, { ...eligible, scheduledRunId: "run-1" }), null);
+    assert.equal(resolveRestrictedMcpGrant(config, { ...eligible, scheduledJobId: "job-1" }), null);
     assert.equal(resolveRestrictedMcpGrant(config, { ...eligible, project: { ...eligible.project, privacyMode: "standard" } }), null);
     assert.equal(resolveRestrictedMcpGrant(config, { ...eligible, project: { ...eligible.project, allowedAgentProfileIds: [] } }), null);
     assert.equal(resolveRestrictedMcpGrant(config, { ...eligible, agentProfile: { ...eligible.agentProfile, id: "33333333-3333-4333-8333-333333333333" } }), null);
