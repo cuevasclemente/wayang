@@ -1,6 +1,13 @@
 import { SessionManager, type SessionNameState } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
-import { getSessionById, normalizeProvisionalSessionTitle, setAutomaticPiSessionTitle, type SessionRow } from "./sessions.js";
+import {
+  getSessionById,
+  normalizeProvisionalSessionTitle,
+  reconcileSessionTitleFromPhysicalNameById,
+  setAutomaticPiSessionTitle,
+  type SessionRow,
+} from "./sessions.js";
 import { authorizeProjectAction } from "./policy.js";
 import {
   extractCompletedTitleExchanges,
@@ -16,6 +23,7 @@ import { isSessionRuntimeMutationLocked } from "./session-runtime-mutation-lock.
 export type AutoTitleOutcome = "attempt" | "success" | "validation_rejection" | "unavailable" | "timeout" | "cas_lost";
 const telemetry = new Map<AutoTitleOutcome, number>();
 const attempted = new Set<string>();
+const interactionAttempted = new Set<string>();
 const MAX_ATTEMPT_KEYS = 4_096;
 const inFlight = new Map<string, Promise<void>>();
 let provider: TitleProvider = new TerraTitleProvider();
@@ -39,6 +47,7 @@ export function autoTitleTelemetrySnapshot(): Readonly<Record<AutoTitleOutcome, 
 export function setAutoTitleProviderForTests(next: TitleProvider | null): void {
   provider = next ?? new TerraTitleProvider();
   attempted.clear();
+  interactionAttempted.clear();
   inFlight.clear();
   telemetry.clear();
 }
@@ -98,7 +107,10 @@ interface PhysicalCandidate {
   projection: TitleSourceProjection;
 }
 
-function readPhysicalCandidate(sessionId: string): PhysicalCandidate | null {
+function readPhysicalCandidate(
+  sessionId: string,
+  options: { repairPhysicalName?: boolean } = {},
+): PhysicalCandidate | null {
   if (isSessionRuntimeMutationLocked(sessionId)) return null;
   const row = getSessionById(sessionId);
   if (!row || !rowEligible(row) || !row.pi_session_file) return null;
@@ -108,7 +120,15 @@ function readPhysicalCandidate(sessionId: string): PhysicalCandidate | null {
     const nameState = manager.getSessionNameState();
     // Any session_info, including a deliberate human clear, permanently
     // suppresses automatic naming. Only a never-named session is provisional.
-    if (nameState.name !== undefined || nameState.entryId !== undefined) return null;
+    if (nameState.name !== undefined || nameState.entryId !== undefined) {
+      if (options.repairPhysicalName && nameState.entryId !== undefined) {
+        reconcileSessionTitleFromPhysicalNameById(sessionId, {
+          piName: nameState.name,
+          firstMessage: firstUserTranscriptText(manager.getEntries()),
+        });
+      }
+      return null;
+    }
     const branch = manager.getBranch();
     const entries = branch.length > 0 ? branch : manager.getEntries();
     const projection = extractCompletedTitleExchanges(entries, {
@@ -123,6 +143,15 @@ function readPhysicalCandidate(sessionId: string): PhysicalCandidate | null {
 
 function attemptKey(sessionId: string, projection: TitleSourceProjection): string {
   return `${sessionId}:${projection.digest}:${projection.completedExchangeCount}`;
+}
+
+function inFlightKey(sessionId: string, projection: TitleSourceProjection): string {
+  return `${sessionId}:${projection.digest}`;
+}
+
+function rememberBounded(set: Set<string>, key: string): void {
+  set.add(key);
+  while (set.size > MAX_ATTEMPT_KEYS) set.delete(set.values().next().value!);
 }
 
 async function performAttempt(
@@ -146,7 +175,6 @@ async function performAttempt(
   if (
     !dispatchProjection
     || dispatchProjection.digest !== expected.digest
-    || dispatchProjection.completedExchangeCount !== expected.completedExchangeCount
   ) return;
   let rawTitle: string;
   try {
@@ -200,18 +228,48 @@ export function scheduleWayangAutoTitle(
   const candidate = readPhysicalCandidate(sessionId);
   if (!candidate) return null;
   const key = attemptKey(sessionId, candidate.projection);
-  const existing = inFlight.get(key);
+  const flightKey = inFlightKey(sessionId, candidate.projection);
+  const existing = inFlight.get(flightKey);
   if (existing) return existing;
   if (attempted.has(key)) return null;
-  attempted.add(key);
-  while (attempted.size > MAX_ATTEMPT_KEYS) attempted.delete(attempted.values().next().value!);
+  rememberBounded(attempted, key);
   const work = performAttempt(sessionId, candidate.projection, () => {
     if (options.stillSelected && !options.stillSelected()) return null;
     return readPhysicalCandidate(sessionId)?.projection ?? null;
   }, options.onCommitted)
     .catch(() => undefined)
-    .finally(() => inFlight.delete(key));
-  inFlight.set(key, work);
+    .finally(() => inFlight.delete(flightKey));
+  inFlight.set(flightKey, work);
+  return work;
+}
+
+/**
+ * Reconsider an older unnamed session after an ordinary browser interaction
+ * settles. Each distinct interaction may retry a failed same-history attempt,
+ * while concurrent interactions still coalesce on the bounded first-three
+ * projection. Title work never changes the source-turn outcome.
+ */
+export function scheduleWayangAutoTitleOnInteraction(
+  sessionId: string,
+  interactionId: string,
+  options: { onCommitted?: (sessionFile: string) => void } = {},
+): Promise<void> | null {
+  const candidate = readPhysicalCandidate(sessionId, { repairPhysicalName: true });
+  if (!candidate) return null;
+  const key = attemptKey(sessionId, candidate.projection);
+  const flightKey = inFlightKey(sessionId, candidate.projection);
+  const interactionKey = `${key}:${createHash("sha256").update(interactionId).digest("hex")}`;
+  if (interactionAttempted.has(interactionKey)) return inFlight.get(flightKey) ?? null;
+  rememberBounded(interactionAttempted, interactionKey);
+  const existing = inFlight.get(flightKey);
+  if (existing) return existing;
+  const work = performAttempt(
+    sessionId,
+    candidate.projection,
+    () => readPhysicalCandidate(sessionId)?.projection ?? null,
+    options.onCommitted,
+  ).catch(() => undefined).finally(() => inFlight.delete(flightKey));
+  inFlight.set(flightKey, work);
   return work;
 }
 
@@ -262,15 +320,15 @@ export function scheduleWayangAutoTitleFromActivation(
   const projection = activationProjection(sessionId, snapshot);
   if (!projection) return null;
   const key = attemptKey(sessionId, projection);
-  const existing = inFlight.get(key);
+  const flightKey = inFlightKey(sessionId, projection);
+  const existing = inFlight.get(flightKey);
   if (existing) return existing;
   if (attempted.has(key)) return null;
-  attempted.add(key);
-  while (attempted.size > MAX_ATTEMPT_KEYS) attempted.delete(attempted.values().next().value!);
+  rememberBounded(attempted, key);
   const work = performAttempt(sessionId, projection, () => {
     if (options.stillSelected && !options.stillSelected()) return null;
     return activationProjection(sessionId, snapshot);
-  }, options.onCommitted).catch(() => undefined).finally(() => inFlight.delete(key));
-  inFlight.set(key, work);
+  }, options.onCommitted).catch(() => undefined).finally(() => inFlight.delete(flightKey));
+  inFlight.set(flightKey, work);
   return work;
 }

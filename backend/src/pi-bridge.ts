@@ -74,7 +74,11 @@ import {
 } from "./reviewed-provider-extensions.js";
 import { getSudoBridge } from "./sudo-bridge.js";
 import { getCommandGuardIdentityBridge } from "./command-guard-bridge.js";
-import { scheduleWayangAutoTitle, type AutoTitleActivationSnapshot } from "./session-title-service.js";
+import {
+  scheduleWayangAutoTitle,
+  scheduleWayangAutoTitleOnInteraction,
+  type AutoTitleActivationSnapshot,
+} from "./session-title-service.js";
 import { extractCompletedTitleExchanges, titleTextBlocks } from "./session-title-policy.js";
 import { createWayangSessionCustomTools } from "./wayang-runtime-context.js";
 import { createSessionInteropToolDefinitions } from "./session-interop.js";
@@ -815,9 +819,37 @@ export function settleInteractiveTurns(handle: PiSessionHandle): BrowserTurnProv
   return settled;
 }
 
-function settleInteractiveTurnsQuietly(handle: PiSessionHandle): void {
-  try { settleInteractiveTurns(handle); }
-  catch { /* source-marker persistence must never change source-turn settlement */ }
+function settleInteractiveTurnsQuietly(handle: PiSessionHandle): BrowserTurnProvenance[] {
+  try { return settleInteractiveTurns(handle); }
+  catch { return []; /* source-marker persistence must never change source-turn settlement */ }
+}
+
+function deferWayangAutoTitleAfterInteraction(
+  handle: PiSessionHandle,
+  turns: readonly BrowserTurnProvenance[],
+): void {
+  const interactionIds = turns.map((turn) => turn.clientMessageId);
+  setImmediate(() => {
+    for (const interactionId of interactionIds) {
+      try {
+        scheduleWayangAutoTitleOnInteraction(handle.id, interactionId, {
+          onCommitted: invalidateSessionFileSnapshot,
+        });
+      } catch {
+        // Title repair/generation never changes source-turn success.
+      }
+    }
+  });
+}
+
+function deferWayangAutoTitle(handle: PiSessionHandle): void {
+  setImmediate(() => {
+    try {
+      scheduleWayangAutoTitle(handle.id, { onCommitted: invalidateSessionFileSnapshot });
+    } catch {
+      // Title generation never changes settlement success.
+    }
+  });
 }
 
 function queuedUserMessageText(message: unknown): string | undefined {
@@ -2859,8 +2891,12 @@ export async function createPiSession(
       persistSettledSessionError(handle, event);
       if (event.type === "agent_settled") {
         markClaimedQueuedBrowserTurnsReady(handle);
-        settleInteractiveTurnsQuietly(handle);
-        scheduleWayangAutoTitle(handle.id, { onCommitted: invalidateSessionFileSnapshot });
+        const settledBrowserTurns = settleInteractiveTurnsQuietly(handle);
+        if (settledBrowserTurns.length > 0) {
+          deferWayangAutoTitleAfterInteraction(handle, settledBrowserTurns);
+        } else if (interactiveTurnLedger(handle).size === 0) {
+          deferWayangAutoTitle(handle);
+        }
       }
       if (event.type === "message_start" || event.type === "message_update") {
         if (event.type === "message_start") markQueuedBrowserMessageStarted(handle, event.message);
@@ -4089,7 +4125,7 @@ export async function sendBrowserMessageTurn(
       settleInteractiveTurnsQuietly(handle);
       // agent_settled fires before prompt() resolves, so idle browser sends do
       // not have their source marker yet in the lifecycle listener above.
-      scheduleWayangAutoTitle(handle.id, { onCommitted: invalidateSessionFileSnapshot });
+      deferWayangAutoTitleAfterInteraction(handle, [completedTurn]);
       return { queued: false, cancellable: false };
     } catch (error) {
       retireInteractiveTurn(handle, turn.token);
