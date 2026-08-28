@@ -22,6 +22,7 @@ Success means:
 - Wayang source: clean commit `ff8b15e498f0df1586ee9b7a593f76ca4cf85ec2`.
 - Wayang Pi dependency: `file:earendil-works-pi-coding-agent-0.84.1-wayang.4f7d03ce.tgz`.
 - Pi artifact SHA-256: `c82956f058b7dc09a2206c8c9f9331f2971042a4fa9597a5ee017f58d5303da9`.
+- Current The-Sceptre `make doctor` passes platform/tool/config checks but reports the installed `better-sqlite3` native binding unavailable under Node 26.4.0 ABI 147. This is local dependency drift, not a target acceptance result; the Tribe-Mac runtime must run a fresh deterministic install for its active Node ABI and pass `make doctor` before activation.
 - Last documented Tribe-Mac Wayang deployment: clean detached runtime at `b4368462c5011f034893d3e03bc46160e0672f14`, launchd label `com.wayang.server.b436846`; the older runtime remains a rollback artifact.
 - Last documented Tribe-Mac Pi deployment: `0.84.1`; the combined `0.84.1-wayang.4f7d03ce` artifact was still pending on 2026-08-28.
 - Last documented Tribe-Mac mypi install: 14 reviewed macOS-compatible extensions, 85 skills, 6 agents, 2 teams, with auth/settings/sessions preserved.
