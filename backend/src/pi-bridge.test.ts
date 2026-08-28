@@ -355,6 +355,10 @@ test("memory review threshold jumps queue one follow-up and reload reconstructs 
   assert.equal(first.queue.length, 1, "a threshold jump queues exactly one continuation");
   assert.deepEqual(first.queue[0]?.options, { deliverAs: "followUp", triggerTurn: true });
   assert.equal(first.queue[0]?.message.customType, MEMORY_REVIEW_REMINDER_MESSAGE);
+  assert.match(first.queue[0]?.message.content, /resume unfinished work autonomously in the same run/);
+  assert.match(first.queue[0]?.message.content, /Do not wait for a human prompt merely because maintenance occurred/);
+  assert.match(first.queue[0]?.message.content, /Stop only when the requested work is complete/);
+  assert.match(first.queue[0]?.message.content, /do not invent extra work to stay active/);
   assert.equal("source_session_id" in first.queue[0]!.message.details, false);
   assert.equal("project_id" in first.queue[0]!.message.details, false);
   assert.equal(branch.some((entry) => entry.customType === MEMORY_REVIEW_REMINDER_QUEUED_ENTRY), true);
@@ -367,6 +371,8 @@ test("memory review threshold jumps queue one follow-up and reload reconstructs 
     "before_agent_start recovery must not trigger a nested queued run");
   assert.equal(recoveredReminder.message.customType, MEMORY_REVIEW_REMINDER_MESSAGE);
   assert.match(recoveredReminder.systemPrompt, /Memory-first traditional compaction/);
+  assert.match(recoveredReminder.systemPrompt, /after any automatic compaction, resume unfinished work autonomously/);
+  assert.match(recoveredReminder.message.content, /resume unfinished work autonomously in the same run/);
   assert.equal(branch.filter((entry) => entry.customType === MEMORY_REVIEW_REMINDER_QUEUED_ENTRY).length, 1,
     "reload recovery does not grow duplicate queue-state entries");
 

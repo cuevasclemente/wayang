@@ -300,6 +300,7 @@ export function buildMemoryFirstGuidance(
     routeGuidance,
     ledgerGuidance,
     "Compaction summaries preserve operational continuity; they do not replace future-value wiki maintenance.",
+    "Memory review and automatic compaction are maintenance boundaries, not reasons to stop. After recording the review outcome, and after any automatic compaction, resume unfinished work autonomously in the same run using retained recent turns and the compaction summary. Do not wait for a human prompt merely because maintenance occurred. Stop only when the requested work is complete, no actionable work remains, or progress genuinely requires human input, authorization, or a safety boundary; do not invent extra work to stay active.",
     executionGuidance(metadata.executionMode, metadata.privacyMode),
   ].join("\n\n");
 }
