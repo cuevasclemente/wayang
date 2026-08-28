@@ -36,6 +36,7 @@ import { FILE_AUDIO_EXPERIMENT_TOOL_NAME, type FileAudioExperimentRuntime } from
 import { classifyReadableStandardArtifact, SESSION_INTEROP_TOOL_NAMES } from "./session-interop.js";
 import {
   isSessionCapabilityEligible,
+  listWorkspaceCapabilityAssociations,
   resolveWorkspaceCapability,
   type WorkspaceCapabilityResolution,
 } from "./workspace-capabilities.js";
@@ -61,6 +62,12 @@ export interface ExactStandardResourcesWitness {
   readonly associationRevision: number;
   /** Omitted for a durable capability association. */
   readonly authoritySource?: "legacy-wren";
+  /**
+   * Legacy witnesses capture an already-present inactive durable row's revision.
+   * Activation may advance exactly once from that captured state while accepted
+   * old-runtime work settles; any later revoke/regrant revision remains stale.
+   */
+  readonly durableAssociationRevision?: number;
 }
 
 function standardResourcesWitnessFromResolution(
@@ -82,7 +89,30 @@ function exactStandardResourcesWitnessEqual(left: ExactStandardResourcesWitness,
     && left.projectId === right.projectId
     && left.agentProfileId === right.agentProfileId
     && left.associationRevision === right.associationRevision
-    && left.authoritySource === right.authoritySource;
+    && left.authoritySource === right.authoritySource
+    && left.durableAssociationRevision === right.durableAssociationRevision;
+}
+
+/**
+ * An accepted legacy-Wren runtime may finish under its captured authority when
+ * the pair's absent or captured-inactive durable witness advances exactly once
+ * to active. Every later source or revision change remains a stale-runtime denial.
+ */
+function capturedStandardResourcesWitnessStillValid(
+  captured: ExactStandardResourcesWitness,
+  current: ExactStandardResourcesWitness,
+): boolean {
+  if (exactStandardResourcesWitnessEqual(captured, current)) return true;
+  const expectedActivatedRevision = captured.durableAssociationRevision === undefined
+    ? 1
+    : captured.durableAssociationRevision + 1;
+  return captured.authoritySource === "legacy-wren"
+    && current.authoritySource === undefined
+    && captured.capabilityId === current.capabilityId
+    && captured.projectId === current.projectId
+    && captured.agentProfileId === current.agentProfileId
+    && Number.isSafeInteger(expectedActivatedRevision)
+    && current.associationRevision === expectedActivatedRevision;
 }
 
 export function resolveCurrentStandardResourcesWitness(options: {
@@ -92,24 +122,32 @@ export function resolveCurrentStandardResourcesWitness(options: {
 }): ExactStandardResourcesWitness | null {
   const row = getSessionById(options.sourceSessionId);
   if (!row || !isSessionCapabilityEligible(row) || row.pending_agent_switch !== null
-    || row.agent_profile_id !== options.agentProfile.id || row.cwd !== options.project.cwd) return null;
-  const associated = standardResourcesWitnessFromResolution(resolveWorkspaceCapability({
+    || row.project_id !== options.project.id || row.agent_profile_id !== options.agentProfile.id
+    || row.cwd !== options.project.cwd) return null;
+  const pair = {
     capability_id: STANDARD_RESOURCES_CAPABILITY_ID,
     project_id: options.project.id,
     agent_profile_id: options.agentProfile.id,
-  }));
+  } as const;
+  const associated = standardResourcesWitnessFromResolution(resolveWorkspaceCapability(pair));
   if (associated) return associated;
-  return isLegacyWrenStandardRuntime({
+  if (!isLegacyWrenStandardRuntime({
     session: row,
     profile: options.agentProfile,
     project: options.project,
-  }) ? Object.freeze({
-      capabilityId: STANDARD_RESOURCES_CAPABILITY_ID,
-      projectId: options.project.id,
-      agentProfileId: options.agentProfile.id,
-      associationRevision: 1,
-      authoritySource: "legacy-wren" as const,
-    }) : null;
+  })) return null;
+  const durableAssociationRevision = listWorkspaceCapabilityAssociations().find((candidate) =>
+    candidate.capability_id === pair.capability_id
+    && candidate.project_id === pair.project_id
+    && candidate.agent_profile_id === pair.agent_profile_id)?.revision;
+  return Object.freeze({
+    capabilityId: STANDARD_RESOURCES_CAPABILITY_ID,
+    projectId: options.project.id,
+    agentProfileId: options.agentProfile.id,
+    associationRevision: 1,
+    authoritySource: "legacy-wren" as const,
+    ...(durableAssociationRevision === undefined ? {} : { durableAssociationRevision }),
+  });
 }
 
 export const RESTRICTED_BUILTIN_TOOLS = ["read", "edit", "write", "grep", "find", "ls", "bash"] as const;
@@ -208,6 +246,12 @@ export function authorizeAgentToolCall(options: {
   const { agentProfile, project } = options;
   const toolName = normalizeToolName(options.toolName);
   const restricted = options.standardResourcesAuthorized !== true;
+  const sourceSession = project.access_policy.privacy_mode === "protected" && options.sourceSessionId
+    ? getSessionById(options.sourceSessionId)
+    : undefined;
+  const protectedScheduled = project.access_policy.privacy_mode === "protected"
+    && sourceSession?.scheduled_job_id !== null && sourceSession?.scheduled_job_id !== undefined
+    && sourceSession?.scheduled_run_id !== null && sourceSession?.scheduled_run_id !== undefined;
 
   if (project.access_policy.privacy_mode === "protected" && isSubagentToolName(toolName)) {
     return { allowed: false, reason: "Subagent tools are unavailable in protected projects" };
@@ -253,6 +297,9 @@ export function authorizeAgentToolCall(options: {
   const memoryCapability = classifyMemoryTool(toolName);
   if (memoryCapability) {
     if (agentProfile.memory_access === "none") return { allowed: false, reason: "Memory tools are disabled for this agent" };
+    if (memoryCapability === "mutation" && protectedScheduled) {
+      return { allowed: false, reason: "Protected scheduled output may be written only inside its project" };
+    }
     if (memoryCapability === "mutation" && agentProfile.memory_access !== "read_write") {
       return { allowed: false, reason: "Memory mutations are disabled for this agent" };
     }
@@ -314,6 +361,9 @@ export function authorizeAgentToolCall(options: {
   if (memoryRoot) {
     if (agentProfile.memory_access === "none") {
       return { allowed: false, reason: "This agent cannot access registered memory roots", canonicalPath };
+    }
+    if (isMutation && protectedScheduled) {
+      return { allowed: false, reason: "Protected scheduled output may be written only inside its project", canonicalPath };
     }
     if (isMutation && agentProfile.memory_access !== "read_write") {
       return { allowed: false, reason: "This agent has read-only memory access", canonicalPath };
@@ -405,17 +455,23 @@ function liveToolDecision(
   if (!row) return { allowed: false, reason: "Wayang session no longer exists" };
   const normalizedToolName = normalizeToolName(toolName);
   const scheduled = row.scheduled_job_id !== null || row.scheduled_run_id !== null;
+  const completeScheduledIdentity = row.scheduled_job_id !== null && row.scheduled_run_id !== null;
   const workspaceControl = normalizedToolName === WAYANG_WORKSPACE_READ_TOOL_NAME || normalizedToolName === WAYANG_WORKSPACE_CHANGE_TOOL_NAME;
   if (workspaceControl && scheduled) {
     return { allowed: false, reason: "Workspace control tools are unavailable for scheduled sessions" };
   }
-  if (normalizedToolName === RESTRICTED_MCP_TOOL_NAME && scheduled && options.restrictedMcpRuntime) {
-    return { allowed: false, reason: "The restricted MCP proxy is unavailable for scheduled sessions" };
+  if (normalizedToolName === RESTRICTED_MCP_TOOL_NAME && scheduled
+    && options.restrictedMcpRuntime && !completeScheduledIdentity) {
+    return { allowed: false, reason: "The restricted MCP proxy requires complete scheduled job/run identity" };
   }
   if (workspaceControl && (typeof row.agent_profile_id !== "string" || !row.agent_profile_id)) {
     return { allowed: false, reason: "Workspace control source profile is missing" };
   }
-  const authorization = authorizeProjectAction({ cwd: row.cwd, actor: "interactive", agentProfileId: row.agent_profile_id });
+  const authorization = authorizeProjectAction({
+    cwd: row.cwd,
+    actor: scheduled ? "scheduled" : "interactive",
+    agentProfileId: row.agent_profile_id,
+  });
   if (!authorization.allowed || !authorization.project || !authorization.agentProfile) {
     return { allowed: false, reason: authorization.reason ?? "Session is no longer authorized" };
   }
@@ -493,7 +549,7 @@ function liveToolDecision(
       project: authorization.project,
       agentProfile: authorization.agentProfile,
     });
-    if (!current || !exactStandardResourcesWitnessEqual(current, expectedStandard)) {
+    if (!current || !capturedStandardResourcesWitnessStillValid(expectedStandard, current)) {
       return { allowed: false, reason: "Standard resource authority was revoked or changed; a fresh runtime is required" };
     }
   }
@@ -731,7 +787,7 @@ export function installAgentToolPolicyGuard(
       project: authorization.project,
       agentProfile: authorization.agentProfile,
     });
-    if (!current || !exactStandardResourcesWitnessEqual(current, standardResourcesWitness)) {
+    if (!current || !capturedStandardResourcesWitnessStillValid(standardResourcesWitness, current)) {
       standardAuthorityRevoked = true;
       return false;
     }

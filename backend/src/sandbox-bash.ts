@@ -129,7 +129,7 @@ export function getBashSandboxAvailability(): BashSandboxAvailability {
 /** Build a fresh, live policy for every execution; no policy state is cached. */
 export function buildBashSandboxPolicy(
   sessionId: string,
-  networkMode: SandboxNetworkMode = "allow_all_proxy",
+  networkMode: SandboxNetworkMode = process.platform === "linux" ? "host" : "allow_all_proxy",
 ): BashSandboxPolicy {
   const session = getSessionById(sessionId);
   if (!session) throw new Error("Wayang session no longer exists");
@@ -234,13 +234,14 @@ export function buildBashSandboxPolicy(
     deniedWriteRoots,
     config: {
       network: {
-        // SRT has no supported unrestricted-domain wildcard. Production's
-        // empty non-strict list delegates each destination to the helper's
-        // explicit allow-all callback. deny_all is retained only for
-        // fail-closed live-upgrade compatibility.
+        // SRT's schema requires a network block at initialization. The helper
+        // removes allowedDomains through SRT's live update API before wrapping
+        // host-mode commands, which preserves the filesystem sandbox without
+        // creating a network namespace or injecting proxy settings. Proxy and
+        // deny modes remain only for live-upgrade and focused regression use.
         allowedDomains: [],
-        deniedDomains: networkMode === "allow_all_proxy" ? [] : ["*"],
-        strictAllowlist: networkMode !== "allow_all_proxy",
+        deniedDomains: networkMode === "deny_all" ? ["*"] : [],
+        strictAllowlist: networkMode === "deny_all",
         allowUnixSockets: [],
         allowAllUnixSockets: legacyWrenStandard,
         allowLocalBinding: false,
@@ -365,9 +366,12 @@ export function createPolicySandboxedBashToolDefinition(
       description: `${tool.description} Exact seeded Wren may read and write ordinary host paths and use visible Unix IPC services. Every registered Protected project and protected control-plane artifact remains masked. Commands run as the Wayang OS user; this is broad same-user authority, not containment.`,
     };
   }
+  const networkDescription = process.platform === "linux"
+    ? "the host TCP/UDP network namespace is retained, including loopback/LAN/VPN access and local listeners"
+    : "outbound TCP destinations use the sandbox HTTP/SOCKS proxies";
   return {
     ...tool,
     label: "bash (Wayang sandboxed)",
-    description: `${tool.description} Wayang runs each command in an independent OS sandbox: writes are limited to the current project and shared host temporary storage, protected/control-plane roots are masked even beneath temporary storage, Unix sockets are blocked, and outbound TCP destinations are allowed through HTTP/SOCKS proxies.`,
+    description: `${tool.description} Wayang runs each command in an independent OS sandbox: writes are limited to the current project and shared host temporary storage, protected/control-plane roots are masked even beneath temporary storage, Unix sockets are blocked, and ${networkDescription}.`,
   };
 }

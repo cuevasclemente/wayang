@@ -6,10 +6,15 @@ import * as path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { close, failNextCommitStoreMutationPersistenceForTests, flush, getStore, init } from "./db.js";
 import { createSession, getSessionById, setProvisionalSessionTitle, updatePiSessionFile } from "./sessions.js";
-import { WAYANG_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE } from "./interactive-turn-provenance.js";
+import {
+  issueBrowserTurnProvenance,
+  WAYANG_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE,
+  type BrowserTurnProvenance,
+} from "./interactive-turn-provenance.js";
 import {
   scheduleWayangAutoTitle,
   scheduleWayangAutoTitleFromActivation,
+  scheduleWayangAutoTitleOnAcceptedTurn,
   scheduleWayangAutoTitleOnInteraction,
   setAutoTitleProviderForTests,
   type TitleProvider,
@@ -76,9 +81,39 @@ function appendExchange(manager: SessionManager, index: number): void {
 }
 
 function persistFile(f: Fixture): void {
+  f.manager.materialize();
   const sessionFile = f.manager.getSessionFile();
   assert.ok(sessionFile);
   updatePiSessionFile(f.rowId, sessionFile);
+}
+
+function acceptedTurn(
+  f: Fixture,
+  rawUserText = "raw first accepted message",
+  clientMessageId = "accepted-title-message",
+  decoratedContent = "decorated accepted message",
+): BrowserTurnProvenance {
+  const row = getSessionById(f.rowId)!;
+  const issued = issueBrowserTurnProvenance({
+    sourceSessionId: row.id,
+    runtimeGeneration: "accepted-title-runtime",
+    agentProfileId: row.agent_profile_id!,
+    projectId: row.project_id!,
+    projectCwd: row.cwd,
+    provider: "synthetic-provider",
+    model: "synthetic-model",
+    acceptedEntryCount: f.manager.getEntries().length,
+  }, decoratedContent, Date.now(), {
+    rawUserText,
+    clientMessageId,
+    sourceMarkerEligible: true,
+  });
+  const piUserEntryId = f.manager.appendMessage({
+    role: "user",
+    content: decoratedContent,
+    timestamp: Date.now(),
+  } as any);
+  return Object.freeze({ ...issued, piUserEntryId });
 }
 
 class FakeProvider implements TitleProvider {
@@ -104,18 +139,13 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-test("Wayang titles exactly after three completed marked exchanges", async () => {
+test("Wayang titles after the first completed marked exchange", async () => {
   const f = fixture();
   try {
-    const fake = new FakeProvider(() => "Three exchange summary");
+    const fake = new FakeProvider(() => "First exchange summary");
     setAutoTitleProviderForTests(fake);
     appendExchange(f.manager, 1);
-    appendExchange(f.manager, 2);
     persistFile(f);
-    assert.equal(scheduleWayangAutoTitle(f.rowId), null);
-    assert.equal(fake.dispatchCalls, 0);
-
-    appendExchange(f.manager, 3);
     const work = scheduleWayangAutoTitle(f.rowId);
     assert.ok(work);
     await work;
@@ -123,9 +153,263 @@ test("Wayang titles exactly after three completed marked exchanges", async () =>
     assert.match(fake.inputs[0]!, /raw 1/);
     assert.doesNotMatch(fake.inputs[0]!, /decorated/);
     const physical = SessionManager.open(f.manager.getSessionFile()!, undefined, f.cwd);
-    assert.equal(physical.getSessionName(), "Three exchange summary");
+    assert.equal(physical.getSessionName(), "First exchange summary");
     assert.equal(physical.getSessionNameState().entryId !== undefined, true);
-    assert.deepEqual([getSessionById(f.rowId)?.title, getSessionById(f.rowId)?.title_source], ["Three exchange summary", "pi"]);
+    assert.deepEqual([getSessionById(f.rowId)?.title, getSessionById(f.rowId)?.title_source], ["First exchange summary", "pi"]);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("Wayang titles from the first accepted browser message before settlement", async () => {
+  const f = fixture();
+  try {
+    const fake = new FakeProvider(() => "Immediate accepted title");
+    setAutoTitleProviderForTests(fake);
+    persistFile(f);
+    const turn = acceptedTurn(f);
+
+    const work = scheduleWayangAutoTitleOnAcceptedTurn(f.rowId, turn, { stillAccepted: () => true });
+    assert.ok(work);
+    await work;
+
+    assert.equal(fake.dispatchCalls, 1);
+    assert.match(fake.inputs[0]!, /raw first accepted message/);
+    assert.doesNotMatch(fake.inputs[0]!, /decorated accepted message/);
+    assert.equal(SessionManager.open(f.manager.getSessionFile()!, undefined, f.cwd).getSessionName(), "Immediate accepted title");
+    assert.deepEqual(
+      [getSessionById(f.rowId)?.title, getSessionById(f.rowId)?.title_source],
+      ["Immediate accepted title", "pi"],
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("accepted-message naming preserves a concurrent human title", async () => {
+  const f = fixture();
+  try {
+    const response = deferred<string>();
+    const dispatched = deferred<void>();
+    setAutoTitleProviderForTests({
+      async prepare() {
+        return {
+          dispatch() {
+            dispatched.resolve();
+            return response.promise;
+          },
+        };
+      },
+    });
+    persistFile(f);
+    const work = scheduleWayangAutoTitleOnAcceptedTurn(f.rowId, acceptedTurn(f), { stillAccepted: () => true })!;
+    await dispatched.promise;
+    SessionManager.open(f.manager.getSessionFile()!, undefined, f.cwd).appendSessionInfo("Human title", { origin: "human" });
+    response.resolve("Automatic title");
+    await work;
+
+    assert.equal(SessionManager.open(f.manager.getSessionFile()!, undefined, f.cwd).getSessionName(), "Human title");
+    assert.notEqual(getSessionById(f.rowId)?.title, "Automatic title");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("accepted-message naming rejects ineligible provenance before provider disclosure", () => {
+  const f = fixture();
+  try {
+    const fake = new FakeProvider(() => "Must not generate");
+    setAutoTitleProviderForTests(fake);
+    persistFile(f);
+    const ineligible = Object.freeze({ ...acceptedTurn(f), sourceMarkerEligible: false });
+    assert.equal(scheduleWayangAutoTitleOnAcceptedTurn(f.rowId, ineligible, { stillAccepted: () => true }), null);
+    assert.equal(fake.prepareCalls, 0);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("accepted-message naming stops before disclosure when admission is cancelled", async () => {
+  const f = fixture();
+  try {
+    const prepared = deferred<{ dispatch(input: string): Promise<string> }>();
+    let dispatchCalls = 0;
+    let accepted = true;
+    setAutoTitleProviderForTests({ prepare: () => prepared.promise });
+    persistFile(f);
+    const work = scheduleWayangAutoTitleOnAcceptedTurn(f.rowId, acceptedTurn(f), {
+      stillAccepted: () => accepted,
+    })!;
+    accepted = false;
+    prepared.resolve({ dispatch: async () => { dispatchCalls++; return "Must not title"; } });
+    await work;
+
+    assert.equal(dispatchCalls, 0);
+    assert.equal(SessionManager.open(f.manager.getSessionFile()!, undefined, f.cwd).getSessionName(), undefined);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("accepted-message naming stops commit when admission is cancelled after disclosure", async () => {
+  const f = fixture();
+  try {
+    const response = deferred<string>();
+    const dispatched = deferred<void>();
+    let accepted = true;
+    setAutoTitleProviderForTests({
+      async prepare() {
+        return {
+          dispatch() {
+            dispatched.resolve();
+            return response.promise;
+          },
+        };
+      },
+    });
+    persistFile(f);
+    const work = scheduleWayangAutoTitleOnAcceptedTurn(f.rowId, acceptedTurn(f), {
+      stillAccepted: () => accepted,
+    })!;
+    await dispatched.promise;
+    accepted = false;
+    response.resolve("Must not commit");
+    await work;
+
+    assert.equal(SessionManager.open(f.manager.getSessionFile()!, undefined, f.cwd).getSessionName(), undefined);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("accepted-message naming reauthorizes privacy immediately before disclosure", async () => {
+  const f = fixture();
+  try {
+    const prepared = deferred<{ dispatch(input: string): Promise<string> }>();
+    let dispatchCalls = 0;
+    setAutoTitleProviderForTests({ prepare: () => prepared.promise });
+    persistFile(f);
+    const work = scheduleWayangAutoTitleOnAcceptedTurn(f.rowId, acceptedTurn(f), {
+      stillAccepted: () => true,
+    })!;
+    const project = getStore().projects.find((candidate) => candidate.cwd === f.cwd)!;
+    project.access_policy.privacy_mode = "protected";
+    project.access_policy.allowed_agent_profile_ids = [project.default_agent_profile_id];
+    flush();
+    prepared.resolve({ dispatch: async () => { dispatchCalls++; return "Must not disclose"; } });
+    await work;
+
+    assert.equal(dispatchCalls, 0);
+    assert.equal(SessionManager.open(f.manager.getSessionFile()!, undefined, f.cwd).getSessionName(), undefined);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("accepted failure retries once on a later interaction using the first message only", async () => {
+  const f = fixture();
+  try {
+    let calls = 0;
+    const fake = new FakeProvider(() => {
+      calls++;
+      if (calls === 1) throw new Error("synthetic first-attempt failure");
+      return "First-message retry title";
+    });
+    setAutoTitleProviderForTests(fake);
+    persistFile(f);
+    const first = acceptedTurn(f, "raw first message", "accepted-first", "decorated first message");
+    await scheduleWayangAutoTitleOnAcceptedTurn(f.rowId, first, { stillAccepted: () => true });
+    assert.equal(fake.dispatchCalls, 1);
+
+    f.manager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "first answer" }],
+      provider: "synthetic",
+      model: "synthetic",
+      stopReason: "stop",
+      timestamp: Date.now(),
+    } as any);
+    f.manager.appendCustomEntry(WAYANG_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE, {
+      user_entry_id: first.piUserEntryId,
+      raw_user_text: first.rawUserText,
+      accepted_at: first.acceptedAt,
+      client_message_id: first.clientMessageId,
+    });
+    assert.equal(
+      scheduleWayangAutoTitleOnInteraction(f.rowId, first.clientMessageId),
+      null,
+      "settlement cannot duplicate the accepted attempt for the same interaction",
+    );
+
+    const second = acceptedTurn(f, "raw second message", "accepted-second", "decorated second message");
+    assert.equal(
+      scheduleWayangAutoTitleOnAcceptedTurn(f.rowId, second, { stillAccepted: () => true }),
+      null,
+      "a later accepted message cannot replace first-message provenance",
+    );
+    await scheduleWayangAutoTitleOnInteraction(f.rowId, second.clientMessageId);
+
+    assert.equal(fake.dispatchCalls, 2);
+    assert.match(fake.inputs[1]!, /raw first message/);
+    assert.doesNotMatch(fake.inputs[1]!, /raw second message/);
+    assert.equal(SessionManager.open(f.manager.getSessionFile()!, undefined, f.cwd).getSessionName(), "First-message retry title");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("historical retry requires the triggering interaction's authoritative marker", async () => {
+  const f = fixture();
+  try {
+    const fake = new FakeProvider(() => "Historical retry title");
+    setAutoTitleProviderForTests(fake);
+    appendExchange(f.manager, 1);
+    persistFile(f);
+    const trigger = acceptedTurn(f, "raw trigger", "historical-trigger", "decorated trigger");
+
+    assert.equal(scheduleWayangAutoTitleOnInteraction(f.rowId, trigger.clientMessageId, {
+      acceptedTurn: trigger,
+      stillAccepted: () => false,
+    }), null);
+    assert.equal(fake.dispatchCalls, 0);
+
+    f.manager.appendCustomEntry(WAYANG_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE, {
+      user_entry_id: trigger.piUserEntryId,
+      raw_user_text: trigger.rawUserText,
+      accepted_at: trigger.acceptedAt,
+      client_message_id: trigger.clientMessageId,
+    });
+    await scheduleWayangAutoTitleOnInteraction(f.rowId, trigger.clientMessageId, {
+      acceptedTurn: trigger,
+      stillAccepted: () => false,
+    });
+    assert.equal(fake.dispatchCalls, 1);
+    assert.match(fake.inputs[0]!, /raw 1/);
+    assert.doesNotMatch(fake.inputs[0]!, /raw trigger/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("historical projection cannot skip an unmarked first physical user", () => {
+  const f = fixture();
+  try {
+    const fake = new FakeProvider(() => "Must not generate");
+    setAutoTitleProviderForTests(fake);
+    f.manager.appendMessage({ role: "user", content: "cancelled first user", timestamp: Date.now() } as any);
+    f.manager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "cancelled" }],
+      provider: "synthetic",
+      model: "synthetic",
+      stopReason: "aborted",
+      timestamp: Date.now(),
+    } as any);
+    appendExchange(f.manager, 2);
+    persistFile(f);
+
+    assert.equal(scheduleWayangAutoTitle(f.rowId), null);
+    assert.equal(fake.prepareCalls, 0);
   } finally {
     f.cleanup();
   }
@@ -290,6 +574,29 @@ test("interaction preserves authored and deliberately cleared physical titles", 
           "a deliberate blank session_info clears stale fallback display and blocks automation",
         );
       }
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test("accepted-message naming preserves authored and deliberately cleared physical titles", () => {
+  for (const physicalName of ["Agent-authored title", ""] as const) {
+    const f = fixture();
+    try {
+      const fake = new FakeProvider(() => "Must not generate");
+      setAutoTitleProviderForTests(fake);
+      persistFile(f);
+      if (!physicalName) setProvisionalSessionTitle(f.rowId, "Old provisional fallback");
+      f.manager.appendSessionInfo(physicalName, { origin: "human" });
+      const turn = acceptedTurn(f, "raw accepted", physicalName ? "accepted-authored" : "accepted-clear");
+
+      assert.equal(scheduleWayangAutoTitleOnAcceptedTurn(f.rowId, turn, { stillAccepted: () => true }), null);
+      assert.equal(fake.dispatchCalls, 0);
+      assert.deepEqual(
+        [getSessionById(f.rowId)?.title, getSessionById(f.rowId)?.title_source],
+        physicalName ? [physicalName, "pi"] : ["", "pi"],
+      );
     } finally {
       f.cleanup();
     }

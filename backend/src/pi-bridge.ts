@@ -10,7 +10,6 @@ import type { AgentSession, AgentSessionEvent, LoadExtensionsResult, ToolDefinit
 import {
   createAgentSession,
   DefaultResourceLoader,
-  discoverAndLoadExtensions,
   getAgentDir,
   ModelRegistry,
   ModelRuntime,
@@ -72,6 +71,7 @@ import {
   REVIEWED_EXTERNAL_MODELS,
   type ReviewedExternalModelEntry,
 } from "./reviewed-provider-extensions.js";
+import { registerReviewedProviders } from "./reviewed-provider-runtime.js";
 import {
   CURATED_TOGETHER_MODELS,
   curateTogetherModelRecords,
@@ -81,7 +81,7 @@ export { curateTogetherModelRecords, isCuratedTogetherModel } from "./together-m
 import { getSudoBridge } from "./sudo-bridge.js";
 import { getCommandGuardIdentityBridge } from "./command-guard-bridge.js";
 import {
-  scheduleWayangAutoTitle,
+  scheduleWayangAutoTitleOnAcceptedTurn,
   scheduleWayangAutoTitleOnInteraction,
   type AutoTitleActivationSnapshot,
 } from "./session-title-service.js";
@@ -178,6 +178,33 @@ interface QueuedBrowserMessageRecord {
   startCorrelated: boolean;
 }
 
+interface DeferredBrowserMessageRecord {
+  queueRecordId: string;
+  clientMessageId?: string;
+  content: string;
+  images?: ImageContent[];
+  queuedDisplay: {
+    content: string;
+    attachmentNames: string[];
+    rawUserText?: string;
+    provisionalTitleText?: string;
+    acceptedAt?: number;
+  };
+  retainedBytes: number;
+  clientVisible: boolean;
+  startCorrelated: boolean;
+}
+
+export interface ManualCompactionMessageQueue {
+  readonly runtimeGeneration: string;
+  compactionLeaseHeld: boolean;
+  records: DeferredBrowserMessageRecord[];
+  dispatching?: DeferredBrowserMessageRecord;
+  retainedBytes: number;
+  draining: boolean;
+  waitForUnlockUnsubscribe?: () => void;
+}
+
 export interface PiSessionHandle {
   id: string; // Same as our DB session ID
   session: AgentSession;
@@ -210,6 +237,8 @@ export interface PiSessionHandle {
   queuedBrowserMessages: Map<string, QueuedBrowserMessageRecord>;
   /** One non-streaming prompt accepted by Pi but not yet echoed as message_start. */
   activeIdleBrowserClientMessageId?: string;
+  /** Bounded FIFO admitted only while this exact runtime owns manual compaction. */
+  manualCompactionMessageQueue?: ManualCompactionMessageQueue;
   /** Latest in-progress Pi message, retained across the pre-persistence message_end gap. */
   liveStreamingMessage?: any;
   /** Successful overflow compaction awaiting a successful SDK continuation. */
@@ -217,6 +246,12 @@ export interface PiSessionHandle {
   /** Lifecycle failure not represented by a final assistant message. */
   pendingSessionError?: string;
   liveStreamingMessageUnsubscribe?: () => void;
+  /** Process-local activation epoch captured before runtime construction. */
+  capabilityActivationGeneration: bigint;
+  /** Accepted top-level work not yet protected solely by SDK queue/ledger state. */
+  acceptedTopLevelWorkCount: number;
+  /** Non-revoking latch: finish captured work, reject new work, then retire idle. */
+  capabilityRefreshPending?: boolean;
   /** Permanent process-local denial latch; only a fresh handle may regain authority. */
   capabilityAuthorityDenied?: boolean;
 }
@@ -299,6 +334,8 @@ interface CommandGuardBridgeController {
 // ---------------------------------------------------------------------------
 
 const MAX_SESSIONS = 50;
+const MAX_MANUAL_COMPACTION_DEFERRED_MESSAGES = 32;
+const MAX_MANUAL_COMPACTION_DEFERRED_BYTES = 32 * 1024 * 1024;
 const SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SESSION_IDLE_CHECK_INTERVAL_MS = 30 * 1000;
 const sessions = new Map<string, PiSessionHandle>();
@@ -311,6 +348,12 @@ const sessionCreations = new Map<string, Promise<PiSessionHandle>>();
 /** Monotonic process-local denial epoch. A creation may publish only while the
  * exact epoch captured before its first await remains current. */
 const sessionCapabilityDenialGenerations = new Map<string, bigint>();
+/** Independent widening epoch. Activation never invokes denial cleanup. */
+const sessionCapabilityActivationGenerations = new Map<string, bigint>();
+/** Refresh retirement is best effort; lazy creation remains the fallback. */
+const capabilityRefreshRetirementScheduled = new WeakSet<object>();
+const capabilityRefreshSettlementRetryCounts = new WeakMap<object, number>();
+const MAX_CAPABILITY_REFRESH_SETTLEMENT_RETRIES = 8;
 /** Strongest browser teardown requested for one exact denial generation. */
 interface SessionBrowserTeardownIntent {
   generation: bigint;
@@ -320,11 +363,15 @@ const sessionBrowserTeardownIntents = new Map<string, SessionBrowserTeardownInte
 const agentSwitches = new Map<string, Promise<AgentSwitchResult>>();
 const runtimeEvents = new EventEmitter();
 onSessionRuntimeMutationLockChanged((sessionId) => {
-  runtimeEvents.emit("event", {
-    type: "runtime_state_changed",
-    sessionId,
-    bashMode: getPiSessionBashMode(sessionId),
-  } satisfies PiSessionRuntimeEvent);
+  try {
+    runtimeEvents.emit("event", {
+      type: "runtime_state_changed",
+      sessionId,
+      bashMode: getPiSessionBashMode(sessionId),
+    } satisfies PiSessionRuntimeEvent);
+  } finally {
+    reschedulePiSessionCapabilityRefreshRetirement(sessionId);
+  }
 });
 const runtimeUnavailableNotifiedHandles = new WeakSet<object>();
 const PROCESS_BOOT_NONCE = randomUUID();
@@ -357,13 +404,7 @@ const piSessionManagerToWebSessionId = new WeakMap<object, string>();
 (globalThis as any).__pi_action_session_files = piSessionFileToWebSessionId;
 
 // Lazy-initialized singletons
-let _modelRuntime: ModelRuntime | null = null;
-let _modelRuntimePromise: Promise<ModelRuntime> | null = null;
-let _modelRegistry: ModelRegistry | null = null;
 let _agentDir: string | null = null;
-let _extensionProviderLoadPromise: Promise<void> | null = null;
-let _extensionProviderLoadError: string | undefined;
-let _extensionProvidersLoaded = false;
 let _modelListingRuntime: ModelRuntime | null = null;
 let _modelListingRegistry: ModelRegistry | null = null;
 let _modelListingRegistryPromise: Promise<{ runtime: ModelRuntime; registry: ModelRegistry; error?: string }> | null = null;
@@ -618,49 +659,52 @@ export function installWayangRawSudoFailClosedGuard(session: AgentSession, sessi
   };
 }
 
-export type ModelContext = { runtime: ModelRuntime; registry: ModelRegistry };
+export type ModelContext = { runtime: ModelRuntime; registry: ModelRegistry; error?: string };
 
 /** @internal Exported for synthetic provider-isolation regression tests. */
-export async function createModelContext(options: { agentDir?: string } = {}): Promise<ModelContext> {
+export async function createModelContext(options: {
+  agentDir?: string;
+  includeReviewedProviders?: boolean;
+  reviewedExternalModels?: readonly ReviewedExternalModelEntry[];
+} = {}): Promise<ModelContext> {
   const agentDir = options.agentDir ?? getAgentDirPath();
   const runtime = await ModelRuntime.create({
     authPath: path.join(agentDir, "auth.json"),
     modelsPath: path.join(agentDir, "models.json"),
     allowModelNetwork: false,
   });
-  return { runtime, registry: new ModelRegistry(runtime) };
+  const context: ModelContext = { runtime, registry: new ModelRegistry(runtime) };
+  if (options.includeReviewedProviders) {
+    const errors = await registerReviewedProviders(
+      context,
+      agentDir,
+      options.reviewedExternalModels ?? REVIEWED_EXTERNAL_MODELS,
+    );
+    context.error = errors.length > 0 ? errors.join("\n") : undefined;
+  }
+  return context;
 }
 
-async function getModelRuntime(): Promise<ModelRuntime> {
-  if (_modelRuntime) return _modelRuntime;
-  _modelRuntimePromise ??= createModelContext().then(({ runtime, registry }) => {
-    _modelRuntime = runtime;
-    _modelRegistry = registry;
-    return runtime;
-  }).finally(() => {
-    _modelRuntimePromise = null;
+/**
+ * Freeze one per-session provider surface after Wayang resolves the selected
+ * model. Resource extensions may still register tools, hooks, commands, and
+ * other session resources, but their provider mutations are deliberately
+ * ignored so project/global resource loading cannot reroute model traffic.
+ */
+export function sealSessionModelProviderRegistry(runtime: ModelRuntime): void {
+  const ignoredProviderMutation = () => undefined;
+  Object.defineProperties(runtime, {
+    registerProvider: { value: ignoredProviderMutation, writable: false, configurable: false },
+    registerNativeProvider: { value: ignoredProviderMutation, writable: false, configurable: false },
+    unregisterProvider: { value: ignoredProviderMutation, writable: false, configurable: false },
   });
-  return _modelRuntimePromise;
 }
 
-async function getModelContext(): Promise<ModelContext> {
-  const runtime = await getModelRuntime();
-  if (!_modelRegistry) throw new Error("Model runtime initialized without a registry");
-  return { runtime, registry: _modelRegistry };
-}
-
-async function getModelRegistry(): Promise<ModelRegistry> {
-  return (await getModelContext()).registry;
-}
-
-/** Refresh model/auth snapshots after an external credential write. */
+/** Refresh the side-effect-free listing/auth snapshot after an external credential write. */
 export function reloadAuthStorage(): void {
-  // Keep the runtime object: extension providers are registered on it and must
-  // survive credential refresh. Refresh is deliberately backgrounded because
-  // the key-mode route historically treats this notification as synchronous;
-  // new requests still resolve auth through the runtime's file-backed store.
-  if (_modelRuntime) void _modelRuntime.refresh({ allowNetwork: false }).catch(() => undefined);
-  if (_modelListingRuntime && _modelListingRuntime !== _modelRuntime) {
+  // Live sessions own fresh model runtimes. New sessions reopen the file-backed
+  // auth store; the cached listing registry is the only shared snapshot here.
+  if (_modelListingRuntime) {
     void _modelListingRuntime.refresh({ allowNetwork: false }).catch(() => undefined);
   }
 }
@@ -693,10 +737,51 @@ function markSessionActivity(id: string): void {
   ensureIdleCleanupTimer();
 }
 
-function assertCapabilityAuthorityAvailable(handle: PiSessionHandle): void {
+function assertCapabilityAuthorityAvailable(handle: Pick<PiSessionHandle, "capabilityAuthorityDenied">): void {
   if (handle.capabilityAuthorityDenied) {
     throw new WorkspaceStoreError("Session runtime authority was denied; reconnect to create a fresh runtime", 409);
   }
+}
+
+export class PiSessionCapabilityRefreshPendingError extends WorkspaceStoreError {
+  readonly code = "capability_refresh_pending" as const;
+
+  constructor() {
+    super("Session runtime capability refresh is pending; retry after current work settles", 409);
+    this.name = "PiSessionCapabilityRefreshPendingError";
+  }
+}
+
+/** Top-level model-producing ingress fence. Completion/control paths must not use it. */
+export function assertPiSessionAcceptsNewWork(
+  handle: Pick<PiSessionHandle, "capabilityAuthorityDenied" | "capabilityRefreshPending">,
+): void {
+  assertCapabilityAuthorityAvailable(handle);
+  if (handle.capabilityRefreshPending) throw new PiSessionCapabilityRefreshPendingError();
+}
+
+export interface PiSessionTopLevelWorkOptions {
+  /** Continue work accepted by an old runtime, such as its interview response. */
+  acceptedContinuation?: boolean;
+}
+
+/** Acquire one top-level-work lease. The returned release is idempotent. */
+export function beginPiSessionTopLevelWork(
+  handle: PiSessionHandle,
+  options: PiSessionTopLevelWorkOptions = {},
+): () => void {
+  // Accepted continuations bypass only the widening refresh fence. Revocation
+  // remains denial-first and blocks them exactly as it blocks every old surface.
+  if (options.acceptedContinuation) assertCapabilityAuthorityAvailable(handle);
+  else assertPiSessionAcceptsNewWork(handle);
+  handle.acceptedTopLevelWorkCount = (handle.acceptedTopLevelWorkCount ?? 0) + 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    handle.acceptedTopLevelWorkCount = Math.max(0, (handle.acceptedTopLevelWorkCount ?? 0) - 1);
+    if (handle.capabilityRefreshPending) schedulePiSessionCapabilityRefreshRetirement(handle);
+  };
 }
 
 function interactiveTurnLedger(handle: PiSessionHandle): Map<string, BrowserTurnProvenance> {
@@ -711,9 +796,12 @@ export function beginInteractiveTurn(
     provisionalTitleText?: string;
     clientMessageId?: string;
     acceptedAt?: number;
+    /** Work synchronously accepted before an activation latch. */
+    acceptedContinuation?: boolean;
   } = {},
 ): BrowserTurnProvenance {
-  assertCapabilityAuthorityAvailable(handle);
+  if (options.acceptedContinuation) assertCapabilityAuthorityAvailable(handle);
+  else assertPiSessionAcceptsNewWork(handle);
   const project = getProjectByCwd(handle.cwd);
   const model = handle.session.model;
   const durable = getSessionById(handle.id);
@@ -836,30 +924,60 @@ function settleInteractiveTurnsQuietly(handle: PiSessionHandle): BrowserTurnProv
   catch { return []; /* source-marker persistence must never change source-turn settlement */ }
 }
 
+function acceptedTitleTurnRemainsValid(handle: PiSessionHandle, turn: BrowserTurnProvenance): boolean {
+  const current = interactiveTurnLedger(handle).get(turn.token);
+  return Boolean(current
+    && current.clientMessageId === turn.clientMessageId
+    && current.piUserEntryId === turn.piUserEntryId
+    && current.contentSha256 === turn.contentSha256
+    && current.rawUserText === turn.rawUserText
+    && current.runtimeGeneration === turn.runtimeGeneration);
+}
+
+function deferWayangAutoTitleAfterPersistedAcceptance(
+  handle: PiSessionHandle,
+  turn: BrowserTurnProvenance,
+): void {
+  setImmediate(() => {
+    try {
+      const ledger = interactiveTurnLedger(handle);
+      if (!ledger.has(turn.token)) return;
+      const persisted = resolveTurnAgainstCurrentBranch(handle, turn);
+      if (!persisted) return;
+      ledger.set(persisted.token, persisted);
+      const stillAccepted = () => acceptedTitleTurnRemainsValid(handle, persisted);
+      const historical = scheduleWayangAutoTitleOnInteraction(handle.id, persisted.clientMessageId, {
+        stillAccepted,
+        acceptedTurn: persisted,
+        onCommitted: invalidateSessionFileSnapshot,
+      });
+      if (!historical) {
+        scheduleWayangAutoTitleOnAcceptedTurn(handle.id, persisted, {
+          stillAccepted,
+          onCommitted: invalidateSessionFileSnapshot,
+        });
+      }
+    } catch {
+      // Title repair/generation never changes source-message acceptance.
+    }
+  });
+}
+
 function deferWayangAutoTitleAfterInteraction(
   handle: PiSessionHandle,
   turns: readonly BrowserTurnProvenance[],
 ): void {
-  const interactionIds = turns.map((turn) => turn.clientMessageId);
+  const settledTurns = [...turns];
   setImmediate(() => {
-    for (const interactionId of interactionIds) {
+    for (const turn of settledTurns) {
       try {
-        scheduleWayangAutoTitleOnInteraction(handle.id, interactionId, {
+        scheduleWayangAutoTitleOnInteraction(handle.id, turn.clientMessageId, {
+          acceptedTurn: turn,
           onCommitted: invalidateSessionFileSnapshot,
         });
       } catch {
         // Title repair/generation never changes source-turn success.
       }
-    }
-  });
-}
-
-function deferWayangAutoTitle(handle: PiSessionHandle): void {
-  setImmediate(() => {
-    try {
-      scheduleWayangAutoTitle(handle.id, { onCommitted: invalidateSessionFileSnapshot });
-    } catch {
-      // Title generation never changes settlement success.
     }
   });
 }
@@ -915,6 +1033,13 @@ export function getRecentBrowserMessageOutcomes(sessionId: string): BrowserMessa
  */
 export function markQueuedBrowserMessageStarted(handle: PiSessionHandle, message: unknown): string | undefined {
   if (!message || typeof message !== "object") return undefined;
+  const deferred = manualCompactionQueueForHandle(handle)?.dispatching;
+  if (deferred && !deferred.startCorrelated && (message as any).role === "user") {
+    deferred.startCorrelated = true;
+    deferred.clientVisible = false;
+    if (deferred.clientMessageId) queuedBrowserClientMessageIds.set(message, deferred.clientMessageId);
+    return deferred.clientMessageId;
+  }
   let clientMessageId = queuedBrowserClientMessageIds.get(message);
   let matchedRecord: QueuedBrowserMessageRecord | undefined;
   if (clientMessageId) {
@@ -987,6 +1112,11 @@ export type NonBrowserTurnSource = "resend" | "interview_submission" | "schedule
 
 /** Non-browser continuations revoke mutation authority without erasing already accepted browser-source evidence. */
 export function beginNonBrowserTurn(handle: PiSessionHandle, _source: NonBrowserTurnSource): void {
+  // This may be an interview/questionnaire continuation belonging to work
+  // accepted before a capability activation. Top-level prompt entry points
+  // fence new work before calling this helper; accepted continuations remain
+  // available so a refresh-pending runtime can settle cleanly.
+  assertCapabilityAuthorityAvailable(handle);
   revokeInteractiveMutationAuthority(handle);
 }
 
@@ -1043,11 +1173,15 @@ export interface RuntimeMutationSessionState {
 
 export function getRuntimeMutationSessionState(id: string): RuntimeMutationSessionState {
   const handle = sessions.get(id);
+  const manualQueue = handle ? manualCompactionQueueForHandle(handle) : undefined;
   return {
     session_id: id,
     runtime_status: handle ? "active" : sessionCreations.has(id) ? "starting" : "stopped",
     streaming: Boolean(handle?.session.isStreaming),
-    queued: Boolean((handle?.session.pendingMessageCount ?? 0) > 0),
+    queued: Boolean(
+      (handle?.session.pendingMessageCount ?? 0) > 0
+      || (manualQueue && (manualQueue.records.length > 0 || manualQueue.dispatching)),
+    ),
     mutation_locked: isSessionRuntimeMutationLocked(id),
   };
 }
@@ -1070,7 +1204,8 @@ export async function stopPiSessionIfIdle(id: string): Promise<boolean> {
   if (sessionCreations.has(id)) return false;
   const handle = sessions.get(id);
   if (!handle) return true;
-  if (handle.session.isStreaming || handle.session.pendingMessageCount > 0) return false;
+  if (handle.session.isStreaming || handle.session.pendingMessageCount > 0
+    || manualCompactionQueueForHandle(handle)) return false;
   await destroyPiSession(id);
   return true;
 }
@@ -1137,7 +1272,7 @@ export function protectedBrowserIdleRetentionIsRequired(
 export async function stopIdlePiSessions(now = Date.now()): Promise<string[]> {
   const stopped: string[] = [];
   for (const [id, handle] of [...sessions]) {
-    if (handle.session.isStreaming) continue;
+    if (handle.session.isStreaming || manualCompactionQueueForHandle(handle)) continue;
     // Protected human handoff intentionally spans chat turns and may take
     // longer than the ordinary idle timeout. Explicit denial, stop, model or
     // agent change, and shutdown paths still revoke it directly.
@@ -1308,50 +1443,6 @@ async function detectDefaultProvider({ runtime, registry }: ModelContext): Promi
 
 function formatLoadErrors(errors: string[]): string | undefined {
   return errors.length > 0 ? errors.join("\n") : undefined;
-}
-
-async function ensureExtensionProvidersLoaded(cwd = process.cwd()): Promise<void> {
-  if (_extensionProvidersLoaded) return;
-  if (!_extensionProviderLoadPromise) {
-    _extensionProviderLoadPromise = (async () => {
-      const { runtime, registry } = await getModelContext();
-      const errors: string[] = [];
-      try {
-        const result = await discoverAndLoadExtensions([], cwd, getAgentDirPath());
-        for (const error of result.errors) {
-          errors.push(`Extension "${error.path}" failed to load: ${error.error}`);
-        }
-        for (const { name, config, extensionPath } of result.runtime.pendingProviderRegistrations) {
-          try {
-            registry.registerProvider(name, config);
-          } catch (error) {
-            errors.push(
-              `Extension "${extensionPath}" failed to register provider "${name}": ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        }
-        result.runtime.pendingProviderRegistrations = [];
-        for (const { provider, extensionPath } of result.runtime.pendingNativeProviderRegistrations) {
-          try {
-            runtime.registerNativeProvider(provider);
-          } catch (error) {
-            errors.push(
-              `Extension "${extensionPath}" failed to register native provider "${provider.id}": ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        }
-        result.runtime.pendingNativeProviderRegistrations = [];
-      } catch (error) {
-        errors.push(`Failed to load extension providers: ${error instanceof Error ? error.message : String(error)}`);
-      } finally {
-        _extensionProviderLoadError = formatLoadErrors(errors);
-        _extensionProvidersLoaded = true;
-      }
-    })().finally(() => {
-      _extensionProviderLoadPromise = null;
-    });
-  }
-  await _extensionProviderLoadPromise;
 }
 
 export function resolveReviewedExternalModels(
@@ -1882,34 +1973,17 @@ export async function listModels(options: {
 }
 
 async function getSessionModelSelectionRegistry(id: string): Promise<ModelRegistry> {
-  const row = getSessionById(id);
-  if (!row) throw new WorkspaceStoreError("Session not found", 404);
-  const profile = row.agent_profile_id ? getAgentProfile(row.agent_profile_id) : undefined;
-  const project = getProjectByCwd(row.cwd);
-  // Provider/model selection may use standard resource providers only when the
-  // durable Project-Agent pair has that association. The selected model is not
-  // an authority input.
-  const standardResourcesWitness = project && profile
-    ? resolveCurrentStandardResourcesWitness({
-        sourceSessionId: row.id,
-        project,
-        agentProfile: profile,
-      })
-    : null;
-  // The read-only model catalog can advertise statically reviewed external
-  // providers without executing them. Selecting one is a deliberate mutation:
-  // after reauthorizing the exact session, load the same provider extensions the
-  // subsequent runtime will use. This also covers legacy Wren Standard access,
-  // whose witness is intentionally equivalent to standard-resources authority.
-  if (standardResourcesWitness) {
-    await ensureExtensionProvidersLoaded(row.cwd);
-    return getModelRegistry();
-  }
-  return (await getModelListingRegistry()).registry;
+  if (!getSessionById(id)) throw new WorkspaceStoreError("Session not found", 404);
+  // Provider/model availability is independent of Project/Profile authority.
+  // Every selection uses the same declarative + reviewed provider bootstrap in
+  // a fresh registry; resource extensions never pre-populate this surface.
+  return (await createModelContext({ includeReviewedProviders: true })).registry;
 }
 
-async function getSessionModelContext(restricted: boolean): Promise<ModelContext> {
-  return restricted ? createModelContext() : getModelContext();
+async function getSessionModelContext(_restricted: boolean): Promise<ModelContext> {
+  // Per-session runtimes prevent one Project's trusted resource extensions from
+  // changing provider routing for a later session in another Project.
+  return createModelContext({ includeReviewedProviders: true });
 }
 
 /** Deny the old runtime synchronously, then wait until every old surface and
@@ -1930,7 +2004,11 @@ async function stopRuntimeForModelChange(
   );
   if (row.provider === targetProvider && row.model === targetModel && liveModelMatches
     && !(forceLiveStop && (sessions.has(id) || sessionCreations.has(id)))) return false;
-  if (handle?.session.isStreaming || (handle?.session.pendingMessageCount ?? 0) > 0) {
+  if (handle && (
+    handle.session.isStreaming
+    || (handle.session.pendingMessageCount ?? 0) > 0
+    || manualCompactionQueueForHandle(handle)
+  )) {
     throw new WorkspaceStoreError("Live model changes require an idle session; stop the session and retry", 409);
   }
   const browserTeardown: PiSessionBrowserTeardown = { kind: "detach", reason: "model_or_agent_switch" };
@@ -1941,7 +2019,11 @@ async function stopRuntimeForModelChange(
 
 function assertModelSwitchIdle(id: string): void {
   const handle = sessions.get(id);
-  if (handle?.session.isStreaming || (handle?.session.pendingMessageCount ?? 0) > 0) {
+  if (handle && (
+    handle.session.isStreaming
+    || (handle.session.pendingMessageCount ?? 0) > 0
+    || manualCompactionQueueForHandle(handle)
+  )) {
     throw new WorkspaceStoreError("Live model changes require an idle session; stop the session and retry", 409);
   }
 }
@@ -2040,6 +2122,7 @@ function resolveAuthorizedRuntimeIdentity(
 ): { row: SessionRow; project: ProjectRow; agentProfile: AgentProfileRow } {
   let row = getSessionById(id);
   if (!row) throw new WorkspaceStoreError("Session not found", 404);
+  if (row.archived) throw new WorkspaceStoreError("Archived sessions are runtime-ineligible", 409);
   if (row.legacy_private_session_quarantine !== false) {
     throw new WorkspaceStoreError("Quarantined legacy sessions are runtime-ineligible", 403);
   }
@@ -2088,16 +2171,9 @@ async function resolveAgentSwitchTarget(sessionRow: SessionRow, targetProfileId:
   if (!profile.enabled) throw new WorkspaceStoreError("Target agent profile is disabled", 409);
   const effective = resolveEffectiveSessionConfig({ project, agentProfile: profile, purpose: "switch" });
 
-  const standard = resolveWorkspaceCapability({
-    capability_id: "wayang.standard-resources.v1",
-    project_id: project.id,
-    agent_profile_id: profile.id,
-  });
-  // Preview never discovers arbitrary extensions. Only a current pair association
-  // may consult an already-loaded global provider registry.
-  const registry = standard.authorized && _extensionProvidersLoaded
-    ? await getModelRegistry()
-    : (await getModelListingRegistry()).registry;
+  // Model choice is not Project/Profile authority. Agent-switch preview uses
+  // the same isolated deployment-global provider registry as runtime startup.
+  const registry = (await createModelContext({ includeReviewedProviders: true })).registry;
   let model: Model<Api> | undefined;
   if (effective.provider && effective.model) {
     model = resolveModelFromRegistry(registry, effective.provider, effective.model);
@@ -2172,7 +2248,6 @@ export function fileAudioExperimentRuntimeIsEligible(input: {
 }
 
 export type PiSessionCreationPrivilegedEffect =
-  | "extension_provider_load"
   | "resource_loader"
   | "restricted_mcp_runtime"
   | "protected_browser_runtime"
@@ -2275,6 +2350,23 @@ function getPiSessionCapabilityDenialGeneration(id: string): bigint {
   return sessionCapabilityDenialGenerations.get(id) ?? 0n;
 }
 
+export function getPiSessionCapabilityActivationGeneration(id: string): bigint {
+  return sessionCapabilityActivationGenerations.get(id) ?? 0n;
+}
+
+export interface PiSessionCreationGeneration {
+  denial: bigint;
+  activation: bigint;
+}
+
+/** Capture before createPiSession's first await. Exported as a synthetic lifecycle seam. */
+export function capturePiSessionCreationGeneration(id: string): PiSessionCreationGeneration {
+  return {
+    denial: getPiSessionCapabilityDenialGeneration(id),
+    activation: getPiSessionCapabilityActivationGeneration(id),
+  };
+}
+
 function currentBrowserTeardownIntent(id: string): PiSessionBrowserTeardown | undefined {
   const intent = sessionBrowserTeardownIntents.get(id);
   return intent?.generation === getPiSessionCapabilityDenialGeneration(id) ? intent.action : undefined;
@@ -2286,9 +2378,12 @@ function clearBrowserTeardownIntent(id: string, generation: bigint): void {
   }
 }
 
-function assertPiSessionCreationGeneration(id: string, captured: bigint): void {
-  if (getPiSessionCapabilityDenialGeneration(id) !== captured) {
+export function assertPiSessionCreationGeneration(id: string, captured: PiSessionCreationGeneration): void {
+  if (getPiSessionCapabilityDenialGeneration(id) !== captured.denial) {
     throw new WorkspaceStoreError("Session runtime creation was revoked; retry to create a fresh runtime", 409);
+  }
+  if (getPiSessionCapabilityActivationGeneration(id) !== captured.activation) {
+    throw new WorkspaceStoreError("Session runtime creation was invalidated by capability activation; retry to create a fresh runtime", 409);
   }
 }
 
@@ -2305,9 +2400,9 @@ async function closeUnpublishedAgentSession(session: AgentSession | undefined): 
 }
 
 export function piSessionHandleRequiresFreshRuntime(
-  handle: Pick<PiSessionHandle, "capabilityAuthorityDenied" | "protectedBrowserRuntime" | "protectedAutomationRuntime" | "fileAudioExperimentRuntime">,
+  handle: Pick<PiSessionHandle, "capabilityAuthorityDenied" | "capabilityRefreshPending" | "protectedBrowserRuntime" | "protectedAutomationRuntime" | "fileAudioExperimentRuntime">,
 ): boolean {
-  if (handle.capabilityAuthorityDenied) return true;
+  if (handle.capabilityAuthorityDenied || handle.capabilityRefreshPending) return true;
   const browser = handle.protectedBrowserRuntime;
   if (browser) {
     const protectedBrowser = (browser as { browser?: { isRevoked?: boolean } }).browser;
@@ -2345,23 +2440,32 @@ export async function createPiSession(
   runtimeOptions: CreatePiSessionRuntimeOptions = {},
 ): Promise<PiSessionHandle> {
   assertRuntimeMutationUnlocked(id);
+  // Capture both narrowing and widening epochs before this function's first
+  // await. Either transition invalidates every later creation checkpoint.
+  const creationGeneration = capturePiSessionCreationGeneration(id);
+  const assertCreationCurrent = () => assertPiSessionCreationGeneration(id, creationGeneration);
   const existing = sessions.get(id);
-  if (existing && !piSessionHandleRequiresFreshRuntime(existing)) {
+  if (existing?.capabilityRefreshPending) {
+    // Preserve current/already-queued work and its exact runtime surfaces.
+    // New work will hit assertPiSessionAcceptsNewWork on this stale handle.
+    if (!piSessionHandleCanRetireCapabilityRefresh(existing)) {
+      markSessionActivity(id);
+      return existing;
+    }
+    await destroyPiSession(id);
+    assertCreationCurrent();
+  } else if (existing && !piSessionHandleRequiresFreshRuntime(existing)) {
     markSessionActivity(id);
     return existing;
+  } else if (existing) {
+    // A denied handle or permanently revoked privileged lease can never be
+    // resumed. The pair-keyed browser profile remains backend-owned.
+    await destroyPiSession(id);
+    assertCreationCurrent();
   }
-  // A denied handle or permanently revoked Protected-browser lease can never
-  // be resumed. A later prompt destroys it before lazily constructing fresh
-  // authority. The pair-keyed browser profile remains backend-owned.
-  if (existing) await destroyPiSession(id);
 
   const pending = sessionCreations.get(id);
   if (pending) return pending;
-
-  // Capture before the creation's first await and before publishing its promise.
-  // A synchronous denial latch can therefore invalidate even a starting-only id.
-  const denialGeneration = getPiSessionCapabilityDenialGeneration(id);
-  const assertCreationCurrent = () => assertPiSessionCreationGeneration(id, denialGeneration);
   const creationStartedAt = performance.now();
   let pendingRestrictedMcpRuntime: RestrictedMcpRuntime | undefined;
   let pendingProtectedBrowserRuntime: CapabilityBoundInteractiveBrowserToolRuntime | undefined;
@@ -2398,7 +2502,14 @@ export async function createPiSession(
     }
     assertCreationCurrent();
     const runtimeIdentity = resolveAuthorizedRuntimeIdentity(id, cwd, runtimeOptions.profileOverride);
-    assertCreationCurrent();
+    const assertRuntimeIdentityCurrent = () => {
+      assertCreationCurrent();
+      const current = getSessionById(id);
+      if (!current || current.archived || current.legacy_private_session_quarantine !== false || current.cwd !== cwd) {
+        throw new WorkspaceStoreError("Session runtime identity changed during construction", 409);
+      }
+    };
+    assertRuntimeIdentityCurrent();
 
     const extensionsStartedAt = performance.now();
     const standardResourcesWitness = resolveCurrentStandardResourcesWitness({
@@ -2409,16 +2520,9 @@ export async function createPiSession(
     assertCreationCurrent();
     if (runtimeOptions.testHooks?.afterStandardResourcesResolution) {
       await runtimeOptions.testHooks.afterStandardResourcesResolution(Boolean(standardResourcesWitness));
-      assertCreationCurrent();
+      assertRuntimeIdentityCurrent();
     }
-    if (standardResourcesWitness) {
-      assertCreationCurrent();
-      runtimeOptions.testHooks?.onPrivilegedEffect?.("extension_provider_load");
-      assertCreationCurrent();
-      await ensureExtensionProvidersLoaded(cwd);
-      assertCreationCurrent();
-    }
-    assertCreationCurrent();
+    assertRuntimeIdentityCurrent();
     runtimeOptions.testHooks?.onPrivilegedEffect?.("resource_loader");
     assertCreationCurrent();
     const runtimeResources = await buildAgentResourceLoader({
@@ -2429,7 +2533,7 @@ export async function createPiSession(
       sourceSessionId: id,
       forceInMemorySettings: runtimeOptions.forceInMemorySettings,
     });
-    assertCreationCurrent();
+    assertRuntimeIdentityCurrent();
     recordLatencyMetric("lazy_extensions_ms", performance.now() - extensionsStartedAt);
 
     const settingsModelStartedAt = performance.now();
@@ -2459,7 +2563,10 @@ export async function createPiSession(
         assertCreationCurrent();
         model = resolveModelFromRegistry(modelRegistry, provider, modelId);
       }
-      if (!model) throw new Error(`Unknown model: ${provider}/${modelId}`);
+      if (!model) {
+        const providerError = modelContext.error ? `\n${modelContext.error}` : "";
+        throw new Error(`Unknown model: ${provider}/${modelId}${providerError}`);
+      }
       if (!modelRegistry.hasConfiguredAuth(model)) throw new Error(`No API key for ${model.provider}/${model.id}`);
     } else if (provider) {
       const preferred = resolveModelFromRegistry(modelRegistry, provider, DEFAULT_MODELS[provider] ?? "");
@@ -2851,6 +2958,11 @@ export async function createPiSession(
     // that case is widened by the exact backend-owned companion names.
     const activeTools = composeRuntimeActiveTools(configuredActiveTools, companionActiveTools);
 
+    // Provider/model routing is deployment-global and was fully resolved above.
+    // Seal this fresh per-session runtime before the SDK binds project/global
+    // resource extensions, preventing them from overwriting reviewed endpoints.
+    sealSessionModelProviderRegistry(modelContext.runtime);
+
     assertCreationCurrent();
     assertPendingBrowserCatalogCurrent();
     runtimeOptions.testHooks?.onPrivilegedEffect?.("agent_session");
@@ -3015,6 +3127,8 @@ export async function createPiSession(
       lastActivityAt: Date.now(),
       agentProfileId: runtimeIdentity.agentProfile.id,
       runtimeGeneration,
+      capabilityActivationGeneration: creationGeneration.activation,
+      acceptedTopLevelWorkCount: 0,
       bashMode,
       ...(trustedHostBashTool ? { trustedHostBashTool } : {}),
       ...(pendingRestrictedMcpRuntime ? { restrictedMcpRuntime: pendingRestrictedMcpRuntime } : {}),
@@ -3039,12 +3153,16 @@ export async function createPiSession(
         const settledBrowserTurns = settleInteractiveTurnsQuietly(handle);
         if (settledBrowserTurns.length > 0) {
           deferWayangAutoTitleAfterInteraction(handle, settledBrowserTurns);
-        } else if (interactiveTurnLedger(handle).size === 0) {
-          deferWayangAutoTitle(handle);
         }
+        schedulePiSessionCapabilityRefreshRetirement(handle);
       }
       if (event.type === "message_start" || event.type === "message_update") {
-        if (event.type === "message_start") markQueuedBrowserMessageStarted(handle, event.message);
+        if (event.type === "message_start") {
+          markQueuedBrowserMessageStarted(handle, event.message);
+          for (const turn of interactiveTurnLedger(handle).values()) {
+            deferWayangAutoTitleAfterPersistedAcceptance(handle, turn);
+          }
+        }
         handle.liveStreamingMessage = event.message;
         return;
       }
@@ -3061,8 +3179,8 @@ export async function createPiSession(
       });
     });
 
-    // No await is permitted between this final fence and publication.
-    assertCreationCurrent();
+    // No await is permitted between this final identity/generation fence and publication.
+    assertRuntimeIdentityCurrent();
     assertPendingBrowserCatalogCurrent();
     runtimeOptions.testHooks?.onPrivilegedEffect?.("handle_publication");
     assertCreationCurrent();
@@ -3149,7 +3267,11 @@ export async function switchSessionAgent(id: string, targetProfileId: string): P
     if (sessionCreations.has(id)) throw new WorkspaceStoreError("Session runtime is still starting", 409);
 
     const currentHandle = sessions.get(id);
-    if (currentHandle?.session.isStreaming || (currentHandle?.session.pendingMessageCount ?? 0) > 0) {
+    if (currentHandle && (
+      currentHandle.session.isStreaming
+      || (currentHandle.session.pendingMessageCount ?? 0) > 0
+      || manualCompactionQueueForHandle(currentHandle)
+    )) {
       throw new WorkspaceStoreError("Agent switching is allowed only while the session is idle", 409);
     }
 
@@ -3650,16 +3772,19 @@ async function collectArgumentSuggestions(command: any): Promise<SlashArgumentSu
   }
 }
 
-/**
- * Return the slash commands that make sense in wayang. Built-ins are limited
- * to commands this backend can faithfully execute; prompts, skills, and
- * extension commands are mirrored from the live AgentSession when available.
- */
-export async function listSlashCommands(id: string): Promise<WebSlashCommand[]> {
-  const handle = sessions.get(id);
-  const commands = new Map<string, WebSlashCommand>();
-  for (const command of WEB_SUPPORTED_BUILTIN_SLASH_COMMANDS) commands.set(command.name, { ...command });
-  if (!handle) return [...commands.values()].sort((a, b) => a.name.localeCompare(b.name));
+function builtinSlashCommands(): Map<string, WebSlashCommand> {
+  return new Map(WEB_SUPPORTED_BUILTIN_SLASH_COMMANDS.map((command) => [command.name, { ...command }]));
+}
+
+/** @internal Exact-handle seam for stale async discovery regressions. */
+export async function listSlashCommandsForHandle(
+  id: string,
+  handle: PiSessionHandle,
+  isCurrent: () => boolean = () => sessions.get(id) === handle
+    && !handle.capabilityAuthorityDenied && !handle.capabilityRefreshPending,
+): Promise<WebSlashCommand[] | null> {
+  const commands = builtinSlashCommands();
+  if (!isCurrent()) return null;
 
   for (const template of handle.session.promptTemplates) {
     if (!template?.name || commands.has(template.name)) continue;
@@ -3675,18 +3800,24 @@ export async function listSlashCommands(id: string): Promise<WebSlashCommand[]> 
   if (extensionRunner && typeof extensionRunner.getRegisteredCommands === "function") {
     const builtinNames = new Set(WEB_SUPPORTED_BUILTIN_SLASH_COMMANDS.map((command) => command.name));
     for (const command of extensionRunner.getRegisteredCommands()) {
+      if (!isCurrent()) return null;
       const name = command.invocationName || command.name;
       if (!name || builtinNames.has(name)) continue;
+      const argumentSuggestions = await collectArgumentSuggestions(command);
+      if (!isCurrent()) return null;
       commands.set(name, {
         name,
         description: command.description || sourceLabel(command.sourceInfo),
         source: "extension",
-        argumentSuggestions: await collectArgumentSuggestions(command),
+        argumentSuggestions,
       });
     }
   }
 
-  for (const skill of handle.session.resourceLoader.getSkills().skills) {
+  if (!isCurrent()) return null;
+  const skills = handle.session.resourceLoader.getSkills().skills;
+  if (!isCurrent()) return null;
+  for (const skill of skills) {
     const name = `skill:${skill.name}`;
     if (commands.has(name)) continue;
     commands.set(name, {
@@ -3696,7 +3827,21 @@ export async function listSlashCommands(id: string): Promise<WebSlashCommand[]> 
     });
   }
 
-  return [...commands.values()].sort((a, b) => a.name.localeCompare(b.name));
+  return isCurrent()
+    ? [...commands.values()].sort((a, b) => a.name.localeCompare(b.name))
+    : null;
+}
+
+/**
+ * Return the slash commands that make sense in wayang. Built-ins are limited
+ * to commands this backend can faithfully execute; prompts, skills, and
+ * extension commands are mirrored only from one still-current live handle.
+ */
+export async function listSlashCommands(id: string): Promise<WebSlashCommand[]> {
+  const handle = sessions.get(id);
+  const builtins = [...builtinSlashCommands().values()].sort((a, b) => a.name.localeCompare(b.name));
+  if (!handle) return builtins;
+  return await listSlashCommandsForHandle(id, handle) ?? builtins;
 }
 
 function getCommandGuardRegistry(): Map<string, CommandGuardBridgeController> | undefined {
@@ -3874,6 +4019,7 @@ function latchPiSessionHandleCapabilityDenial(
   }
   handle.bashMode = "unavailable";
   handle.trustedHostBashTool = undefined;
+  dropManualCompactionMessageQueue(handle);
   retireInteractiveTurn(handle);
 
   const browserToolNames = handle.protectedBrowserRuntime?.tools?.map((tool) => tool.name) ?? [];
@@ -3914,6 +4060,106 @@ export interface PiSessionCapabilityDenialLookup {
   get(runtimeId: string): PiSessionHandle | undefined;
 }
 
+export type PiSessionCapabilityActivationLookup = PiSessionCapabilityDenialLookup;
+
+export function piSessionHandleCanRetireCapabilityRefresh(
+  handle: Pick<PiSessionHandle, "id" | "acceptedTopLevelWorkCount" | "capabilityRefreshPending" | "manualCompactionMessageQueue" | "session" | "interactiveTurns" | "queuedBrowserMessages">,
+): boolean {
+  return Boolean(handle.capabilityRefreshPending)
+    && (handle.acceptedTopLevelWorkCount ?? 0) === 0
+    && !handle.manualCompactionMessageQueue
+    && !isSessionRuntimeMutationLocked(handle.id)
+    && !handle.session.isStreaming
+    && !handle.session.isCompacting
+    && handle.session.pendingMessageCount === 0
+    && handle.interactiveTurns.size === 0
+    && handle.queuedBrowserMessages.size === 0;
+}
+
+function refreshSettlementRetryIsEligible(handle: PiSessionHandle): boolean {
+  return Boolean(handle.capabilityRefreshPending)
+    && (handle.acceptedTopLevelWorkCount ?? 0) === 0
+    && !handle.manualCompactionMessageQueue
+    && !isSessionRuntimeMutationLocked(handle.id)
+    && !handle.session.isStreaming
+    && !handle.session.isCompacting
+    && handle.session.pendingMessageCount === 0
+    && [...interactiveTurnLedger(handle).values()].some((turn) => turn.settlementReady);
+}
+
+/** Synthetic seam plus best-effort production retirement implementation. */
+export async function retirePiSessionCapabilityRefreshIfIdle(
+  handle: PiSessionHandle,
+  options: {
+    lookup?: PiSessionCapabilityActivationLookup;
+    retire?: (runtimeId: string) => Promise<void>;
+  } = {},
+): Promise<boolean> {
+  const lookup = options.lookup ?? sessions;
+  if (lookup.get(handle.id) !== handle) return false;
+  // A transient source-marker append failure leaves its exact ready ledger item
+  // for retry. Retry it before deciding the stale handle cannot retire.
+  if (refreshSettlementRetryIsEligible(handle)) settleInteractiveTurnsQuietly(handle);
+  if (!piSessionHandleCanRetireCapabilityRefresh(handle)) return false;
+  await (options.retire ?? ((runtimeId) => destroyPiSession(runtimeId)))(handle.id);
+  capabilityRefreshSettlementRetryCounts.delete(handle);
+  return true;
+}
+
+function schedulePiSessionCapabilityRefreshRetirement(handle: PiSessionHandle): void {
+  if (capabilityRefreshRetirementScheduled.has(handle)) return;
+  capabilityRefreshRetirementScheduled.add(handle);
+  setImmediate(() => {
+    capabilityRefreshRetirementScheduled.delete(handle);
+    void retirePiSessionCapabilityRefreshIfIdle(handle).then((retired) => {
+      if (retired || !refreshSettlementRetryIsEligible(handle)) {
+        capabilityRefreshSettlementRetryCounts.delete(handle);
+        return;
+      }
+      const attempt = (capabilityRefreshSettlementRetryCounts.get(handle) ?? 0) + 1;
+      if (attempt > MAX_CAPABILITY_REFRESH_SETTLEMENT_RETRIES) return;
+      capabilityRefreshSettlementRetryCounts.set(handle, attempt);
+      const retry = setTimeout(() => schedulePiSessionCapabilityRefreshRetirement(handle), Math.min(250, attempt * 25));
+      retry.unref?.();
+    }).catch((error) => {
+      console.warn(`[pi-bridge] Deferred capability refresh retirement failed for session ${handle.id}:`, error);
+    });
+  });
+}
+
+/** Re-arm best-effort retirement after mutation-lock state changes. */
+export function reschedulePiSessionCapabilityRefreshRetirement(
+  id: string,
+  lookup: PiSessionCapabilityActivationLookup = sessions,
+): boolean {
+  const handle = lookup.get(id);
+  if (!handle?.capabilityRefreshPending) return false;
+  schedulePiSessionCapabilityRefreshRetirement(handle);
+  return true;
+}
+
+/**
+ * Synchronously latch a non-revoking capability activation for exact sessions.
+ * Approval integration must call this immediately before its synchronous store
+ * commit, with no await between latch and commit. A persistence failure may
+ * cause an unnecessary refresh but cannot create authority.
+ */
+export function latchPiSessionCapabilityActivation(
+  runtimeIds: readonly string[],
+  lookup: PiSessionCapabilityActivationLookup = sessions,
+): void {
+  for (const id of new Set(runtimeIds)) {
+    const generation = getPiSessionCapabilityActivationGeneration(id) + 1n;
+    sessionCapabilityActivationGenerations.set(id, generation);
+    const handle = lookup.get(id);
+    if (!handle || handle.capabilityActivationGeneration >= generation) continue;
+    // Do not alter runtimeGeneration, tools, leases, queues, subscriptions,
+    // output, or denial state. The captured old runtime finishes as constructed.
+    handle.capabilityRefreshPending = true;
+    schedulePiSessionCapabilityRefreshRetirement(handle);
+  }
+}
+
 /**
  * Synchronously and permanently deny every privileged surface on affected live
  * handles. The optional lookup is a synthetic-test seam; production uses the
@@ -3937,6 +4183,13 @@ export function latchPiSessionCapabilityDenial(
     } catch { /* the durable denial remains authoritative */ }
   }
   for (const id of new Set(runtimeIds)) {
+    // Cancel every human-input continuation synchronously, including for a
+    // starting runtime with no published handle. A late UI response must not
+    // wake tool work after durable capability denial.
+    getActionApprovalBridge().cancelSession(id, "runtime capability authority revoked");
+    getInterviewBridge().cancelSession(id);
+    getSudoBridge().cancelSession(id);
+    getCommandGuardIdentityBridge().cancelSession(id);
     // Advance first and without awaiting or requiring a published handle. This
     // is the authoritative starting-runtime revocation latch.
     const generation = getPiSessionCapabilityDenialGeneration(id) + 1n;
@@ -3950,7 +4203,6 @@ export function latchPiSessionCapabilityDenial(
     sessionBrowserTeardownIntents.set(id, { generation, action: effectiveTeardown });
     const handle = lookup.get(id);
     if (handle) latchPiSessionHandleCapabilityDenial(handle, effectiveTeardown);
-    else getActionApprovalBridge().cancelSession(id, "runtime capability authority revoked");
   }
 }
 
@@ -3989,6 +4241,9 @@ export async function destroyPiSession(
   // extension hooks. This is deliberately safe even when no live handle exists
   // (for example a stop/archive racing a just-finished session).
   getActionApprovalBridge().cancelSession(id, "session destroyed");
+  getInterviewBridge().cancelSession(id);
+  getSudoBridge().cancelSession(id);
+  getCommandGuardIdentityBridge().cancelSession(id);
   const pendingCreation = sessionCreations.get(id);
   if (pendingCreation) {
     const generation = getPiSessionCapabilityDenialGeneration(id) + 1n;
@@ -4029,26 +4284,26 @@ export async function destroyPiSession(
   } catch {
     // ignore
   }
-  getInterviewBridge().cancelSession(id);
-  getSudoBridge().cancelSession(id);
-  getCommandGuardIdentityBridge().cancelSession(id);
   handle.events.removeAllListeners();
   if (handle.sessionFile) invalidateSessionFileSnapshot(handle.sessionFile);
-  sessions.delete(id);
+  // Concurrent best-effort refresh retirement and lazy creation may both wait
+  // on teardown of this exact old object. Never let a late old destroy delete
+  // a coherently published replacement or its identity mappings.
+  const removedCurrentHandle = sessions.get(id) === handle;
+  if (removedCurrentHandle) sessions.delete(id);
   if (teardownIntentGeneration !== undefined) clearBrowserTeardownIntent(id, teardownIntentGeneration);
   maybeStopIdleCleanupTimer();
-  // Clean up web-session lookup mappings. Exact object ownership is removed
-  // synchronously so a stale tool context cannot fall through to colliding
-  // legacy ID/file maps during teardown.
   piSessionManagerToWebSessionId.delete(handle.session.sessionManager);
-  for (const [cwd, sid] of cwdToSessionId) {
-    if (sid === id) cwdToSessionId.delete(cwd);
-  }
-  for (const [piSessionId, sid] of piSessionToWebSessionId) {
-    if (sid === id) piSessionToWebSessionId.delete(piSessionId);
-  }
-  for (const [sessionFile, sid] of piSessionFileToWebSessionId) {
-    if (sid === id) piSessionFileToWebSessionId.delete(sessionFile);
+  if (removedCurrentHandle) {
+    for (const [cwd, sid] of cwdToSessionId) {
+      if (sid === id) cwdToSessionId.delete(cwd);
+    }
+    for (const [piSessionId, sid] of piSessionToWebSessionId) {
+      if (sid === id) piSessionToWebSessionId.delete(piSessionId);
+    }
+    for (const [sessionFile, sid] of piSessionFileToWebSessionId) {
+      if (sid === id) piSessionFileToWebSessionId.delete(sessionFile);
+    }
   }
 }
 
@@ -4146,36 +4401,298 @@ export async function deliverInterviewSubmission(
   if (existing) return { entryId: existing, alreadyPresent: true };
   assertRuntimeMutationUnlocked(sessionId);
 
-  // Delayed interview delivery is not a fresh browser sendMessage turn and
-  // cannot carry interactive-turn mutation provenance.
-  beginNonBrowserTurn(handle, "interview_submission");
-  const details = {
-    request_id: record.request_id,
-    submission_id: record.submission_id,
-    session_id: record.session_id,
-    origin_tool_name: record.origin_tool_name,
-    origin_tool_call_id: record.origin_tool_call_id ?? null,
-    created_at: record.created_at,
-    submitted_at: record.submitted_at,
-    questions: record.questions,
-    answers: record.answers ?? [],
-  };
-  await handle.session.sendCustomMessage({
-    customType: "wayang-interview-submission",
-    content: interviewSubmissionContent(record),
-    display: true,
-    details,
-  }, { deliverAs: "steer", triggerTurn: true });
+  // The originating old turn already accepted this continuation. It may cross
+  // an activation latch, but never a denial latch, and remains leased until its
+  // exact durable CustomMessageEntry is visible.
+  const releaseTopLevelWork = beginPiSessionTopLevelWork(handle, { acceptedContinuation: true });
+  try {
+    revokeInteractiveMutationAuthority(handle);
+    const details = {
+      request_id: record.request_id,
+      submission_id: record.submission_id,
+      session_id: record.session_id,
+      origin_tool_name: record.origin_tool_name,
+      origin_tool_call_id: record.origin_tool_call_id ?? null,
+      created_at: record.created_at,
+      submitted_at: record.submitted_at,
+      questions: record.questions,
+      answers: record.answers ?? [],
+    };
+    await handle.session.sendCustomMessage({
+      customType: "wayang-interview-submission",
+      content: interviewSubmissionContent(record),
+      display: true,
+      details,
+    }, { deliverAs: "steer", triggerTurn: true });
 
-  // When pi is streaming, sendCustomMessage queues steering work. Wait for the
-  // SDK to persist its CustomMessageEntry before acknowledging delivery.
-  const deadline = performance.now() + 30_000;
-  while (performance.now() < deadline) {
-    const entryId = findInterviewSubmissionEntry(handle, record);
-    if (entryId) return { entryId, alreadyPresent: false };
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // When pi is streaming, sendCustomMessage queues steering work. Wait for the
+    // SDK to persist its CustomMessageEntry before acknowledging delivery.
+    const deadline = performance.now() + 30_000;
+    while (performance.now() < deadline) {
+      const entryId = findInterviewSubmissionEntry(handle, record);
+      if (entryId) return { entryId, alreadyPresent: false };
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error("Interview submission was queued but not persisted before delivery timeout");
+  } finally {
+    releaseTopLevelWork();
   }
-  throw new Error("Interview submission was queued but not persisted before delivery timeout");
+}
+
+function manualCompactionQueueForHandle(handle: PiSessionHandle): ManualCompactionMessageQueue | undefined {
+  const queue = handle.manualCompactionMessageQueue;
+  return queue && queue.runtimeGeneration === handle.runtimeGeneration && !handle.capabilityAuthorityDenied
+    ? queue
+    : undefined;
+}
+
+function dropManualCompactionMessageQueue(handle: PiSessionHandle): void {
+  const queue = handle.manualCompactionMessageQueue;
+  if (!queue) return;
+  queue.waitForUnlockUnsubscribe?.();
+  queue.waitForUnlockUnsubscribe = undefined;
+  queue.records.length = 0;
+  queue.dispatching = undefined;
+  queue.retainedBytes = 0;
+  handle.manualCompactionMessageQueue = undefined;
+}
+
+/** Start only after the caller owns the existing transcript mutation lease. */
+export function beginManualCompactionMessageQueue(handle: PiSessionHandle): void {
+  assertPiSessionAcceptsNewWork(handle);
+  if (handle.manualCompactionMessageQueue) {
+    throw new WorkspaceStoreError("Manual compaction message admission is already active", 409);
+  }
+  handle.manualCompactionMessageQueue = {
+    runtimeGeneration: handle.runtimeGeneration,
+    compactionLeaseHeld: true,
+    records: [],
+    retainedBytes: 0,
+    draining: false,
+  };
+}
+
+export function isManualCompactionMessageQueueActive(id: string): boolean {
+  const handle = sessions.get(id);
+  return Boolean(handle && manualCompactionQueueForHandle(handle));
+}
+
+/** Call synchronously after releasing the exact manual-compaction mutation lease. */
+export function markManualCompactionMutationLeaseReleased(handle: PiSessionHandle): void {
+  const queue = manualCompactionQueueForHandle(handle);
+  if (queue) queue.compactionLeaseHeld = false;
+}
+
+export function manualCompactionCanDeferBrowserMessage(
+  id: string,
+  rawContent: unknown,
+  hasAttachments: boolean,
+): boolean {
+  const handle = sessions.get(id);
+  const queue = handle && manualCompactionQueueForHandle(handle);
+  if (!handle || !queue || handle.capabilityRefreshPending || typeof rawContent !== "string") return false;
+  if (isSessionRuntimeMutationLocked(id) && !queue.compactionLeaseHeld) return false;
+  const trimmed = rawContent.trim();
+  return !trimmed.startsWith("/") && (trimmed.length > 0 || hasAttachments);
+}
+
+export function manualCompactionCanCancelQueuedBrowserMessage(id: string, clientMessageId: unknown): boolean {
+  if (typeof clientMessageId !== "string") return false;
+  const handle = sessions.get(id);
+  const queue = handle && manualCompactionQueueForHandle(handle);
+  if (!handle || !queue || (isSessionRuntimeMutationLocked(id) && !queue.compactionLeaseHeld)) return false;
+  if (queue.dispatching?.clientMessageId === clientMessageId
+    || queue.records.some((record) => record.clientMessageId === clientMessageId)) return true;
+  const captured = handle.queuedBrowserMessages.get(clientMessageId);
+  return Boolean(captured && isQueuedChatMessagePending(captured.capture));
+}
+
+export function manualCompactionCanInterrupt(id: string): boolean {
+  const handle = sessions.get(id);
+  const queue = handle && manualCompactionQueueForHandle(handle);
+  return Boolean(queue && (!isSessionRuntimeMutationLocked(id) || queue.compactionLeaseHeld));
+}
+
+function deferredBrowserMessageBytes(
+  content: string,
+  images: readonly ImageContent[] | undefined,
+  display: DeferredBrowserMessageRecord["queuedDisplay"],
+): number {
+  let bytes = Buffer.byteLength(content, "utf8")
+    + Buffer.byteLength(display.content, "utf8")
+    + Buffer.byteLength(display.rawUserText ?? "", "utf8")
+    + Buffer.byteLength(display.provisionalTitleText ?? "", "utf8");
+  for (const name of display.attachmentNames) bytes += Buffer.byteLength(name, "utf8");
+  for (const image of images ?? []) {
+    bytes += Buffer.byteLength(image.mimeType, "utf8") + Buffer.byteLength(image.data, "utf8");
+  }
+  return bytes;
+}
+
+/** @internal Exact handle seam used by focused FIFO tests. */
+export function deferBrowserMessageDuringManualCompaction(
+  handle: PiSessionHandle,
+  content: string,
+  images?: ImageContent[],
+  clientMessageId?: string,
+  queuedDisplay: {
+    content: string;
+    attachmentNames?: string[];
+    rawUserText?: string;
+    provisionalTitleText?: string;
+    acceptedAt?: number;
+  } = { content },
+): BrowserMessageTurnResult {
+  assertPiSessionAcceptsNewWork(handle);
+  const queue = manualCompactionQueueForHandle(handle);
+  if (!queue || queuedDisplay.content.trim().startsWith("/")) {
+    throw new WorkspaceStoreError("Session transcript mutation is in progress", 409);
+  }
+  const queueRecordId = clientMessageId ?? randomUUID();
+  if (clientMessageId && (
+    queue.records.some((record) => record.clientMessageId === clientMessageId)
+    || queue.dispatching?.clientMessageId === clientMessageId
+    || handle.queuedBrowserMessages.has(clientMessageId)
+    || [...interactiveTurnLedger(handle).values()].some((turn) => turn.clientMessageId === clientMessageId)
+  )) throw new Error("Duplicate browser message ID");
+  const display: DeferredBrowserMessageRecord["queuedDisplay"] = {
+    content: queuedDisplay.content,
+    attachmentNames: [...(queuedDisplay.attachmentNames ?? [])],
+    ...(queuedDisplay.rawUserText !== undefined ? { rawUserText: queuedDisplay.rawUserText } : {}),
+    ...(queuedDisplay.provisionalTitleText !== undefined
+      ? { provisionalTitleText: queuedDisplay.provisionalTitleText }
+      : {}),
+    ...(queuedDisplay.acceptedAt !== undefined ? { acceptedAt: queuedDisplay.acceptedAt } : {}),
+  };
+  const retainedBytes = deferredBrowserMessageBytes(content, images, display);
+  const retainedCount = queue.records.length + (queue.dispatching ? 1 : 0);
+  if (retainedCount >= MAX_MANUAL_COMPACTION_DEFERRED_MESSAGES
+    || retainedBytes > MAX_MANUAL_COMPACTION_DEFERRED_BYTES - queue.retainedBytes) {
+    throw new WorkspaceStoreError("Manual compaction message queue is full", 409);
+  }
+  queue.records.push({
+    queueRecordId,
+    ...(clientMessageId ? { clientMessageId } : {}),
+    content,
+    ...(images && images.length > 0 ? { images: [...images] } : {}),
+    queuedDisplay: display,
+    retainedBytes,
+    clientVisible: Boolean(clientMessageId),
+    startCorrelated: false,
+  });
+  queue.retainedBytes += retainedBytes;
+  markSessionActivity(handle.id);
+  return { queued: true, cancellable: Boolean(clientMessageId) };
+}
+
+function boundedDeferredDispatchError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const safe = raw.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, " ").trim()
+    || "Queued message dispatch failed";
+  if (Buffer.byteLength(safe, "utf8") <= 448) return safe;
+  let bounded = "";
+  for (const character of safe) {
+    if (Buffer.byteLength(`${bounded}${character}…`, "utf8") > 448) break;
+    bounded += character;
+  }
+  return `${bounded}…`;
+}
+
+function manualCompactionRuntimeIsCurrent(handle: PiSessionHandle, queue: ManualCompactionMessageQueue): boolean {
+  return sessions.get(handle.id) === handle
+    && !handle.capabilityAuthorityDenied
+    && handle.runtimeGeneration === queue.runtimeGeneration
+    && handle.manualCompactionMessageQueue === queue;
+}
+
+/** Release the mutation lease before calling this; the phase remains active until its FIFO empties. */
+export async function drainManualCompactionMessageQueue(
+  handle: PiSessionHandle,
+  options: { isRuntimeCurrent?: () => boolean } = {},
+): Promise<void> {
+  const queue = manualCompactionQueueForHandle(handle);
+  if (!queue || queue.draining) return;
+  const isCurrent = options.isRuntimeCurrent ?? (() => manualCompactionRuntimeIsCurrent(handle, queue));
+  if (!isCurrent()) {
+    dropManualCompactionMessageQueue(handle);
+    return;
+  }
+  if (isSessionRuntimeMutationLocked(handle.id)) {
+    if (!queue.waitForUnlockUnsubscribe) {
+      const retry = () => {
+        if (isSessionRuntimeMutationLocked(handle.id)) return;
+        queue.waitForUnlockUnsubscribe?.();
+        queue.waitForUnlockUnsubscribe = undefined;
+        void drainManualCompactionMessageQueue(handle, options).catch(() => undefined);
+      };
+      queue.waitForUnlockUnsubscribe = onSessionRuntimeMutationLockChanged((sessionId) => {
+        if (sessionId === handle.id) retry();
+      });
+      queueMicrotask(retry);
+    }
+    return;
+  }
+
+  queue.draining = true;
+  try {
+    while (queue.records.length > 0) {
+      if (!isCurrent()) {
+        dropManualCompactionMessageQueue(handle);
+        return;
+      }
+      if (isSessionRuntimeMutationLocked(handle.id)) {
+        queue.draining = false;
+        await drainManualCompactionMessageQueue(handle, options);
+        return;
+      }
+      const record = queue.records.shift()!;
+      queue.dispatching = record;
+      try {
+        await sendBrowserMessageTurn(
+          handle,
+          record.content,
+          record.images,
+          record.clientMessageId,
+          record.queuedDisplay,
+          { acceptedContinuation: true },
+        );
+      } catch (error) {
+        const bounded = boundedDeferredDispatchError(error);
+        const errorMessage = `Queued message dispatch failed: ${bounded}`;
+        try { updateSessionError(handle.id, errorMessage); } catch { /* runtime authority below remains decisive */ }
+        if (record.clientMessageId) {
+          try {
+            handle.events.emit("message", {
+              type: "queued_message_ack",
+              client_message_id: record.clientMessageId,
+              status: "rejected",
+              error: errorMessage,
+            } satisfies SerializedMessage);
+          } catch { /* a failing observer cannot reorder or stop the FIFO */ }
+        }
+        try {
+          handle.events.emit("message", {
+            type: "error",
+            code: "queued_message_dispatch_failed",
+            ...(record.clientMessageId ? { client_message_id: record.clientMessageId } : {}),
+            error: errorMessage,
+          } satisfies SerializedMessage);
+        } catch { /* a failing observer cannot reorder or stop the FIFO */ }
+        try { await handle.session.waitForIdle(); } catch { /* authority/current checks below remain decisive */ }
+      } finally {
+        if (queue.dispatching === record) queue.dispatching = undefined;
+        queue.retainedBytes = Math.max(0, queue.retainedBytes - record.retainedBytes);
+      }
+    }
+  } finally {
+    if (handle.manualCompactionMessageQueue === queue) {
+      queue.draining = false;
+      if (queue.records.length === 0 && !queue.dispatching) {
+        dropManualCompactionMessageQueue(handle);
+        if (handle.capabilityRefreshPending) schedulePiSessionCapabilityRefreshRetirement(handle);
+      }
+    }
+  }
 }
 
 export interface BrowserMessageTurnResult {
@@ -4201,66 +4718,75 @@ export async function sendBrowserMessageTurn(
     provisionalTitleText?: string;
     acceptedAt?: number;
   },
+  workOptions: PiSessionTopLevelWorkOptions = {},
 ): Promise<BrowserMessageTurnResult> {
-  assertCapabilityAuthorityAvailable(handle);
-  if (clientMessageId && [...interactiveTurnLedger(handle).values()].some((candidate) => candidate.clientMessageId === clientMessageId)) {
-    throw new Error("Duplicate browser message ID");
-  }
-  const turn = beginInteractiveTurn(handle, content, {
-    rawUserText: queuedDisplay?.rawUserText ?? queuedDisplay?.content ?? content,
-    provisionalTitleText: queuedDisplay?.provisionalTitleText ?? queuedDisplay?.content ?? content,
-    clientMessageId,
-    acceptedAt: queuedDisplay?.acceptedAt,
-  });
-  const isStreaming = handle.session.isStreaming;
-  if (isStreaming) {
-    try {
-      const queueRecordId = clientMessageId ?? turn.clientMessageId;
-      if (handle.queuedBrowserMessages.has(queueRecordId)) {
-        throw new Error("Duplicate queued browser message ID");
-      }
-      const queueBefore = snapshotQueuedChatMessages(handle.session);
-      // In pi 0.84.1 steer() mutates the queue synchronously before returning
-      // its promise. Capture in this same event-loop turn so concurrent browser
-      // messages cannot collapse two registrations into one ambiguous delta.
-      // Provenance capture is required even for legacy clients that omit a
-      // client_message_id; those internal records are never projected to the UI.
-      const steering = handle.session.steer(content, images);
-      const capture = captureQueuedChatMessage(handle.session, queueBefore);
-      if (capture) {
-        if (clientMessageId) queuedBrowserClientMessageIds.set(capture.message, clientMessageId);
-        handle.queuedBrowserMessages.set(queueRecordId, {
-          capture,
-          content: queuedDisplay?.content ?? content,
-          attachmentNames: [...(queuedDisplay?.attachmentNames ?? [])],
-          turnToken: turn.token,
-          clientVisible: Boolean(clientMessageId),
-          startCorrelated: false,
-        });
-      }
-      await steering;
-      const pendingTurn = interactiveTurnLedger(handle).get(turn.token);
-      if (pendingTurn) {
-        interactiveTurnLedger(handle).set(turn.token, Object.freeze({
-          ...pendingTurn,
-          provisionalTitleAccepted: true,
-        }));
-      }
-      return {
-        queued: capture ? isQueuedChatMessagePending(capture) : handle.session.getSteeringMessages().includes(content),
-        cancellable: Boolean(clientMessageId && capture && isQueuedChatMessagePending(capture)),
-      };
-    } catch (error) {
-      retireInteractiveTurn(handle, turn.token);
-      throw error;
+  // Final synchronous browser ingress boundary, after upstream attachment work
+  // and before provenance or steering-queue capture. Manual-compaction records
+  // accepted before activation use the continuation mode only while draining.
+  const releaseTopLevelWork = beginPiSessionTopLevelWork(handle, workOptions);
+  try {
+    if (clientMessageId && [...interactiveTurnLedger(handle).values()].some((candidate) => candidate.clientMessageId === clientMessageId)) {
+      throw new Error("Duplicate browser message ID");
     }
-  } else {
+    const turn = beginInteractiveTurn(handle, content, {
+      rawUserText: queuedDisplay?.rawUserText ?? queuedDisplay?.content ?? content,
+      provisionalTitleText: queuedDisplay?.provisionalTitleText ?? queuedDisplay?.content ?? content,
+      clientMessageId,
+      acceptedAt: queuedDisplay?.acceptedAt,
+      acceptedContinuation: workOptions.acceptedContinuation,
+    });
+    const isStreaming = handle.session.isStreaming;
+    if (isStreaming) {
+      try {
+        const queueRecordId = clientMessageId ?? turn.clientMessageId;
+        if (handle.queuedBrowserMessages.has(queueRecordId)) {
+          throw new Error("Duplicate queued browser message ID");
+        }
+        const queueBefore = snapshotQueuedChatMessages(handle.session);
+        // Pi mutates the steering queue synchronously. Once captured, SDK queue
+        // state plus the provenance ledger protect this accepted old work.
+        const steering = handle.session.steer(content, images);
+        const capture = captureQueuedChatMessage(handle.session, queueBefore);
+        deferWayangAutoTitleAfterPersistedAcceptance(handle, turn);
+        if (capture) {
+          if (clientMessageId) queuedBrowserClientMessageIds.set(capture.message, clientMessageId);
+          handle.queuedBrowserMessages.set(queueRecordId, {
+            capture,
+            content: queuedDisplay?.content ?? content,
+            attachmentNames: [...(queuedDisplay?.attachmentNames ?? [])],
+            turnToken: turn.token,
+            clientVisible: Boolean(clientMessageId),
+            startCorrelated: false,
+          });
+        }
+        releaseTopLevelWork();
+        await steering;
+        const pendingTurn = interactiveTurnLedger(handle).get(turn.token);
+        if (pendingTurn) {
+          interactiveTurnLedger(handle).set(turn.token, Object.freeze({
+            ...pendingTurn,
+            provisionalTitleAccepted: true,
+          }));
+        }
+        return {
+          queued: capture ? isQueuedChatMessagePending(capture) : handle.session.getSteeringMessages().includes(content),
+          cancellable: Boolean(clientMessageId && capture && isQueuedChatMessagePending(capture)),
+        };
+      } catch (error) {
+        retireInteractiveTurn(handle, turn.token);
+        throw error;
+      }
+    }
+
     try {
       if (clientMessageId) handle.activeIdleBrowserClientMessageId = clientMessageId;
-      await handle.session.prompt(content, {
+      // The lease spans the complete idle prompt and result/title settlement.
+      const prompting = handle.session.prompt(content, {
         expandPromptTemplates: true,
         images,
       });
+      deferWayangAutoTitleAfterPersistedAcceptance(handle, turn);
+      await prompting;
       const completedTurn = Object.freeze({
         ...turn,
         provisionalTitleAccepted: true,
@@ -4268,10 +4794,12 @@ export async function sendBrowserMessageTurn(
       });
       interactiveTurnLedger(handle).set(turn.token, completedTurn);
       persistAcceptedProvisionalTitle(handle, completedTurn);
-      settleInteractiveTurnsQuietly(handle);
+      const settledBrowserTurns = settleInteractiveTurnsQuietly(handle);
       // agent_settled fires before prompt() resolves, so idle browser sends do
       // not have their source marker yet in the lifecycle listener above.
-      deferWayangAutoTitleAfterInteraction(handle, [completedTurn]);
+      if (settledBrowserTurns.length > 0) {
+        deferWayangAutoTitleAfterInteraction(handle, settledBrowserTurns);
+      }
       return { queued: false, cancellable: false };
     } catch (error) {
       retireInteractiveTurn(handle, turn.token);
@@ -4281,6 +4809,8 @@ export async function sendBrowserMessageTurn(
         handle.activeIdleBrowserClientMessageId = undefined;
       }
     }
+  } finally {
+    releaseTopLevelWork();
   }
 }
 
@@ -4297,17 +4827,29 @@ export async function sendMessage(
     acceptedAt?: number;
   },
 ): Promise<BrowserMessageTurnResult> {
-  assertRuntimeMutationUnlocked(id);
   const handle = sessions.get(id);
   if (!handle) throw new Error(`Session ${id} not found`);
-  assertCapabilityAuthorityAvailable(handle);
+  assertPiSessionAcceptsNewWork(handle);
+  const manualQueue = manualCompactionQueueForHandle(handle);
+  if (manualQueue) {
+    if (isSessionRuntimeMutationLocked(id) && !manualQueue.compactionLeaseHeld) {
+      assertRuntimeMutationUnlocked(id);
+    }
+    return deferBrowserMessageDuringManualCompaction(
+      handle,
+      content,
+      images,
+      clientMessageId,
+      queuedDisplay ?? { content },
+    );
+  }
+  assertRuntimeMutationUnlocked(id);
   markSessionActivity(id);
   return sendBrowserMessageTurn(handle, content, images, clientMessageId, queuedDisplay);
 }
 
-export function getQueuedBrowserMessages(id: string): QueuedBrowserMessageProjection[] {
-  const handle = sessions.get(id);
-  if (!handle) return [];
+/** @internal Shared projection seam for live reconnect and focused queue tests. */
+export function projectQueuedBrowserMessages(handle: PiSessionHandle): QueuedBrowserMessageProjection[] {
   const messages: QueuedBrowserMessageProjection[] = [];
   for (const [clientMessageId, record] of handle.queuedBrowserMessages) {
     const state = queuedChatMessageState(record.capture);
@@ -4323,14 +4865,44 @@ export function getQueuedBrowserMessages(id: string): QueuedBrowserMessageProjec
       });
     }
   }
+  const deferred = manualCompactionQueueForHandle(handle);
+  const deferredRecords = deferred
+    ? [...(deferred.dispatching?.clientVisible ? [deferred.dispatching] : []), ...deferred.records]
+    : [];
+  for (const record of deferredRecords) {
+    if (!record.clientVisible || !record.clientMessageId) continue;
+    messages.push({
+      client_message_id: record.clientMessageId,
+      content: record.queuedDisplay.content,
+      attachment_names: [...record.queuedDisplay.attachmentNames],
+    });
+  }
   return messages;
 }
 
-export function cancelQueuedBrowserMessage(id: string, clientMessageId: string): boolean {
-  assertRuntimeMutationUnlocked(id);
+export function getQueuedBrowserMessages(id: string): QueuedBrowserMessageProjection[] {
   const handle = sessions.get(id);
-  if (!handle) throw new Error(`Session ${id} not found`);
+  return handle ? projectQueuedBrowserMessages(handle) : [];
+}
+
+/** @internal Exact handle seam used by focused deferred-cancellation tests. */
+export function cancelQueuedBrowserMessageForHandle(handle: PiSessionHandle, clientMessageId: string): boolean {
   assertCapabilityAuthorityAvailable(handle);
+  const id = handle.id;
+  const deferred = manualCompactionQueueForHandle(handle);
+  if (deferred && isSessionRuntimeMutationLocked(id) && !deferred.compactionLeaseHeld) {
+    assertRuntimeMutationUnlocked(id);
+  }
+  if (deferred?.dispatching?.clientMessageId === clientMessageId) return false;
+  const deferredIndex = deferred?.records.findIndex((record) => record.clientMessageId === clientMessageId) ?? -1;
+  if (deferred && deferredIndex >= 0) {
+    const [cancelled] = deferred.records.splice(deferredIndex, 1);
+    if (!cancelled) return false;
+    deferred.retainedBytes = Math.max(0, deferred.retainedBytes - cancelled.retainedBytes);
+    markSessionActivity(id);
+    return true;
+  }
+  if (!deferred) assertRuntimeMutationUnlocked(id);
   const record = handle.queuedBrowserMessages.get(clientMessageId);
   if (!record) return false;
   const cancelled = cancelCapturedQueuedChatMessage(record.capture);
@@ -4338,6 +4910,7 @@ export function cancelQueuedBrowserMessage(id: string, clientMessageId: string):
     handle.queuedBrowserMessages.delete(clientMessageId);
     retireInteractiveTurn(handle, record.turnToken);
     markSessionActivity(id);
+    schedulePiSessionCapabilityRefreshRetirement(handle);
     return true;
   }
   const state = queuedChatMessageState(record.capture);
@@ -4348,6 +4921,12 @@ export function cancelQueuedBrowserMessage(id: string, clientMessageId: string):
     return false;
   }
   throw new Error("The pi queued-message layout changed; cancellation was refused without changing the queue");
+}
+
+export function cancelQueuedBrowserMessage(id: string, clientMessageId: string): boolean {
+  const handle = sessions.get(id);
+  if (!handle) throw new Error(`Session ${id} not found`);
+  return cancelQueuedBrowserMessageForHandle(handle, clientMessageId);
 }
 
 function extractReplayPayloadFromUserContent(content: unknown): { text: string; images: ImageContent[] } {
@@ -4379,37 +4958,44 @@ export async function resendMessage(id: string, messageId: string, includeHistor
   assertRuntimeMutationUnlocked(id);
   const handle = sessions.get(id);
   if (!handle) throw new Error(`Session ${id} not found`);
-  assertCapabilityAuthorityAvailable(handle);
-  if (handle.session.isStreaming) throw new Error("Cannot resend while the agent is running");
+  const releaseTopLevelWork = beginPiSessionTopLevelWork(handle);
+  let releaseOwnedByTurn = false;
+  try {
+    if (handle.session.isStreaming) throw new Error("Cannot resend while the agent is running");
 
-  const entry = handle.session.sessionManager.getEntry(messageId);
-  if (!entry || entry.type !== "message" || entry.message?.role !== "user") {
-    throw new Error("Can only resend a user message from the current session history");
-  }
+    const entry = handle.session.sessionManager.getEntry(messageId);
+    if (!entry || entry.type !== "message" || entry.message?.role !== "user") {
+      throw new Error("Can only resend a user message from the current session history");
+    }
 
-  const { text, images } = extractReplayPayloadFromUserContent(entry.message.content);
-  if (!text.trim() && images.length === 0) {
-    throw new Error("Selected user message has no replayable text or images");
-  }
+    const { text, images } = extractReplayPayloadFromUserContent(entry.message.content);
+    if (!text.trim() && images.length === 0) {
+      throw new Error("Selected user message has no replayable text or images");
+    }
 
-  markSessionActivity(id);
-  const navigation = await handle.session.navigateTree(messageId, { summarize: false });
-  if (navigation.cancelled) throw new Error("Resend was cancelled");
-
-  // Resend replays a persisted entry and is not fresh browser-originated
-  // provenance. It must never inherit or mint interactive-turn mutation authority.
-  beginNonBrowserTurn(handle, "resend");
-  const turn = handle.session.prompt(text, {
-    expandPromptTemplates: true,
-    images: images.length > 0 ? images : undefined,
-  }).then(() => {
     markSessionActivity(id);
-  });
+    const navigation = await handle.session.navigateTree(messageId, { summarize: false });
+    if (navigation.cancelled) throw new Error("Resend was cancelled");
 
-  return {
-    messages: includeHistory ? getMessageHistory(id) : [],
-    turn,
-  };
+    // This resend was accepted before navigation. Activation may latch during
+    // that await, but denial still blocks its final dispatch.
+    assertCapabilityAuthorityAvailable(handle);
+    revokeInteractiveMutationAuthority(handle);
+    const turn = handle.session.prompt(text, {
+      expandPromptTemplates: true,
+      images: images.length > 0 ? images : undefined,
+    }).then(() => {
+      markSessionActivity(id);
+    }).finally(releaseTopLevelWork);
+    releaseOwnedByTurn = true;
+
+    return {
+      messages: includeHistory ? getMessageHistory(id) : [],
+      turn,
+    };
+  } finally {
+    if (!releaseOwnedByTurn) releaseTopLevelWork();
+  }
 }
 
 export interface RunPromptResult {
@@ -4551,7 +5137,7 @@ export async function runMessagingPromptAndWait(
   }
   const handle = sessions.get(id);
   if (!handle) throw new Error(`Session ${id} not found`);
-  assertCapabilityAuthorityAvailable(handle);
+  assertPiSessionAcceptsNewWork(handle);
   if (handle.session.isStreaming || handle.session.pendingMessageCount > 0) {
     throw new WorkspaceStoreError("Wayang session is busy", 409);
   }
@@ -4560,6 +5146,13 @@ export async function runMessagingPromptAndWait(
     throw new WorkspaceStoreError("Wayang session has an interactive approval client; continue in Wayang or close it first", 409);
   }
   if (!lockRuntimeMutationSession(id)) throw new WorkspaceStoreError("Wayang session is already reserved", 409);
+  let releaseTopLevelWork: (() => void) | null = null;
+  try {
+    releaseTopLevelWork = beginPiSessionTopLevelWork(handle);
+  } catch (error) {
+    unlockRuntimeMutationSession(id);
+    throw error;
+  }
   let releaseHeadlessLease: (() => void) | null = null;
   let priorToolNames: string[] | null = null;
 
@@ -4582,7 +5175,7 @@ export async function runMessagingPromptAndWait(
     handle.session.setActiveToolsByName([]);
     const firstNewMessageIndex = handle.session.messages.length;
     markSessionActivity(id);
-    beginNonBrowserTurn(handle, "messaging_prompt");
+    revokeInteractiveMutationAuthority(handle);
     const completion = (async () => {
       await handle.session.sendCustomMessage({
         customType: "wayang-messaging-input",
@@ -4631,6 +5224,7 @@ export async function runMessagingPromptAndWait(
     } finally {
       releaseHeadlessLease?.();
       unlockRuntimeMutationSession(id);
+      releaseTopLevelWork?.();
     }
   }
 }
@@ -4643,20 +5237,24 @@ export async function runPromptAndWait(
   assertRuntimeMutationUnlocked(id);
   const handle = sessions.get(id);
   if (!handle) throw new Error(`Session ${id} not found`);
-  assertCapabilityAuthorityAvailable(handle);
-  markSessionActivity(id);
-  beginNonBrowserTurn(handle, "scheduled_prompt");
+  const releaseTopLevelWork = beginPiSessionTopLevelWork(handle);
+  try {
+    markSessionActivity(id);
+    revokeInteractiveMutationAuthority(handle);
 
-  await waitForScheduledPrompt(handle.session, content, options);
+    await waitForScheduledPrompt(handle.session, content, options);
 
-  const outcome = classifyScheduledPromptResult(handle.session.messages);
-  if (outcome.error) throw new Error(outcome.error);
+    const outcome = classifyScheduledPromptResult(handle.session.messages);
+    if (outcome.error) throw new Error(outcome.error);
 
-  return {
-    resultSummary: outcome.resultSummary,
-    finalAssistantText: extractLastAssistantText(handle.session.messages),
-    messages: getMessageHistory(id),
-  };
+    return {
+      resultSummary: outcome.resultSummary,
+      finalAssistantText: extractLastAssistantText(handle.session.messages),
+      messages: getMessageHistory(id),
+    };
+  } finally {
+    releaseTopLevelWork();
+  }
 }
 
 export async function abortInteractiveTurn(
@@ -4667,8 +5265,10 @@ export async function abortInteractiveTurn(
   const clearedQueue = options.clearQueue
     ? handle.session.clearQueue()
     : { steering: [], followUp: [] };
+  if (options.clearQueue) dropManualCompactionMessageQueue(handle);
   if (handle.session.isCompacting) handle.session.abortCompaction();
   await handle.session.abort();
+  schedulePiSessionCapabilityRefreshRetirement(handle);
   return clearedQueue;
 }
 
@@ -4766,9 +5366,14 @@ export function subscribeToSession(
       onMessage(serialized);
     }
   });
+  const onRuntimeMessage = (message: SerializedMessage) => {
+    if (!handle.capabilityAuthorityDenied) onMessage(message);
+  };
+  handle.events.on("message", onRuntimeMessage);
 
   return () => {
     handle.subscriberCount = Math.max(0, handle.subscriberCount - 1);
+    handle.events.off("message", onRuntimeMessage);
     unsub();
   };
 }

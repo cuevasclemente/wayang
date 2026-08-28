@@ -16,6 +16,7 @@ import {
 import { createOpenInterview, getInterviewForSession } from "./interviews.js";
 import { recoverSearchAfterFailedSessionDelete } from "./routes/sessions.js";
 import { createAgentProfile } from "./agent-profiles.js";
+import { createProject } from "./projects.js";
 import type { MessagingEndpointDeclaration } from "./messaging/contracts.js";
 import {
   activateMessagingSession,
@@ -63,6 +64,37 @@ test("session catalog background synchronization pause is explicit and fail-safe
   assert.equal(isSessionCatalogBackgroundSyncEnabled("0"), false);
   assert.throws(() => isSessionCatalogBackgroundSyncEnabled("true"), /must be 0 or 1/);
   assert.throws(() => isSessionCatalogBackgroundSyncEnabled("off"), /must be 0 or 1/);
+});
+
+test("legacy whole-transcript scanning refuses before listAll when any Protected project exists", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-legacy-protected-denial-"));
+  const cwd = path.join(dir, "protected");
+  fs.mkdirSync(cwd);
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  const originalListAll = SessionManager.listAll;
+  let listAllCalled = false;
+  process.env.WAYANG_DATA_DIR = path.join(dir, "data");
+  try {
+    init();
+    const profile = createAgentProfile({ name: "Legacy scan protected profile" });
+    createProject({
+      cwd,
+      default_agent_profile_id: profile.id,
+      access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [profile.id] },
+    });
+    SessionManager.listAll = async () => {
+      listAllCalled = true;
+      return [];
+    };
+    await assert.rejects(() => syncPiSessionFiles(), /unavailable while Protected projects are registered/);
+    assert.equal(listAllCalled, false, "Protected denial must precede whole-transcript SDK parsing");
+  } finally {
+    SessionManager.listAll = originalListAll;
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("every supported pre-title-provenance schema classifies blank titles as provisional", () => {

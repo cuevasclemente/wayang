@@ -16,6 +16,7 @@ import {
 } from "../session-runtime-mutation-lock.js";
 import { validateSessionDeletionPinAttempt } from "../transcript-mutations.js";
 import { invalidateTranscriptPaginationSession } from "../transcript-pagination/service.js";
+import { classifySessionPrivacy } from "../session-interop.js";
 
 export const router = Router();
 
@@ -29,13 +30,17 @@ type SessionResponse = ProtocolSession & SessionRow & ReturnType<typeof getPiSes
 
 /** @internal Exported for focused response-projection tests. */
 export function serializeSession(session: SessionRow): SessionResponse {
+  const error = classifySessionPrivacy(session) === "protected" && session.error
+    ? "Protected session error; open the Protected session for details"
+    : session.error;
   return {
     ...session,
+    error,
     ...getPiSessionRuntimeState(session.id),
     bash_mode: getPiSessionBashMode(session.id),
     browser_mode: getPiSessionBrowserMode(session.id, session),
     browser_agent: getPiSessionBrowserAgentDiagnostic(session.id, session),
-    error_kind: classifyAssistantErrorKind(session.error),
+    error_kind: classifyAssistantErrorKind(error),
     humanAttention: listHumanAttentionForSession(session.id),
   };
 }

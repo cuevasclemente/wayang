@@ -180,6 +180,23 @@ test("protected automation activation uses the reviewed preview and PIN reservat
   assert.equal(reservations, 1);
 });
 
+test("runtime display saturation has a distinct response and consumes no PIN reservation", async () => {
+  let reservations = 0;
+  const service = new WorkspaceCapabilityApprovalService({
+    workspace: {
+      ...workspacePort([]),
+      async previewActivation() { return { status: "runtime_limit", limit: 64 }; },
+    },
+    pinAttempts: {
+      async reserve() { reservations += 1; return { status: "reserved" as const }; },
+      async verifyAndConsume() { return { status: "verified" as const }; },
+      async cancelAndConsume() {},
+    },
+  });
+  await assert.rejects(service.requestActivation(OWNER, INTENT), code("runtime_limit"));
+  assert.equal(reservations, 0);
+});
+
 test("history saturation rejects before consuming a PIN reservation", async () => {
   let reservations = 0;
   const service = new WorkspaceCapabilityApprovalService({

@@ -3,15 +3,19 @@ import type { Config } from "./config.js";
 import type { AuthService } from "./auth/service.js";
 import {
   cleanupPiSessionCapabilityDenial,
+  latchPiSessionCapabilityActivation,
   latchPiSessionCapabilityDenial,
 } from "./pi-bridge.js";
 import type { WorkspaceCapabilitiesRouterOptions } from "./routes/workspace-capabilities.js";
-import type { CapabilityAssociationRecord } from "./workspace-capability-approval/types.js";
+import type {
+  CapabilityActivationIntent,
+  CapabilityAssociationRecord,
+} from "./workspace-capability-approval/types.js";
 import {
   createWorkspaceCapabilityApprovalIntegration,
   provisionPinAttemptStateForService,
   type HardenedSettingsPinAttemptAdapter,
-  type WorkspaceCapabilityRuntimeDenialPort,
+  type WorkspaceCapabilityRuntimeLifecyclePort,
 } from "./workspace-capability-integration.js";
 import { workspaceSettingsService } from "./workspace-settings-service.js";
 
@@ -24,9 +28,13 @@ export interface ProductionWorkspaceCapabilityBootstrap {
   close(): Promise<void>;
 }
 
-class ProductionCapabilityRuntimeDenial implements WorkspaceCapabilityRuntimeDenialPort {
+class ProductionCapabilityRuntimeLifecycle implements WorkspaceCapabilityRuntimeLifecyclePort {
   private readonly affectedRuntimeIds = new Set<string>();
   private readonly cleanupTasks = new Set<Promise<void>>();
+
+  latchActivation(input: { intent: CapabilityActivationIntent; runtimeIds: readonly string[] }): void {
+    latchPiSessionCapabilityActivation(input.runtimeIds);
+  }
 
   latchDenied(input: { association: CapabilityAssociationRecord; runtimeIds: readonly string[] }): void {
     for (const id of input.runtimeIds) this.affectedRuntimeIds.add(id);
@@ -84,9 +92,9 @@ export function createProductionWorkspaceCapabilityBootstrap(
   if (provisioned.status === "unavailable") {
     console.warn(`[workspace-capabilities] PIN approval remains unavailable (${provisioned.reason}); run make doctor and optionally make setup-capability-approval`);
   }
-  const denial = new ProductionCapabilityRuntimeDenial();
+  const lifecycle = new ProductionCapabilityRuntimeLifecycle();
   const { integration, service, pinAttempts } = createWorkspaceCapabilityApprovalIntegration({
-    denial,
+    lifecycle,
     pinAttemptStatePath,
     // A failed initialization stays unavailable for this process even if a
     // partial publication happens to look valid afterward. Restart performs a
@@ -105,6 +113,6 @@ export function createProductionWorkspaceCapabilityBootstrap(
       owners: { resolve: (request) => auth.resolveSettingsOwner(request) },
     },
     pinAttempts,
-    close: () => denial.close(),
+    close: () => lifecycle.close(),
   };
 }

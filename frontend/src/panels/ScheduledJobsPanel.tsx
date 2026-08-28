@@ -119,17 +119,17 @@ export function ScheduledJobsPanel({
     () => selected ? projectForCwd(projects, selected.cwd) : null,
     [projects, selected],
   );
-  const selectedBlocked = selectedProject?.access_policy.privacy_mode === "protected";
+  const selectedProtected = selectedProject?.access_policy.privacy_mode === "protected";
   const formProject = useMemo(
     () => projectForCwd(projects, form.cwd),
     [form.cwd, projects],
   );
-  const formBlocked = formProject?.access_policy.privacy_mode === "protected";
+  const formProtected = formProject?.access_policy.privacy_mode === "protected";
 
   const submit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
-    if (formBlocked) {
-      setError("Protected projects do not allow scheduled/background agents. Choose a Standard project to save this job.");
+    if (formProtected && !form.agent_profile_id) {
+      setError("Protected scheduled jobs require an explicit allowed agent.");
       return;
     }
     setSaving(true);
@@ -148,10 +148,10 @@ export function ScheduledJobsPanel({
     } finally {
       setSaving(false);
     }
-  }, [form, formBlocked, selectedJobId, onSelectJob, onChanged, refresh]);
+  }, [form, formProtected, selectedJobId, onSelectJob, onChanged, refresh]);
 
   const runNow = useCallback(async () => {
-    if (!selectedJobId || selectedBlocked) return;
+    if (!selectedJobId) return;
     setError("");
     try {
       await runScheduledAgentJob(selectedJobId);
@@ -160,7 +160,7 @@ export function ScheduledJobsPanel({
     } catch (err) {
       setError(apiErrorMessage(err));
     }
-  }, [selectedBlocked, selectedJobId, onChanged, refresh]);
+  }, [selectedJobId, onChanged, refresh]);
 
   const remove = useCallback(async () => {
     if (!selectedJobId || !window.confirm("Delete this scheduled job? Run history rows will remain in storage.")) return;
@@ -175,7 +175,7 @@ export function ScheduledJobsPanel({
   }, [selectedJobId, onSelectJob, onChanged]);
 
   const toggleEnabled = useCallback(async () => {
-    if (!selected || selectedBlocked) return;
+    if (!selected) return;
     setError("");
     try {
       await updateScheduledAgentJob(selected.id, { enabled: !selected.enabled });
@@ -184,7 +184,7 @@ export function ScheduledJobsPanel({
     } catch (err) {
       setError(apiErrorMessage(err));
     }
-  }, [selected, selectedBlocked, onChanged, refresh]);
+  }, [selected, onChanged, refresh]);
 
   return (
     <div className="h-full flex flex-col bg-neutral-950">
@@ -220,8 +220,7 @@ export function ScheduledJobsPanel({
             projects={projects}
             profiles={profiles}
             project={formProject}
-            blocked={formBlocked}
-            retained={Boolean(selectedJobId)}
+            protectedProject={formProtected}
             submitLabel={selectedJobId ? "Save changes" : "Create job"}
             onChange={setForm}
             onSubmit={submit}
@@ -237,7 +236,7 @@ export function ScheduledJobsPanel({
                   <h2 className="text-xl font-semibold text-neutral-100 truncate">{selected.name}</h2>
                   <div className="mt-1 flex flex-wrap gap-2 text-xs text-neutral-500">
                     <span className="font-mono">{selected.cron_expr}</span>
-                    <span className={selectedBlocked ? "text-amber-400" : undefined}>{selectedBlocked ? "blocked · retained" : selected.enabled ? "enabled" : "disabled"}</span>
+                    <span className={selectedProtected ? "text-blue-300" : undefined}>{selectedProtected ? `Protected · ${selected.enabled ? "enabled" : "disabled"}` : selected.enabled ? "enabled" : "disabled"}</span>
                     <span>cwd: {selected.cwd}</span>
                   </div>
                 </div>
@@ -245,20 +244,19 @@ export function ScheduledJobsPanel({
                   <button
                     type="button"
                     onClick={runNow}
-                    disabled={selectedBlocked}
-                    title={selectedBlocked ? "Protected projects deny scheduled/background runs" : "Run this job now"}
+                    title={selectedProtected ? "Run now under Protected project policy" : "Run this job now"}
                     className="flex items-center gap-1 rounded bg-neutral-100 px-2 py-1 text-xs font-medium text-neutral-900 hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
                   ><Play size={13} /> Run now</button>
                   <button type="button" onClick={() => setEditing(true)} className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-200 hover:bg-neutral-800">Edit</button>
-                  <button type="button" onClick={toggleEnabled} disabled={selectedBlocked} title={selectedBlocked ? "The retained job cannot be changed while its project is Protected; edit it to select a Standard project" : undefined} className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-200 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40">{selected.enabled ? "Disable" : "Enable"}</button>
+                  <button type="button" onClick={toggleEnabled} className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-200 hover:bg-neutral-800">{selected.enabled ? "Disable" : "Enable"}</button>
                   <button type="button" onClick={remove} className="rounded border border-red-900/60 px-2 py-1 text-xs text-red-300 hover:bg-red-950/50"><Trash2 size={13} /></button>
                 </div>
               </div>
-              {selectedBlocked && (
-                <BlockedNotice retained projectName={selectedProject?.name ?? selected.cwd} />
+              {selectedProtected && (
+                <ProtectedScheduledNotice projectName={selectedProject?.name ?? selected.cwd} />
               )}
               <div className="mt-4 grid gap-3 text-xs text-neutral-400 sm:grid-cols-3">
-                <Info label="Next run" value={selectedBlocked ? "Blocked while project is Protected" : selected.next_run_at ? new Date(selected.next_run_at).toLocaleString() : "—"} />
+                <Info label="Next run" value={selected.next_run_at ? new Date(selected.next_run_at).toLocaleString() : "—"} />
                 <Info label="Last run" value={selected.last_run_at ? formatRelativeTime(selected.last_run_at) : "never"} />
                 <Info label="Timeout" value={`${Math.round(selected.timeout_ms / 60000)} min`} />
                 <Info label="Command guard" value={commandGuardLabel(selected.command_guard_mode)} />
@@ -276,15 +274,15 @@ export function ScheduledJobsPanel({
             <div className="mt-3 divide-y divide-neutral-800">
               {jobs.map((existing) => {
                 const existingProject = projectForCwd(projects, existing.cwd);
-                const blocked = existingProject?.access_policy.privacy_mode === "protected";
+                const protectedProject = existingProject?.access_policy.privacy_mode === "protected";
                 return (
                   <button key={existing.id} type="button" onClick={() => onSelectJob(existing.id)} className="w-full py-2 text-left hover:bg-neutral-900/80">
                     <div className="flex items-center justify-between gap-2 px-2">
                       <span className="flex min-w-0 items-center gap-2 text-sm text-neutral-200">
                         <span className="truncate">{existing.name}</span>
-                        {blocked && <span className="inline-flex shrink-0 items-center gap-1 rounded bg-amber-950/50 px-1.5 py-0.5 text-[10px] font-medium text-amber-300"><Lock size={10} /> blocked · retained</span>}
+                        {protectedProject && <span className="inline-flex shrink-0 items-center gap-1 rounded bg-blue-950/50 px-1.5 py-0.5 text-[10px] font-medium text-blue-300"><Lock size={10} /> Protected</span>}
                       </span>
-                      <span className="shrink-0 text-[11px] text-neutral-500">{blocked ? "cannot run while Protected" : existing.next_run_at ? new Date(existing.next_run_at).toLocaleString() : "not scheduled"}</span>
+                      <span className="shrink-0 text-[11px] text-neutral-500">{existing.next_run_at ? new Date(existing.next_run_at).toLocaleString() : "not scheduled"}</span>
                     </div>
                   </button>
                 );
@@ -297,14 +295,13 @@ export function ScheduledJobsPanel({
   );
 }
 
-function JobForm({ form, saving, projects, profiles, project, blocked, retained, submitLabel, onChange, onSubmit, onCancel }: {
+function JobForm({ form, saving, projects, profiles, project, protectedProject, submitLabel, onChange, onSubmit, onCancel }: {
   form: JobFormState;
   saving: boolean;
   projects: WorkspaceProject[];
   profiles: AgentProfileSummary[];
   project: WorkspaceProject | null;
-  blocked: boolean;
-  retained: boolean;
+  protectedProject: boolean;
   submitLabel: string;
   onChange: (next: JobFormState) => void;
   onSubmit: (e: React.FormEvent) => void;
@@ -318,11 +315,14 @@ function JobForm({ form, saving, projects, profiles, project, blocked, retained,
   const chooseProject = (cwd: string) => {
     const nextProject = projectForCwd(projects, cwd);
     const nextAllowed = allowedScheduledProfiles(profiles, nextProject);
+    const retainedProfile = form.agent_profile_id && nextAllowed.some((profile) => profile.id === form.agent_profile_id)
+      ? form.agent_profile_id
+      : "";
     set({
       cwd,
-      agent_profile_id: form.agent_profile_id && nextAllowed.some((profile) => profile.id === form.agent_profile_id)
-        ? form.agent_profile_id
-        : "",
+      agent_profile_id: retainedProfile || (nextProject?.access_policy.privacy_mode === "protected"
+        ? nextProject.default_agent_profile_id
+        : ""),
     });
   };
   return (
@@ -342,11 +342,13 @@ function JobForm({ form, saving, projects, profiles, project, blocked, retained,
         <label className="block">
           <span className="text-xs font-medium text-neutral-400">Agent</span>
           <select className="mt-1 w-full rounded border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 focus:border-neutral-500 focus:outline-none" value={form.agent_profile_id} onChange={(event) => set({ agent_profile_id: event.target.value })}>
-            <option value="">Project default{defaultProfile ? ` (${defaultProfile.name})` : ""}</option>
+            <option value="" disabled={protectedProject}>Project default{defaultProfile ? ` (${defaultProfile.name})` : ""}{protectedProject ? " — select explicitly for Protected scheduling" : ""}</option>
             {!explicitProfileAvailable && <option value={form.agent_profile_id}>Current agent — no longer enabled or allowed</option>}
             {allowedProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
           </select>
-          <span className="mt-1 block text-[11px] leading-relaxed text-neutral-500">Only enabled profiles permitted by this project are shown. Project default is resolved again immediately before each run.</span>
+          <span className="mt-1 block text-[11px] leading-relaxed text-neutral-500">{protectedProject
+            ? "Protected jobs persist one explicit allowed agent and reauthorize it immediately before each run."
+            : "Only enabled profiles permitted by this project are shown. Project default is resolved again immediately before each run."}</span>
         </label>
         <Field label="Provider (optional)" value={form.provider} onChange={(provider) => set({ provider })} />
         <Field label="Model (optional)" value={form.model} onChange={(model) => set({ model })} />
@@ -363,7 +365,7 @@ function JobForm({ form, saving, projects, profiles, project, blocked, retained,
           ]}
         />
       </div>
-      {blocked && <BlockedNotice retained={retained} projectName={project?.name ?? form.cwd} />}
+      {protectedProject && <ProtectedScheduledNotice projectName={project?.name ?? form.cwd} />}
       {!projectKnown && form.cwd && (
         <div className="flex items-start gap-2 rounded border border-amber-900/60 bg-amber-950/20 px-3 py-2 text-xs leading-relaxed text-amber-100/85"><AlertTriangle size={14} className="mt-0.5 shrink-0" />This project path is not in the durable project registry. Select a registered project before saving.</div>
       )}
@@ -373,7 +375,7 @@ function JobForm({ form, saving, projects, profiles, project, blocked, retained,
         <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} /> Enabled
       </label>
       <div className="flex gap-2">
-        <button type="submit" disabled={saving || blocked || !projectKnown} title={blocked ? "Choose a Standard project before saving" : undefined} className="flex items-center gap-1 rounded bg-neutral-100 px-3 py-1.5 text-xs font-medium text-neutral-900 hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"><Save size={13} /> {saving ? "Saving…" : submitLabel}</button>
+        <button type="submit" disabled={saving || !projectKnown} className="flex items-center gap-1 rounded bg-neutral-100 px-3 py-1.5 text-xs font-medium text-neutral-900 hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"><Save size={13} /> {saving ? "Saving…" : submitLabel}</button>
         {onCancel && <button type="button" onClick={onCancel} className="rounded px-3 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800">Cancel</button>}
       </div>
     </form>
@@ -400,16 +402,13 @@ function SelectField<T extends string>({ label, value, onChange, options }: { la
   );
 }
 
-function BlockedNotice({ retained, projectName }: { retained: boolean; projectName: string }) {
+function ProtectedScheduledNotice({ projectName }: { projectName: string }) {
   return (
-    <div className="mt-4 flex items-start gap-2 rounded border border-amber-800/70 bg-amber-950/25 px-3 py-2.5 text-xs leading-relaxed text-amber-100/90">
-      <Lock size={15} className="mt-0.5 shrink-0 text-amber-400" />
+    <div className="mt-4 flex items-start gap-2 rounded border border-blue-800/70 bg-blue-950/25 px-3 py-2.5 text-xs leading-relaxed text-blue-100/90">
+      <Lock size={15} className="mt-0.5 shrink-0 text-blue-300" />
       <span>
-        <strong className="font-semibold">Blocked by Protected project policy.</strong>{" "}
-        Scheduled and background agents cannot run in {projectName || "this project"}.
-        {retained
-          ? " This job is retained, including its history, but scheduled and manual runs remain blocked until you edit it to use a Standard project or change the project privacy policy."
-          : " Choose a Standard project to create this job."}
+        <strong className="font-semibold">Protected scheduled run.</strong>{" "}
+        This job uses the exact allowed agent for {projectName || "this project"}. Writes remain project-confined, and assistant output is available only through the linked Protected session—not shared run summaries or global search.
       </span>
     </div>
   );

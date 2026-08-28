@@ -11,14 +11,19 @@ import {
   abortInteractiveTurn,
   appendStreamingMessageToHistory,
   beginInteractiveTurn,
+  beginManualCompactionMessageQueue,
   beginNonBrowserTurn,
+  cancelQueuedBrowserMessageForHandle,
   classifyScheduledPromptResult,
   cleanupPiSessionCapabilityDenial,
   curateTogetherModelRecords,
   closePiSessionAuthorities,
   composeRuntimeActiveTools,
+  createModelContext,
   createPiSession,
   destroyPiSession,
+  drainManualCompactionMessageQueue,
+  deferBrowserMessageDuringManualCompaction,
   fileAudioExperimentRuntimeIsEligible,
   getPiSession,
   getPiSessionBashMode,
@@ -30,23 +35,30 @@ import {
   invalidateSessionFileSnapshot,
   installInteractiveBrowserSessionLifecyclePort,
   installWayangRawSudoFailClosedGuard,
+  latchPiSessionCapabilityActivation,
   latchPiSessionCapabilityDenial,
   interviewSubmissionContent,
   isCuratedTogetherModel,
   isWayangProviderVisible,
   listModels,
+  listSlashCommandsForHandle,
   markClaimedQueuedBrowserTurnsReady,
+  markManualCompactionMutationLeaseReleased,
   markQueuedBrowserMessageStarted,
   onPiSessionRuntimeEvent,
   persistSettledSessionError,
   trackOverflowRecovery,
+  piSessionHandleCanRetireCapabilityRefresh,
   piSessionHandleRequiresFreshRuntime,
   previewSessionAgentSwitch,
   protectedBrowserIdleRetentionIsRequired,
+  projectQueuedBrowserMessages,
   reconcilePendingAgentSwitch,
   resolveInteractiveBrowserAuthority,
   resolveInteractiveTurn,
+  retirePiSessionCapabilityRefreshIfIdle,
   sendBrowserMessageTurn,
+  sealSessionModelProviderRegistry,
   serializeEvent,
   settleInteractiveTurns,
   setSessionDefaultModel,
@@ -61,7 +73,7 @@ import {
 import { createAgentProfile } from "./agent-profiles.js";
 import { close, commitStoreMutation, getStore, init } from "./db.js";
 import { createProject } from "./projects.js";
-import { beginAgentSwitch, createSession, getSessionById, updatePiSessionFile } from "./sessions.js";
+import { archiveSession, beginAgentSwitch, createSession, getSessionById, updatePiSessionFile } from "./sessions.js";
 import { browserTurnContentHash } from "./interactive-turn-provenance.js";
 import { createHostBashOperations } from "./host-execution.js";
 import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability, revokeWorkspaceCapabilityAssociation } from "./workspace-capabilities.js";
@@ -71,6 +83,10 @@ import type { ProtectedBrowserBinding } from "./browser/types.js";
 import { getActionApprovalBridge } from "./action-approval-bridge.js";
 import { scheduleWayangAutoTitle, setAutoTitleProviderForTests } from "./session-title-service.js";
 import { extractCompletedTitleExchanges } from "./session-title-policy.js";
+import {
+  acquireSessionRuntimeMutationLock,
+  releaseSessionRuntimeMutationLock,
+} from "./session-runtime-mutation-lock.js";
 
 function syntheticProtectedRuntime(
   mode: "agent" | "user" | "paused",
@@ -193,6 +209,264 @@ function currentTurnFixture(name: string) {
   };
 }
 
+test("manual compaction queue releases before FIFO drain, projects/cancels records, and admits new tail work", async () => {
+  const f = currentTurnFixture("wayang-manual-compaction-fifo-");
+  const row = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: row.id });
+  updatePiSessionFile(row.id, manager.getSessionFile()!);
+  const starts = [deferred(), deferred(), deferred()];
+  const finishes = [deferred(), deferred(), deferred()];
+  const dispatched: string[] = [];
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    async prompt(content: string) {
+      const index = dispatched.length;
+      this.isStreaming = true;
+      dispatched.push(content);
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      starts[index]!.resolve();
+      await finishes[index]!.promise;
+      manager.appendMessage({
+        role: "assistant",
+        content: `answer ${index}`,
+        provider: "synthetic",
+        model: "synthetic",
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as any);
+      this.isStreaming = false;
+    },
+    async waitForIdle() {},
+  };
+  const handle = {
+    id: row.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "manual-compaction-fifo",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    events: new EventEmitter(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    assert.equal(acquireSessionRuntimeMutationLock(row.id), true);
+    beginManualCompactionMessageQueue(handle);
+    assert.deepEqual(deferBrowserMessageDuringManualCompaction(
+      handle, "A decorated", undefined, "A", { content: "A", attachmentNames: ["a.txt"] },
+    ), { queued: true, cancellable: true });
+    deferBrowserMessageDuringManualCompaction(handle, "B decorated", undefined, "B", { content: "B" });
+    assert.deepEqual(projectQueuedBrowserMessages(handle), [
+      { client_message_id: "A", content: "A", attachment_names: ["a.txt"] },
+      { client_message_id: "B", content: "B", attachment_names: [] },
+    ]);
+    assert.equal(cancelQueuedBrowserMessageForHandle(handle, "B"), true);
+    assert.deepEqual(projectQueuedBrowserMessages(handle).map((message) => message.client_message_id), ["A"]);
+    deferBrowserMessageDuringManualCompaction(handle, "B decorated", undefined, "B", { content: "B" });
+    assert.throws(
+      () => deferBrowserMessageDuringManualCompaction(handle, "/name unsafe", undefined, "slash", { content: "/name unsafe" }),
+      /mutation is in progress/,
+    );
+
+    assert.deepEqual(dispatched, [], "the compaction lease prevents early dispatch");
+    releaseSessionRuntimeMutationLock(row.id);
+    markManualCompactionMutationLeaseReleased(handle);
+    assert.equal(acquireSessionRuntimeMutationLock(row.id), true);
+    assert.throws(
+      () => cancelQueuedBrowserMessageForHandle(handle, "A"),
+      /runtime is rebuilding/,
+      "a later generic mutation lease does not inherit the compaction exception",
+    );
+    releaseSessionRuntimeMutationLock(row.id);
+    const drain = drainManualCompactionMessageQueue(handle, { isRuntimeCurrent: () => true });
+    await starts[0]!.promise;
+    assert.deepEqual(dispatched, ["A decorated"]);
+    const startedMessage = { role: "user", content: "A decorated" };
+    assert.equal(markQueuedBrowserMessageStarted(handle, startedMessage), "A");
+    assert.equal(serializeEvent({ type: "message_start", message: startedMessage } as any)?.client_message_id, "A");
+    deferBrowserMessageDuringManualCompaction(handle, "C decorated", undefined, "C", { content: "C" });
+    finishes[0]!.resolve();
+    await starts[1]!.promise;
+    assert.deepEqual(dispatched, ["A decorated", "B decorated"]);
+    finishes[1]!.resolve();
+    await starts[2]!.promise;
+    assert.deepEqual(dispatched, ["A decorated", "B decorated", "C decorated"]);
+    finishes[2]!.resolve();
+    await drain;
+    assert.equal(handle.manualCompactionMessageQueue, undefined);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  } finally {
+    releaseSessionRuntimeMutationLock(row.id);
+    f.cleanup();
+  }
+});
+
+test("capability activation preserves pre-accepted manual-compaction FIFO and rejects later queue admission", async () => {
+  const f = currentTurnFixture("wayang-manual-compaction-activation-");
+  const row = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: row.id });
+  const dispatched: string[] = [];
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    isCompacting: true,
+    pendingMessageCount: 0,
+    async prompt(content: string) {
+      dispatched.push(content);
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      manager.appendMessage({
+        role: "assistant",
+        content: "accepted old work completed",
+        provider: "synthetic",
+        model: "synthetic",
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as any);
+    },
+    async waitForIdle() {},
+  };
+  const handle = {
+    id: row.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "manual-compaction-activation",
+    capabilityActivationGeneration: 0n,
+    acceptedTopLevelWorkCount: 0,
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    events: new EventEmitter(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    assert.equal(acquireSessionRuntimeMutationLock(row.id), true);
+    beginManualCompactionMessageQueue(handle);
+    deferBrowserMessageDuringManualCompaction(handle, "accepted before activation", undefined, "before", { content: "before" });
+
+    latchPiSessionCapabilityActivation([row.id], new Map([[row.id, handle]]));
+
+    assert.equal(handle.capabilityRefreshPending, true);
+    assert.equal(piSessionHandleCanRetireCapabilityRefresh(handle), false);
+    assert.throws(
+      () => deferBrowserMessageDuringManualCompaction(handle, "offered after activation", undefined, "after", { content: "after" }),
+      /refresh is pending/,
+    );
+
+    fakeSession.isCompacting = false;
+    releaseSessionRuntimeMutationLock(row.id);
+    markManualCompactionMutationLeaseReleased(handle);
+    await drainManualCompactionMessageQueue(handle, { isRuntimeCurrent: () => true });
+
+    assert.deepEqual(dispatched, ["accepted before activation"]);
+    assert.equal(handle.manualCompactionMessageQueue, undefined);
+    assert.equal(piSessionHandleCanRetireCapabilityRefresh(handle), true);
+  } finally {
+    releaseSessionRuntimeMutationLock(row.id);
+    f.cleanup();
+  }
+});
+
+test("manual compaction queue is bounded, continues after a failed record, and stops on authority loss", async () => {
+  const f = currentTurnFixture("wayang-manual-compaction-failure-");
+  const row = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: row.id });
+  const secondStarted = deferred();
+  const secondFinished = deferred();
+  const dispatched: string[] = [];
+  let current = true;
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    async prompt(content: string) {
+      dispatched.push(content);
+      if (content === "failed") throw new Error("synthetic failure");
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      secondStarted.resolve();
+      await secondFinished.promise;
+      manager.appendMessage({ role: "assistant", content: "done", provider: "synthetic", model: "synthetic", stopReason: "stop", timestamp: Date.now() } as any);
+    },
+    async waitForIdle() {},
+  };
+  const handle = {
+    id: row.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "manual-compaction-failure",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    events: new EventEmitter(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    beginManualCompactionMessageQueue(handle);
+    markManualCompactionMutationLeaseReleased(handle);
+    for (let index = 0; index < 32; index++) {
+      deferBrowserMessageDuringManualCompaction(handle, `bounded ${index}`, undefined, `bounded-${index}`, { content: `bounded ${index}` });
+    }
+    assert.throws(
+      () => deferBrowserMessageDuringManualCompaction(handle, "overflow", undefined, "overflow", { content: "overflow" }),
+      /queue is full/,
+    );
+    handle.manualCompactionMessageQueue!.records.length = 0;
+    handle.manualCompactionMessageQueue!.retainedBytes = 0;
+    deferBrowserMessageDuringManualCompaction(handle, "failed", undefined, "failed", { content: "failed" });
+    deferBrowserMessageDuringManualCompaction(handle, "second", undefined, "second", { content: "second" });
+    deferBrowserMessageDuringManualCompaction(handle, "must not dispatch", undefined, "third", { content: "third" });
+    const errors: any[] = [];
+    handle.events.on("message", (message) => errors.push(message));
+    const drain = drainManualCompactionMessageQueue(handle, { isRuntimeCurrent: () => current });
+    await secondStarted.promise;
+    assert.deepEqual(dispatched, ["failed", "second"], "a failed head is removed before the next FIFO record starts");
+    assert.equal(errors.find((message) => message.type === "queued_message_ack")?.status, "rejected");
+    assert.equal(errors.find((message) => message.type === "error")?.code, "queued_message_dispatch_failed");
+    current = false;
+    secondFinished.resolve();
+    await drain;
+    assert.deepEqual(dispatched, ["failed", "second"], "authority loss prevents later dispatch");
+    assert.equal(handle.manualCompactionMessageQueue, undefined);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("interrupt queue clearing drops manual-compaction work before aborting", async () => {
+  let compactionAborts = 0;
+  let aborts = 0;
+  const handle = {
+    id: "synthetic-manual-compaction-interrupt",
+    session: {
+      isCompacting: true,
+      clearQueue: () => ({ steering: ["pi queued"], followUp: [] }),
+      abortCompaction: () => { compactionAborts++; },
+      abort: async () => { aborts++; },
+    },
+    runtimeGeneration: "manual-compaction-interrupt",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    events: new EventEmitter(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+
+  beginManualCompactionMessageQueue(handle);
+  deferBrowserMessageDuringManualCompaction(handle, "deferred", undefined, "deferred", { content: "deferred" });
+  const cleared = await abortInteractiveTurn(handle, { clearQueue: true });
+
+  assert.deepEqual(cleared, { steering: ["pi queued"], followUp: [] });
+  assert.equal(handle.manualCompactionMessageQueue, undefined);
+  assert.equal(compactionAborts, 1);
+  assert.equal(aborts, 1);
+});
+
 test("settled lifecycle persists terminal assistant and compaction failures", () => {
   const f = currentTurnFixture("wayang-settled-error-");
   try {
@@ -227,6 +501,64 @@ test("settled lifecycle persists terminal assistant and compaction failures", ()
   } finally {
     f.cleanup();
   }
+});
+
+test("slash discovery discards stale async extension results before reading old skills", async () => {
+  const entered = deferred();
+  const release = deferred();
+  let current = true;
+  let skillReads = 0;
+  const handle = {
+    id: "synthetic-stale-slash-discovery",
+    session: {
+      promptTemplates: [{ name: "old-prompt", description: "old prompt" }],
+      _extensionRunner: {
+        getRegisteredCommands: () => [{
+          name: "old-extension",
+          description: "old extension",
+          async getArgumentCompletions() {
+            entered.resolve();
+            await release.promise;
+            return [{ value: "old-value" }];
+          },
+        }],
+      },
+      resourceLoader: {
+        getSkills() {
+          skillReads++;
+          return { skills: [{ name: "old-skill", description: "old skill" }] };
+        },
+      },
+    },
+  } as unknown as PiSessionHandle;
+
+  const listing = listSlashCommandsForHandle(handle.id, handle, () => current && !handle.capabilityAuthorityDenied);
+  await entered.promise;
+  current = false;
+  release.resolve();
+
+  assert.equal(await listing, null);
+  assert.equal(skillReads, 0, "stale discovery must not continue into the old resource loader");
+
+  const currentHandle = {
+    ...handle,
+    id: "synthetic-current-slash-discovery",
+    session: {
+      ...(handle.session as any),
+      promptTemplates: [{ name: "current-prompt", description: "current prompt" }],
+      _extensionRunner: {
+        getRegisteredCommands: () => [{
+          name: "current-extension",
+          async getArgumentCompletions() { return [{ value: "current-value" }]; },
+        }],
+      },
+      resourceLoader: { getSkills: () => ({ skills: [{ name: "current-skill", description: "current skill" }] }) },
+    },
+  } as unknown as PiSessionHandle;
+  const commands = await listSlashCommandsForHandle(currentHandle.id, currentHandle, () => true);
+  assert.ok(commands?.some((command) => command.name === "current-extension"
+    && command.argumentSuggestions?.[0]?.value === "current-value"));
+  assert.ok(commands?.some((command) => command.name === "skill:current-skill"));
 });
 
 test("Pi bridge stopped projections never infer host authority from durable identity", () => {
@@ -616,6 +948,22 @@ test("starting runtime revocation fences privileged loading and publication, whi
     await assert.rejects(destroyedCreation, /creation was revoked/);
     await destroyed;
     assert.equal(getPiSessionRuntimeState(row.id).runtime_status, "stopped", "destroy fences an unpublished creation");
+
+    const archiveEntered = deferred();
+    const archiveRelease = deferred();
+    const archivedCreation = createPiSession(row.id, cwd, row.provider, row.model, null, {
+      testHooks: {
+        async afterStandardResourcesResolution() {
+          archiveEntered.resolve();
+          await archiveRelease.promise;
+        },
+      },
+    });
+    await archiveEntered.promise;
+    archiveSession(row.id);
+    archiveRelease.resolve();
+    await assert.rejects(archivedCreation, /runtime identity changed during construction/);
+    assert.equal(getPiSession(row.id), undefined, "an archived session cannot publish after an overlapping creation");
   } finally {
     release.resolve();
     await cleanupPiSessionCapabilityDenial([row.id]);
@@ -626,7 +974,7 @@ test("starting runtime revocation fences privileged loading and publication, whi
   }
 });
 
-test("legacy Wren runtime authorizes provider extension loading before model resolution", async () => {
+test("legacy Wren runtime still resolves its Standard-resource witness independently of providers", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-legacy-wren-provider-load-"));
   const cwd = path.join(dir, "project");
   const previousDataDir = process.env.WAYANG_DATA_DIR;
@@ -671,7 +1019,7 @@ test("legacy Wren runtime authorizes provider extension loading before model res
       },
     }), /synthetic stop before provider discovery/);
     assert.equal(authorized, true,
-      "the same legacy Wren witness used by resource loading must authorize reviewed provider discovery");
+      "legacy Wren Standard-resource authority remains unchanged by provider isolation");
     assert.equal(project.access_policy.privacy_mode, "standard");
   } finally {
     await cleanupPiSessionCapabilityDenial([row.id]);
@@ -1198,6 +1546,126 @@ test("idle browser prompt completion schedules title generation after its marker
   }
 });
 
+test("the first accepted browser message starts title generation before assistant settlement", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-accepted-title-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: durableRow.id });
+  manager.materialize();
+  updatePiSessionFile(durableRow.id, manager.getSessionFile()!);
+  const promptGate = deferred();
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    async prompt(content: string) {
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      await promptGate.promise;
+      manager.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "answer after title" }],
+        provider: "synthetic",
+        model: "synthetic",
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as any);
+    },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "accepted-title-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  const previousFlag = process.env.WAYANG_AUTO_SESSION_TITLE;
+  const previousProtectedFlag = process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED;
+  process.env.WAYANG_AUTO_SESSION_TITLE = "on";
+  process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED = "on";
+  let dispatchCalls = 0;
+  setAutoTitleProviderForTests({
+    async prepare() {
+      return { dispatch: async () => { dispatchCalls++; return "Immediate first-message title"; } };
+    },
+  });
+  try {
+    const sending = sendBrowserMessageTurn(handle, "first accepted message", undefined, "accepted-first");
+    const deadline = Date.now() + 2_000;
+    while (SessionManager.open(manager.getSessionFile()!, undefined, f.cwd).getSessionName() !== "Immediate first-message title") {
+      if (Date.now() >= deadline) throw new Error("title generation waited for assistant settlement");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(dispatchCalls, 1);
+    promptGate.resolve();
+    await sending;
+  } finally {
+    promptGate.resolve();
+    setAutoTitleProviderForTests(null);
+    if (previousFlag === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE;
+    else process.env.WAYANG_AUTO_SESSION_TITLE = previousFlag;
+    if (previousProtectedFlag === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED;
+    else process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED = previousProtectedFlag;
+    f.cleanup();
+  }
+});
+
+test("rejected prompt admission never discloses accepted title text", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-rejected-accepted-title-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: durableRow.id });
+  manager.materialize();
+  updatePiSessionFile(durableRow.id, manager.getSessionFile()!);
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    async prompt() {
+      throw new Error("synthetic prompt rejection");
+    },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "rejected-accepted-title",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  const previousFlag = process.env.WAYANG_AUTO_SESSION_TITLE;
+  const previousProtectedFlag = process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED;
+  process.env.WAYANG_AUTO_SESSION_TITLE = "on";
+  process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED = "on";
+  let prepareCalls = 0;
+  setAutoTitleProviderForTests({
+    async prepare() {
+      prepareCalls++;
+      return { dispatch: async () => "Must not title" };
+    },
+  });
+  try {
+    await assert.rejects(
+      sendBrowserMessageTurn(handle, "rejected first message", undefined, "rejected-first"),
+      /synthetic prompt rejection/,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(prepareCalls, 0);
+    assert.equal(SessionManager.open(manager.getSessionFile()!, undefined, f.cwd).getSessionName(), undefined);
+  } finally {
+    setAutoTitleProviderForTests(null);
+    if (previousFlag === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE;
+    else process.env.WAYANG_AUTO_SESSION_TITLE = previousFlag;
+    if (previousProtectedFlag === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED;
+    else process.env.WAYANG_AUTO_SESSION_TITLE_PROTECTED = previousProtectedFlag;
+    f.cleanup();
+  }
+});
+
 test("an accepted browser interaction retries title generation for an older unnamed session", async () => {
   const f = currentTurnFixture("wayang-pi-bridge-older-title-retry-");
   const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
@@ -1630,7 +2098,7 @@ test("queued browser ledger persists distinct source markers exactly once and ex
   }
 });
 
-test("marker append failure retains the exact resolved ledger item for retry", () => {
+test("marker append failure retains the exact resolved ledger item for refresh retirement retry", async () => {
   const f = currentTurnFixture("wayang-pi-bridge-source-append-retry-");
   const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
   const manager = SessionManager.create(f.cwd, f.sessionDir);
@@ -1652,6 +2120,11 @@ test("marker append failure retains the exact resolved ledger item for retry", (
     const turn = Object.freeze({ ...pendingTurn, settlementReady: true });
     handle.interactiveTurns.set(turn.token, turn);
     manager.appendMessage({ role: "user", content: "retryable exact content", timestamp: Date.now() } as any);
+    handle.capabilityRefreshPending = true;
+    handle.acceptedTopLevelWorkCount = 0;
+    (handle.session as any).isStreaming = false;
+    (handle.session as any).isCompacting = false;
+    (handle.session as any).pendingMessageCount = 0;
     const exactUserId = manager.getLeafId();
     let fail = true;
     manager.appendCustomEntry = ((...args: Parameters<typeof manager.appendCustomEntry>) => {
@@ -1662,10 +2135,14 @@ test("marker append failure retains the exact resolved ledger item for retry", (
       return originalAppend(...args);
     }) as typeof manager.appendCustomEntry;
 
-    assert.throws(() => settleInteractiveTurns(handle), /synthetic append failure/);
+    const lookup = new Map([[handle.id, handle]]);
+    const retired: string[] = [];
+    const retire = async (id: string) => { retired.push(id); };
+    assert.equal(await retirePiSessionCapabilityRefreshIfIdle(handle, { lookup, retire }), false);
     assert.equal(handle.interactiveTurns.has(turn.token), true, "resolvable failed marker remains retryable");
     assert.equal(handle.interactiveTurns.get(turn.token)?.piUserEntryId, exactUserId);
-    assert.equal(settleInteractiveTurns(handle).length, 1);
+    assert.equal(await retirePiSessionCapabilityRefreshIfIdle(handle, { lookup, retire }), true);
+    assert.deepEqual(retired, [handle.id]);
     assert.equal(handle.interactiveTurns.size, 0);
     const markers = manager.getEntries().filter((entry: any) => entry.customType === "wayang-interactive-turn-source.v1") as any[];
     assert.equal(markers.length, 1);
@@ -1916,7 +2393,7 @@ function writeSyntheticNarwhalReviewedExtension(agentDir: string, moduleMarker: 
   const extensionPath = path.join(extensionDir, "index.ts");
   fs.writeFileSync(extensionPath, [
     'import * as fs from "node:fs";',
-    `fs.writeFileSync(${JSON.stringify(moduleMarker)}, "executed");`,
+    `fs.writeFileSync(${JSON.stringify(moduleMarker)}, import.meta.url);`,
     'export default function narwhalHornSynthetic(pi: any) {',
     '  pi.registerProvider("narwhal-horn", {',
     '    name: "Narwhal Horn (LAN)",',
@@ -1991,6 +2468,99 @@ test("listModels statically projects the reviewed Narwhal model without executin
       result.models.every((model) => !model.id.includes("heretic")),
       "no stale qwen3.6-35b-a3b-heretic entry may appear in the catalog",
     );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("restricted model contexts load a reviewed provider in an isolated registry", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-provider-runtime-"));
+  const homeDir = path.join(dir, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const moduleMarker = path.join(dir, "reviewed-extension-executed");
+  const extensionPath = writeSyntheticNarwhalReviewedExtension(agentDir, moduleMarker);
+
+  try {
+    fs.appendFileSync(extensionPath, [
+      "",
+      "// Resource registrations are deliberately not projected into a model context.",
+    ].join("\n"));
+    const reviewed = syntheticReviewedModel(extensionPath);
+    const context = await createModelContext({
+      agentDir,
+      includeReviewedProviders: true,
+      reviewedExternalModels: reviewed,
+    });
+    const model = context.registry.find("narwhal-horn", "qwen3.8-flash-next");
+    assert.ok(model, "reviewed provider model must be resolvable in an isolated context");
+    assert.equal(context.registry.hasConfiguredAuth(model!), true);
+    assert.equal(context.error, undefined);
+    assert.equal(fs.existsSync(moduleMarker), true, "runtime provider registration executes the reviewed artifact");
+    const executedUrl = fs.readFileSync(moduleMarker, "utf8");
+    assert.match(executedUrl, /wayang-reviewed-provider-load-/,
+      "the loader must execute the private verified-byte copy");
+    assert.notEqual(executedUrl, new URL(`file://${extensionPath}`).href,
+      "the installed provider pathname must not be reopened for execution");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sealed session registries ignore provider overrides from resource extensions", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-provider-seal-"));
+  const homeDir = path.join(dir, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const extensionPath = writeSyntheticNarwhalReviewedExtension(
+    agentDir,
+    path.join(dir, "reviewed-extension-executed"),
+  );
+
+  try {
+    const context = await createModelContext({
+      agentDir,
+      includeReviewedProviders: true,
+      reviewedExternalModels: syntheticReviewedModel(extensionPath),
+    });
+    const before = context.registry.find("narwhal-horn", "qwen3.8-flash-next");
+    assert.ok(before);
+    sealSessionModelProviderRegistry(context.runtime);
+    context.registry.registerProvider("narwhal-horn", {
+      baseUrl: "https://unreviewed.invalid/v1",
+      headers: { "x-unreviewed": "true" },
+    });
+    context.runtime.unregisterProvider("narwhal-horn");
+    const after = context.registry.find("narwhal-horn", "qwen3.8-flash-next");
+    assert.equal(after?.baseUrl, before?.baseUrl, "resource extension cannot reroute the reviewed endpoint");
+    assert.equal(after?.headers?.["x-unreviewed"], undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("reviewed provider runtime rejects unreviewed provider registrations from the same artifact", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-provider-extra-"));
+  const homeDir = path.join(dir, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const extensionDir = path.join(agentDir, "extensions", "narwhal-horn");
+  const extensionPath = path.join(extensionDir, "index.ts");
+  fs.mkdirSync(extensionDir, { recursive: true });
+  fs.writeFileSync(extensionPath, [
+    "export default function synthetic(pi: any) {",
+    "  const model = { id: 'qwen3.8-flash-next', name: 'Synthetic', reasoning: true, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 262144, maxTokens: 32768 };",
+    "  pi.registerProvider('narwhal-horn', { baseUrl: 'http://127.0.0.1:9/v1', apiKey: 'synthetic', api: 'openai-completions', models: [model] });",
+    "  pi.registerProvider('unexpected-provider', { baseUrl: 'http://127.0.0.1:9/v1', apiKey: 'synthetic', api: 'openai-completions', models: [{ ...model, id: 'unexpected' }] });",
+    "}",
+  ].join("\n"));
+
+  try {
+    const context = await createModelContext({
+      agentDir,
+      includeReviewedProviders: true,
+      reviewedExternalModels: syntheticReviewedModel(extensionPath),
+    });
+    assert.equal(context.registry.find("narwhal-horn", "qwen3.8-flash-next"), undefined);
+    assert.equal(context.registry.find("unexpected-provider", "unexpected"), undefined);
+    assert.match(context.error ?? "", /registered an unreviewed provider/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

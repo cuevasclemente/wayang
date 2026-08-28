@@ -51,8 +51,9 @@ export function stripInternalCapabilityEnv(source: NodeJS.ProcessEnv): NodeJS.Pr
 /**
  * Sandboxed bash receives only non-secret process mechanics. Provider keys,
  * OAuth/AWS credentials, proxy credentials, loader hooks, and arbitrary
- * deployment variables stay in the backend. Sandbox Runtime injects its own
- * per-command proxy variables through Bubblewrap after this filtering step.
+ * deployment variables stay in the backend. Production host-network mode
+ * injects no proxy variables; legacy proxy-mode tests may add their own through
+ * Bubblewrap only after this filtering step.
  */
 export function buildRestrictedSandboxEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};

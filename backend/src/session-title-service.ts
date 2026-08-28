@@ -10,6 +10,7 @@ import {
 } from "./sessions.js";
 import { authorizeProjectAction } from "./policy.js";
 import {
+  acceptedTurnTitleProjection,
   extractCompletedTitleExchanges,
   normalizeGeneratedTitle,
   titleTextBlocks,
@@ -19,6 +20,11 @@ import { TerraTitleProvider, type TitleProvider } from "./terra-title-provider.j
 export type { TitleProvider } from "./terra-title-provider.js";
 import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
 import { isSessionRuntimeMutationLocked } from "./session-runtime-mutation-lock.js";
+import {
+  resolveBrowserTurnPiUserEntry,
+  wayangInteractiveTurnSourceFromEntry,
+  type BrowserTurnProvenance,
+} from "./interactive-turn-provenance.js";
 
 export type AutoTitleOutcome = "attempt" | "success" | "validation_rejection" | "unavailable" | "timeout" | "cas_lost";
 const telemetry = new Map<AutoTitleOutcome, number>();
@@ -94,7 +100,9 @@ function firstUserTranscriptText(entries: readonly any[]): string {
 }
 
 function projectionEligibleForRow(row: SessionRow, entries: readonly any[], projection: TitleSourceProjection): boolean {
-  if (projection.completedExchangeCount < 3) return false;
+  if (projection.completedExchangeCount < 1) return false;
+  const firstPhysicalUser = entries.find((entry: any) => entry?.type === "message" && entry.message?.role === "user");
+  if (!firstPhysicalUser || projection.firstThree[0]?.userEntryId !== firstPhysicalUser.id) return false;
   if (row.title_source === "provisional") return !projection.legacySourceUsed;
   const fallback = normalizeProvisionalSessionTitle(firstUserTranscriptText(entries));
   return Boolean(fallback) && row.title === fallback;
@@ -141,12 +149,78 @@ function readPhysicalCandidate(
   }
 }
 
+interface AcceptedPhysicalCandidate {
+  row: SessionRow;
+  manager: SessionManager;
+}
+
+function acceptedTurnBindsRow(row: SessionRow, turn: BrowserTurnProvenance): boolean {
+  return turn.sourceKind === "browser_send_message"
+    && turn.sourceMarkerEligible
+    && Boolean(turn.piUserEntryId)
+    && Boolean(turn.rawUserText.trim())
+    && turn.sourceSessionId === row.id
+    && turn.projectId === row.project_id
+    && turn.projectCwd === row.cwd
+    && turn.agentProfileId === row.agent_profile_id;
+}
+
+function readAcceptedPhysicalCandidate(
+  sessionId: string,
+  turn: BrowserTurnProvenance,
+  options: { repairPhysicalName?: boolean; requireFirstUser?: boolean } = {},
+): AcceptedPhysicalCandidate | null {
+  if (isSessionRuntimeMutationLocked(sessionId)) return null;
+  const row = getSessionById(sessionId);
+  if (!row || !rowEligible(row) || !row.pi_session_file || !acceptedTurnBindsRow(row, turn)) return null;
+  try {
+    const manager = SessionManager.open(row.pi_session_file, undefined, row.cwd);
+    if (manager.getSessionId() !== row.id || manager.getHeader()?.cwd !== row.cwd) return null;
+    const branch = manager.getBranch();
+    const branchIds = new Set(branch.map((entry: any) => entry?.id)
+      .filter((id: unknown): id is string => typeof id === "string"));
+    if (!resolveBrowserTurnPiUserEntry(turn, manager.getEntries(), branchIds)) return null;
+    const userIndex = branch.findIndex((entry: any) => entry?.id === turn.piUserEntryId);
+    if (userIndex < 0 || (options.requireFirstUser !== false && branch.slice(0, userIndex).some((entry: any) => (
+      entry?.type === "message" && entry.message?.role === "user"
+    )))) return null;
+    const nameState = manager.getSessionNameState();
+    if (nameState.name !== undefined || nameState.entryId !== undefined) {
+      if (options.repairPhysicalName && nameState.entryId !== undefined) {
+        reconcileSessionTitleFromPhysicalNameById(sessionId, {
+          piName: nameState.name,
+          firstMessage: firstUserTranscriptText(manager.getEntries()),
+        });
+      }
+      return null;
+    }
+    return { row, manager };
+  } catch {
+    return null;
+  }
+}
+
+function physicalAcceptedMarkerExists(sessionId: string, turn: BrowserTurnProvenance): boolean {
+  const candidate = readAcceptedPhysicalCandidate(sessionId, turn, { requireFirstUser: false });
+  if (!candidate) return false;
+  return candidate.manager.getEntries().some((entry: unknown) => {
+    const marker = wayangInteractiveTurnSourceFromEntry(entry);
+    return marker?.client_message_id === turn.clientMessageId
+      && marker.user_entry_id === turn.piUserEntryId
+      && marker.raw_user_text === turn.rawUserText;
+  });
+}
+
 function attemptKey(sessionId: string, projection: TitleSourceProjection): string {
   return `${sessionId}:${projection.digest}:${projection.completedExchangeCount}`;
 }
 
-function inFlightKey(sessionId: string, projection: TitleSourceProjection): string {
-  return `${sessionId}:${projection.digest}`;
+function inFlightKey(sessionId: string): string {
+  return sessionId;
+}
+
+function interactionAttemptKey(sessionId: string, interactionId: string): string {
+  return `${sessionId}:${createHash("sha256").update(interactionId).digest("hex")}`;
 }
 
 function rememberBounded(set: Set<string>, key: string): void {
@@ -154,11 +228,38 @@ function rememberBounded(set: Set<string>, key: string): void {
   while (set.size > MAX_ATTEMPT_KEYS) set.delete(set.values().next().value!);
 }
 
+function commitAutomaticTitle(
+  sessionId: string,
+  candidate: Pick<PhysicalCandidate, "row" | "manager">,
+  title: string,
+  onCommitted?: (sessionFile: string) => void,
+): boolean {
+  const expectedState = candidate.manager.getSessionNameState();
+  const result = candidate.manager.appendSessionInfoIfCurrent(title, expectedState, { origin: "automatic" });
+  if (!result.written) {
+    record("cas_lost");
+    return false;
+  }
+  try {
+    setAutomaticPiSessionTitle(sessionId, title);
+  } catch {
+    // Pi is canonical. A later targeted catalog reconciliation repairs the
+    // Wayang mirror; never retry the provider request after durable success.
+  } finally {
+    // The physical Pi file changed even if Wayang's mirror write failed or a
+    // concurrent explicit human title correctly made it non-replaceable.
+    onCommitted?.(candidate.row.pi_session_file!);
+  }
+  record("success");
+  return true;
+}
+
 async function performAttempt(
   sessionId: string,
   expected: TitleSourceProjection,
   finalDisclosureGate: () => TitleSourceProjection | null,
   onCommitted?: (sessionFile: string) => void,
+  commitGate: () => boolean = () => true,
 ): Promise<void> {
   record("attempt");
   let prepared;
@@ -193,28 +294,79 @@ async function performAttempt(
 
   // Commit-time physical revalidation and the shared Pi lock/CAS are separate
   // from the request-time disclosure gate.
-  const commitCandidate = readPhysicalCandidate(sessionId);
+  const commitCandidate = commitGate() ? readPhysicalCandidate(sessionId) : null;
   if (!commitCandidate || commitCandidate.projection.digest !== expected.digest) {
     record("cas_lost");
     return;
   }
-  const expectedState = commitCandidate.manager.getSessionNameState();
-  const result = commitCandidate.manager.appendSessionInfoIfCurrent(title, expectedState, { origin: "automatic" });
-  if (!result.written) {
+  commitAutomaticTitle(sessionId, commitCandidate, title, onCommitted);
+}
+
+async function performAcceptedAttempt(
+  sessionId: string,
+  turn: BrowserTurnProvenance,
+  expected: TitleSourceProjection,
+  stillAccepted: () => boolean,
+  onCommitted?: (sessionFile: string) => void,
+): Promise<void> {
+  const admissionRemainsValid = () => stillAccepted() || physicalAcceptedMarkerExists(sessionId, turn);
+  record("attempt");
+  let prepared;
+  try {
+    prepared = await provider.prepare();
+  } catch {
+    record("unavailable");
+    return;
+  }
+
+  // Final synchronous disclosure gate over the exact accepted browser witness.
+  // Do not insert an await between this physical re-read and dispatch().
+  if (!admissionRemainsValid() || !readAcceptedPhysicalCandidate(sessionId, turn)) return;
+  let rawTitle: string;
+  try {
+    rawTitle = await prepared.dispatch(expected.boundedInput);
+  } catch (error: any) {
+    record(error?.name === "AbortError" ? "timeout" : "unavailable");
+    return;
+  }
+
+  const title = normalizeGeneratedTitle(rawTitle);
+  if (!title) {
+    record("validation_rejection");
+    return;
+  }
+  const commitCandidate = admissionRemainsValid() ? readAcceptedPhysicalCandidate(sessionId, turn) : null;
+  if (!commitCandidate) {
     record("cas_lost");
     return;
   }
-  try {
-    setAutomaticPiSessionTitle(sessionId, title);
-  } catch {
-    // Pi is canonical. A later targeted catalog reconciliation repairs the
-    // Wayang mirror; never retry the provider request after durable success.
-  } finally {
-    // The physical Pi file changed even if Wayang's mirror write failed or a
-    // concurrent explicit human title correctly made it non-replaceable.
-    onCommitted?.(commitCandidate.row.pi_session_file!);
-  }
-  record("success");
+  commitAutomaticTitle(sessionId, commitCandidate, title, onCommitted);
+}
+
+/**
+ * Start standard title creation from one exact browser message after Pi accepts
+ * prompt/steer admission, without waiting for assistant settlement.
+ */
+export function scheduleWayangAutoTitleOnAcceptedTurn(
+  sessionId: string,
+  turn: BrowserTurnProvenance,
+  options: { stillAccepted: () => boolean; onCommitted?: (sessionFile: string) => void },
+): Promise<void> | null {
+  const flightKey = inFlightKey(sessionId);
+  const interactionKey = interactionAttemptKey(sessionId, turn.clientMessageId);
+  if (interactionAttempted.has(interactionKey)) return inFlight.get(flightKey) ?? null;
+  const admissionRemainsValid = () => options.stillAccepted() || physicalAcceptedMarkerExists(sessionId, turn);
+  const projection = acceptedTurnTitleProjection(turn.clientMessageId, turn.rawUserText);
+  if (!admissionRemainsValid() || !projection
+    || !readAcceptedPhysicalCandidate(sessionId, turn, { repairPhysicalName: true })) return null;
+  rememberBounded(interactionAttempted, interactionKey);
+  const existing = inFlight.get(flightKey);
+  if (existing) return existing;
+  const work = performAcceptedAttempt(sessionId, turn, projection, options.stillAccepted, options.onCommitted)
+    .catch(() => undefined)
+    .finally(() => inFlight.delete(flightKey));
+  inFlight.set(flightKey, work);
+  return work;
 }
 
 /**
@@ -228,7 +380,7 @@ export function scheduleWayangAutoTitle(
   const candidate = readPhysicalCandidate(sessionId);
   if (!candidate) return null;
   const key = attemptKey(sessionId, candidate.projection);
-  const flightKey = inFlightKey(sessionId, candidate.projection);
+  const flightKey = inFlightKey(sessionId);
   const existing = inFlight.get(flightKey);
   if (existing) return existing;
   if (attempted.has(key)) return null;
@@ -252,22 +404,32 @@ export function scheduleWayangAutoTitle(
 export function scheduleWayangAutoTitleOnInteraction(
   sessionId: string,
   interactionId: string,
-  options: { onCommitted?: (sessionFile: string) => void } = {},
+  options: {
+    stillAccepted?: () => boolean;
+    acceptedTurn?: BrowserTurnProvenance;
+    onCommitted?: (sessionFile: string) => void;
+  } = {},
 ): Promise<void> | null {
+  const flightKey = inFlightKey(sessionId);
+  const interactionKey = interactionAttemptKey(sessionId, interactionId);
+  if (interactionAttempted.has(interactionKey)) return inFlight.get(flightKey) ?? null;
+  const interactionRemainsValid = () => options.acceptedTurn
+    ? Boolean(options.stillAccepted?.()) || physicalAcceptedMarkerExists(sessionId, options.acceptedTurn)
+    : options.stillAccepted?.() ?? true;
+  if (!interactionRemainsValid()) return null;
   const candidate = readPhysicalCandidate(sessionId, { repairPhysicalName: true });
   if (!candidate) return null;
-  const key = attemptKey(sessionId, candidate.projection);
-  const flightKey = inFlightKey(sessionId, candidate.projection);
-  const interactionKey = `${key}:${createHash("sha256").update(interactionId).digest("hex")}`;
-  if (interactionAttempted.has(interactionKey)) return inFlight.get(flightKey) ?? null;
   rememberBounded(interactionAttempted, interactionKey);
   const existing = inFlight.get(flightKey);
   if (existing) return existing;
   const work = performAttempt(
     sessionId,
     candidate.projection,
-    () => readPhysicalCandidate(sessionId)?.projection ?? null,
+    () => interactionRemainsValid()
+      ? readPhysicalCandidate(sessionId)?.projection ?? null
+      : null,
     options.onCommitted,
+    interactionRemainsValid,
   ).catch(() => undefined).finally(() => inFlight.delete(flightKey));
   inFlight.set(flightKey, work);
   return work;
@@ -320,7 +482,7 @@ export function scheduleWayangAutoTitleFromActivation(
   const projection = activationProjection(sessionId, snapshot);
   if (!projection) return null;
   const key = attemptKey(sessionId, projection);
-  const flightKey = inFlightKey(sessionId, projection);
+  const flightKey = inFlightKey(sessionId);
   const existing = inFlight.get(flightKey);
   if (existing) return existing;
   if (attempted.has(key)) return null;

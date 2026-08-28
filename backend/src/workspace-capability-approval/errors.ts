@@ -11,6 +11,7 @@ export type CapabilityApprovalErrorCode =
   | "pin_unavailable"
   | "wrong_pin"
   | "state_conflict"
+  | "runtime_limit"
   | "history_full"
   | "denied";
 

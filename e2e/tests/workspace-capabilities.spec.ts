@@ -78,6 +78,10 @@ async function installSyntheticApi(page: Page, options: {
   modelDiscoveryFails?: boolean;
   activationFailure?: { status: number; code: string; error: string };
   activationDelayMs?: number;
+  challengeRuntimes?: Array<{
+    runtimeId: string;
+    status: "idle" | "streaming" | "queued" | "starting" | "mutation_locked";
+  }>;
   catalogFailure?: { status: number; code: string; error: string };
   commitFailure?: { status: number; code: string; error: string };
   revokeFailure?: { status: number; code: string; error: string };
@@ -164,7 +168,7 @@ async function installSyntheticApi(page: Page, options: {
           "The agent may navigate, click, type non-secret text, download, and cause remote mutations.",
           "Existing authenticated cookies may permit purchases, deletion, exports, or account-setting changes.",
         ],
-        affectedRuntimes: [{ runtimeId: "runtime-synthetic-1", status: "idle" }],
+        affectedRuntimes: options.challengeRuntimes ?? [{ runtimeId: "runtime-synthetic-1", status: "idle" }],
       } });
     }
 
@@ -263,9 +267,12 @@ test("capability Settings uses model-independent Project-Agent associations, exa
   await expect(challenge).toContainText("re-enabling the same ID restores it through a fresh runtime without another PIN");
   await expect(challenge).toContainText("exact-profile allowlist exclusion, incompatible privacy, or subject deletion ends it");
   await expect(challenge).toContainText("revocation cannot undo completed effects");
+  await expect(challenge).toContainText("New runtimes receive the grant immediately after approval.");
+  await expect(challenge).toContainText("Current and already-queued work on an affected older runtime finishes with its old authority.");
+  await expect(challenge).toContainText("later work uses a fresh runtime with the grant");
   await expect(challenge).not.toContainText(provider);
   await expect(challenge).not.toContainText(model);
-  await expect(challenge).toContainText("runtime-synthetic-1 (idle)");
+  await expect(challenge).toContainText("Affected runtimes at review: runtime-synthetic-1 (idle)");
   await expect(settings).toHaveAttribute("inert", "");
 
   const pin = challenge.getByLabel("8-digit identity PIN");
@@ -298,7 +305,8 @@ test("capability Settings uses model-independent Project-Agent associations, exa
   await expect(history).toContainText(approvalEventId);
   await expect(history).toContainText("association revision 1");
   await expect(history).toContainText("digest-operation-abc123");
-  await expect(settings).toContainText("A fresh runtime can use it with any model selected for that agent.");
+  await expect(settings).toContainText("New runtimes receive the grant immediately.");
+  await expect(settings).toContainText("Current and already-queued work on an older runtime finishes with its old authority; later work uses a fresh runtime with the grant.");
   expect(await page.evaluate(() => `${Object.values(localStorage).join("")} ${Object.values(sessionStorage).join("")}`)).not.toContain(syntheticPin);
 
   page.once("dialog", (dialog) => dialog.accept());
@@ -316,9 +324,46 @@ test("capability Settings uses model-independent Project-Agent associations, exa
   await expect(current.getByRole("button", { name: "Revoke" })).toHaveCount(0);
 });
 
+test("busy affected runtimes remain review information and PIN commit succeeds without stale-state messaging", async ({ page }) => {
+  const api = await installSyntheticApi(page, {
+    challengeRuntimes: [
+      { runtimeId: "runtime-streaming", status: "streaming" },
+      { runtimeId: "runtime-queued", status: "queued" },
+      { runtimeId: "runtime-starting", status: "starting" },
+      { runtimeId: "runtime-mutation", status: "mutation_locked" },
+    ],
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open workspace and capability settings" }).click();
+  const settings = page.getByRole("dialog", { name: "Workspace settings" });
+  await settings.getByRole("tab", { name: "Capabilities" }).click();
+  await expect(settings).toContainText("Affected runtimes may be busy; their status is review information and does not require stopping current work.");
+  await settings.getByRole("button", { name: /Protected browser/ }).click();
+  await settings.getByLabel("Project").selectOption(protectedProjectId);
+  await settings.getByLabel("Agent profile").selectOption(profileId);
+  await settings.getByRole("button", { name: "Review association" }).click();
+
+  const challenge = page.getByRole("dialog", { name: "Associate protected browser with the synthetic Project-Agent pair" });
+  await expect(challenge).toContainText("runtime-streaming (streaming)");
+  await expect(challenge).toContainText("runtime-queued (queued)");
+  await expect(challenge).toContainText("runtime-starting (starting)");
+  await expect(challenge).toContainText("runtime-mutation (mutation locked)");
+  await expect(challenge).toContainText("Current and already-queued work on an affected older runtime finishes with its old authority.");
+  await expect(settings).not.toContainText(/Capability (?:authority )?state changed/);
+
+  await challenge.getByLabel("8-digit identity PIN").fill(syntheticPin);
+  await challenge.getByRole("button", { name: "Associate capability" }).click();
+
+  await expect.poll(() => api.commitBodies).toEqual([{ pin: syntheticPin }]);
+  await expect(settings.getByRole("region", { name: "Current associations" }).getByText("ACTIVE", { exact: true })).toBeVisible();
+  await expect(settings).toContainText("New runtimes receive the grant immediately.");
+  await expect(settings).not.toContainText(/Capability (?:authority )?state changed/);
+});
+
 for (const scenario of [
   { label: "unauthenticated owner", failure: { status: 401, code: "unauthenticated", error: "Authentication required" }, expected: "authenticated owner identity" },
   { label: "invalid remote origin", failure: { status: 403, code: "invalid_origin", error: "Origin not allowed" }, expected: "rejected this browser Origin" },
+  { label: "runtime-count saturation", failure: { status: 409, code: "runtime_limit", error: "Too many affected runtimes" }, expected: "runtime-count limit, not a capability state conflict" },
   { label: "PIN cooldown", failure: { status: 429, code: "cooldown", error: "Try later" }, expected: "temporarily cooling down" },
   { label: "PIN metadata unavailable", failure: { status: 503, code: "pin_unavailable", error: "Settings PIN approval is unavailable" }, expected: "PIN approval is unavailable" },
   { label: "backend failure", failure: { status: 500, code: "internal", error: "Capability approval failed" }, expected: "could not create the capability review" },

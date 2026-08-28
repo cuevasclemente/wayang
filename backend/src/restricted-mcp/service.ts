@@ -113,7 +113,11 @@ export function parseRestrictedMcpOperation(input: unknown): RestrictedMcpOperat
 
 export function resolveRestrictedMcpGrant(config: RestrictedMcpConfig, context: RestrictedMcpLiveContext): RestrictedMcpGrant | null {
   if (!context.agentProfile.enabled || context.agentProfile.resourceMode !== "project_only" || context.agentProfile.memoryAccess !== "read") return null;
-  if (context.project.privacyMode !== "protected" || context.isSubagent || context.scheduledJobId || context.scheduledRunId) return null;
+  if (context.project.privacyMode !== "protected" || context.isSubagent) return null;
+  // Scheduled sessions may use the same exact Project-Agent grant, but only
+  // with the complete backend-issued job/run identity. A partial scheduling
+  // marker is ambiguous and fails closed.
+  if ((context.scheduledJobId === null) !== (context.scheduledRunId === null)) return null;
   if (!context.project.allowedAgentProfileIds?.includes(context.agentProfile.id)) return null;
   let canonicalCwd: string;
   try { canonicalCwd = fs.realpathSync.native(context.project.cwd); } catch { return null; }

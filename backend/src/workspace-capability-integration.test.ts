@@ -3,17 +3,28 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { createAgentProfile } from "./agent-profiles.js";
-import { close, getStore, init } from "./db.js";
+import { createAgentProfile, updateAgentProfile } from "./agent-profiles.js";
+import {
+  close,
+  failNextCommitStoreMutationPersistenceForTests,
+  getStore,
+  init,
+} from "./db.js";
 import { createProject, updateProject } from "./projects.js";
 import { capabilityOperationDigest } from "./workspace-capability-approval/renderer.js";
-import type { CapabilityApprovalBinding } from "./workspace-capability-approval/types.js";
+import type {
+  AffectedRuntimeStatus,
+  CapabilityApprovalBinding,
+  WorkspaceCapabilityId,
+  WorkspacePrivacyMode,
+} from "./workspace-capability-approval/types.js";
 import {
   HardenedSettingsPinAttemptAdapter,
   WorkspaceCapabilityIntegration,
+  buildWorkspaceCapabilityActivationPreview,
   provisionPinAttemptStateForService,
   syncDirectoryBestEffort,
-  type WorkspaceCapabilityRuntimeDenialPort,
+  type WorkspaceCapabilityRuntimeLifecyclePort,
 } from "./workspace-capability-integration.js";
 
 let root = "";
@@ -36,10 +47,12 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-function denial(): WorkspaceCapabilityRuntimeDenialPort & { latched: string[]; cleaned: string[] } {
+function denial(): WorkspaceCapabilityRuntimeLifecyclePort & { activations: string[]; latched: string[]; cleaned: string[] } {
   return {
+    activations: [],
     latched: [],
     cleaned: [],
+    latchActivation(input) { this.activations.push(`${input.intent.capabilityId}:${input.runtimeIds.join(",")}`); },
     latchDenied(input) { this.latched.push(`${input.association.capabilityId}:${input.association.revision}`); },
     async cleanupDeniedRuntimeIds(runtimeIds) { this.cleaned.push(...runtimeIds); },
   };
@@ -116,6 +129,205 @@ test("provider/model default changes do not conflict with a pair approval", asyn
     approvedAt: 11,
   });
   assert.equal(result.status, "committed");
+});
+
+test("preview accepts and displays every bounded affected runtime status", () => {
+  const { intent } = setup();
+  const statuses: AffectedRuntimeStatus[] = ["idle", "streaming", "queued", "starting", "mutation_locked"];
+  const result = buildWorkspaceCapabilityActivationPreview(intent, statuses.map((status, index) => ({
+    runtimeId: `runtime-${index}`,
+    status,
+  })));
+  assert.equal(result.status, "ok");
+  if (result.status !== "ok") return;
+  assert.deepEqual(result.preview.affectedRuntimes.map((runtime) => runtime.status), statuses);
+  assert.doesNotThrow(() => capabilityOperationDigest(result.preview, binding()));
+});
+
+test("busy preview semantics apply to all compiled capability classes", () => {
+  const capabilities: Array<[WorkspaceCapabilityId, WorkspacePrivacyMode]> = [
+    ["wayang.standard-resources.v1", "standard"],
+    ["wayang.standard-browser.v1", "standard"],
+    ["wayang.host-execution.v1", "standard"],
+    ["wayang.protected-browser.v1", "protected"],
+    ["wayang.protected-automation.v1", "protected"],
+  ];
+  for (const [index, [capabilityId, privacyMode]] of capabilities.entries()) {
+    const cwd = path.join(root, `capability-project-${index}`);
+    fs.mkdirSync(cwd);
+    const profile = createAgentProfile({ name: `Capability Profile ${index}`, resource_mode: "standard" });
+    const project = createProject({
+      cwd,
+      name: `Capability Project ${index}`,
+      default_agent_profile_id: profile.id,
+      access_policy: { privacy_mode: privacyMode, allowed_agent_profile_ids: [profile.id] },
+    });
+    const result = buildWorkspaceCapabilityActivationPreview({
+      capabilityId,
+      projectId: project.id,
+      agentProfileId: profile.id,
+    }, [{ runtimeId: `busy-${index}`, status: "streaming" }]);
+    assert.equal(result.status, "ok", capabilityId);
+  }
+});
+
+test("renderer rejects unknown affected runtime statuses", () => {
+  const { intent } = setup();
+  const result = buildWorkspaceCapabilityActivationPreview(intent, [{ runtimeId: "runtime", status: "idle" }]);
+  assert.equal(result.status, "ok");
+  if (result.status !== "ok") return;
+  const forged = structuredClone(result.preview) as any;
+  forged.affectedRuntimes[0].status = "unknown";
+  assert.throws(() => capabilityOperationDigest(forged, binding()), /invalid affected runtime status/);
+});
+
+test("runtime display saturation is distinct from authority conflict", () => {
+  const { intent } = setup();
+  const result = buildWorkspaceCapabilityActivationPreview(intent, Array.from({ length: 65 }, (_, index) => ({
+    runtimeId: `runtime-${index}`,
+    status: "idle" as const,
+  })));
+  assert.deepEqual(result, { status: "runtime_limit", limit: 64 });
+});
+
+test("runtime list and status drift do not conflict after PIN review", async () => {
+  const lifecycle = denial();
+  const integration = new WorkspaceCapabilityIntegration(lifecycle);
+  const { intent } = setup();
+  const reviewed = buildWorkspaceCapabilityActivationPreview(intent, [
+    { runtimeId: "reviewed-stream", status: "streaming" },
+    { runtimeId: "reviewed-queue", status: "queued" },
+  ]);
+  assert.equal(reviewed.status, "ok");
+  if (reviewed.status !== "ok") return;
+  const approvalBinding = binding();
+  const result = await integration.commitActivation({
+    preview: reviewed.preview,
+    approvalBinding,
+    approvalDigest: capabilityOperationDigest(reviewed.preview, approvalBinding),
+    approvedAt: 11,
+  });
+  assert.equal(result.status, "committed");
+  assert.deepEqual(lifecycle.activations, ["wayang.host-execution.v1:"]);
+});
+
+test("authority drift still conflicts without invoking the activation latch", async () => {
+  const lifecycle = denial();
+  const integration = new WorkspaceCapabilityIntegration(lifecycle);
+  const { intent, project } = setup();
+  const reviewed = await integration.previewActivation(intent);
+  assert.equal(reviewed.status, "ok");
+  if (reviewed.status !== "ok") return;
+  const replacement = createAgentProfile({ name: "Authority Drift Replacement", resource_mode: "standard" });
+  updateProject(project.id, {
+    default_agent_profile_id: replacement.id,
+    access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [replacement.id] },
+  });
+  const approvalBinding = binding();
+  const result = await integration.commitActivation({
+    preview: reviewed.preview,
+    approvalBinding,
+    approvalDigest: capabilityOperationDigest(reviewed.preview, approvalBinding),
+    approvedAt: 11,
+  });
+  assert.equal(result.status, "conflict");
+  assert.deepEqual(lifecycle.activations, []);
+  assert.equal(getStore().workspaceCapabilityAssociations.length, 0);
+});
+
+test("profile enabled-state drift still conflicts without invoking the activation latch", async () => {
+  const lifecycle = denial();
+  const integration = new WorkspaceCapabilityIntegration(lifecycle);
+  const { intent, project, profile } = setup();
+  const reviewed = await integration.previewActivation(intent);
+  assert.equal(reviewed.status, "ok");
+  if (reviewed.status !== "ok") return;
+  const replacement = createAgentProfile({ name: "Replacement Profile", resource_mode: "standard" });
+  updateProject(project.id, {
+    default_agent_profile_id: replacement.id,
+    access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [profile.id, replacement.id] },
+  });
+  updateAgentProfile(profile.id, { enabled: false });
+  const approvalBinding = binding();
+  const result = await integration.commitActivation({
+    preview: reviewed.preview,
+    approvalBinding,
+    approvalDigest: capabilityOperationDigest(reviewed.preview, approvalBinding),
+    approvedAt: 11,
+  });
+  assert.equal(result.status, "conflict");
+  assert.deepEqual(lifecycle.activations, []);
+});
+
+test("privacy-mode drift still conflicts without invoking the activation latch", async () => {
+  const lifecycle = denial();
+  const integration = new WorkspaceCapabilityIntegration(lifecycle);
+  const { intent, project, profile } = setup();
+  const reviewed = await integration.previewActivation(intent);
+  assert.equal(reviewed.status, "ok");
+  if (reviewed.status !== "ok") return;
+  updateProject(project.id, {
+    access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [profile.id] },
+  });
+  const approvalBinding = binding();
+  const result = await integration.commitActivation({
+    preview: reviewed.preview,
+    approvalBinding,
+    approvalDigest: capabilityOperationDigest(reviewed.preview, approvalBinding),
+    approvedAt: 11,
+  });
+  assert.equal(result.status, "conflict");
+  assert.deepEqual(lifecycle.activations, []);
+});
+
+test("association revision drift still conflicts after another activation wins", async () => {
+  const lifecycle = denial();
+  const integration = new WorkspaceCapabilityIntegration(lifecycle);
+  const { intent } = setup();
+  const reviewed = await integration.previewActivation(intent);
+  assert.equal(reviewed.status, "ok");
+  if (reviewed.status !== "ok") return;
+  const approvalBinding = binding();
+  const input = {
+    preview: reviewed.preview,
+    approvalBinding,
+    approvalDigest: capabilityOperationDigest(reviewed.preview, approvalBinding),
+    approvedAt: 11,
+  };
+  assert.equal((await integration.commitActivation(input)).status, "committed");
+  assert.equal((await integration.commitActivation({ ...input, approvedAt: 12 })).status, "conflict");
+  assert.equal(lifecycle.activations.length, 1);
+  assert.equal(getStore().workspaceCapabilityApprovalEvents.length, 1);
+});
+
+test("activation latch is synchronous and precedes durable association/event commit", async () => {
+  const lifecycle = denial();
+  lifecycle.latchActivation = function (input) {
+    assert.equal(getStore().workspaceCapabilityAssociations.length, 0);
+    assert.equal(getStore().workspaceCapabilityApprovalEvents.length, 0);
+    this.activations.push(input.intent.capabilityId);
+  };
+  const integration = new WorkspaceCapabilityIntegration(lifecycle);
+  const { intent } = setup();
+  const result = await commit(integration, intent, 12);
+  assert.equal(result.status, "committed");
+  assert.deepEqual(lifecycle.activations, ["wayang.host-execution.v1"]);
+  assert.equal(getStore().workspaceCapabilityAssociations.length, 1);
+  assert.equal(getStore().workspaceCapabilityApprovalEvents.length, 1);
+});
+
+test("durable commit failure after latching creates no authority and leaves refresh requested", async () => {
+  const lifecycle = denial();
+  lifecycle.latchActivation = function (input) {
+    this.activations.push(input.intent.capabilityId);
+    failNextCommitStoreMutationPersistenceForTests(new Error("synthetic activation persistence failure"));
+  };
+  const integration = new WorkspaceCapabilityIntegration(lifecycle);
+  const { intent } = setup();
+  await assert.rejects(commit(integration, intent, 12), /synthetic activation persistence failure/);
+  assert.deepEqual(lifecycle.activations, ["wayang.host-execution.v1"]);
+  assert.equal(getStore().workspaceCapabilityAssociations.length, 0);
+  assert.equal(getStore().workspaceCapabilityApprovalEvents.length, 0);
 });
 
 test("exact-revision revocation publishes tombstone before latch and annotates audit", async () => {
