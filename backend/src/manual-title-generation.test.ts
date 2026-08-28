@@ -16,6 +16,7 @@ import {
   cancelManualTitleGeneration,
   enqueueManualTitleGeneration,
   getManualTitleGeneration,
+  ManualTitleGenerationError,
   resetManualTitleGenerationForTests,
   runManualTitleGenerationNowForTests,
   setManualTitleProviderForTests,
@@ -38,7 +39,9 @@ function fixture(title?: string): Fixture {
   const cwd = path.join(root, "project");
   fs.mkdirSync(cwd, { recursive: true });
   const previousDataDir = process.env.WAYANG_DATA_DIR;
+  const previousAutoTitle = process.env.WAYANG_AUTO_SESSION_TITLE;
   process.env.WAYANG_DATA_DIR = path.join(root, "data");
+  process.env.WAYANG_AUTO_SESSION_TITLE = "on";
   init();
   const row = createSession(cwd, title ? { title } : undefined);
   const manager = SessionManager.create(cwd, path.join(root, "sessions"), { id: row.id });
@@ -58,6 +61,8 @@ function fixture(title?: string): Fixture {
       close();
       if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
       else process.env.WAYANG_DATA_DIR = previousDataDir;
+      if (previousAutoTitle === undefined) delete process.env.WAYANG_AUTO_SESSION_TITLE;
+      else process.env.WAYANG_AUTO_SESSION_TITLE = previousAutoTitle;
       fs.rmSync(root, { recursive: true, force: true });
     },
   };
@@ -254,6 +259,22 @@ test("no completed turn fails without preparing Terra", async () => {
     const result = getManualTitleGeneration(f.rowId);
     assert.deepEqual([result.state, result.code], ["failed", "title_input_unavailable"]);
     assert.equal(fake.prepareCalls, 0);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("explicit action retains the configured Terra disclosure gate", () => {
+  const f = fixture();
+  try {
+    appendExchange(f.manager, 1);
+    delete process.env.WAYANG_AUTO_SESSION_TITLE;
+    assert.throws(
+      () => enqueueManualTitleGeneration(f.rowId, { expectedTitle: "" }, f.dependencies),
+      (error: unknown) => error instanceof ManualTitleGenerationError
+        && error.code === "title_generation_disabled"
+        && error.statusCode === 403,
+    );
   } finally {
     f.cleanup();
   }

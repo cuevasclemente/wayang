@@ -555,6 +555,16 @@ export function SessionsPanel({
     }
   }, [refresh]);
 
+  useEffect(() => {
+    for (const session of sessions) {
+      const status = titleGenerations[session.id] ?? session.title_generation;
+      if (!status?.request_id || (status.state !== "queued" && status.state !== "running")) continue;
+      if (titlePollRequestsRef.current.get(session.id) === status.request_id) continue;
+      setTitleGenerations((previous) => ({ ...previous, [session.id]: status }));
+      void pollTitleGeneration(session.id, status.request_id);
+    }
+  }, [pollTitleGeneration, sessions, titleGenerations]);
+
   const handleGenerateTitle = useCallback(async (session: Session) => {
     const currentTitle = session.title.trim();
     const replacement = currentTitle ? `replace “${currentTitle}”` : "name this untitled session";

@@ -12,6 +12,8 @@ import {
 } from "./session-title-policy.js";
 import { TerraTitleProvider, type TitleProvider } from "./terra-title-provider.js";
 import { isSessionRuntimeMutationLocked } from "./session-runtime-mutation-lock.js";
+import { authorizeProjectAction } from "./policy.js";
+import { protectedAutoTitleEnabled, wayangAutoTitleEnabled } from "./session-title-service.js";
 import type { SessionTitleSource } from "./workspace-types.js";
 
 export type ManualTitleGenerationState =
@@ -106,6 +108,29 @@ function physicalNameMatchesWitness(witness: TitleWitness, state: SessionNameSta
   return state.entryId === undefined;
 }
 
+function explicitTitleDisclosureAllowed(row: SessionRow): boolean {
+  if (!wayangAutoTitleEnabled()
+    || row.legacy_capability_ineligible !== false
+    || row.legacy_private_session_quarantine !== false
+    || row.pending_agent_switch !== null
+    || row.scheduled_job_id !== null
+    || row.scheduled_run_id !== null
+    || !row.project_id
+    || !row.agent_profile_id) return false;
+  const authorization = authorizeProjectAction({
+    cwd: row.cwd,
+    actor: "interactive",
+    agentProfileId: row.agent_profile_id,
+  });
+  return Boolean(
+    authorization.allowed
+    && authorization.project
+    && authorization.project.id === row.project_id
+    && authorization.project.cwd === row.cwd
+    && (authorization.project.access_policy.privacy_mode !== "protected" || protectedAutoTitleEnabled()),
+  );
+}
+
 function titleWitnessStillCurrent(witness: TitleWitness): SessionRow | null {
   const row = getSessionById(witness.sessionId);
   if (!row
@@ -113,7 +138,8 @@ function titleWitnessStillCurrent(witness: TitleWitness): SessionRow | null {
     || row.pi_session_file !== witness.sessionFile
     || row.title !== witness.title
     || row.title_source !== witness.titleSource
-    || row.archived !== 0) return null;
+    || row.archived !== 0
+    || !explicitTitleDisclosureAllowed(row)) return null;
   return row;
 }
 
@@ -292,6 +318,13 @@ export function enqueueManualTitleGeneration(
   if (existing && (existing.state === "queued" || existing.state === "running")) return project(existing);
   const row = getSessionById(sessionId);
   if (!row) throw new ManualTitleGenerationError("Session not found", 404, "session_not_found");
+  if (!explicitTitleDisclosureAllowed(row)) {
+    throw new ManualTitleGenerationError(
+      "Terra title disclosure is not enabled for this session",
+      403,
+      "title_generation_disabled",
+    );
+  }
   if (!row.pi_session_file) {
     throw new ManualTitleGenerationError("Session has no transcript", 409, "title_input_unavailable");
   }

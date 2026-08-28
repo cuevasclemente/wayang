@@ -231,3 +231,71 @@ test("catalog title stays provisional through two exchanges and updates after th
   await expect(sessionRow).not.toContainText(provisionalTitle);
   expect(fixture.titleRequestMethods.filter((method) => method === "PATCH")).toEqual([]);
 });
+
+test("Generate title confirms, shows progress, and refreshes the row", async ({ page, request }) => {
+  const session = await createE2eSession(request, "Manual title action");
+  const generatedTitle = `Generated title ${Date.now()}`;
+  const requestId = `title-request-${Date.now()}`;
+  let completed = false;
+  let statusReads = 0;
+
+  await page.route(`**/api/sessions/${encodeURIComponent(session.id)}/title-generation`, async (route) => {
+    if (route.request().method() === "POST") {
+      expect(route.request().postDataJSON()).toEqual({ expected_title: session.title });
+      await route.fulfill({
+        status: 202,
+        contentType: "application/json",
+        body: JSON.stringify({
+          session_id: session.id,
+          request_id: requestId,
+          state: "queued",
+          created_at: Date.now(),
+          updated_at: Date.now(),
+        }),
+      });
+      return;
+    }
+    statusReads++;
+    completed = statusReads >= 2;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        session_id: session.id,
+        request_id: requestId,
+        state: completed ? "completed" : "running",
+        ...(completed ? { title: generatedTitle } : {}),
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      }),
+    });
+  });
+
+  await page.route("**/api/sessions", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.continue();
+      return;
+    }
+    const response = await route.fetch();
+    const payload = await response.json() as unknown;
+    const sessions = Array.isArray(payload)
+      ? payload.map((value) => value && typeof value === "object" && (value as { id?: unknown }).id === session.id
+        ? { ...value, pi_session_file: "/synthetic/session.jsonl", ...(completed ? { title: generatedTitle } : {}) }
+        : value)
+      : payload;
+    await route.fulfill({ response, json: sessions });
+  });
+
+  await openSessionInUi(page, session);
+  const row = page.locator(`[data-testid="session-row"][data-session-id="${session.id}"]`);
+  await row.hover();
+  page.once("dialog", async (dialog) => {
+    expect(dialog.message()).toContain("openai-codex/gpt-5.6-terra");
+    expect(dialog.message()).toContain("first one to three completed turns");
+    await dialog.accept();
+  });
+  await row.getByRole("button", { name: "Generate session title" }).click();
+  await expect(row.getByRole("button", { name: "Generating session title" })).toBeDisabled();
+  await expect(page.getByTestId("session-title-generation-notice")).toContainText(generatedTitle);
+  await expect(row).toContainText(generatedTitle);
+});

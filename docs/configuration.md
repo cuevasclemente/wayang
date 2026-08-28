@@ -121,6 +121,8 @@ The fixed model is `openai-codex/gpt-5.6-terra`; there is no provider fallback. 
 
 Generation runs on a deferred task and does not delay source-message admission. Rejected, unpersisted, cancelled-before-start, attachment-only, non-browser, scheduled, connector/headless, subagent, interview-continuation, resend, and ambiguous decorated legacy turns cannot become first-message title provenance. Before disclosure and commit, Wayang requires either the exact live accepted-turn ledger entry or its exact marker in a freshly reopened physical transcript, then rechecks Project/Profile/privacy policy and the canonical Pi name revision. A later eligible interaction may retry a failed attempt, but cannot replace the physical first user message as title provenance. Human titles and deliberate clears use the shared Pi lock and win races. Disable promptly by setting the flags to `off` and restarting through the normal reviewed deployment procedure; already persisted titles are not removed or regenerated.
 
+The session-row **Generate title** action uses the same configured Terra disclosure scope and is unavailable when the corresponding flag is off. After confirmation, it may replace any existing title using bounded prose from the first one to three completed active-branch exchanges. A request made while the session is busy is queued in backend memory, survives browser navigation/disconnect, and runs once the session is idle; it is intentionally lost on a Wayang restart. A newer manual or physical Pi rename wins instead of being overwritten. Archive, delete, or manual rename cancels pending work.
+
 ### Pi paths and settings
 
 | Variable/path | Meaning |
