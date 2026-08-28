@@ -67,7 +67,7 @@ For a single-user private LAN without an existing reverse proxy, Wayang includes
 
 ## Pi provider authentication
 
-Wayang uses pi 0.84.1's standard authentication and model runtime. The coding-agent package is pinned to the repository-vendored `0.84.1-wayang.f351bec9` artifact (SHA-256 `981f531ffe7b0a93ccf31a2f794d17c54025894cf8d39094193e892fed023938`) so session-name writers and PIN-gated transcript event mutations share the reviewed physical-file transaction, lock, atomic multi-entry CAS, and stale-runtime mutation epoch.
+Wayang uses pi 0.84.1's standard authentication and model runtime. The coding-agent package is pinned to the repository-vendored `0.84.1-wayang.29fcca05` artifact (SHA-256 `fc09c52ec79888b30b10e63a985b3ba1c23a96e6ee37b5cf0f3ab1fdfbfb2007`) so session-name writers and PIN-gated transcript event mutations share the reviewed physical-file transaction, lock, atomic multi-entry CAS, stale-runtime mutation epoch, optional fixed compaction threshold, and optional complete-turn retention.
 
 ### OAuth or pi-managed API key
 
@@ -107,6 +107,38 @@ OpenRouter models are intentionally unavailable in Wayang's picker and model-swi
 Provider/model availability is deployment-global and does not depend on Project privacy, Agent Profile resource mode, or derived Project-Agent authority. Declarative pi providers are present in every fresh per-session model context. Exact extension-backed providers admitted to Wayang's reviewed external catalog are no-follow/hash-verified, copied from the verified descriptor into private temporary storage, and loaded through a provider-only bootstrap for restricted and Standard runtimes alike. That bootstrap retains only provider registrations; it does not attach the extension's tools, hooks, commands, prompts, skills, renderers, or resource paths. After model resolution, resource-extension provider mutations are ignored for that session. Static picker listing never executes provider extension code, and project-local extensions cannot pre-populate or overwrite another session's provider registry.
 
 Credential resolution in pi prefers a CLI override, then pi `auth.json`, then environment variables, then a custom provider key. Wayang does not accept provider keys in browser storage or URLs.
+
+### Memory-first traditional compaction
+
+The integration is disabled by default. It keeps one physical Pi `AgentSession` and uses repeated traditional Pi compaction; it does not create capsules, logical episodes, replacement sessions, or a second content telemetry ledger.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `WAYANG_MEMORY_FIRST_ENABLED` | `0` | Master gate. Alone it enables nothing; at least one independently explicit component flag is also required. |
+| `WAYANG_MEMORY_FIRST_GUIDANCE_ENABLED` | `0` | Together with the master gate, inject stable memory/compaction guidance. |
+| `WAYANG_MEMORY_FIRST_REVIEW_ENABLED` | `0` | Together with the master gate, queue one memory-review continuation per traditional compaction cycle after the review threshold. |
+| `WAYANG_MEMORY_FIRST_COMPACTION_CONTROLS_ENABLED` | `0` | Together with the master gate, apply compaction settings only to the runtime's in-memory `SettingsManager` snapshot. Never writes Pi settings files. |
+| `WAYANG_MEMORY_FIRST_LEDGER_ENABLED` | `0` | Together with the master gate, emit bounded anonymous lifecycle aggregates on the reviewed event-bus/sink contract and leave any content ledger with its owning memory extension. |
+| `WAYANG_MEMORY_FIRST_STANDARD_INTERACTIVE_ENABLED` | `0` | Admit Standard interactive sessions to explicitly enabled components. |
+| `WAYANG_MEMORY_FIRST_STANDARD_SCHEDULED_ENABLED` | `0` | Independently admit Standard scheduled sessions. |
+| `WAYANG_MEMORY_FIRST_PROTECTED_INTERACTIVE_ENABLED` | `0` | Independently admit Protected interactive sessions to the project-local route. |
+| `WAYANG_MEMORY_FIRST_PROTECTED_SCHEDULED_ENABLED` | `0` | Independently admit Protected scheduled sessions. |
+| `WAYANG_MEMORY_FIRST_SUBAGENT_ENABLED` | `0` | Independently admit runtimes explicitly classified as subagents. |
+| `WAYANG_MEMORY_FIRST_REVIEW_TOKENS` | `96000` | Memory-review threshold; must be below the compaction trigger. |
+| `WAYANG_MEMORY_FIRST_COMPACTION_TRIGGER_TOKENS` | `128000` | Absolute traditional-compaction target. The selected model must also provide at least 16,384 tokens of headroom. |
+| `WAYANG_MEMORY_FIRST_KEEP_RECENT_TOKENS` | `20000` | Recent context tail retained by Pi compaction; must be below the review threshold. |
+| `WAYANG_MEMORY_FIRST_KEEP_COMPLETE_TURNS` | `0` | Independently requests complete-turn retention through the narrow forward-compatibility field; has effect only when compaction controls are also explicit. |
+| `WAYANG_MEMORY_FIRST_STANDARD_ROUTE` | `memoriki` | Fixed Standard-project durable-memory route. Other values fail configuration. |
+| `WAYANG_MEMORY_FIRST_PROTECTED_ROUTE` | `project-local` | Fixed Protected-project route. Other values fail configuration. |
+| `WAYANG_MEMORY_FIRST_PROTECTED_PROJECT_PATH` | `.wayang/memory.md` | Relative traversal-free durable-memory path inside the owning Protected project. |
+
+The master, every component flag, and every cohort flag accept only `0` or `1` and default off. The policy remains inert unless at least one component and one cohort are both explicit. Standard interactive, Standard scheduled, Protected interactive, Protected scheduled, and subagent runtimes are scoped independently before prompt injection, tool registration, model validation, settings snapshots, or compaction overrides. Thresholds are independently range/order validated. When compaction controls are explicit, Wayang validates the selected model before runtime publication, creates an in-memory settings snapshot even for Standard resources, and applies `enabled`, a current-SDK `reserveTokens` fallback, and `keepRecentTokens`. Optional `triggerTokens` is isolated behind one compatibility helper; `keepCompleteTurns` is omitted unless its own flag is also explicit. Wayang-owned `/reload` waits for Pi's SDK reload, then validates the current model/config and reapplies these in-memory overrides before reporting success; reload, reapply, or validation failure destroys the runtime rather than continuing with partially refreshed or silently reverted settings. Disabling the master restores existing resource loading and settings behavior.
+
+The inline extension factory is injected through Standard or restricted resource loaders only when guidance, review, or aggregate lifecycle reporting is explicit **and** that exact runtime's privacy/execution cohort is enabled. Standard guidance uses the Memoriki wiki only according to the active profile's memory authority. Protected guidance names only the configured project-local wiki and never suggests global/personal/cross-project memory access. Guidance distinguishes future-value short-term knowledge (active commitments, current state, near-term decisions) from selective long-term knowledge (stable facts, preferences, constraints, reusable decisions). Scheduled guidance requires a best-effort review without waiting for human input; the exported subagent seam requires a bounded handoff.
+
+At the review threshold, `agent_end` queues a `followUp` custom reminder with `triggerTurn: true`. Because Pi emits `before_agent_start` before marking the run active, reload/high-context recovery returns the reminder directly in that pending run's `{ message }` result and never calls `sendMessage` from the pre-run hook. The enum-only `memory_review_complete` tool records only `outcome`, `short_term`, and `long_term` values in a typed extension entry—never memory content, paths, or raw identifiers. An exact repeated completion returns the canonical stored outcome without another entry/event; conflicting retries are rejected. Review completion, the enum-only queued marker, a delivered reminder, and the single threshold-deferral marker are reconstructed from the active branch after the latest compaction. A delivered reminder counts only when its strict enum details match the current privacy mode, memory route, and execution mode, so a policy transition reissues correctly specialized guidance. Manual and overflow compaction always pass through. Threshold compaction may be cancelled once to allow review: an ordinary reminder still in Pi's queue is reused as that continuation, while a delivered-but-incomplete reminder receives one retry turn. The next threshold attempt passes even when review remains blocked. No broad Wayang mutation lease is taken.
+
+Lifecycle events contain only a fixed event type, privacy/route/execution classifications, timestamp, and optional token count/reason. They contain no session or Project identity, prompts, summaries, tool data, memory content, paths, or transcript bytes; they are capped at 64 emissions per runtime, and consumer failure never affects the session. Wayang publishes the same frozen aggregate contract on Pi's `wayang:memory-first-lifecycle:v1` event bus and through the optional exported sink; it does not persist the events itself. A reviewed mypi extension may consume that interface and remain the sole owner of any richer content ledger.
 
 ### Automatic Terra session titles
 

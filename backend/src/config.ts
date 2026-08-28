@@ -2,6 +2,12 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { isPasswordHashRecord } from "./auth/password.js";
 import { isLoopbackHost } from "./loopback.js";
+import {
+  DEFAULT_MEMORY_COMPACTION_TRIGGER_TOKENS,
+  DEFAULT_MEMORY_KEEP_RECENT_TOKENS,
+  DEFAULT_MEMORY_REVIEW_TOKENS,
+  type MemoryFirstCompactionConfig,
+} from "./memory-first-compaction.js";
 
 export interface TtsConfig {
   /** Shared TTS broker base URL; preferred for streaming/job-based playback. */
@@ -84,6 +90,7 @@ export interface Config {
   auth: AuthConfig;
   browser: BrowserConfig;
   messaging: MessagingConfig;
+  memoryFirstCompaction: MemoryFirstCompactionConfig;
   fileAudioExperiment: FileAudioExperimentConfig;
 }
 
@@ -138,6 +145,90 @@ function envFlag(name: string, fallback = "0"): boolean {
 
 function authEnabled(): boolean {
   return envFlag("WAYANG_AUTH_ENABLED");
+}
+
+function exactMemoryRoute<T extends "memoriki" | "project-local">(name: string, expected: T): T {
+  const raw = process.env[name] === undefined ? expected : process.env[name];
+  if (raw !== expected) throw new Error(`${name} must be ${expected}`);
+  return expected;
+}
+
+function protectedProjectMemoryPath(): string {
+  const raw = process.env.WAYANG_MEMORY_FIRST_PROTECTED_PROJECT_PATH ?? ".wayang/memory.md";
+  if (!raw || raw !== raw.trim() || path.isAbsolute(raw) || raw.includes("\\") || raw.includes("\0")
+    || raw !== raw.normalize("NFC") || Buffer.byteLength(raw, "utf8") > 512
+    || /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(raw)) {
+    throw new Error("WAYANG_MEMORY_FIRST_PROTECTED_PROJECT_PATH must be a bounded relative project-local path");
+  }
+  const parts = raw.split("/");
+  if (parts.length === 0 || parts.some((part) => !part || part === "." || part === "..")) {
+    throw new Error("WAYANG_MEMORY_FIRST_PROTECTED_PROJECT_PATH must be a traversal-free project-local path");
+  }
+  return parts.join("/");
+}
+
+function memoryFirstCompactionConfig(): MemoryFirstCompactionConfig {
+  const masterEnabled = envFlag("WAYANG_MEMORY_FIRST_ENABLED");
+  const requestedGuidance = envFlag("WAYANG_MEMORY_FIRST_GUIDANCE_ENABLED");
+  const requestedReview = envFlag("WAYANG_MEMORY_FIRST_REVIEW_ENABLED");
+  const requestedCompaction = envFlag("WAYANG_MEMORY_FIRST_COMPACTION_CONTROLS_ENABLED");
+  const requestedLedger = envFlag("WAYANG_MEMORY_FIRST_LEDGER_ENABLED");
+  const standardInteractiveEnabled = masterEnabled && envFlag("WAYANG_MEMORY_FIRST_STANDARD_INTERACTIVE_ENABLED");
+  const standardScheduledEnabled = masterEnabled && envFlag("WAYANG_MEMORY_FIRST_STANDARD_SCHEDULED_ENABLED");
+  const protectedInteractiveEnabled = masterEnabled && envFlag("WAYANG_MEMORY_FIRST_PROTECTED_INTERACTIVE_ENABLED");
+  const protectedScheduledEnabled = masterEnabled && envFlag("WAYANG_MEMORY_FIRST_PROTECTED_SCHEDULED_ENABLED");
+  const subagentEnabled = masterEnabled && envFlag("WAYANG_MEMORY_FIRST_SUBAGENT_ENABLED");
+  const reviewTokens = getPositiveEnvInt(
+    "WAYANG_MEMORY_FIRST_REVIEW_TOKENS",
+    DEFAULT_MEMORY_REVIEW_TOKENS,
+    16_000,
+    1_000_000,
+  );
+  const compactionTriggerTokens = getPositiveEnvInt(
+    "WAYANG_MEMORY_FIRST_COMPACTION_TRIGGER_TOKENS",
+    DEFAULT_MEMORY_COMPACTION_TRIGGER_TOKENS,
+    32_000,
+    2_000_000,
+  );
+  const keepRecentTokens = getPositiveEnvInt(
+    "WAYANG_MEMORY_FIRST_KEEP_RECENT_TOKENS",
+    DEFAULT_MEMORY_KEEP_RECENT_TOKENS,
+    1_000,
+    200_000,
+  );
+  const requestedKeepCompleteTurns = envFlag("WAYANG_MEMORY_FIRST_KEEP_COMPLETE_TURNS");
+  if (reviewTokens >= compactionTriggerTokens) {
+    throw new Error("WAYANG_MEMORY_FIRST_REVIEW_TOKENS must be less than WAYANG_MEMORY_FIRST_COMPACTION_TRIGGER_TOKENS");
+  }
+  if (keepRecentTokens >= reviewTokens) {
+    throw new Error("WAYANG_MEMORY_FIRST_KEEP_RECENT_TOKENS must be less than WAYANG_MEMORY_FIRST_REVIEW_TOKENS");
+  }
+  const guidanceEnabled = masterEnabled && requestedGuidance;
+  const reviewEnabled = masterEnabled && requestedReview;
+  const compactionControlsEnabled = masterEnabled && requestedCompaction;
+  const ledgerEnabled = masterEnabled && requestedLedger;
+  const anyBehaviorEnabled = guidanceEnabled || reviewEnabled || compactionControlsEnabled || ledgerEnabled;
+  const anyCohortEnabled = standardInteractiveEnabled || standardScheduledEnabled
+    || protectedInteractiveEnabled || protectedScheduledEnabled || subagentEnabled;
+  return {
+    enabled: anyBehaviorEnabled && anyCohortEnabled,
+    guidanceEnabled,
+    reviewEnabled,
+    compactionControlsEnabled,
+    ledgerEnabled,
+    standardInteractiveEnabled,
+    standardScheduledEnabled,
+    protectedInteractiveEnabled,
+    protectedScheduledEnabled,
+    subagentEnabled,
+    reviewTokens,
+    compactionTriggerTokens,
+    keepRecentTokens,
+    keepCompleteTurns: compactionControlsEnabled && requestedKeepCompleteTurns,
+    standardRoute: exactMemoryRoute("WAYANG_MEMORY_FIRST_STANDARD_ROUTE", "memoriki"),
+    protectedRoute: exactMemoryRoute("WAYANG_MEMORY_FIRST_PROTECTED_ROUTE", "project-local"),
+    protectedProjectMemoryPath: protectedProjectMemoryPath(),
+  };
 }
 
 function trustProxy(): "loopback" | false {
@@ -272,6 +363,7 @@ export function getConfig(overrides?: Partial<Config>): Config {
       enabled: envFlag("WAYANG_MESSAGING_ENABLED"),
       configPath: process.env.WAYANG_MESSAGING_CONFIG_PATH?.trim() || "",
     },
+    memoryFirstCompaction: memoryFirstCompactionConfig(),
     fileAudioExperiment: {
       enabled: envFlag("WAYANG_FILE_AUDIO_EXPERIMENT_ENABLED"),
       permitTtlMs: getPositiveEnvInt("WAYANG_FILE_AUDIO_EXPERIMENT_PERMIT_TTL_MS", 60_000, 1_000, 120_000),

@@ -53,6 +53,7 @@ import {
   previewSessionAgentSwitch,
   protectedBrowserIdleRetentionIsRequired,
   projectQueuedBrowserMessages,
+  reloadAgentSessionWithMemoryFirstOverrides,
   reconcilePendingAgentSwitch,
   resolveInteractiveBrowserAuthority,
   resolveInteractiveTurn,
@@ -87,6 +88,38 @@ import {
   acquireSessionRuntimeMutationLock,
   releaseSessionRuntimeMutationLock,
 } from "./session-runtime-mutation-lock.js";
+import {
+  applyMemoryFirstCompactionOverrides,
+  createMemoryFirstCompactionExtension,
+  DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+  MEMORY_FIRST_COHORT_ENTRY,
+  MEMORY_REVIEW_COMPLETE_ENTRY,
+  MEMORY_REVIEW_COMPLETE_TOOL_NAME,
+  MEMORY_REVIEW_REMINDER_MESSAGE,
+  MEMORY_REVIEW_REMINDER_QUEUED_ENTRY,
+  MEMORY_REVIEW_THRESHOLD_DEFERRED_ENTRY,
+  reconstructMemoryReviewCycle,
+  validateMemoryFirstModel,
+  type MemoryFirstCompactionConfig,
+  type MemoryFirstLifecycleEvent,
+} from "./memory-first-compaction.js";
+
+const STANDARD_MEMORY_REVIEW_BINDING = {
+  privacyMode: "standard" as const,
+  route: "memoriki" as const,
+  executionMode: "interactive" as const,
+};
+
+const piBridgeMemoryFirstConfig: MemoryFirstCompactionConfig = {
+  ...DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+  enabled: true,
+  guidanceEnabled: true,
+  reviewEnabled: true,
+  compactionControlsEnabled: true,
+  ledgerEnabled: true,
+  standardInteractiveEnabled: true,
+  keepCompleteTurns: true,
+};
 
 function syntheticProtectedRuntime(
   mode: "agent" | "user" | "paused",
@@ -106,6 +139,447 @@ test("runtime companion tools preserve unrestricted policy and only widen explic
     composeRuntimeActiveTools(["read", "bash"], ["browser_status", "bash"]),
     ["read", "bash", "browser_status"],
   );
+});
+
+test("Wayang reload reapplies current memory-first settings after SDK reload and fails closed", async () => {
+  const successOrder: string[] = [];
+  let currentConfig: MemoryFirstCompactionConfig = DISABLED_MEMORY_FIRST_COMPACTION_CONFIG;
+  await reloadAgentSessionWithMemoryFirstOverrides({
+    async reloadSdk() {
+      successOrder.push("sdk_reload");
+      currentConfig = piBridgeMemoryFirstConfig;
+    },
+    getConfig: () => currentConfig,
+    getModel: () => ({ provider: "synthetic", id: "large", contextWindow: 200_000 }),
+    settingsManager: {
+      applyOverrides(value: any) {
+        successOrder.push("override");
+        assert.equal(value.compaction.triggerTokens, 128_000);
+        assert.equal(value.compaction.keepCompleteTurns, true);
+      },
+    } as any,
+    async failClosed() { assert.fail("successful reload must not fail closed"); },
+  });
+  assert.deepEqual(successOrder, ["sdk_reload", "override"]);
+
+  const failureOrder: string[] = [];
+  await assert.rejects(() => reloadAgentSessionWithMemoryFirstOverrides({
+    async reloadSdk() { failureOrder.push("sdk_reload"); },
+    getConfig: () => piBridgeMemoryFirstConfig,
+    getModel: () => ({ provider: "synthetic", id: "large", contextWindow: 200_000 }),
+    settingsManager: {
+      applyOverrides() {
+        failureOrder.push("override_failed");
+        throw new Error("synthetic override failure");
+      },
+    } as any,
+    async failClosed() { failureOrder.push("failed_closed"); },
+  }), /synthetic override failure/);
+  assert.deepEqual(failureOrder, ["sdk_reload", "override_failed", "failed_closed"]);
+
+  let invalidModelClosed = false;
+  await assert.rejects(() => reloadAgentSessionWithMemoryFirstOverrides({
+    async reloadSdk() {},
+    getConfig: () => piBridgeMemoryFirstConfig,
+    getModel: () => ({ provider: "synthetic", id: "too-small", contextWindow: 128_000 }),
+    settingsManager: { applyOverrides() { assert.fail("invalid model must fail before override"); } } as any,
+    async failClosed() { invalidModelClosed = true; },
+  }), /provide at least 16384 tokens beyond the compaction trigger/);
+  assert.equal(invalidModelClosed, true);
+
+  let sdkFailureClosed = false;
+  await assert.rejects(() => reloadAgentSessionWithMemoryFirstOverrides({
+    async reloadSdk() { throw new Error("synthetic SDK reload failure"); },
+    getConfig: () => DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+    getModel: () => undefined,
+    settingsManager: { applyOverrides() {} } as any,
+    async failClosed() { sdkFailureClosed = true; },
+  }), /synthetic SDK reload failure/);
+  assert.equal(sdkFailureClosed, true);
+});
+
+test("memory-first model validation and compatibility settings enforce explicit 96K/128K/20K controls", () => {
+  assert.doesNotThrow(() => validateMemoryFirstModel(
+    DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+    { provider: "synthetic", id: "small-disabled", contextWindow: 32_000 },
+  ));
+  assert.throws(() => validateMemoryFirstModel(
+    piBridgeMemoryFirstConfig,
+    { provider: "synthetic", id: "too-small", contextWindow: 128_000 },
+  ), /provide at least 16384 tokens beyond the compaction trigger/);
+  assert.doesNotThrow(() => validateMemoryFirstModel(
+    piBridgeMemoryFirstConfig,
+    { provider: "synthetic", id: "large", contextWindow: 200_000 },
+  ));
+
+  let disabledOverride: unknown;
+  applyMemoryFirstCompactionOverrides({
+    applyOverrides(value: unknown) { disabledOverride = value; },
+  } as any, DISABLED_MEMORY_FIRST_COMPACTION_CONFIG, 200_000);
+  assert.equal(disabledOverride, undefined);
+
+  let applied: any;
+  applyMemoryFirstCompactionOverrides({
+    applyOverrides(value: unknown) { applied = value; },
+  } as any, piBridgeMemoryFirstConfig, 200_000);
+  assert.deepEqual(applied, {
+    compaction: {
+      enabled: true,
+      reserveTokens: 72_000,
+      keepRecentTokens: 20_000,
+      triggerTokens: 128_000,
+      keepCompleteTurns: true,
+    },
+  });
+
+  applied = undefined;
+  applyMemoryFirstCompactionOverrides({
+    applyOverrides(value: unknown) { applied = value; },
+  } as any, { ...piBridgeMemoryFirstConfig, keepCompleteTurns: false }, 200_000);
+  assert.equal("keepCompleteTurns" in applied.compaction, false,
+    "the optional compatibility field is absent unless independently enabled");
+});
+
+function memoryFirstHarness(
+  branch: any[],
+  metadata: { privacyMode: "standard" | "protected" } = { privacyMode: "standard" },
+  config: MemoryFirstCompactionConfig = piBridgeMemoryFirstConfig,
+) {
+  const handlers = new Map<string, (...args: any[]) => any>();
+  const queue: Array<{ message: any; options: any }> = [];
+  const lifecycle: MemoryFirstLifecycleEvent[] = [];
+  let tool: any;
+  let tokens: number | null = 0;
+  const ctx = {
+    sessionManager: { getBranch: () => branch },
+    getContextUsage: () => ({ tokens }),
+  };
+  const factory = createMemoryFirstCompactionExtension({
+    privacyMode: metadata.privacyMode,
+    executionMode: "interactive",
+    memoryAccess: "read_write",
+  }, config, (event) => lifecycle.push({ ...event }));
+  factory({
+    on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
+    registerTool(definition: any) { tool = definition; },
+    appendEntry(customType: string, data: unknown) {
+      branch.push({ type: "custom", customType, data });
+    },
+    sendMessage(message: any, options: any) { queue.push({ message, options }); },
+    events: { emit() {} },
+  } as any);
+  return {
+    handlers,
+    queue,
+    lifecycle,
+    ctx,
+    get tool() { return tool; },
+    setTokens(value: number | null) { tokens = value; },
+  };
+}
+
+test("memory review branch reconstruction rejects content-bearing or identity-bearing pseudo-state", () => {
+  const state = reconstructMemoryReviewCycle([
+    {
+      type: "custom",
+      customType: MEMORY_REVIEW_COMPLETE_ENTRY,
+      data: { outcome: "saved", short_term: "updated", long_term: "unchanged", content: "must reject" },
+    },
+    {
+      type: "custom_message",
+      customType: MEMORY_REVIEW_REMINDER_MESSAGE,
+      details: {
+        schema: "v1",
+        privacy: "standard",
+        route: "memoriki",
+        execution: "interactive",
+        trigger: "review_threshold",
+        source_session_id: "must-reject",
+      },
+    },
+  ], STANDARD_MEMORY_REVIEW_BINDING);
+  assert.deepEqual(state, {
+    completed: false,
+    thresholdDeferred: false,
+    reminderQueued: false,
+    reminderDelivered: false,
+  });
+});
+
+test("memory-first component behaviors remain independently explicit", () => {
+  const branch: any[] = [];
+  const guidanceOnly = memoryFirstHarness(branch, { privacyMode: "standard" }, {
+    ...DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+    enabled: true,
+    guidanceEnabled: true,
+  });
+  guidanceOnly.setTokens(200_000);
+  guidanceOnly.handlers.get("agent_end")?.({}, guidanceOnly.ctx);
+  assert.equal(guidanceOnly.queue.length, 0);
+  assert.equal(guidanceOnly.tool, undefined);
+  assert.equal(
+    guidanceOnly.handlers.get("session_before_compact")?.({ reason: "threshold" }, guidanceOnly.ctx),
+    undefined,
+  );
+  assert.deepEqual(branch, [], "guidance alone adds no review, ledger, or compaction-control state");
+});
+
+test("memory review threshold jumps queue one follow-up and reload reconstructs enum-only completion", async () => {
+  const branch: any[] = [];
+  const first = memoryFirstHarness(branch);
+  first.handlers.get("session_start")?.({ reason: "startup" }, first.ctx);
+  first.handlers.get("session_start")?.({ reason: "reload" }, first.ctx);
+  const cohortMarkers = branch.filter((entry) => entry.customType === MEMORY_FIRST_COHORT_ENTRY);
+  assert.equal(cohortMarkers.length, 1);
+  assert.deepEqual(cohortMarkers[0]?.data, {
+    schema_version: 1,
+    privacy_mode: "standard",
+    execution_mode: "interactive",
+  });
+  assert.equal(first.tool.name, MEMORY_REVIEW_COMPLETE_TOOL_NAME);
+  assert.deepEqual(Object.keys(first.tool.parameters.properties).sort(), ["long_term", "outcome", "short_term"]);
+  assert.equal(first.tool.parameters.additionalProperties, false);
+  const reviewSchema = JSON.stringify(first.tool.parameters);
+  assert.match(reviewSchema, /nothing_future_valuable/);
+  assert.doesNotMatch(reviewSchema, /content|path|session|project|raw.?id/i);
+
+  first.setTokens(null);
+  first.handlers.get("agent_end")?.({}, first.ctx);
+  first.setTokens(95_999);
+  first.handlers.get("agent_end")?.({}, first.ctx);
+  assert.equal(first.queue.length, 0, "null and below-threshold ContextUsage never queue review");
+
+  first.setTokens(130_000);
+  first.handlers.get("agent_end")?.({}, first.ctx);
+  first.handlers.get("agent_end")?.({}, first.ctx);
+  assert.equal(first.queue.length, 1, "a threshold jump queues exactly one continuation");
+  assert.deepEqual(first.queue[0]?.options, { deliverAs: "followUp", triggerTurn: true });
+  assert.equal(first.queue[0]?.message.customType, MEMORY_REVIEW_REMINDER_MESSAGE);
+  assert.equal("source_session_id" in first.queue[0]!.message.details, false);
+  assert.equal("project_id" in first.queue[0]!.message.details, false);
+  assert.equal(branch.some((entry) => entry.customType === MEMORY_REVIEW_REMINDER_QUEUED_ENTRY), true);
+
+  const lostQueueReload = memoryFirstHarness(branch);
+  lostQueueReload.setTokens(130_000);
+  lostQueueReload.handlers.get("session_start")?.({ reason: "reload" }, lostQueueReload.ctx);
+  const recoveredReminder = lostQueueReload.handlers.get("before_agent_start")?.({ systemPrompt: "base" }, lostQueueReload.ctx);
+  assert.equal(lostQueueReload.queue.length, 0,
+    "before_agent_start recovery must not trigger a nested queued run");
+  assert.equal(recoveredReminder.message.customType, MEMORY_REVIEW_REMINDER_MESSAGE);
+  assert.match(recoveredReminder.systemPrompt, /Memory-first traditional compaction/);
+  assert.equal(branch.filter((entry) => entry.customType === MEMORY_REVIEW_REMINDER_QUEUED_ENTRY).length, 1,
+    "reload recovery does not grow duplicate queue-state entries");
+
+  branch.push({
+    type: "custom_message",
+    customType: MEMORY_REVIEW_REMINDER_MESSAGE,
+    details: first.queue[0]!.message.details,
+  });
+  const reloaded = memoryFirstHarness(branch);
+  reloaded.setTokens(130_000);
+  reloaded.handlers.get("session_start")?.({ reason: "reload" }, reloaded.ctx);
+  const promptResult = reloaded.handlers.get("before_agent_start")?.({ systemPrompt: "base" }, reloaded.ctx);
+  assert.match(promptResult.systemPrompt, /future-value short- and long-term wiki knowledge/);
+  assert.equal(reloaded.queue.length, 0, "a durable reminder makes reload recovery idempotent");
+
+  const reviewOutcome = {
+    outcome: "saved",
+    short_term: "updated",
+    long_term: "unchanged",
+  } as const;
+  const firstCompletionResult = await reloaded.tool.execute(
+    "review", reviewOutcome, undefined, undefined, reloaded.ctx,
+  );
+  const completion = branch.find((entry) => entry.customType === MEMORY_REVIEW_COMPLETE_ENTRY);
+  assert.deepEqual(completion?.data, {
+    outcome: "saved",
+    short_term: "updated",
+    long_term: "unchanged",
+  });
+  assert.deepEqual(Object.keys(completion.data).sort(), ["long_term", "outcome", "short_term"]);
+  assert.doesNotMatch(JSON.stringify(completion.data), /content|path|session|project|id/i);
+  assert.equal(reconstructMemoryReviewCycle(branch, STANDARD_MEMORY_REVIEW_BINDING).completed, true);
+  const canonicalRetry = await reloaded.tool.execute(
+    "review-retry", reviewOutcome, undefined, undefined, reloaded.ctx,
+  );
+  assert.deepEqual(canonicalRetry.details, firstCompletionResult.details);
+  assert.equal(branch.filter((entry) => entry.customType === MEMORY_REVIEW_COMPLETE_ENTRY).length, 1);
+  assert.equal(reloaded.lifecycle.filter((event) => event.type === "review_completed").length, 1,
+    "an exact completion retry emits no duplicate lifecycle event");
+  await assert.rejects(() => reloaded.tool.execute("review-conflict", {
+    outcome: "blocked",
+    short_term: "blocked",
+    long_term: "unchanged",
+  }, undefined, undefined, reloaded.ctx), /conflicts with the canonical completion/);
+  assert.equal(branch.filter((entry) => entry.customType === MEMORY_REVIEW_COMPLETE_ENTRY).length, 1);
+  assert.equal(reloaded.lifecycle.filter((event) => event.type === "review_completed").length, 1);
+  assert.equal(
+    reloaded.handlers.get("session_before_compact")?.({ reason: "threshold" }, reloaded.ctx),
+    undefined,
+    "a typed completion outcome permits threshold compaction immediately",
+  );
+
+  const afterCompletionReload = memoryFirstHarness(branch);
+  afterCompletionReload.setTokens(150_000);
+  afterCompletionReload.handlers.get("before_agent_start")?.({ systemPrompt: "base" }, afterCompletionReload.ctx);
+  assert.equal(afterCompletionReload.queue.length, 0);
+
+  branch.push({ type: "compaction", id: "synthetic-compaction-boundary" });
+  const nextCycle = memoryFirstHarness(branch);
+  nextCycle.setTokens(130_000);
+  const nextCycleReminder = nextCycle.handlers.get("before_agent_start")?.({ systemPrompt: "base" }, nextCycle.ctx);
+  assert.equal(nextCycle.queue.length, 0);
+  assert.equal(nextCycleReminder.message.customType, MEMORY_REVIEW_REMINDER_MESSAGE,
+    "high-context before_agent_start injects recovery directly into the pending run");
+});
+
+test("agent_end queued reminder is the sole continuation for same-cycle threshold deferral", () => {
+  const branch: any[] = [];
+  const harness = memoryFirstHarness(branch);
+  harness.setTokens(130_000);
+  harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+  harness.handlers.get("agent_end")?.({}, harness.ctx);
+  assert.equal(harness.queue.length, 1);
+  assert.deepEqual(
+    harness.handlers.get("session_before_compact")?.({ reason: "threshold" }, harness.ctx),
+    { cancel: true },
+  );
+  assert.equal(harness.queue.length, 1,
+    "threshold deferral reuses the already queued ordinary reminder instead of adding a retry turn");
+  assert.equal(branch.filter((entry) => entry.customType === MEMORY_REVIEW_THRESHOLD_DEFERRED_ENTRY).length, 1);
+});
+
+test("threshold compaction defers once while manual and overflow always pass through", () => {
+  const branch: any[] = [];
+  const harness = memoryFirstHarness(branch);
+  harness.setTokens(130_000);
+  harness.handlers.get("session_start")?.({ reason: "startup" }, harness.ctx);
+
+  assert.equal(harness.handlers.get("session_before_compact")?.({ reason: "manual" }, harness.ctx), undefined);
+  assert.equal(harness.handlers.get("session_before_compact")?.({ reason: "overflow" }, harness.ctx), undefined);
+  assert.equal(branch.some((entry) => entry.customType === MEMORY_REVIEW_THRESHOLD_DEFERRED_ENTRY), false);
+
+  assert.deepEqual(
+    harness.handlers.get("session_before_compact")?.({ reason: "threshold" }, harness.ctx),
+    { cancel: true },
+  );
+  assert.equal(branch.filter((entry) => entry.customType === MEMORY_REVIEW_THRESHOLD_DEFERRED_ENTRY).length, 1);
+  assert.deepEqual(branch.find((entry) => entry.customType === MEMORY_REVIEW_THRESHOLD_DEFERRED_ENTRY)?.data,
+    { action: "deferred" });
+  assert.deepEqual(branch.find((entry) => entry.customType === MEMORY_REVIEW_REMINDER_QUEUED_ENTRY)?.data,
+    { state: "queued" });
+  assert.deepEqual(reconstructMemoryReviewCycle(branch, STANDARD_MEMORY_REVIEW_BINDING), {
+    completed: false,
+    thresholdDeferred: true,
+    reminderQueued: true,
+    reminderDelivered: false,
+  });
+  assert.equal(harness.queue.length, 1);
+  assert.deepEqual(harness.queue[0]?.options, { deliverAs: "followUp", triggerTurn: true });
+  const retryAfterReload = memoryFirstHarness(branch);
+  retryAfterReload.setTokens(130_000);
+  retryAfterReload.handlers.get("session_start")?.({ reason: "reload" }, retryAfterReload.ctx);
+  assert.deepEqual(
+    retryAfterReload.handlers.get("session_before_compact")?.({ reason: "threshold" }, retryAfterReload.ctx),
+    { cancel: true },
+    "the first post-reload threshold attempt restores the lost in-memory review continuation",
+  );
+  assert.equal(retryAfterReload.queue.length, 1);
+  assert.equal(branch.filter((entry) => entry.customType === MEMORY_REVIEW_THRESHOLD_DEFERRED_ENTRY).length, 1);
+  assert.equal(
+    retryAfterReload.handlers.get("session_before_compact")?.({ reason: "threshold" }, retryAfterReload.ctx),
+    undefined,
+    "after restoring the single continuation, the next threshold attempt proceeds",
+  );
+
+  const deliveredBranch: any[] = [{
+    type: "custom",
+    customType: MEMORY_REVIEW_REMINDER_QUEUED_ENTRY,
+    data: { state: "queued" },
+  }, {
+    type: "custom_message",
+    customType: MEMORY_REVIEW_REMINDER_MESSAGE,
+    details: {
+      schema: "v1",
+      privacy: "standard",
+      route: "memoriki",
+      execution: "interactive",
+      trigger: "review_threshold",
+    },
+  }];
+  const deliveredWithoutOutcome = memoryFirstHarness(deliveredBranch);
+  deliveredWithoutOutcome.setTokens(130_000);
+  deliveredWithoutOutcome.handlers.get("session_start")?.({ reason: "startup" }, deliveredWithoutOutcome.ctx);
+  assert.deepEqual(
+    deliveredWithoutOutcome.handlers.get("session_before_compact")?.({ reason: "threshold" }, deliveredWithoutOutcome.ctx),
+    { cancel: true },
+  );
+  assert.equal(deliveredWithoutOutcome.queue.length, 1,
+    "an ignored delivered review gets one immediate retry continuation before threshold compaction");
+  assert.match(deliveredWithoutOutcome.queue[0]!.message.content, /single memory-review retry/);
+});
+
+test("a Standard reminder is not accepted after transition to a Protected route", () => {
+  const branch: any[] = [{
+    type: "custom",
+    customType: MEMORY_REVIEW_REMINDER_QUEUED_ENTRY,
+    data: { state: "queued" },
+  }, {
+    type: "custom_message",
+    customType: MEMORY_REVIEW_REMINDER_MESSAGE,
+    details: {
+      schema: "v1",
+      privacy: "standard",
+      route: "memoriki",
+      execution: "interactive",
+      trigger: "review_threshold",
+    },
+  }];
+  assert.equal(reconstructMemoryReviewCycle(branch, {
+    privacyMode: "protected",
+    route: "project-local",
+    executionMode: "interactive",
+  }).reminderDelivered, false);
+
+  const protectedRuntime = memoryFirstHarness(branch, { privacyMode: "protected" });
+  protectedRuntime.setTokens(100_000);
+  protectedRuntime.handlers.get("session_start")?.({ reason: "startup" }, protectedRuntime.ctx);
+  protectedRuntime.handlers.get("agent_end")?.({}, protectedRuntime.ctx);
+  assert.equal(protectedRuntime.queue.length, 1);
+  assert.match(protectedRuntime.queue[0]!.message.content, /project-local wiki at \.wayang\/memory\.md/);
+  assert.doesNotMatch(protectedRuntime.queue[0]!.message.content, /Memoriki/i);
+  assert.deepEqual(protectedRuntime.queue[0]!.message.details, {
+    schema: "v1",
+    privacy: "protected",
+    route: "project-local",
+    execution: "interactive",
+    trigger: "review_threshold",
+  });
+});
+
+test("Protected memory reminders expose only project-local wiki guidance and anonymous aggregate telemetry", () => {
+  const branch: any[] = [];
+  const harness = memoryFirstHarness(branch, { privacyMode: "protected" });
+  harness.setTokens(100_000);
+  harness.handlers.get("agent_end")?.({}, harness.ctx);
+  assert.equal(harness.queue.length, 1);
+  const reminder = harness.queue[0]!.message;
+  assert.match(reminder.content, /project-local wiki at \.wayang\/memory\.md/);
+  assert.doesNotMatch(reminder.content, /Memoriki/i);
+  assert.doesNotMatch(JSON.stringify(reminder.details), /source|session|project.?id|raw.?id/i);
+  assert.ok(harness.lifecycle.length > 0);
+  for (const event of harness.lifecycle) {
+    assert.equal("sourceSessionId" in event, false);
+    assert.equal("projectId" in event, false);
+    assert.equal("content" in event, false);
+    assert.equal("path" in event, false);
+    assert.equal(event.privacyMode, "protected");
+    assert.equal(event.route, "project-local");
+  }
+  for (let index = 0; index < 100; index++) {
+    harness.handlers.get("session_before_compact")?.({ reason: "manual" }, harness.ctx);
+  }
+  assert.equal(harness.lifecycle.length, 64, "aggregate lifecycle emission remains runtime-bounded");
 });
 
 test("file-audio experiment eligibility is disabled-by-default and exact Wren Standard interactive only", () => {

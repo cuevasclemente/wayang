@@ -37,6 +37,25 @@ import { WAYANG_RUNTIME_CONTEXT_TOOL_NAME } from "./wayang-runtime-context.js";
 import { RESTRICTED_MCP_TOOL_NAME, type RestrictedMcpRuntime } from "./restricted-mcp/index.js";
 import { FILE_AUDIO_EXPERIMENT_TOOL_NAME, type FileAudioExperimentRuntime } from "./audio-experiment/types.js";
 import type { InteractiveBrowserToolRuntime } from "./browser/interactive-runtime.js";
+import {
+  buildMemoryFirstGuidance,
+  DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+  MEMORY_REVIEW_COMPLETE_TOOL_NAME,
+  scopeMemoryFirstCompactionConfig,
+  type MemoryFirstCompactionConfig,
+} from "./memory-first-compaction.js";
+
+const enabledMemoryFirstConfig: MemoryFirstCompactionConfig = {
+  ...DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+  enabled: true,
+  guidanceEnabled: true,
+  reviewEnabled: true,
+  compactionControlsEnabled: true,
+  ledgerEnabled: true,
+  standardInteractiveEnabled: true,
+  protectedInteractiveEnabled: true,
+  keepCompleteTurns: true,
+};
 
 function fixture(name: string): {
   dir: string;
@@ -126,6 +145,90 @@ test("restricted resource loader trusts project Pi code while retaining instruct
   } finally {
     f.cleanup();
   }
+});
+
+test("memory-first factory is absent when disabled and injected into eligible Standard loaders when enabled", async () => {
+  const f = fixture("wayang-runtime-memory-first-factory-");
+  try {
+    const profile = createAgentProfile({ name: "Memory-first loader", memory_access: "read_write" });
+    const project = createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
+    const source = createSession(f.cwd, { agentProfileId: profile.id });
+
+    const disabled = await buildAgentResourceLoader({
+      cwd: f.cwd,
+      agentDir: f.agentDir,
+      agentProfile: profile,
+      project,
+      sourceSessionId: source.id,
+      memoryFirstCompaction: DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+    });
+    assert.equal(disabled.restricted, false);
+    assert.equal(disabled.resourceLoader.getExtensions().extensions.length, 0);
+
+    const enabled = await buildAgentResourceLoader({
+      cwd: f.cwd,
+      agentDir: f.agentDir,
+      agentProfile: profile,
+      project,
+      sourceSessionId: source.id,
+      memoryFirstCompaction: enabledMemoryFirstConfig,
+    });
+    assert.equal(enabled.restricted, false);
+    assert.equal(enabled.resourceLoader.getExtensions().extensions.length, 1);
+    assert.equal(enabled.memoryFirstCompaction.enabled, true);
+    assert.notEqual(enabled.settingsManager, disabled.settingsManager,
+      "enabled compaction controls receive a per-runtime in-memory settings snapshot");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("memory-first cohort scoping enables only the explicitly reviewed runtime class", () => {
+  const standardInteractiveOnly: MemoryFirstCompactionConfig = {
+    ...enabledMemoryFirstConfig,
+    protectedInteractiveEnabled: false,
+  };
+  assert.equal(scopeMemoryFirstCompactionConfig(standardInteractiveOnly, {
+    privacyMode: "standard",
+    executionMode: "interactive",
+  }).enabled, true);
+  for (const metadata of [
+    { privacyMode: "standard" as const, executionMode: "scheduled" as const },
+    { privacyMode: "protected" as const, executionMode: "interactive" as const },
+    { privacyMode: "protected" as const, executionMode: "scheduled" as const },
+    { privacyMode: "standard" as const, executionMode: "subagent" as const },
+  ]) {
+    const scoped = scopeMemoryFirstCompactionConfig(standardInteractiveOnly, metadata);
+    assert.equal(scoped.enabled, false);
+    assert.equal(scoped.guidanceEnabled, false);
+    assert.equal(scoped.reviewEnabled, false);
+    assert.equal(scoped.compactionControlsEnabled, false);
+    assert.equal(scoped.ledgerEnabled, false);
+  }
+});
+
+test("memory-first privacy routing gives Standard Memoriki guidance and Protected project-local-only guidance", () => {
+  const standard = buildMemoryFirstGuidance({
+    privacyMode: "standard",
+    executionMode: "scheduled",
+    memoryAccess: "read_write",
+  }, enabledMemoryFirstConfig);
+  assert.match(standard, /Standard Memoriki wiki route/);
+  assert.match(standard, /scheduled work/);
+  assert.match(standard, /one persistent Pi AgentSession/);
+  assert.doesNotMatch(standard, /capsule ledger/i);
+
+  const protectedPrompt = buildMemoryFirstGuidance({
+    privacyMode: "protected",
+    executionMode: "subagent",
+    memoryAccess: "read_write",
+  }, enabledMemoryFirstConfig, true);
+  assert.match(protectedPrompt, /project-local wiki at \.wayang\/memory\.md/);
+  assert.match(protectedPrompt, /owning Protected project/);
+  assert.doesNotMatch(protectedPrompt, /Memoriki/i,
+    "Protected prompts must never imply a global Memoriki route");
+  assert.doesNotMatch(protectedPrompt, /global.*access is available/i);
+  assert.doesNotMatch(protectedPrompt, /source[-_ ]?session|project[-_ ]?id/i);
 });
 
 test("interactive communication appendix reaches restricted and Standard sessions but not scheduled runs", async () => {
@@ -594,6 +697,7 @@ test("memory capability registry and filesystem policy implement none/read/read_
     const writeProfile = { ...base, memory_access: "read_write" as const };
     assert.equal(decide(writeProfile, "edit", path.join(memoryRoot, "note.md")).allowed, true);
     assert.equal(authorizeAgentToolCall({ cwd: f.cwd, project, agentProfile: writeProfile, toolName: "unknown_custom_tool", params: {} }).allowed, false);
+    assert.equal(authorizeAgentToolCall({ cwd: f.cwd, project, agentProfile: writeProfile, toolName: MEMORY_REVIEW_COMPLETE_TOOL_NAME, params: {} }).allowed, true);
     assert.equal(authorizeAgentToolCall({ cwd: f.cwd, project, agentProfile: writeProfile, toolName: WAYANG_RUNTIME_CONTEXT_TOOL_NAME, params: {} }).allowed, true);
     assert.equal(authorizeAgentToolCall({ cwd: f.cwd, project, agentProfile: writeProfile, toolName: "bash", params: {} }).allowed, true);
     assert.equal(authorizeAgentToolCall({

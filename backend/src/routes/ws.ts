@@ -2048,6 +2048,15 @@ function sendCommandNotice(ws: WebSocket, content: string): void {
   });
 }
 
+/** @internal Success is reported only after the handle-owned reload policy boundary completes. */
+export async function reloadWebSocketRuntime(
+  handle: Pick<PiSessionHandle, "reloadResources">,
+  reportSuccess: () => void,
+): Promise<void> {
+  await handle.reloadResources();
+  reportSuccess();
+}
+
 async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, content: string): Promise<boolean> {
   const parsed = parseSlashCommand(content);
   if (!parsed) return false;
@@ -2179,8 +2188,9 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
     case "reload": {
       const releaseTopLevelWork = beginPiSessionTopLevelWork(handle);
       try {
-        await handle.session.reload();
-        sendCommandNotice(ws, "Reloaded settings, extensions, skills, prompts, and context files.");
+        await reloadWebSocketRuntime(handle, () => {
+          sendCommandNotice(ws, "Reloaded settings, extensions, skills, prompts, context files, and Wayang runtime overrides.");
+        });
         return true;
       } finally {
         releaseTopLevelWork();

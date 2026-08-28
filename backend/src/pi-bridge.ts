@@ -147,6 +147,14 @@ import {
 } from "./queued-chat-messages.js";
 import { getConfig } from "./config.js";
 import {
+  applyMemoryFirstCompactionOverrides,
+  DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+  scopeMemoryFirstCompactionConfig,
+  validateMemoryFirstModel,
+  type MemoryFirstCompactionConfig,
+  type MemoryFirstModelDescriptor,
+} from "./memory-first-compaction.js";
+import {
   FILE_AUDIO_EXPERIMENT_TOOL_NAME,
   type FileAudioExperimentBinding,
   type FileAudioExperimentDependencies,
@@ -218,6 +226,8 @@ export interface PiSessionHandle {
   agentProfileId: string;
   runtimeGeneration: string;
   bashMode: HostExecutionMode;
+  /** Wayang-owned reload boundary; SDK settings reload is not success until runtime overrides are restored. */
+  reloadResources: () => Promise<void>;
   /** Exact backend-created host definition/executable, captured after guards. */
   trustedHostBashTool?: TrustedHostBashTool;
   /** In-flight bounded TERM/KILL teardown started by the denial latch. */
@@ -254,6 +264,53 @@ export interface PiSessionHandle {
   capabilityRefreshPending?: boolean;
   /** Permanent process-local denial latch; only a fresh handle may regain authority. */
   capabilityAuthorityDenied?: boolean;
+}
+
+export interface MemoryFirstReloadBoundary {
+  reloadSdk(): Promise<void>;
+  getConfig(): MemoryFirstCompactionConfig;
+  getModel(): MemoryFirstModelDescriptor | undefined;
+  settingsManager: SettingsManager;
+  failClosed(error: unknown): Promise<void>;
+}
+
+/**
+ * SDK reload refreshes SettingsManager from storage and therefore drops
+ * applyOverrides(). Revalidate and restore Wayang's in-memory policy before
+ * any caller may report reload success.
+ */
+export async function reloadAgentSessionWithMemoryFirstOverrides(
+  boundary: MemoryFirstReloadBoundary,
+): Promise<void> {
+  try {
+    await boundary.reloadSdk();
+    const config = boundary.getConfig();
+    if (!config.enabled) return;
+    const model = boundary.getModel();
+    if (!model) throw new Error("Memory-first reload could not resolve the active model");
+    validateMemoryFirstModel(config, model);
+    applyMemoryFirstCompactionOverrides(boundary.settingsManager, config, model.contextWindow);
+  } catch (error) {
+    try {
+      await boundary.failClosed(error);
+    } catch (cleanupError) {
+      throw new Error("Memory-first reload failed and runtime cleanup did not complete", { cause: cleanupError });
+    }
+    throw error;
+  }
+}
+
+function memoryFirstCompactionForSession(
+  row: SessionRow,
+  project: ProjectRow,
+): MemoryFirstCompactionConfig {
+  const executionMode = row.scheduled_job_id !== null || row.scheduled_run_id !== null
+    ? "scheduled"
+    : "interactive";
+  return scopeMemoryFirstCompactionConfig(getConfig().memoryFirstCompaction, {
+    privacyMode: project.access_policy.privacy_mode,
+    executionMode,
+  });
 }
 
 export interface SerializedMessage {
@@ -2056,6 +2113,11 @@ export async function setSessionModel(
     }
     if (!model) throw new Error(`Unknown model: ${provider}/${modelId}`);
     if (!registry.hasConfiguredAuth(model)) throw new Error(`No API key for ${model.provider}/${model.id}`);
+    const project = getProjectByCwd(row.cwd);
+    validateMemoryFirstModel(
+      project ? memoryFirstCompactionForSession(row, project) : DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+      { provider: String(model.provider), id: model.id, contextWindow: model.contextWindow },
+    );
 
     await stopRuntimeForModelChange(id, row, provider, modelId);
     // Persistence happens only after the old loader, hooks, tools, host process,
@@ -2081,6 +2143,11 @@ export async function setSessionDefaultModel(
     if (!registry.hasConfiguredAuth(defaultModel)) {
       throw new Error(`No API key for ${defaultModel.provider}/${defaultModel.id}`);
     }
+    const project = getProjectByCwd(row.cwd);
+    validateMemoryFirstModel(
+      project ? memoryFirstCompactionForSession(row, project) : DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+      { provider: String(defaultModel.provider), id: defaultModel.id, contextWindow: defaultModel.contextWindow },
+    );
     await stopRuntimeForModelChange(id, row, null, null, true);
     updateSessionModel(id, null, null);
     return { provider: String(defaultModel.provider), model: defaultModel.id, name: defaultModel.name };
@@ -2189,6 +2256,9 @@ async function resolveAgentSwitchTarget(sessionRow: SessionRow, targetProfileId:
   if (!registry.hasConfiguredAuth(model)) {
     throw new WorkspaceStoreError(`No API key for ${model.provider}/${model.id}`, 409);
   }
+  validateMemoryFirstModel(memoryFirstCompactionForSession(sessionRow, project), {
+    provider: String(model.provider), id: model.id, contextWindow: model.contextWindow,
+  });
   return { project, profile, model };
 }
 
@@ -2525,6 +2595,7 @@ export async function createPiSession(
     assertRuntimeIdentityCurrent();
     runtimeOptions.testHooks?.onPrivilegedEffect?.("resource_loader");
     assertCreationCurrent();
+    const runtimeConfig = getConfig();
     const runtimeResources = await buildAgentResourceLoader({
       cwd,
       agentDir: getAgentDirPath(),
@@ -2532,6 +2603,7 @@ export async function createPiSession(
       project: runtimeIdentity.project,
       sourceSessionId: id,
       forceInMemorySettings: runtimeOptions.forceInMemorySettings,
+      memoryFirstCompaction: runtimeConfig.memoryFirstCompaction,
     });
     assertRuntimeIdentityCurrent();
     recordLatencyMetric("lazy_extensions_ms", performance.now() - extensionsStartedAt);
@@ -2582,6 +2654,14 @@ export async function createPiSession(
         );
       }
     }
+    validateMemoryFirstModel(runtimeResources.memoryFirstCompaction, {
+      provider: String(model.provider), id: model.id, contextWindow: model.contextWindow,
+    });
+    applyMemoryFirstCompactionOverrides(
+      settingsManager,
+      runtimeResources.memoryFirstCompaction,
+      model.contextWindow,
+    );
     recordLatencyMetric("lazy_settings_model_ms", performance.now() - settingsModelStartedAt);
 
     // Generate a fresh process-local runtime epoch before composing privileged tools.
@@ -2746,7 +2826,7 @@ export async function createPiSession(
       }
     }
 
-    const audioConfig = getConfig().fileAudioExperiment;
+    const audioConfig = runtimeConfig.fileAudioExperiment;
     const selectedFileAudioExperimentFactory: FileAudioExperimentFactory | undefined = runtimeOptions.fileAudioExperimentFactory
       ?? (productionFileAudioExperimentDependencies
         ? ((factoryOptions: Parameters<FileAudioExperimentFactory>[0]) => createFileAudioExperimentRuntime({
@@ -3130,6 +3210,19 @@ export async function createPiSession(
       capabilityActivationGeneration: creationGeneration.activation,
       acceptedTopLevelWorkCount: 0,
       bashMode,
+      reloadResources: () => reloadAgentSessionWithMemoryFirstOverrides({
+        reloadSdk: () => session.reload(),
+        getConfig: () => memoryFirstCompactionForSession(runtimeIdentity.row, runtimeIdentity.project),
+        getModel: () => session.model ? {
+          provider: String(session.model.provider),
+          id: session.model.id,
+          contextWindow: session.model.contextWindow,
+        } : undefined,
+        settingsManager,
+        failClosed: async () => {
+          await destroyPiSession(id);
+        },
+      }),
       ...(trustedHostBashTool ? { trustedHostBashTool } : {}),
       ...(pendingRestrictedMcpRuntime ? { restrictedMcpRuntime: pendingRestrictedMcpRuntime } : {}),
       ...(pendingProtectedBrowserRuntime ? { protectedBrowserRuntime: pendingProtectedBrowserRuntime } : {}),

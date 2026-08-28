@@ -89,7 +89,7 @@ Protect at least:
 - `~/.wayang/store.json`, `search.db`, `auth-sessions.json`, private policy projections (including capability-bound questionnaire submissions), and session-scoped `attachments/`; Standard-session attachments are intentionally readable by other eligible Wayang sessions but remain private at the OS/storage boundary, while Protected/unclassified attachment subtrees remain cross-session private;
 - configured file-audio Wren capsule, shared task, neutral adapter, response schema, Sol synthesis prompt, and disposable `WAYANG_DATA_DIR/audio-experiment/` workspaces;
 - Protected-automation job/run metadata, immutable snapshots, bounded state/diagnostics/download staging, and persistent job browser realms under `WAYANG_DATA_DIR/protected-automation/`;
-- projects and files Wayang can access;
+- projects and files Wayang can access, including any enabled memory-first Protected project-local memory file (default `.wayang/memory.md` inside its owning project);
 - shared `WAYANG_DATA_DIR/browser-workbench/` and explicit project `.pi/browser-workbench/` profiles, cookies, downloads, and artifacts;
 - the ephemeral browser-credential unlock socket and in-memory Bitwarden session;
 - proxy/VPN configuration and logs;

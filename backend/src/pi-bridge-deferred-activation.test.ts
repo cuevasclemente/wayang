@@ -47,6 +47,7 @@ function syntheticHandle(
     capabilityActivationGeneration: getPiSessionCapabilityActivationGeneration(id),
     acceptedTopLevelWorkCount: 0,
     bashMode: "sandboxed",
+    reloadResources: async () => undefined,
     interactiveTurns: new Map(),
     queuedBrowserMessages: new Map(),
   };
