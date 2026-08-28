@@ -1,7 +1,7 @@
 # Explicit session “Generate title” action
 
-**Date:** 2026-08-28  
-**Status:** implementation authorized; execution plan  
+**Date:** 2026-08-28
+**Status:** implementation authorized; execution plan
 **Base:** Wayang `2720ea2`
 
 ## Goal and resolved product behavior
