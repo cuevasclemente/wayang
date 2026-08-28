@@ -92,6 +92,7 @@ import {
   applyMemoryFirstCompactionOverrides,
   createMemoryFirstCompactionExtension,
   DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+  MEMORY_FIRST_COHORT_ENTRY,
   MEMORY_REVIEW_COMPLETE_ENTRY,
   MEMORY_REVIEW_COMPLETE_TOOL_NAME,
   MEMORY_REVIEW_REMINDER_MESSAGE,
@@ -327,6 +328,14 @@ test("memory review threshold jumps queue one follow-up and reload reconstructs 
   const branch: any[] = [];
   const first = memoryFirstHarness(branch);
   first.handlers.get("session_start")?.({ reason: "startup" }, first.ctx);
+  first.handlers.get("session_start")?.({ reason: "reload" }, first.ctx);
+  const cohortMarkers = branch.filter((entry) => entry.customType === MEMORY_FIRST_COHORT_ENTRY);
+  assert.equal(cohortMarkers.length, 1);
+  assert.deepEqual(cohortMarkers[0]?.data, {
+    schema_version: 1,
+    privacy_mode: "standard",
+    execution_mode: "interactive",
+  });
   assert.equal(first.tool.name, MEMORY_REVIEW_COMPLETE_TOOL_NAME);
   assert.deepEqual(Object.keys(first.tool.parameters.properties).sort(), ["long_term", "outcome", "short_term"]);
   assert.equal(first.tool.parameters.additionalProperties, false);

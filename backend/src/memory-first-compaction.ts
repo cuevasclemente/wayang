@@ -14,6 +14,7 @@ export const MEMORY_REVIEW_COMPLETE_ENTRY = "wayang-memory-review-complete-v1";
 export const MEMORY_REVIEW_THRESHOLD_DEFERRED_ENTRY = "wayang-memory-review-threshold-deferred-v1";
 export const MEMORY_REVIEW_REMINDER_MESSAGE = "wayang-memory-review-reminder-v1";
 export const MEMORY_REVIEW_REMINDER_QUEUED_ENTRY = "wayang-memory-review-reminder-queued-v1";
+export const MEMORY_FIRST_COHORT_ENTRY = "wayang-memory-first-cohort-v1";
 
 export type MemoryFirstPrivacyMode = "standard" | "protected";
 export type MemoryFirstRoute = "memoriki" | "project-local";
@@ -459,7 +460,22 @@ export function createMemoryFirstCompactionExtension(
 
     pi.on("session_start", (_event, ctx) => {
       recoverQueuedReminder = true;
+      const branch = ctx.sessionManager.getBranch();
       currentCycle(ctx); // Validate/reconstruct branch state at every startup or reload.
+      const cohortData = Object.freeze({
+        schema_version: 1 as const,
+        privacy_mode: metadata.privacyMode,
+        execution_mode: metadata.executionMode,
+      });
+      const cohortAlreadyMarked = branch.some((entry: any) => (
+        entry?.type === "custom"
+        && entry.customType === MEMORY_FIRST_COHORT_ENTRY
+        && entry.data?.schema_version === cohortData.schema_version
+        && entry.data?.privacy_mode === cohortData.privacy_mode
+        && entry.data?.execution_mode === cohortData.execution_mode
+        && exactObjectKeys(entry.data as Record<string, unknown>, ["schema_version", "privacy_mode", "execution_mode"])
+      ));
+      if (!cohortAlreadyMarked) pi.appendEntry(MEMORY_FIRST_COHORT_ENTRY, cohortData);
       emit({ type: "session_started" });
     });
 
