@@ -131,6 +131,11 @@ test("memory-first traditional compaction is default-off with independently vali
     "WAYANG_MEMORY_FIRST_REVIEW_ENABLED",
     "WAYANG_MEMORY_FIRST_COMPACTION_CONTROLS_ENABLED",
     "WAYANG_MEMORY_FIRST_LEDGER_ENABLED",
+    "WAYANG_MEMORY_FIRST_STANDARD_INTERACTIVE_ENABLED",
+    "WAYANG_MEMORY_FIRST_STANDARD_SCHEDULED_ENABLED",
+    "WAYANG_MEMORY_FIRST_PROTECTED_INTERACTIVE_ENABLED",
+    "WAYANG_MEMORY_FIRST_PROTECTED_SCHEDULED_ENABLED",
+    "WAYANG_MEMORY_FIRST_SUBAGENT_ENABLED",
     "WAYANG_MEMORY_FIRST_REVIEW_TOKENS",
     "WAYANG_MEMORY_FIRST_COMPACTION_TRIGGER_TOKENS",
     "WAYANG_MEMORY_FIRST_KEEP_RECENT_TOKENS",
@@ -148,6 +153,11 @@ test("memory-first traditional compaction is default-off with independently vali
       reviewEnabled: false,
       compactionControlsEnabled: false,
       ledgerEnabled: false,
+      standardInteractiveEnabled: false,
+      standardScheduledEnabled: false,
+      protectedInteractiveEnabled: false,
+      protectedScheduledEnabled: false,
+      subagentEnabled: false,
       reviewTokens: 96_000,
       compactionTriggerTokens: 128_000,
       keepRecentTokens: 20_000,
@@ -182,8 +192,16 @@ test("memory-first traditional compaction is default-off with independently vali
 
     process.env.WAYANG_MEMORY_FIRST_GUIDANCE_ENABLED = "1";
     process.env.WAYANG_MEMORY_FIRST_PROTECTED_PROJECT_PATH = ".memory/review.md";
+    assert.equal(getConfig().memoryFirstCompaction.enabled, false,
+      "behavior flags remain inert until an explicit cohort is enabled");
+    process.env.WAYANG_MEMORY_FIRST_STANDARD_INTERACTIVE_ENABLED = "1";
     let enabled = getConfig().memoryFirstCompaction;
     assert.equal(enabled.enabled, true);
+    assert.equal(enabled.standardInteractiveEnabled, true);
+    assert.equal(enabled.standardScheduledEnabled, false);
+    assert.equal(enabled.protectedInteractiveEnabled, false);
+    assert.equal(enabled.protectedScheduledEnabled, false);
+    assert.equal(enabled.subagentEnabled, false);
     assert.equal(enabled.guidanceEnabled, true);
     assert.equal(enabled.reviewEnabled, false);
     assert.equal(enabled.compactionControlsEnabled, false);

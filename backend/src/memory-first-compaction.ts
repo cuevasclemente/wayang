@@ -26,6 +26,11 @@ export interface MemoryFirstCompactionConfig {
   reviewEnabled: boolean;
   compactionControlsEnabled: boolean;
   ledgerEnabled: boolean;
+  standardInteractiveEnabled: boolean;
+  standardScheduledEnabled: boolean;
+  protectedInteractiveEnabled: boolean;
+  protectedScheduledEnabled: boolean;
+  subagentEnabled: boolean;
   reviewTokens: number;
   compactionTriggerTokens: number;
   keepRecentTokens: number;
@@ -42,6 +47,11 @@ export const DISABLED_MEMORY_FIRST_COMPACTION_CONFIG: Readonly<MemoryFirstCompac
   reviewEnabled: false,
   compactionControlsEnabled: false,
   ledgerEnabled: false,
+  standardInteractiveEnabled: false,
+  standardScheduledEnabled: false,
+  protectedInteractiveEnabled: false,
+  protectedScheduledEnabled: false,
+  subagentEnabled: false,
   reviewTokens: DEFAULT_MEMORY_REVIEW_TOKENS,
   compactionTriggerTokens: DEFAULT_MEMORY_COMPACTION_TRIGGER_TOKENS,
   keepRecentTokens: DEFAULT_MEMORY_KEEP_RECENT_TOKENS,
@@ -90,6 +100,40 @@ export interface MemoryFirstExtensionMetadata {
   privacyMode: MemoryFirstPrivacyMode;
   executionMode: MemoryFirstExecutionMode;
   memoryAccess: "none" | "read" | "read_write";
+}
+
+export type MemoryFirstCohortMetadata = Pick<MemoryFirstExtensionMetadata, "privacyMode" | "executionMode">;
+
+export function isMemoryFirstCohortEligible(
+  config: MemoryFirstCompactionConfig,
+  metadata: MemoryFirstCohortMetadata,
+): boolean {
+  if (!config.enabled) return false;
+  if (metadata.executionMode === "subagent") return config.subagentEnabled;
+  if (metadata.privacyMode === "protected") {
+    return metadata.executionMode === "scheduled"
+      ? config.protectedScheduledEnabled
+      : config.protectedInteractiveEnabled;
+  }
+  return metadata.executionMode === "scheduled"
+    ? config.standardScheduledEnabled
+    : config.standardInteractiveEnabled;
+}
+
+export function scopeMemoryFirstCompactionConfig(
+  config: MemoryFirstCompactionConfig,
+  metadata: MemoryFirstCohortMetadata,
+): MemoryFirstCompactionConfig {
+  if (isMemoryFirstCohortEligible(config, metadata)) return config;
+  return {
+    ...config,
+    enabled: false,
+    guidanceEnabled: false,
+    reviewEnabled: false,
+    compactionControlsEnabled: false,
+    ledgerEnabled: false,
+    keepCompleteTurns: false,
+  };
 }
 
 const REVIEW_OUTCOMES = ["saved", "nothing_future_valuable", "blocked"] as const;

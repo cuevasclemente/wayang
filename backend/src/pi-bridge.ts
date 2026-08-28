@@ -148,6 +148,8 @@ import {
 import { getConfig } from "./config.js";
 import {
   applyMemoryFirstCompactionOverrides,
+  DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+  scopeMemoryFirstCompactionConfig,
   validateMemoryFirstModel,
   type MemoryFirstCompactionConfig,
   type MemoryFirstModelDescriptor,
@@ -296,6 +298,19 @@ export async function reloadAgentSessionWithMemoryFirstOverrides(
     }
     throw error;
   }
+}
+
+function memoryFirstCompactionForSession(
+  row: SessionRow,
+  project: ProjectRow,
+): MemoryFirstCompactionConfig {
+  const executionMode = row.scheduled_job_id !== null || row.scheduled_run_id !== null
+    ? "scheduled"
+    : "interactive";
+  return scopeMemoryFirstCompactionConfig(getConfig().memoryFirstCompaction, {
+    privacyMode: project.access_policy.privacy_mode,
+    executionMode,
+  });
 }
 
 export interface SerializedMessage {
@@ -2098,9 +2113,11 @@ export async function setSessionModel(
     }
     if (!model) throw new Error(`Unknown model: ${provider}/${modelId}`);
     if (!registry.hasConfiguredAuth(model)) throw new Error(`No API key for ${model.provider}/${model.id}`);
-    validateMemoryFirstModel(getConfig().memoryFirstCompaction, {
-      provider: String(model.provider), id: model.id, contextWindow: model.contextWindow,
-    });
+    const project = getProjectByCwd(row.cwd);
+    validateMemoryFirstModel(
+      project ? memoryFirstCompactionForSession(row, project) : DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+      { provider: String(model.provider), id: model.id, contextWindow: model.contextWindow },
+    );
 
     await stopRuntimeForModelChange(id, row, provider, modelId);
     // Persistence happens only after the old loader, hooks, tools, host process,
@@ -2126,9 +2143,11 @@ export async function setSessionDefaultModel(
     if (!registry.hasConfiguredAuth(defaultModel)) {
       throw new Error(`No API key for ${defaultModel.provider}/${defaultModel.id}`);
     }
-    validateMemoryFirstModel(getConfig().memoryFirstCompaction, {
-      provider: String(defaultModel.provider), id: defaultModel.id, contextWindow: defaultModel.contextWindow,
-    });
+    const project = getProjectByCwd(row.cwd);
+    validateMemoryFirstModel(
+      project ? memoryFirstCompactionForSession(row, project) : DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+      { provider: String(defaultModel.provider), id: defaultModel.id, contextWindow: defaultModel.contextWindow },
+    );
     await stopRuntimeForModelChange(id, row, null, null, true);
     updateSessionModel(id, null, null);
     return { provider: String(defaultModel.provider), model: defaultModel.id, name: defaultModel.name };
@@ -2237,7 +2256,7 @@ async function resolveAgentSwitchTarget(sessionRow: SessionRow, targetProfileId:
   if (!registry.hasConfiguredAuth(model)) {
     throw new WorkspaceStoreError(`No API key for ${model.provider}/${model.id}`, 409);
   }
-  validateMemoryFirstModel(getConfig().memoryFirstCompaction, {
+  validateMemoryFirstModel(memoryFirstCompactionForSession(sessionRow, project), {
     provider: String(model.provider), id: model.id, contextWindow: model.contextWindow,
   });
   return { project, profile, model };
@@ -2635,12 +2654,12 @@ export async function createPiSession(
         );
       }
     }
-    validateMemoryFirstModel(runtimeConfig.memoryFirstCompaction, {
+    validateMemoryFirstModel(runtimeResources.memoryFirstCompaction, {
       provider: String(model.provider), id: model.id, contextWindow: model.contextWindow,
     });
     applyMemoryFirstCompactionOverrides(
       settingsManager,
-      runtimeConfig.memoryFirstCompaction,
+      runtimeResources.memoryFirstCompaction,
       model.contextWindow,
     );
     recordLatencyMetric("lazy_settings_model_ms", performance.now() - settingsModelStartedAt);
@@ -3193,7 +3212,7 @@ export async function createPiSession(
       bashMode,
       reloadResources: () => reloadAgentSessionWithMemoryFirstOverrides({
         reloadSdk: () => session.reload(),
-        getConfig: () => getConfig().memoryFirstCompaction,
+        getConfig: () => memoryFirstCompactionForSession(runtimeIdentity.row, runtimeIdentity.project),
         getModel: () => session.model ? {
           provider: String(session.model.provider),
           id: session.model.id,

@@ -41,6 +41,7 @@ import {
   buildMemoryFirstGuidance,
   DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
   MEMORY_REVIEW_COMPLETE_TOOL_NAME,
+  scopeMemoryFirstCompactionConfig,
   type MemoryFirstCompactionConfig,
 } from "./memory-first-compaction.js";
 
@@ -51,6 +52,8 @@ const enabledMemoryFirstConfig: MemoryFirstCompactionConfig = {
   reviewEnabled: true,
   compactionControlsEnabled: true,
   ledgerEnabled: true,
+  standardInteractiveEnabled: true,
+  protectedInteractiveEnabled: true,
   keepCompleteTurns: true,
 };
 
@@ -144,7 +147,7 @@ test("restricted resource loader trusts project Pi code while retaining instruct
   }
 });
 
-test("memory-first factory is absent when disabled and injected through restricted and Standard loaders when enabled", async () => {
+test("memory-first factory is absent when disabled and injected into eligible Standard loaders when enabled", async () => {
   const f = fixture("wayang-runtime-memory-first-factory-");
   try {
     const profile = createAgentProfile({ name: "Memory-first loader", memory_access: "read_write" });
@@ -159,10 +162,10 @@ test("memory-first factory is absent when disabled and injected through restrict
       sourceSessionId: source.id,
       memoryFirstCompaction: DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
     });
-    assert.equal(disabled.restricted, true);
+    assert.equal(disabled.restricted, false);
     assert.equal(disabled.resourceLoader.getExtensions().extensions.length, 0);
 
-    const restricted = await buildAgentResourceLoader({
+    const enabled = await buildAgentResourceLoader({
       cwd: f.cwd,
       agentDir: f.agentDir,
       agentProfile: profile,
@@ -170,30 +173,37 @@ test("memory-first factory is absent when disabled and injected through restrict
       sourceSessionId: source.id,
       memoryFirstCompaction: enabledMemoryFirstConfig,
     });
-    assert.equal(restricted.restricted, true);
-    assert.equal(restricted.resourceLoader.getExtensions().extensions.length, 1);
-    assert.equal(restricted.tools?.includes(MEMORY_REVIEW_COMPLETE_TOOL_NAME), true);
-    assert.notEqual(restricted.settingsManager, disabled.settingsManager,
+    assert.equal(enabled.restricted, false);
+    assert.equal(enabled.resourceLoader.getExtensions().extensions.length, 1);
+    assert.equal(enabled.memoryFirstCompaction.enabled, true);
+    assert.notEqual(enabled.settingsManager, disabled.settingsManager,
       "enabled compaction controls receive a per-runtime in-memory settings snapshot");
-
-    commitWorkspaceCapabilityActivation({
-      capability_id: "wayang.standard-resources.v1",
-      project_id: project.id,
-      agent_profile_id: profile.id,
-      operation_digest: "9".repeat(64),
-    });
-    const standard = await buildAgentResourceLoader({
-      cwd: f.cwd,
-      agentDir: f.agentDir,
-      agentProfile: profile,
-      project,
-      sourceSessionId: source.id,
-      memoryFirstCompaction: enabledMemoryFirstConfig,
-    });
-    assert.equal(standard.restricted, false);
-    assert.equal(standard.resourceLoader.getExtensions().extensions.length, 1);
   } finally {
     f.cleanup();
+  }
+});
+
+test("memory-first cohort scoping enables only the explicitly reviewed runtime class", () => {
+  const standardInteractiveOnly: MemoryFirstCompactionConfig = {
+    ...enabledMemoryFirstConfig,
+    protectedInteractiveEnabled: false,
+  };
+  assert.equal(scopeMemoryFirstCompactionConfig(standardInteractiveOnly, {
+    privacyMode: "standard",
+    executionMode: "interactive",
+  }).enabled, true);
+  for (const metadata of [
+    { privacyMode: "standard" as const, executionMode: "scheduled" as const },
+    { privacyMode: "protected" as const, executionMode: "interactive" as const },
+    { privacyMode: "protected" as const, executionMode: "scheduled" as const },
+    { privacyMode: "standard" as const, executionMode: "subagent" as const },
+  ]) {
+    const scoped = scopeMemoryFirstCompactionConfig(standardInteractiveOnly, metadata);
+    assert.equal(scoped.enabled, false);
+    assert.equal(scoped.guidanceEnabled, false);
+    assert.equal(scoped.reviewEnabled, false);
+    assert.equal(scoped.compactionControlsEnabled, false);
+    assert.equal(scoped.ledgerEnabled, false);
   }
 });
 

@@ -116,6 +116,7 @@ const piBridgeMemoryFirstConfig: MemoryFirstCompactionConfig = {
   reviewEnabled: true,
   compactionControlsEnabled: true,
   ledgerEnabled: true,
+  standardInteractiveEnabled: true,
   keepCompleteTurns: true,
 };
 

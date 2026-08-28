@@ -173,6 +173,11 @@ function memoryFirstCompactionConfig(): MemoryFirstCompactionConfig {
   const requestedReview = envFlag("WAYANG_MEMORY_FIRST_REVIEW_ENABLED");
   const requestedCompaction = envFlag("WAYANG_MEMORY_FIRST_COMPACTION_CONTROLS_ENABLED");
   const requestedLedger = envFlag("WAYANG_MEMORY_FIRST_LEDGER_ENABLED");
+  const standardInteractiveEnabled = masterEnabled && envFlag("WAYANG_MEMORY_FIRST_STANDARD_INTERACTIVE_ENABLED");
+  const standardScheduledEnabled = masterEnabled && envFlag("WAYANG_MEMORY_FIRST_STANDARD_SCHEDULED_ENABLED");
+  const protectedInteractiveEnabled = masterEnabled && envFlag("WAYANG_MEMORY_FIRST_PROTECTED_INTERACTIVE_ENABLED");
+  const protectedScheduledEnabled = masterEnabled && envFlag("WAYANG_MEMORY_FIRST_PROTECTED_SCHEDULED_ENABLED");
+  const subagentEnabled = masterEnabled && envFlag("WAYANG_MEMORY_FIRST_SUBAGENT_ENABLED");
   const reviewTokens = getPositiveEnvInt(
     "WAYANG_MEMORY_FIRST_REVIEW_TOKENS",
     DEFAULT_MEMORY_REVIEW_TOKENS,
@@ -202,12 +207,20 @@ function memoryFirstCompactionConfig(): MemoryFirstCompactionConfig {
   const reviewEnabled = masterEnabled && requestedReview;
   const compactionControlsEnabled = masterEnabled && requestedCompaction;
   const ledgerEnabled = masterEnabled && requestedLedger;
+  const anyBehaviorEnabled = guidanceEnabled || reviewEnabled || compactionControlsEnabled || ledgerEnabled;
+  const anyCohortEnabled = standardInteractiveEnabled || standardScheduledEnabled
+    || protectedInteractiveEnabled || protectedScheduledEnabled || subagentEnabled;
   return {
-    enabled: guidanceEnabled || reviewEnabled || compactionControlsEnabled || ledgerEnabled,
+    enabled: anyBehaviorEnabled && anyCohortEnabled,
     guidanceEnabled,
     reviewEnabled,
     compactionControlsEnabled,
     ledgerEnabled,
+    standardInteractiveEnabled,
+    standardScheduledEnabled,
+    protectedInteractiveEnabled,
+    protectedScheduledEnabled,
+    subagentEnabled,
     reviewTokens,
     compactionTriggerTokens,
     keepRecentTokens,

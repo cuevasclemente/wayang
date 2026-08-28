@@ -43,6 +43,7 @@ import {
   createMemoryFirstCompactionExtension,
   DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
   MEMORY_REVIEW_COMPLETE_TOOL_NAME,
+  scopeMemoryFirstCompactionConfig,
   type MemoryFirstCompactionConfig,
   type MemoryFirstExecutionMode,
 } from "./memory-first-compaction.js";
@@ -844,6 +845,7 @@ export interface AgentResourceLoaderResult {
   settingsManager: SettingsManager;
   restricted: boolean;
   standardResourcesWitness?: ExactStandardResourcesWitness;
+  memoryFirstCompaction: MemoryFirstCompactionConfig;
   tools?: string[];
   excludeTools?: string[];
 }
@@ -861,13 +863,17 @@ export async function buildAgentResourceLoader(options: {
 }): Promise<AgentResourceLoaderResult> {
   const communicationAppendix = interactiveCommunicationAppendix(options.sourceSessionId);
   const profileInstructions = options.agentProfile.instructions;
-  const memoryFirstCompaction = options.memoryFirstCompaction ?? DISABLED_MEMORY_FIRST_COMPACTION_CONFIG;
+  const requestedMemoryFirstCompaction = options.memoryFirstCompaction ?? DISABLED_MEMORY_FIRST_COMPACTION_CONFIG;
   const sourceRow = options.sourceSessionId ? getSessionById(options.sourceSessionId) : undefined;
+  const executionMode: MemoryFirstExecutionMode = options.executionMode
+    ?? (sourceRow && (sourceRow.scheduled_job_id !== null || sourceRow.scheduled_run_id !== null) ? "scheduled" : "interactive");
+  const memoryFirstCompaction = scopeMemoryFirstCompactionConfig(requestedMemoryFirstCompaction, {
+    privacyMode: options.project.access_policy.privacy_mode,
+    executionMode,
+  });
   if (memoryFirstCompaction.enabled && (!options.sourceSessionId || !sourceRow)) {
     throw new Error("Memory-first compaction requires an exact durable source session");
   }
-  const executionMode: MemoryFirstExecutionMode = options.executionMode
-    ?? (sourceRow && (sourceRow.scheduled_job_id !== null || sourceRow.scheduled_run_id !== null) ? "scheduled" : "interactive");
   const memoryFirstExtensionEnabled = memoryFirstCompaction.guidanceEnabled
     || memoryFirstCompaction.reviewEnabled || memoryFirstCompaction.ledgerEnabled;
   const memoryFirstFactory = memoryFirstExtensionEnabled && options.sourceSessionId
@@ -916,6 +922,7 @@ export async function buildAgentResourceLoader(options: {
         settingsManager,
         restricted: false,
         standardResourcesWitness,
+        memoryFirstCompaction,
         excludeTools: options.project.access_policy.privacy_mode === "protected" ? [...SUBAGENT_TOOLS] : undefined,
       };
     }
@@ -950,6 +957,7 @@ export async function buildAgentResourceLoader(options: {
     resourceLoader,
     settingsManager,
     restricted: true,
+    memoryFirstCompaction,
     tools: memoryFirstCompaction.reviewEnabled
       ? [...new Set([...reviewed, MEMORY_REVIEW_COMPLETE_TOOL_NAME])]
       : [...reviewed],
