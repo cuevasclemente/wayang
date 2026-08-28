@@ -98,6 +98,26 @@ export interface TranscriptEventsResponse {
 
 export type TranscriptMutationOperation = "edit" | "delete";
 
+export type ManualTitleGenerationState =
+  | "idle"
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "conflict"
+  | "cancelled";
+
+export interface ManualTitleGenerationProjection {
+  session_id: string;
+  request_id: string | null;
+  state: ManualTitleGenerationState;
+  title?: string;
+  code?: string;
+  message?: string;
+  created_at?: number;
+  updated_at?: number;
+}
+
 export interface TranscriptMutationResult {
   replacement: Readonly<Record<string, unknown>> | null;
   warnings: TranscriptEventWarning[];
@@ -137,6 +157,7 @@ export interface Session {
   bash_mode: BashMode;
   browser_mode: BrowserSurfaceMode;
   browser_agent?: BrowserAgentDiagnostic;
+  title_generation?: ManualTitleGenerationProjection;
   humanAttention: HumanAttention[];
 }
 
@@ -1009,6 +1030,17 @@ export async function deleteTranscriptEvent(
     false,
     "no-store",
   ));
+}
+
+export function generateSessionTitle(id: string, expectedTitle: string): Promise<ManualTitleGenerationProjection> {
+  return apiPost<ManualTitleGenerationProjection>(
+    `/api/sessions/${encodeURIComponent(id)}/title-generation`,
+    { expected_title: expectedTitle },
+  );
+}
+
+export function getSessionTitleGeneration(id: string): Promise<ManualTitleGenerationProjection> {
+  return apiGet<ManualTitleGenerationProjection>(`/api/sessions/${encodeURIComponent(id)}/title-generation`);
 }
 
 export function archiveSession(id: string): Promise<null> {
