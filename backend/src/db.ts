@@ -11,6 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { getConfig } from "./config.js";
+import { deriveWorkspaceCapabilityAssociation } from "./derived-project-authority.js";
 import {
   inventoryBrowserProfilesForSchemaFour,
   validateBrowserCatalogRows,
@@ -65,6 +66,7 @@ import {
   type SessionTitleSource,
   type WorkspaceCapabilityApprovalEventRow,
   type WorkspaceCapabilityAssociationRow,
+  type WorkspaceCapabilityId,
   type WorkspaceSettingsRow,
 } from "./workspace-types.js";
 
@@ -710,7 +712,6 @@ function validateProtectedAutomationRows(
   raw: Record<string, unknown>,
   projectIds: ReadonlySet<string>,
   profileIds: ReadonlySet<string>,
-  associationsByKey: ReadonlyMap<string, WorkspaceCapabilityAssociationRow>,
 ): void {
   const jobs = raw.protectedAutomationJobs as unknown[];
   const runs = raw.protectedAutomationRuns as unknown[];
@@ -757,11 +758,19 @@ function validateProtectedAutomationRows(
       if (!projectIds.has(row.project_id) || !profileIds.has(row.agent_profile_id)) {
         throw new Error("Wayang store contains an orphan live protected automation job");
       }
-      const association = associationsByKey.get(`${row.project_id}\u0000${row.agent_profile_id}\u0000${PROTECTED_AUTOMATION_CAPABILITY_ID}`);
-      if (!association || association.revision < row.capability_revision) {
-        throw new Error("Wayang store contains unattributed protected automation capability state");
-      }
-      if ((!association.active || association.revision !== row.capability_revision) && row.blocked_reason === null) {
+      const project = (raw.projects as ProjectRow[]).find((candidate) => candidate.id === row.project_id)!;
+      const profile = (raw.agentProfiles as AgentProfileRow[]).find((candidate) => candidate.id === row.agent_profile_id)!;
+      const eligible = project.access_policy.privacy_mode === "protected"
+        && profile.enabled
+        && project.access_policy.allowed_agent_profile_ids?.includes(profile.id) === true;
+      const derived = eligible
+        ? deriveWorkspaceCapabilityAssociation({
+            capability_id: PROTECTED_AUTOMATION_CAPABILITY_ID,
+            project_id: project.id,
+            agent_profile_id: profile.id,
+          }, project, profile)
+        : null;
+      if ((!derived || derived.revision !== row.capability_revision) && row.blocked_reason === null) {
         throw new Error("Wayang store contains an unblocked stale protected automation job");
       }
     }
@@ -1050,7 +1059,7 @@ function validateCurrentStore(raw: Record<string, unknown>): StoreData {
       throw new Error("Wayang store contains rolled-back workspace capability association revision state");
     }
   }
-  validateProtectedAutomationRows(raw, projectIds, profileIds, associationsByKey);
+  validateProtectedAutomationRows(raw, projectIds, profileIds);
   validateBrowserCatalogRows({
     dataDir: getConfig().dataDir,
     browserProfiles: raw.browserProfiles,
@@ -1428,7 +1437,7 @@ function normalizeSchemaFiveStore(raw: Record<string, unknown>, browserProfilesE
   for (const key of schemaFiveArrayKeys) {
     if (!Array.isArray(raw[key])) throw new Error(`Schema-5 Wayang store field ${key} must be an array`);
   }
-  // Schema 5 owns canonical title provenance. Current schema 7 preserves every
+  // Schema 5 owns canonical title provenance. Current schema 8 preserves every
   // byte of those rows, inventories only expected profile-root metadata when
   // enabled, and adds an empty content-free recovery journal.
   const migrated = {
@@ -1458,6 +1467,49 @@ function normalizeSchemaSixStore(raw: Record<string, unknown>): StoreData {
     schema_version: STORE_SCHEMA_VERSION,
     transcriptRecoveryJournal: [],
   });
+}
+
+function normalizeSchemaSevenStore(raw: Record<string, unknown>): StoreData {
+  const allowedKeys = new Set<string>(["schema_version", "workspaceSettings", ...ARRAY_KEYS]);
+  for (const key of Object.keys(raw)) {
+    if (!allowedKeys.has(key)) throw new Error(`Schema-7 Wayang store contains unsupported field ${key}`);
+  }
+  for (const key of ARRAY_KEYS) {
+    if (!Array.isArray(raw[key])) throw new Error(`Schema-7 Wayang store field ${key} must be an array`);
+  }
+  const migrated = {
+    ...structuredClone(raw),
+    schema_version: STORE_SCHEMA_VERSION,
+  } as unknown as StoreData;
+  const now = Date.now();
+  for (const job of migrated.protectedAutomationJobs) {
+    if (job.deleted_at !== null) continue;
+    const project = migrated.projects.find((candidate) => candidate.id === job.project_id);
+    const profile = migrated.agentProfiles.find((candidate) => candidate.id === job.agent_profile_id);
+    const eligible = Boolean(project && profile
+      && project.access_policy.privacy_mode === "protected"
+      && profile.enabled
+      && project.access_policy.allowed_agent_profile_ids?.includes(profile.id));
+    if (eligible) {
+      job.capability_revision = deriveWorkspaceCapabilityAssociation({
+        capability_id: PROTECTED_AUTOMATION_CAPABILITY_ID,
+        project_id: project!.id,
+        agent_profile_id: profile!.id,
+      }, project!, profile!).revision;
+      if (job.blocked_reason === "capability_revoked") job.blocked_reason = "paused";
+      continue;
+    }
+    if (job.enabled || job.blocked_reason === null) {
+      job.revision += 1;
+      job.enabled = false;
+      job.blocked_reason = !project || project.access_policy.privacy_mode !== "protected"
+        ? "project_policy_incompatible"
+        : !profile?.enabled ? "profile_disabled" : "profile_not_allowed";
+      job.updated_at = Math.max(now, job.updated_at, job.created_at);
+      job.next_run_at = null;
+    }
+  }
+  return validateCurrentStore(migrated as unknown as Record<string, unknown>);
 }
 
 function isPlausibleInterviewRecord(record: unknown): record is InterviewRecord {
@@ -1791,19 +1843,85 @@ function buildHostExecutionQuestionnaireProjection(
   return availableProjection;
 }
 
+const STANDARD_DERIVED_CAPABILITIES: readonly WorkspaceCapabilityId[] = [
+  "wayang.standard-resources.v1",
+  "wayang.standard-browser.v1",
+  "wayang.host-execution.v1",
+];
+const PROTECTED_DERIVED_CAPABILITIES: readonly WorkspaceCapabilityId[] = [
+  "wayang.protected-browser.v1",
+  "wayang.protected-automation.v1",
+];
+function derivedCapabilityAssociations(data: StoreData): WorkspaceCapabilityAssociationRow[] {
+  const rows: WorkspaceCapabilityAssociationRow[] = [];
+  for (const project of data.projects) {
+    const capabilities = project.access_policy.privacy_mode === "protected"
+      ? PROTECTED_DERIVED_CAPABILITIES
+      : STANDARD_DERIVED_CAPABILITIES;
+    for (const profile of data.agentProfiles) {
+      if (!profile.enabled) continue;
+      const allowed = project.access_policy.allowed_agent_profile_ids;
+      if (allowed !== null && !allowed.includes(profile.id)) continue;
+      for (const capability_id of capabilities) {
+        rows.push(deriveWorkspaceCapabilityAssociation({
+          capability_id,
+          project_id: project.id,
+          agent_profile_id: profile.id,
+        }, project, profile));
+      }
+    }
+  }
+  rows.sort((left, right) => {
+    const leftKey = `${left.project_id}\u0000${left.agent_profile_id}\u0000${left.capability_id}`;
+    const rightKey = `${right.project_id}\u0000${right.agent_profile_id}\u0000${right.capability_id}`;
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+  return rows;
+}
+
+function projectionBinding(row: WorkspaceCapabilityAssociationRow): WorkspaceCapabilityProjectionBinding {
+  return {
+    capability_id: row.capability_id,
+    project_id: row.project_id,
+    agent_profile_id: row.agent_profile_id,
+  };
+}
+
+function projectionBindingKey(binding: WorkspaceCapabilityProjectionBinding): string {
+  return `${binding.project_id}\u0000${binding.agent_profile_id}\u0000${binding.capability_id}`;
+}
+
 function writeHostExecutionProjectionDenials(data: StoreData): void {
-  for (const association of data.workspaceCapabilityAssociations) {
-    if (association.capability_id !== "wayang.host-execution.v1") continue;
-    const binding: WorkspaceCapabilityProjectionBinding = {
-      capability_id: association.capability_id,
-      project_id: association.project_id,
-      agent_profile_id: association.agent_profile_id,
-    };
+  const currentDerived = derivedCapabilityAssociations(data);
+  const hostProjectionDir = path.join(
+    path.resolve(getConfig().dataDir),
+    "agent-readable",
+    "capabilities",
+    "wayang.host-execution.v1",
+  );
+  try {
+    for (const entry of fs.readdirSync(hostProjectionDir, { withFileTypes: true })) {
+      if (!entry.name.endsWith(".json") || (!entry.isFile() && !entry.isSymbolicLink())) continue;
+      fs.unlinkSync(path.join(hostProjectionDir, entry.name));
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const bindings = new Map<string, WorkspaceCapabilityProjectionBinding>();
+  for (const row of [...data.workspaceCapabilityAssociations, ...currentDerived]) {
+    const binding = projectionBinding(row);
+    bindings.set(projectionBindingKey(binding), binding);
+  }
+  for (const binding of bindings.values()) {
+    if (binding.capability_id !== "wayang.host-execution.v1") continue;
+    const association = currentDerived.find((row) => projectionBindingKey(projectionBinding(row)) === projectionBindingKey(binding))
+      ?? data.workspaceCapabilityAssociations.find((row) => projectionBindingKey(projectionBinding(row)) === projectionBindingKey(binding));
+    const revision = association?.revision ?? 1;
     writePrivateProjection(getWorkspaceCapabilityStoreProjectionPath(binding), {
       schema_version: HOST_EXECUTION_PAIR_PROJECTION_SCHEMA_VERSION,
       binding,
-      association_revision: association.revision,
-      active: association.active,
+      association_revision: revision,
+      active: false,
       available: false,
     });
   }
@@ -1823,38 +1941,17 @@ export function observeNextHostExecutionProjectionDenialForTests(observer: () =>
 }
 
 function writeWorkspaceCapabilityStoreProjections(data: StoreData): void {
-  for (const association of data.workspaceCapabilityAssociations) {
+  const associations = derivedCapabilityAssociations(data);
+  for (const association of associations) {
     const binding: WorkspaceCapabilityProjectionBinding = {
       capability_id: association.capability_id,
       project_id: association.project_id,
       agent_profile_id: association.agent_profile_id,
     };
     const destination = getWorkspaceCapabilityStoreProjectionPath(binding);
-    if (!association.active) {
-      writePrivateProjection(destination, {
-        schema_version: association.capability_id === "wayang.host-execution.v1"
-          ? HOST_EXECUTION_PAIR_PROJECTION_SCHEMA_VERSION : 2,
-        binding,
-        association_revision: association.revision,
-        active: false,
-        available: false,
-      });
-      continue;
-    }
     const project = data.projects.find((candidate) => candidate.id === association.project_id);
     const profile = data.agentProfiles.find((candidate) => candidate.id === association.agent_profile_id);
     if (!project || !profile) continue; // current-store validation rejects this state
-    if (!profile.enabled) {
-      writePrivateProjection(destination, {
-        schema_version: association.capability_id === "wayang.host-execution.v1"
-          ? HOST_EXECUTION_PAIR_PROJECTION_SCHEMA_VERSION : 2,
-        binding,
-        association_revision: association.revision,
-        active: true,
-        available: false,
-      });
-      continue;
-    }
     const sessions = data.sessions.filter((session) =>
       session.project_id === project.id
       && session.cwd === project.cwd
@@ -1931,7 +2028,7 @@ function canonicalizeCapabilityEligibility(data: StoreData): void {
 }
 
 function persistedStoreForBrowserMode(data: StoreData, _browserProfilesEnabled: boolean): StoreData {
-  // Schema 7 recovery authority is required in every runtime mode. Gate-off
+  // Schema 8 recovery authority is required in every runtime mode. Gate-off
   // stores retain empty browser catalogs rather than projecting back to schema 5.
   return data;
 }
@@ -2026,7 +2123,7 @@ function loadStore(storePath: string, browserProfilesEnabled = _browserProfilesE
   if (!browserProfilesEnabled && version === STORE_SCHEMA_VERSION) {
     for (const key of BROWSER_CATALOG_ARRAY_KEYS) {
       if (!Array.isArray(raw[key]) || (raw[key] as unknown[]).length !== 0) {
-        throw new Error("Wayang schema 7 browser persistence requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1");
+        throw new Error(`Wayang schema ${STORE_SCHEMA_VERSION} browser persistence requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1`);
       }
     }
   }
@@ -2038,7 +2135,8 @@ function loadStore(storePath: string, browserProfilesEnabled = _browserProfilesE
   // durable private backup. Any backup error aborts startup.
   createPrivateBackup(storePath, contents, version);
   let migrated: StoreData;
-  if (version === 6) migrated = normalizeSchemaSixStore(raw);
+  if (version === 7) migrated = normalizeSchemaSevenStore(raw);
+  else if (version === 6) migrated = normalizeSchemaSixStore(raw);
   else if (version === 5) migrated = normalizeSchemaFiveStore(raw, browserProfilesEnabled);
   else if (version === 4) migrated = normalizeSchemaFourStore(raw, browserProfilesEnabled);
   else if (version === 3) migrated = normalizeSchemaThreeStore(raw, browserProfilesEnabled);

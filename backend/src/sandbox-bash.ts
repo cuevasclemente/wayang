@@ -162,7 +162,7 @@ export function buildBashSandboxPolicy(
   for (const root of getProtectedArtifactWriteRoots()) deniedWrite.add(root);
 
   // resource_mode and provider/model are profile/runtime preferences, not
-  // filesystem authority. Only a live pair association opens global Pi roots.
+  // filesystem authority. Only live privacy/RBAC-derived pair authority opens global Pi roots.
   const standardResources = isSessionCapabilityEligible(session)
     && session.pending_agent_switch === null
     && sourceAuthorization.project

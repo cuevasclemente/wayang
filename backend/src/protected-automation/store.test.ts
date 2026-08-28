@@ -7,7 +7,7 @@ import { afterEach, beforeEach, test } from "node:test";
 import { createAgentProfile } from "../agent-profiles.js";
 import { close, failNextCommitStoreMutationPersistenceForTests, getStore, init } from "../db.js";
 import { createProject } from "../projects.js";
-import { commitWorkspaceCapabilityActivation, revokeWorkspaceCapabilityAssociation } from "../workspace-capabilities.js";
+import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability, revokeWorkspaceCapabilityAssociation } from "../workspace-capabilities.js";
 import { captureProtectedAutomationSnapshot } from "./snapshots.js";
 import {
   createProtectedAutomationJob,
@@ -67,6 +67,12 @@ function fixture() {
     operation_digest: "a".repeat(64),
     approved_at: 10,
   });
+  const authority = resolveWorkspaceCapability({
+    capability_id: "wayang.protected-automation.v1",
+    project_id: project.id,
+    agent_profile_id: profile.id,
+  });
+  if (!authority.authorized) throw new Error("Derived automation authority unavailable");
   fs.mkdirSync(path.join(projectRoot, "src"), { recursive: true });
   fs.writeFileSync(path.join(projectRoot, "src", "main.mjs"), "export default 'synthetic';\n");
   const jobId = randomUUID();
@@ -84,7 +90,7 @@ function fixture() {
     id: jobId,
     project_id: project.id,
     agent_profile_id: profile.id,
-    capability_revision: association.revision,
+    capability_revision: authority.association.revision,
     name: "Synthetic daily import",
     source_manifest_sha256: snapshot.manifestSha256,
     entrypoint: snapshot.entrypoint,
@@ -111,7 +117,7 @@ test("create/update/tombstone use overall and source CAS revisions", () => {
   assert.equal(created.next_run_at, null);
   assert.equal(created.project_id, f.project.id);
   assert.equal(created.agent_profile_id, f.profile.id);
-  assert.equal(created.capability_revision, f.association.revision);
+  assert.equal(created.capability_revision, f.input.capability_revision);
 
   const secondSnapshot = f.captureRevision(2);
   const updated = updateProtectedAutomationJob(created.id, 1, {
@@ -209,37 +215,43 @@ test("create and update require the exact owner/job/revision snapshot hash and e
   assert.equal(getProtectedAutomationJob(created.id)!.revision, created.revision);
 });
 
-test("explicit capability revocation and matching job denial share one durable commit", () => {
+test("legacy association revocation is inert to derived automation authority", () => {
   const f = fixture();
   const job = createProtectedAutomationJob(f.input, 100);
-  failNextCommitStoreMutationPersistenceForTests();
-  assert.throws(() => revokeWorkspaceCapabilityAssociation({
+  revokeWorkspaceCapabilityAssociation({
     capability_id: "wayang.protected-automation.v1",
     project_id: f.project.id,
     agent_profile_id: f.profile.id,
     expected_revision: f.association.revision,
-    revoked_at: 200,
-  }), /Synthetic store persistence failure/);
-  assert.equal(getStore().workspaceCapabilityAssociations.find((row) => row.capability_id === "wayang.protected-automation.v1")!.active, true);
-  assert.deepEqual(getProtectedAutomationJob(job.id), job);
-
-  const revoked = revokeWorkspaceCapabilityAssociation({
-    capability_id: "wayang.protected-automation.v1",
-    project_id: f.project.id,
-    agent_profile_id: f.profile.id,
-    expected_revision: f.association.revision,
-    revoked_at: 200,
+    revoked_at: 110,
   });
-  assert.equal(revoked.status, "revoked");
-  const blocked = getProtectedAutomationJob(job.id)!;
-  assert.equal(blocked.revision, job.revision + 1);
-  assert.equal(blocked.blocked_reason, "capability_revoked");
-  assert.equal(blocked.next_run_at, null);
+  const retained = getProtectedAutomationJob(job.id)!;
+  assert.equal(retained.enabled, job.enabled);
+  assert.equal(retained.blocked_reason, job.blocked_reason);
+  assert.equal(retained.capability_revision, job.capability_revision);
+});
 
+test("schema 7 migrates legacy automation attribution to derived RBAC authority", () => {
+  const f = fixture();
+  const job = createProtectedAutomationJob(f.input, 100);
   close();
+  const storePath = path.join(dataDir, "store.json");
+  const legacy = JSON.parse(fs.readFileSync(storePath, "utf8"));
+  legacy.schema_version = 7;
+  const legacyJob = legacy.protectedAutomationJobs.find((candidate: { id: string }) => candidate.id === job.id);
+  legacyJob.capability_revision = f.association.revision;
+  legacyJob.enabled = false;
+  legacyJob.blocked_reason = "capability_revoked";
+  legacyJob.next_run_at = null;
+  fs.writeFileSync(storePath, JSON.stringify(legacy, null, 2), { mode: 0o600 });
+
   init();
-  assert.equal(getStore().workspaceCapabilityAssociations.find((row) => row.capability_id === "wayang.protected-automation.v1")!.active, false);
-  assert.deepEqual(getProtectedAutomationJob(job.id), blocked);
+  const migrated = getProtectedAutomationJob(job.id)!;
+  assert.equal(getStore().schema_version, 8);
+  assert.equal(migrated.capability_revision, f.input.capability_revision);
+  assert.equal(migrated.blocked_reason, "paused");
+  const backups = fs.readdirSync(dataDir).filter((name) => name.startsWith("store.json.backup-v7-"));
+  assert.equal(backups.length, 1);
 });
 
 test("fallback duplicate wall-minute fire is claimed only once", { concurrency: false }, () => {
@@ -279,74 +291,6 @@ test("queue claims and cursor metadata do not publish when canonical persistence
   assert.equal(getProtectedAutomationJob(job.id)?.last_occurrence_key, null);
 });
 
-test("capability revocation atomically disables the job and cancels queued claims", () => {
-  const f = fixture();
-  const job = createProtectedAutomationJob(f.input, 100);
-  const enabled = transitionProtectedAutomationJobLifecycle(job.id, 1, true, 150);
-  const queued = enqueueProtectedAutomationRun({
-    jobId: enabled.id,
-    expectedRevision: enabled.revision,
-    trigger: "manual",
-    scheduledFor: null,
-    occurrenceKey: null,
-    now: 160,
-  });
-  revokeWorkspaceCapabilityAssociation({
-    capability_id: "wayang.protected-automation.v1",
-    project_id: f.project.id,
-    agent_profile_id: f.profile.id,
-    expected_revision: f.association.revision,
-    revoked_at: 200,
-  });
-  const blocked = getProtectedAutomationJob(job.id)!;
-  assert.equal(blocked.enabled, false);
-  assert.equal(blocked.revision, enabled.revision + 1);
-  assert.equal(blocked.source_revision, 1);
-  assert.equal(blocked.blocked_reason, "capability_revoked");
-  assert.equal(listProtectedAutomationRuns(job.id).find((run) => run.id === queued.id)?.status, "cancelled");
-  assert.equal(listProtectedAutomationRuns(job.id).find((run) => run.id === queued.id)?.outcome_code, "authority_blocked");
-  close();
-  init();
-  assert.equal(getProtectedAutomationJob(job.id)?.blocked_reason, "capability_revoked");
-  assert.equal(listProtectedAutomationRuns(job.id)[0]?.status, "cancelled");
-});
-
-test("capability regrant advances attribution but never silently resumes or adopts retained jobs", () => {
-  const f = fixture();
-  const job = createProtectedAutomationJob(f.input);
-  revokeWorkspaceCapabilityAssociation({
-    capability_id: "wayang.protected-automation.v1",
-    project_id: f.project.id,
-    agent_profile_id: f.profile.id,
-    expected_revision: f.association.revision,
-  });
-  const regranted = commitWorkspaceCapabilityActivation({
-    capability_id: "wayang.protected-automation.v1",
-    project_id: f.project.id,
-    agent_profile_id: f.profile.id,
-    operation_digest: "9".repeat(64),
-  });
-  assert.equal(regranted.revision, 3);
-  const retained = getProtectedAutomationJob(job.id)!;
-  assert.equal(retained.enabled, false);
-  assert.equal(retained.blocked_reason, "capability_revoked");
-  assert.equal(retained.capability_revision, 1);
-  assert.equal(retained.revision, job.revision + 1);
-  assert.equal(retained.next_run_at, null);
-  assert.throws(() => updateProtectedAutomationJob(job.id, job.revision, { name: "must explicitly rebind later" }), /revision conflict/);
-  assert.equal(getProtectedAutomationJob(job.id)!.revision, retained.revision);
-
-  const rebound = rebindProtectedAutomationJob(job.id, retained.revision, regranted.revision, 300);
-  assert.equal(rebound.capability_revision, regranted.revision);
-  assert.equal(rebound.revision, retained.revision + 1);
-  assert.equal(rebound.source_revision, retained.source_revision);
-  assert.equal(rebound.enabled, false);
-  assert.equal(rebound.blocked_reason, "paused");
-  const enabled = transitionProtectedAutomationJobLifecycle(job.id, rebound.revision, true, 301);
-  assert.equal(enabled.enabled, true);
-  assert.equal(enabled.revision, rebound.revision + 1);
-});
-
 test("strict bounded schemas reject executable, environment, path, origin, argv, and enable smuggling", () => {
   const f = fixture();
   assert.throws(() => createProtectedAutomationJob({ ...f.input, enabled: true } as never), /unsupported fields/);
@@ -361,7 +305,7 @@ test("strict bounded schemas reject executable, environment, path, origin, argv,
   assert.deepEqual(getStore().protectedAutomationJobs, []);
 });
 
-test("durable load accepts canonical nonterminal and historical pre-rebind run attribution", () => {
+test("durable load accepts canonical nonterminal state and rejects rolled-back source revisions", () => {
   const f = fixture();
   const job = createProtectedAutomationJob(f.input, 100);
   createProtectedAutomationRun({
@@ -398,17 +342,6 @@ test("durable load accepts canonical nonterminal and historical pre-rebind run a
   fs.writeFileSync(storePath, JSON.stringify(rolledBackSource), { mode: 0o600 });
   assert.throws(() => init(), /malformed protected automation job/);
   close();
-
-  const staleCapability = structuredClone(valid) as unknown as {
-    protectedAutomationJobs: Array<Record<string, unknown>>;
-    protectedAutomationRuns: Array<Record<string, unknown>>;
-    workspaceCapabilityAssociations: Array<Record<string, unknown>>;
-  };
-  staleCapability.protectedAutomationJobs[0]!.capability_revision = 2;
-  staleCapability.workspaceCapabilityAssociations.find((row) => row.capability_id === "wayang.protected-automation.v1")!.revision = 2;
-  assert.equal(staleCapability.protectedAutomationRuns[0]!.capability_revision, 1);
-  fs.writeFileSync(storePath, JSON.stringify(staleCapability), { mode: 0o600 });
-  assert.doesNotThrow(() => init());
 });
 
 test("run pruning retires private storage only after the canonical store commit is durable", () => {

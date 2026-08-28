@@ -37,6 +37,21 @@ test("stale attachment rejection is coded and never replaces the durable session
 
     assert.deepEqual(frames, [
       {
+        type: "queued_message_snapshot",
+        session_id: session.id,
+        selection_id: "selection-current",
+        reason: "post_message",
+        client_message_id: "client-current",
+        message_status: "rejected",
+        accepted_user_turn: false,
+        outcomes: [{
+          client_message_id: "client-current",
+          status: "rejected",
+          accepted_user_turn: false,
+        }],
+        messages: [],
+      },
+      {
         type: "queued_message_ack",
         session_id: session.id,
         client_message_id: "client-current",

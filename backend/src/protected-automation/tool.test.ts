@@ -5,9 +5,9 @@ import * as path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import { createAgentProfile } from "../agent-profiles.js";
 import { close, failNextCommitStoreMutationPersistenceForTests, init } from "../db.js";
-import { createProject } from "../projects.js";
+import { createProject, updateProject } from "../projects.js";
 import { createSession } from "../sessions.js";
-import { commitWorkspaceCapabilityActivation, revokeWorkspaceCapabilityAssociation } from "../workspace-capabilities.js";
+import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability } from "../workspace-capabilities.js";
 import type { ProtectedAutomationBinding } from "./authority.js";
 import { ProtectedAutomationManager, setProtectedAutomationManager } from "./manager.js";
 import { installProtectedAutomationPreparationPort } from "./browser-preparation.js";
@@ -60,13 +60,19 @@ function fixture() {
     agent_profile_id: profile.id,
     operation_digest: "a".repeat(64),
   });
+  const authority = resolveWorkspaceCapability({
+    capability_id: "wayang.protected-automation.v1",
+    project_id: project.id,
+    agent_profile_id: profile.id,
+  });
+  if (!authority.authorized) throw new Error("Derived authority unavailable");
   const binding: ProtectedAutomationBinding = {
     capabilityId: "wayang.protected-automation.v1",
     sourceSessionId: session.id,
     projectId: project.id,
     projectCwd: project.cwd,
     agentProfileId: profile.id,
-    associationRevision: association.revision,
+    associationRevision: authority.association.revision,
     runtimeGeneration: "synthetic-runtime-generation",
     processBootNonce: "synthetic-process-boot",
   };
@@ -397,23 +403,17 @@ test("update, enable, pause, and tombstone synchronously publish jobChanged befo
   }
 });
 
-test("rebind synchronously publishes jobChanged for the retained exact job", async () => {
+test("rebind synchronously publishes jobChanged after Protected RBAC is restored", async () => {
   const f = fixture();
   const first = createProtectedAutomationToolRuntime({ binding: f.binding, isRuntimeCurrent: () => true });
   const captured = jsonResult(await (first.tool.execute as any)("capture", {
     operation: "capture_job", ...configuration,
   }));
   await first.close();
-  revokeWorkspaceCapabilityAssociation({
-    capability_id: "wayang.protected-automation.v1", project_id: f.project.id,
-    agent_profile_id: f.profile.id, expected_revision: f.association.revision,
-  });
-  const regranted = commitWorkspaceCapabilityActivation({
-    capability_id: "wayang.protected-automation.v1", project_id: f.project.id,
-    agent_profile_id: f.profile.id, operation_digest: "d".repeat(64),
-  });
+  updateProject(f.project.id, { access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [f.profile.id] } });
+  updateProject(f.project.id, { access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [f.profile.id] } });
   const fresh = createProtectedAutomationToolRuntime({
-    binding: { ...f.binding, associationRevision: regranted.revision, runtimeGeneration: "rebind-runtime" },
+    binding: { ...f.binding, runtimeGeneration: "rebind-runtime" },
     isRuntimeCurrent: () => true,
   });
   const changed: string[] = [];
@@ -425,12 +425,13 @@ test("rebind synchronously publishes jobChanged for the retained exact job", asy
     const retained = jsonResult(await (fresh.tool.execute as any)("get", {
       operation: "get_job", job_id: captured.job.id,
     }));
+    assert.equal(retained.job.blocked_reason, "project_policy_incompatible");
     const rebindPromise = (fresh.tool.execute as any)("rebind", {
       operation: "rebind_job", job_id: captured.job.id, expected_revision: retained.job.revision,
     });
     assert.deepEqual(changed, [captured.job.id], "rebind latches before its tool promise is released");
     const rebound = jsonResult(await rebindPromise);
-    assert.equal(rebound.job.capability_revision, regranted.revision);
+    assert.equal(rebound.job.capability_revision, f.binding.associationRevision);
   } finally {
     uninstall();
     await fresh.close();
@@ -553,62 +554,7 @@ test("new captures are discarded on authority or store failure while idempotent 
   await current.close();
 });
 
-test("a post-capture stale-capability conflict is sanitized while the private orphan stays undisclosed", async () => {
-  const f = fixture();
-  const first = createProtectedAutomationToolRuntime({ binding: f.binding, isRuntimeCurrent: () => true });
-  const captured = jsonResult(await (first.tool.execute as any)("capture", {
-    operation: "capture_job",
-    ...configuration,
-  }));
-  revokeWorkspaceCapabilityAssociation({
-    capability_id: "wayang.protected-automation.v1",
-    project_id: f.project.id,
-    agent_profile_id: f.profile.id,
-    expected_revision: f.association.revision,
-  });
-  const regranted = commitWorkspaceCapabilityActivation({
-    capability_id: "wayang.protected-automation.v1",
-    project_id: f.project.id,
-    agent_profile_id: f.profile.id,
-    operation_digest: "c".repeat(64),
-  });
-  const fresh = createProtectedAutomationToolRuntime({
-    binding: { ...f.binding, associationRevision: regranted.revision, runtimeGeneration: "fresh-generation" },
-    isRuntimeCurrent: () => true,
-  });
-  const error = await (fresh.tool.execute as any)("stale-update", {
-    operation: "update_job",
-    job_id: captured.job.id,
-    expected_revision: 1,
-    ...configuration,
-  }).then(() => null, (failure: Error) => failure);
-  assert.ok(error);
-  assert.equal(error.message, "Protected automation conflict; refresh exact job metadata and retry");
-  assert.equal(error.message.includes(projectRoot), false);
-  assert.equal(error.message.includes("snapshot"), false);
-  const retained = jsonResult(await (fresh.tool.execute as any)("get", {
-    operation: "get_job",
-    job_id: captured.job.id,
-  }));
-  assert.ok(retained.job.revision > captured.job.revision);
-  assert.equal(retained.job.blocked_reason, "capability_revoked");
-  const rebound = jsonResult(await (fresh.tool.execute as any)("rebind", {
-    operation: "rebind_job",
-    job_id: captured.job.id,
-    expected_revision: retained.job.revision,
-  }));
-  assert.equal(rebound.job.capability_revision, regranted.revision);
-  assert.equal(rebound.job.enabled, false);
-  assert.equal(rebound.job.source_revision, captured.job.source_revision);
-  const enabled = jsonResult(await (fresh.tool.execute as any)("enable-rebound", {
-    operation: "enable",
-    job_id: captured.job.id,
-    expected_revision: rebound.job.revision,
-  }));
-  assert.equal(enabled.job.enabled, true);
-});
-
-test("revocation and prerelease drift permanently suppress stale runtime results", async () => {
+test("RBAC and prerelease drift permanently suppress stale runtime results", async () => {
   const f = fixture();
   let checks = 0;
   const drifting = createProtectedAutomationToolRuntime({
@@ -622,11 +568,10 @@ test("revocation and prerelease drift permanently suppress stale runtime results
   assert.equal(drifting.preflight().allowed, false);
 
   const current = createProtectedAutomationToolRuntime({ binding: f.binding, isRuntimeCurrent: () => true });
-  revokeWorkspaceCapabilityAssociation({
-    capability_id: "wayang.protected-automation.v1",
-    project_id: f.project.id,
-    agent_profile_id: f.profile.id,
-    expected_revision: f.association.revision,
+  const replacement = createAgentProfile({ name: "RBAC replacement" });
+  updateProject(f.project.id, {
+    default_agent_profile_id: replacement.id,
+    access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [replacement.id] },
   });
   assert.equal(current.preflight().allowed, false);
   await assert.rejects(

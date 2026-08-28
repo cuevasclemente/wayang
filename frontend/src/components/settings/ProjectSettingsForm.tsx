@@ -223,7 +223,7 @@ export function ProjectSettingsForm({ project, profiles, models, onSaved }: Proj
           </Field>
         </SettingsSection>
 
-        <SettingsSection title="Defaults" description="New sessions use these settings unless Advanced overrides them. Provider/model defaults are runtime choices and do not change capability associations.">
+        <SettingsSection title="Defaults" description="New sessions use these settings unless Advanced overrides them. Provider/model defaults are runtime choices and do not change privacy/RBAC-derived authority.">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Default agent">
               <select value={defaultAgentId} onChange={(event) => chooseDefaultAgent(event.target.value)} className={inputClass}>
@@ -244,7 +244,7 @@ export function ProjectSettingsForm({ project, profiles, models, onSaved }: Proj
         </SettingsSection>
 
         {privacyMode === "standard" && (browserProfiles.length > 0 || browserDefault) && (
-          <SettingsSection title="Browser default" description="New or unassigned sessions may use this named Browser Profile. Changing it does not switch the current session or change browser capability authority.">
+          <SettingsSection title="Browser default" description="New or unassigned sessions may use this named Browser Profile. Changing it does not switch the current session or change project-derived browser authority.">
             <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
               <Field label="Default Browser Profile">
                 <select value={browserDefaultValue} onChange={(event) => setBrowserDefaultValue(event.target.value)} className={inputClass}>
@@ -263,7 +263,7 @@ export function ProjectSettingsForm({ project, profiles, models, onSaved }: Proj
           </SettingsSection>
         )}
 
-        <SettingsSection title="Allowed agents" description="A non-empty allowlist is enforced even when the project is Standard. Removing a profile tombstones only that Project-Agent pair’s capabilities; widening access does not create or restore authority.">
+        <SettingsSection title="Allowed agents" description="A non-empty allowlist is enforced even when the project is Standard. Removing a profile immediately removes this Project-Agent pair’s derived authority; adding it automatically grants the authority selected by this Project’s privacy mode.">
           <div className="flex items-center justify-between gap-3">
             <p className="text-xs text-neutral-400">
               {allowedAgentIds === null ? "All enabled agents may open this project." : `${allowedAgentIds.length} agent${allowedAgentIds.length === 1 ? "" : "s"} allowed.`}
@@ -297,7 +297,7 @@ export function ProjectSettingsForm({ project, profiles, models, onSaved }: Proj
           )}
         </SettingsSection>
 
-        <SettingsSection title="Privacy" description="Protected is a fixed, fail-closed Wayang policy preset. A privacy change tombstones capabilities incompatible with the new mode; changing back requires fresh PIN activation.">
+        <SettingsSection title="Privacy" description="Protected is a fixed, fail-closed Wayang policy preset. Privacy directly selects the authority available to enabled allowlisted agents, and affected runtimes rebuild when it changes.">
           <label className={`flex cursor-pointer items-start gap-3 rounded-lg border p-4 ${privacyMode === "protected" ? "border-amber-700/70 bg-amber-950/20" : "border-neutral-800 bg-neutral-950/60"}`}>
             <input
               type="checkbox"
@@ -315,7 +315,7 @@ export function ProjectSettingsForm({ project, profiles, models, onSaved }: Proj
           </label>
           {privacyMode === "protected" && (
             <div className="rounded border border-amber-900/60 bg-amber-950/20 px-3 py-2 text-xs leading-relaxed text-amber-100/80">
-              TTS, activated browser capabilities, and project apps remain separate disclosure boundaries. Protection prevents future background access; it cannot undo prior host, browser, or disclosure effects. It is not isolation from other processes running as the same OS user.
+              TTS, privacy-derived browser authority, and project apps remain separate disclosure boundaries. Protection prevents future background access; it cannot undo prior host, browser, or disclosure effects. It is not isolation from other processes running as the same OS user.
             </div>
           )}
         </SettingsSection>
@@ -330,7 +330,7 @@ export function ProjectSettingsForm({ project, profiles, models, onSaved }: Proj
         </div>
       </form>
 
-      <SettingsSection title="Project instructions" description="Edit the real project-root AGENTS.md with optimistic conflict protection. Instruction edits preserve Project-Agent capability associations while affected runtimes rebuild.">
+      <SettingsSection title="Project instructions" description="Edit the real project-root AGENTS.md with optimistic conflict protection. Instruction edits preserve privacy/RBAC-derived authority while affected runtimes rebuild.">
         {instructionsLoading ? (
           <div className="flex items-center gap-2 text-sm text-neutral-500"><Loader2 size={14} className="animate-spin" /> Loading AGENTS.md…</div>
         ) : instructions ? (

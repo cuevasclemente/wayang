@@ -29,7 +29,19 @@ test("second-client sends during PIN wait and post-CAS cleanup receive coded rej
           client_message_id: `client-${phase}`,
           content: "must not dispatch",
         });
-        assert.deepEqual(frames[0], {
+        assert.equal(frames[0]?.type, "queued_message_snapshot");
+        assert.equal(frames[0]?.session_id, session.id);
+        assert.equal(frames[0]?.selection_id, `selection-${phase}`);
+        assert.equal(frames[0]?.client_message_id, `client-${phase}`);
+        assert.equal(frames[0]?.message_status, "rejected");
+        assert.equal(frames[0]?.accepted_user_turn, false);
+        assert.deepEqual(frames[0]?.messages, []);
+        assert.deepEqual((frames[0]?.outcomes as Array<Record<string, unknown>>).at(-1), {
+          client_message_id: `client-${phase}`,
+          status: "rejected",
+          accepted_user_turn: false,
+        });
+        assert.deepEqual(frames[1], {
           type: "queued_message_ack",
           session_id: session.id,
           client_message_id: `client-${phase}`,
@@ -37,7 +49,7 @@ test("second-client sends during PIN wait and post-CAS cleanup receive coded rej
           error_code: "mutation_locked",
           error: "Session transcript mutation is in progress",
         });
-        assert.deepEqual(frames[1], {
+        assert.deepEqual(frames[2], {
           type: "error",
           session_id: session.id,
           selection_id: `selection-${phase}`,

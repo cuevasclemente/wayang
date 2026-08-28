@@ -108,12 +108,12 @@ const capabilityApproval = diagnoseCapabilityApprovalMetadata();
 if (capabilityApproval.pin.ok) {
   ok("command-guard identity PIN metadata is owner-only and safe (contents not inspected)");
 } else {
-  warn(`workspace capability approval PIN metadata is unavailable or unsafe (${capabilityApproval.pin.reason}); ensure the existing command-guard PIN is owner-only and accessible to the deployed service`);
+  warn(`owner PIN confirmation metadata is unavailable or unsafe (${capabilityApproval.pin.reason}); ensure the existing command-guard PIN is owner-only and accessible to the deployed service`);
 }
 if (capabilityApproval.state.ok) {
-  ok("workspace capability approval cooldown metadata is owner-only and safe (contents not inspected)");
+  ok("owner PIN confirmation cooldown metadata is owner-only and safe (contents not inspected)");
 } else {
-  warn(`workspace capability approval cooldown metadata is unavailable or unsafe (${capabilityApproval.state.reason}); deployed service startup initializes missing state automatically when PIN metadata is safe (make setup-capability-approval is an optional preflight)`);
+  warn(`owner PIN confirmation cooldown metadata is unavailable or unsafe (${capabilityApproval.state.reason}); deployed service startup initializes missing state automatically when PIN metadata is safe (make setup-owner-pin-confirmations is an optional preflight)`);
 }
 
 const providerVariables = [

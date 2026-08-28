@@ -36,7 +36,6 @@ import { FILE_AUDIO_EXPERIMENT_TOOL_NAME, type FileAudioExperimentRuntime } from
 import { classifyReadableStandardArtifact, SESSION_INTEROP_TOOL_NAMES } from "./session-interop.js";
 import {
   isSessionCapabilityEligible,
-  listWorkspaceCapabilityAssociations,
   resolveWorkspaceCapability,
   type WorkspaceCapabilityResolution,
 } from "./workspace-capabilities.js";
@@ -60,14 +59,6 @@ export interface ExactStandardResourcesWitness {
   readonly projectId: string;
   readonly agentProfileId: string;
   readonly associationRevision: number;
-  /** Omitted for a durable capability association. */
-  readonly authoritySource?: "legacy-wren";
-  /**
-   * Legacy witnesses capture an already-present inactive durable row's revision.
-   * Activation may advance exactly once from that captured state while accepted
-   * old-runtime work settles; any later revoke/regrant revision remains stale.
-   */
-  readonly durableAssociationRevision?: number;
 }
 
 function standardResourcesWitnessFromResolution(
@@ -88,31 +79,7 @@ function exactStandardResourcesWitnessEqual(left: ExactStandardResourcesWitness,
   return left.capabilityId === right.capabilityId
     && left.projectId === right.projectId
     && left.agentProfileId === right.agentProfileId
-    && left.associationRevision === right.associationRevision
-    && left.authoritySource === right.authoritySource
-    && left.durableAssociationRevision === right.durableAssociationRevision;
-}
-
-/**
- * An accepted legacy-Wren runtime may finish under its captured authority when
- * the pair's absent or captured-inactive durable witness advances exactly once
- * to active. Every later source or revision change remains a stale-runtime denial.
- */
-function capturedStandardResourcesWitnessStillValid(
-  captured: ExactStandardResourcesWitness,
-  current: ExactStandardResourcesWitness,
-): boolean {
-  if (exactStandardResourcesWitnessEqual(captured, current)) return true;
-  const expectedActivatedRevision = captured.durableAssociationRevision === undefined
-    ? 1
-    : captured.durableAssociationRevision + 1;
-  return captured.authoritySource === "legacy-wren"
-    && current.authoritySource === undefined
-    && captured.capabilityId === current.capabilityId
-    && captured.projectId === current.projectId
-    && captured.agentProfileId === current.agentProfileId
-    && Number.isSafeInteger(expectedActivatedRevision)
-    && current.associationRevision === expectedActivatedRevision;
+    && left.associationRevision === right.associationRevision;
 }
 
 export function resolveCurrentStandardResourcesWitness(options: {
@@ -129,25 +96,7 @@ export function resolveCurrentStandardResourcesWitness(options: {
     project_id: options.project.id,
     agent_profile_id: options.agentProfile.id,
   } as const;
-  const associated = standardResourcesWitnessFromResolution(resolveWorkspaceCapability(pair));
-  if (associated) return associated;
-  if (!isLegacyWrenStandardRuntime({
-    session: row,
-    profile: options.agentProfile,
-    project: options.project,
-  })) return null;
-  const durableAssociationRevision = listWorkspaceCapabilityAssociations().find((candidate) =>
-    candidate.capability_id === pair.capability_id
-    && candidate.project_id === pair.project_id
-    && candidate.agent_profile_id === pair.agent_profile_id)?.revision;
-  return Object.freeze({
-    capabilityId: STANDARD_RESOURCES_CAPABILITY_ID,
-    projectId: options.project.id,
-    agentProfileId: options.agentProfile.id,
-    associationRevision: 1,
-    authoritySource: "legacy-wren" as const,
-    ...(durableAssociationRevision === undefined ? {} : { durableAssociationRevision }),
-  });
+  return standardResourcesWitnessFromResolution(resolveWorkspaceCapability(pair));
 }
 
 export const RESTRICTED_BUILTIN_TOOLS = ["read", "edit", "write", "grep", "find", "ls", "bash"] as const;
@@ -549,7 +498,7 @@ function liveToolDecision(
       project: authorization.project,
       agentProfile: authorization.agentProfile,
     });
-    if (!current || !capturedStandardResourcesWitnessStillValid(expectedStandard, current)) {
+    if (!current || !exactStandardResourcesWitnessEqual(expectedStandard, current)) {
       return { allowed: false, reason: "Standard resource authority was revoked or changed; a fresh runtime is required" };
     }
   }
@@ -787,7 +736,7 @@ export function installAgentToolPolicyGuard(
       project: authorization.project,
       agentProfile: authorization.agentProfile,
     });
-    if (!current || !capturedStandardResourcesWitnessStillValid(standardResourcesWitness, current)) {
+    if (!current || !exactStandardResourcesWitnessEqual(standardResourcesWitness, current)) {
       standardAuthorityRevoked = true;
       return false;
     }
@@ -939,7 +888,7 @@ export async function buildAgentResourceLoader(options: {
         excludeTools: options.project.access_policy.privacy_mode === "protected" ? [...SUBAGENT_TOOLS] : undefined,
       };
     }
-    // Never publish resources loaded under a stale association. Construct a fresh
+    // Never publish resources loaded under stale privacy/RBAC-derived authority. Construct a fresh
     // pre-load-excluded loader and permanently discard the loaded instance.
     settingsManager = createInMemorySettingsSnapshot(options.cwd, options.agentDir);
   }

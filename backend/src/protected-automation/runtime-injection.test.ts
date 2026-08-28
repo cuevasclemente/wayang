@@ -10,6 +10,7 @@ import { createProject } from "../projects.js";
 import { createSession } from "../sessions.js";
 import {
   commitWorkspaceCapabilityActivation,
+  resolveWorkspaceCapability,
   revokeWorkspaceCapabilityAssociation,
 } from "../workspace-capabilities.js";
 import { INTERACTIVE_BROWSER_TOOL_NAMES } from "../browser/protected-tools.js";
@@ -54,13 +55,19 @@ function fixture(options: { activate?: boolean } = {}) {
     agent_profile_id: profile.id,
     operation_digest: "b".repeat(64),
   });
+  const authority = resolveWorkspaceCapability({
+    capability_id: "wayang.protected-automation.v1",
+    project_id: project.id,
+    agent_profile_id: profile.id,
+  });
+  if (!authority.authorized) throw new Error("Synthetic derived authority is unavailable");
   const bindingFor = (sourceSessionId: string): ProtectedAutomationBinding => ({
     capabilityId: "wayang.protected-automation.v1",
     sourceSessionId,
     projectId: project.id,
     projectCwd: project.cwd,
     agentProfileId: profile.id,
-    associationRevision: association?.revision ?? 1,
+    associationRevision: authority.association.revision,
     runtimeGeneration: "synthetic-runtime-generation",
     processBootNonce: "synthetic-process-boot",
   });
@@ -258,20 +265,18 @@ test("scheduled, quarantined, and pending-switch sources cannot authorize the ru
   }
 });
 
-test("a missing exact-pair association permanently denies protected automation", async () => {
+test("a missing legacy association row does not deny derived protected automation", async () => {
   const missing = fixture({ activate: false });
   const missingRuntime = createProtectedAutomationToolRuntime({
     binding: missing.bindingFor(missing.session.id),
     isRuntimeCurrent: () => true,
   });
-  assert.equal(missingRuntime.preflight().allowed, false, "missing association");
-  await assert.rejects(
-    () => (missingRuntime.tool.execute as any)("missing", { operation: "status" }),
-    /revoked|authority changed/,
-  );
+  assert.equal(missingRuntime.preflight().allowed, true, "legacy association row is not authority");
+  const status = await (missingRuntime.tool.execute as any)("missing", { operation: "status" });
+  assert.match(status.content[0].text, /wayang\.protected-automation\.v1/);
 });
 
-test("revoking the exact-pair association permanently denies the captured runtime", async () => {
+test("revoking an inert legacy association does not deny derived protected automation", async () => {
   const revoked = fixture();
   const revokedRuntime = createProtectedAutomationToolRuntime({
     binding: revoked.bindingFor(revoked.session.id),
@@ -284,9 +289,7 @@ test("revoking the exact-pair association permanently denies the captured runtim
     agent_profile_id: revoked.profile.id,
     expected_revision: revoked.association!.revision,
   });
-  assert.equal(revokedRuntime.preflight().allowed, false, "revoked association");
-  await assert.rejects(
-    () => (revokedRuntime.tool.execute as any)("revoked", { operation: "status" }),
-    /revoked|authority changed/,
-  );
+  assert.equal(revokedRuntime.preflight().allowed, true, "legacy revocation is inert");
+  const status = await (revokedRuntime.tool.execute as any)("revoked", { operation: "status" });
+  assert.match(status.content[0].text, /wayang\.protected-automation\.v1/);
 });

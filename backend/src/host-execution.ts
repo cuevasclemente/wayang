@@ -16,7 +16,7 @@ export type HostExecutionMode = "host" | "sandboxed" | "sandboxed-wren" | "unava
 
 /**
  * Backend-issued proof that the closed workspace capability resolver found the
- * exact active project/profile association. Host execution consumes this proof;
+ * exact current privacy/RBAC-derived Project/Profile authority. Host execution consumes this proof;
  * provider/model, names, built-in kinds, resource preferences, and configuration
  * flags are not authority inputs here.
  */
@@ -189,7 +189,7 @@ export function resolveHostExecutionAuthorization(
     !witnessIsWellFormed(execution.expectedCapabilityWitness)
     || !witnessesAreExact(execution.expectedCapabilityWitness, witness)
   ) {
-    return deny("Host-execution association differs from the creation-time binding");
+    return deny("Host-execution authority differs from the creation-time binding");
   }
   if (execution.selectedBashMode !== "host") return deny("Runtime was not created with host execution");
   if (

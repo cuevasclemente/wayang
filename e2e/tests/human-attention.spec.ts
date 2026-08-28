@@ -183,7 +183,7 @@ async function installSyntheticApi(
 }
 
 async function openNotificationSettings(page: Page): Promise<void> {
-  await page.getByRole("button", { name: "Open workspace and capability settings" }).click();
+  await page.getByRole("button", { name: "Open workspace settings" }).click();
   await page.getByRole("tab", { name: "Notifications" }).click();
 }
 

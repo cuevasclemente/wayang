@@ -736,8 +736,8 @@ function HeaderBar({
         <button
           type="button"
           onClick={onOpenSettings}
-          title="Workspace and capability settings"
-          aria-label="Open workspace and capability settings"
+          title="Workspace settings"
+          aria-label="Open workspace settings"
           className="rounded p-1.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-100"
         >
           <SettingsIcon size={15} />

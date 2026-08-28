@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { commitStoreMutation, getStore, type SessionRow, type StoreData, type StoredScheduledJobRow } from "./db.js";
 import { notifyPolicyChanged } from "./policy-generation.js";
-import { blockProtectedAutomationJobsDraft } from "./protected-automation/draft-lifecycle.js";
-import { PROTECTED_AUTOMATION_CAPABILITY_ID } from "./protected-automation/types.js";
+import { deriveWorkspaceCapabilityAssociation } from "./derived-project-authority.js";
+export { deriveWorkspaceCapabilityAssociation } from "./derived-project-authority.js";
 import {
   WORKSPACE_CAPABILITY_IDS,
   WorkspaceStoreError,
@@ -70,8 +70,6 @@ export type WorkspaceCapabilityDenialReason =
   | "incompatible_privacy_mode"
   | "profile_disabled"
   | "profile_not_allowed"
-  | "association_missing"
-  | "association_inactive"
   | "stale_association_revision";
 
 export type WorkspaceCapabilityResolution =
@@ -178,9 +176,10 @@ export function resolveWorkspaceCapability(input: WorkspaceCapabilityResolutionI
   }
   if (!profile.enabled) return { authorized: false, reason: "profile_disabled" };
   if (!projectAllowsAgentProfile(project, profile.id)) return { authorized: false, reason: "profile_not_allowed" };
-  const association = findWorkspaceCapabilityAssociation(store, input);
-  if (!association) return { authorized: false, reason: "association_missing" };
-  if (!association.active) return { authorized: false, reason: "association_inactive" };
+  // Project privacy + exact enabled/allowed profile are the complete live
+  // authority model. Legacy per-pair association rows and PIN approval history
+  // are intentionally ignored and retained only as inert migration data.
+  const association = deriveWorkspaceCapabilityAssociation(input, project, profile);
   return Object.freeze({
     authorized: true as const,
     ...immutableWitness(WORKSPACE_CAPABILITY_REGISTRY[input.capability_id], project, profile, association),
@@ -340,15 +339,6 @@ export function revokeWorkspaceCapabilityAssociation(
       throw new WorkspaceStoreError("Workspace capability association revision conflict", 409);
     }
     tombstoneWorkspaceCapabilityAssociationsDraft(draft, (candidate) => candidate === row, now);
-    if (row.capability_id === PROTECTED_AUTOMATION_CAPABILITY_ID) {
-      blockProtectedAutomationJobsDraft(
-        draft,
-        (job) => job.project_id === row.project_id && job.agent_profile_id === row.agent_profile_id,
-        "capability_revoked",
-        row.revoked_at!,
-        true,
-      );
-    }
     return { status: "revoked", association: { ...row } } as const;
   });
   if (result.status === "revoked") notifyPolicyChanged();

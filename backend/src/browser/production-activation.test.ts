@@ -43,7 +43,7 @@ test("tracked supervised deployment template standardizes named profiles on auto
   assert.doesNotMatch(deprecatedBundledTemplate, /^Environment=/m);
 });
 
-test("production gate-on startup accepts gate-off schema 7 only after complete browser composition", { timeout: 60_000 }, async () => {
+test("production gate-on startup accepts gate-off schema 8 only after complete browser composition", { timeout: 60_000 }, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-browser-production-activation-"));
   const dataDir = path.join(root, "data");
   const home = path.join(root, "home");
@@ -66,7 +66,7 @@ test("production gate-on startup accepts gate-off schema 7 only after complete b
   }
   const storePath = path.join(dataDir, "store.json");
   const gateOffStore = JSON.parse(fs.readFileSync(storePath, "utf8"));
-  assert.equal(gateOffStore.schema_version, 7);
+  assert.equal(gateOffStore.schema_version, 8);
   assert.deepEqual(gateOffStore.browserProfiles, []);
   assert.deepEqual(gateOffStore.projectBrowserDefaults, []);
   assert.deepEqual(gateOffStore.sessionBrowserStates, []);
@@ -128,11 +128,11 @@ test("production gate-on startup accepts gate-off schema 7 only after complete b
   }
 
   const migrated = JSON.parse(fs.readFileSync(storePath, "utf8"));
-  assert.equal(migrated.schema_version, 7);
+  assert.equal(migrated.schema_version, 8);
   assert.ok(Array.isArray(migrated.browserProfiles));
   assert.deepEqual(migrated.transcriptRecoveryJournal, []);
   const backups = fs.readdirSync(dataDir).filter((name) => name.startsWith("store.json.backup-v"));
-  assert.equal(backups.length, 0, "current schema 7 requires no migration rewrite");
+  assert.equal(backups.length, 0, "current schema 8 requires no migration rewrite");
   fs.rmSync(root, { recursive: true, force: true });
 });
 

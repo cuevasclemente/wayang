@@ -11,6 +11,7 @@ import {
   type AgentProfileUpdateInput,
 } from "./agent-profiles.js";
 import { getStore } from "./db.js";
+import { deriveWorkspaceCapabilityAssociation } from "./derived-project-authority.js";
 import { getInterviewForSession, type InterviewRecord } from "./interviews.js";
 import {
   createProject,
@@ -46,11 +47,14 @@ import {
 } from "./interview-provenance.js";
 import type { CapabilityAssociationRecord } from "./workspace-capability-approval/types.js";
 import {
+  projectAllowsAgentProfile,
+  WORKSPACE_CAPABILITY_REGISTRY,
+} from "./workspace-capabilities.js";
+import {
   WorkspaceStoreError,
   type AgentProfileRow,
   type ProjectAccessPolicy,
   type ProjectRow,
-  type WorkspaceCapabilityAssociationRow,
 } from "./workspace-types.js";
 
 export type WorkspaceMutationAuthority =
@@ -58,7 +62,7 @@ export type WorkspaceMutationAuthority =
   | { kind: "agent_approval"; sourceSessionId: string; requestId: string; submissionId: string };
 
 export interface WorkspaceCapabilityInvalidationPort {
-  /** Synchronously latches runtime/control denial after durable tombstoning and before cleanup. */
+  /** Synchronously latches runtime/control denial after the durable RBAC change and before cleanup. */
   latchDenied(input: {
     associations: readonly CapabilityAssociationRecord[];
     runtimeIds: readonly string[];
@@ -395,7 +399,7 @@ function prepareMutation(raw: unknown): PreparedMutation {
         target: { id: current.id, label: current.name },
         warning: permissionWidening
           ? "This change widens the agent profile's permissions or enables it."
-          : mutation.updates.enabled === false ? "This disables runtime use but preserves stable-ID attribution and capability associations." : undefined,
+          : mutation.updates.enabled === false ? "This disables runtime use and removes privacy/RBAC-derived authority everywhere while preserving stable-ID attribution." : undefined,
         profileId: current.id,
       };
     }
@@ -490,77 +494,78 @@ function verifyApproval(record: InterviewRecord | undefined, expected: Workspace
   }
 }
 
-function associationKey(row: Pick<WorkspaceCapabilityAssociationRow, "project_id" | "agent_profile_id" | "capability_id">): string {
-  return `${row.project_id}\u0000${row.agent_profile_id}\u0000${row.capability_id}`;
+function deniedDerivedAuthorityRecords(
+  project: ProjectRow,
+  profile: AgentProfileRow,
+  deniedAt: number,
+): CapabilityAssociationRecord[] {
+  if (!profile.enabled || !projectAllowsAgentProfile(project, profile.id)) return [];
+  return Object.values(WORKSPACE_CAPABILITY_REGISTRY)
+    .filter((capability) => capability.privacy_mode === project.access_policy.privacy_mode)
+    .map((capability) => {
+      const row = deriveWorkspaceCapabilityAssociation({
+        capability_id: capability.id,
+        project_id: project.id,
+        agent_profile_id: profile.id,
+      }, project, profile);
+      return {
+        capabilityId: row.capability_id,
+        projectId: row.project_id,
+        agentProfileId: row.agent_profile_id,
+        revision: row.revision,
+        active: false,
+        approvedAt: row.approved_at,
+        revokedAt: deniedAt,
+        updatedAt: deniedAt,
+      };
+    });
 }
 
-function plannedInvalidatedAssociationKeys(prepared: PreparedMutation): string[] {
+/** Authority present before the mutation that the mutation will remove. */
+function plannedInvalidatedDerivedAuthorities(prepared: PreparedMutation, deniedAt = Date.now()): CapabilityAssociationRecord[] {
   const store = getStore();
   if (prepared.canonical.mutation_type === "project_update") {
     const mutation = prepared.canonical.mutation;
     const project = store.projects.find((candidate) => candidate.id === mutation.id);
-    if (!project) return [];
-    const nextPolicy = mutation.updates.access_policy ?? project.access_policy;
-    return store.workspaceCapabilityAssociations.filter((association) => {
-      if (!association.active || association.project_id !== project.id) return false;
-      const compatibleMode = association.capability_id === "wayang.protected-browser.v1"
-        || association.capability_id === "wayang.protected-automation.v1"
-        ? "protected"
-        : "standard";
-      return compatibleMode !== nextPolicy.privacy_mode
-        || (nextPolicy.allowed_agent_profile_ids !== null
-          && !nextPolicy.allowed_agent_profile_ids.includes(association.agent_profile_id));
-    }).map(associationKey);
+    if (!project || mutation.updates.access_policy === undefined) return [];
+    const nextPolicy = mutation.updates.access_policy;
+    return store.agentProfiles.flatMap((profile) => {
+      if (!profile.enabled || !projectAllowsAgentProfile(project, profile.id)) return [];
+      const remainsAllowed = nextPolicy.allowed_agent_profile_ids === null
+        || nextPolicy.allowed_agent_profile_ids.includes(profile.id);
+      if (nextPolicy.privacy_mode === project.access_policy.privacy_mode && remainsAllowed) return [];
+      return deniedDerivedAuthorityRecords(project, profile, deniedAt);
+    });
   }
   if (prepared.canonical.mutation_type === "project_delete_registration") {
-    const projectId = prepared.canonical.mutation.id;
-    return store.workspaceCapabilityAssociations
-      .filter((association) => association.active && association.project_id === projectId)
-      .map(associationKey);
+    const mutation = prepared.canonical.mutation;
+    const project = store.projects.find((candidate) => candidate.id === mutation.id);
+    return project
+      ? store.agentProfiles.flatMap((profile) => deniedDerivedAuthorityRecords(project, profile, deniedAt))
+      : [];
+  }
+  if (prepared.canonical.mutation_type === "agent_profile_update") {
+    const mutation = prepared.canonical.mutation;
+    const profile = store.agentProfiles.find((candidate) => candidate.id === mutation.id);
+    if (!profile?.enabled || mutation.updates.enabled !== false) return [];
+    return store.projects.flatMap((project) => deniedDerivedAuthorityRecords(project, profile, deniedAt));
   }
   if (prepared.canonical.mutation_type === "agent_profile_delete") {
-    const profileId = prepared.canonical.mutation.id;
-    return store.workspaceCapabilityAssociations
-      .filter((association) => association.active && association.agent_profile_id === profileId)
-      .map(associationKey);
+    const mutation = prepared.canonical.mutation;
+    const profile = store.agentProfiles.find((candidate) => candidate.id === mutation.id);
+    return profile
+      ? store.projects.flatMap((project) => deniedDerivedAuthorityRecords(project, profile, deniedAt))
+      : [];
   }
-  // Disable/reenable and every definition/default/instruction edit preserve authority.
   return [];
 }
 
-function runtimeIdsForAssociationKeys(keys: readonly string[]): string[] {
-  const selected = new Set(keys);
-  const store = getStore();
-  const pairKeys = new Set(store.workspaceCapabilityAssociations
-    .filter((association) => selected.has(associationKey(association)))
-    .map((association) => `${association.project_id}\u0000${association.agent_profile_id}`));
-  const projectCwds = new Map(store.projects.map((project) => [project.id, project.cwd]));
-  return store.sessions.filter((session) => {
-    if (typeof session.agent_profile_id !== "string") return false;
-    for (const pairKey of pairKeys) {
-      const separator = pairKey.indexOf("\u0000");
-      const projectId = pairKey.slice(0, separator);
-      const profileId = pairKey.slice(separator + 1);
-      if (session.cwd === projectCwds.get(projectId) && session.agent_profile_id === profileId) return true;
-    }
-    return false;
-  }).map((session) => session.id).sort();
-}
-
-function tombstonedAssociationRecords(keys: readonly string[]): CapabilityAssociationRecord[] {
-  const selected = new Set(keys);
-  return getStore().workspaceCapabilityAssociations
-    .filter((association) => selected.has(associationKey(association)))
-    .map((row) => ({
-      capabilityId: row.capability_id,
-      projectId: row.project_id,
-      agentProfileId: row.agent_profile_id,
-      revision: row.revision,
-      active: row.active,
-      approvedAt: row.approved_at,
-      revokedAt: row.revoked_at,
-      updatedAt: row.updated_at,
-    }));
+function runtimeIdsForDerivedAuthorities(authorities: readonly CapabilityAssociationRecord[]): string[] {
+  const pairs = new Set(authorities.map((authority) => `${authority.projectId}\u0000${authority.agentProfileId}`));
+  return getStore().sessions.filter((session) => typeof session.agent_profile_id === "string"
+    && pairs.has(`${session.project_id}\u0000${session.agent_profile_id}`))
+    .map((session) => session.id)
+    .sort();
 }
 
 async function settleMutation(
@@ -577,9 +582,9 @@ async function settleMutation(
     if (current.precondition.sha256 !== prepared.precondition.sha256 || stableWorkspaceJson(current.canonical) !== stableWorkspaceJson(prepared.canonical)) {
       throw new WorkspaceStoreError("Workspace state changed after approval", 409);
     }
-    const invalidatedKeys = plannedInvalidatedAssociationKeys(prepared);
-    const deniedRuntimeIds = runtimeIdsForAssociationKeys(invalidatedKeys);
-    if (invalidatedKeys.length > 0 && !invalidation) {
+    const invalidatedAuthorities = plannedInvalidatedDerivedAuthorities(prepared);
+    const deniedRuntimeIds = runtimeIdsForDerivedAuthorities(invalidatedAuthorities);
+    if (deniedRuntimeIds.length > 0 && !invalidation) {
       throw new WorkspaceStoreError("Capability invalidation runtime latch is unavailable", 503);
     }
     let result: unknown;
@@ -604,10 +609,9 @@ async function settleMutation(
     // succeeded. Consume issuance before post-commit idle-runtime cleanup so a
     // cleanup error cannot leave reusable authority for an already-applied op.
     onMutationCommitted?.();
-    const runtimeIds = lease?.affected_session_ids ?? [];
-    if (invalidatedKeys.length > 0) {
-      invalidation!.latchDenied({
-        associations: tombstonedAssociationRecords(invalidatedKeys),
+    if (invalidatedAuthorities.length > 0 && invalidation) {
+      invalidation.latchDenied({
+        associations: invalidatedAuthorities,
         runtimeIds: deniedRuntimeIds,
         reason: "ordinary_workspace_mutation",
       });
@@ -615,8 +619,8 @@ async function settleMutation(
     await lease?.commitAndStopIdle();
     const cleanupFailures = lease ? [...lease.cleanup_failures] : [];
     lease = null;
-    if (invalidatedKeys.length > 0) {
-      await invalidation!.cleanupAfterDenial({ runtimeIds: deniedRuntimeIds }).catch(() => undefined);
+    if (invalidatedAuthorities.length > 0 && invalidation) {
+      await invalidation.cleanupAfterDenial({ runtimeIds: deniedRuntimeIds }).catch(() => undefined);
     }
     return { result, cleanupFailures };
   } catch (error) {
@@ -772,24 +776,24 @@ export class WorkspaceSettingsService {
     if (!current) throw new WorkspaceStoreError("Project not found", 404);
     const prepared = prepareMutation({ mutation_type: "project_update", mutation: { id, updates: input } });
     const impact = await runtimeImpact();
-    const invalidatedKeys = plannedInvalidatedAssociationKeys(prepared);
-    const deniedRuntimeIds = runtimeIdsForAssociationKeys(invalidatedKeys);
-    if (invalidatedKeys.length > 0 && !this.capabilityInvalidation) {
+    const invalidatedAuthorities = plannedInvalidatedDerivedAuthorities(prepared);
+    const deniedRuntimeIds = runtimeIdsForDerivedAuthorities(invalidatedAuthorities);
+    if (deniedRuntimeIds.length > 0 && !this.capabilityInvalidation) {
       throw new WorkspaceStoreError("Capability invalidation runtime latch is unavailable", 503);
     }
-    let lease = runtimeAffecting || invalidatedKeys.length > 0 ? impact.acquireProject(current.cwd) : null;
+    let lease = runtimeAffecting || invalidatedAuthorities.length > 0 ? impact.acquireProject(current.cwd) : null;
     try {
       const result = updateProject(id, input);
-      if (invalidatedKeys.length > 0) {
-        this.capabilityInvalidation!.latchDenied({
-          associations: tombstonedAssociationRecords(invalidatedKeys),
+      if (invalidatedAuthorities.length > 0 && this.capabilityInvalidation) {
+        this.capabilityInvalidation.latchDenied({
+          associations: invalidatedAuthorities,
           runtimeIds: deniedRuntimeIds,
           reason: "ordinary_workspace_mutation",
         });
       }
       await lease?.commitAndStopIdle(); lease = null;
-      if (invalidatedKeys.length > 0) {
-        await this.capabilityInvalidation!.cleanupAfterDenial({ runtimeIds: deniedRuntimeIds }).catch(() => undefined);
+      if (invalidatedAuthorities.length > 0 && this.capabilityInvalidation) {
+        await this.capabilityInvalidation.cleanupAfterDenial({ runtimeIds: deniedRuntimeIds }).catch(() => undefined);
       }
       return result;
     } catch (error) { lease?.release(); throw error; }
@@ -799,25 +803,25 @@ export class WorkspaceSettingsService {
     const current = getProject(id);
     if (!current) throw new WorkspaceStoreError("Project not found", 404);
     const prepared = prepareMutation({ mutation_type: "project_delete_registration", mutation: { id } });
-    const invalidatedKeys = plannedInvalidatedAssociationKeys(prepared);
-    const deniedRuntimeIds = runtimeIdsForAssociationKeys(invalidatedKeys);
-    if (invalidatedKeys.length > 0 && !this.capabilityInvalidation) {
+    const invalidatedAuthorities = plannedInvalidatedDerivedAuthorities(prepared);
+    const deniedRuntimeIds = runtimeIdsForDerivedAuthorities(invalidatedAuthorities);
+    if (deniedRuntimeIds.length > 0 && !this.capabilityInvalidation) {
       throw new WorkspaceStoreError("Capability invalidation runtime latch is unavailable", 503);
     }
     const impact = await runtimeImpact();
     let lease: RuntimeMutationImpactLease | null = impact.acquireProject(current.cwd);
     try {
       deleteProjectRegistration(id);
-      if (invalidatedKeys.length > 0) {
-        this.capabilityInvalidation!.latchDenied({
-          associations: tombstonedAssociationRecords(invalidatedKeys),
+      if (invalidatedAuthorities.length > 0 && this.capabilityInvalidation) {
+        this.capabilityInvalidation.latchDenied({
+          associations: invalidatedAuthorities,
           runtimeIds: deniedRuntimeIds,
           reason: "ordinary_workspace_mutation",
         });
       }
       await lease.commitAndStopIdle(); lease = null;
-      if (invalidatedKeys.length > 0) {
-        await this.capabilityInvalidation!.cleanupAfterDenial({ runtimeIds: deniedRuntimeIds }).catch(() => undefined);
+      if (invalidatedAuthorities.length > 0 && this.capabilityInvalidation) {
+        await this.capabilityInvalidation.cleanupAfterDenial({ runtimeIds: deniedRuntimeIds }).catch(() => undefined);
       }
     } catch (error) { lease?.release(); throw error; }
   }
@@ -831,22 +835,22 @@ export class WorkspaceSettingsService {
       mutation: { id, updates: input, replacement_agent_profile_id: replacementId ?? null },
     });
     const impact = await runtimeImpact();
-    const invalidatedKeys = plannedInvalidatedAssociationKeys(prepared);
-    if (invalidatedKeys.length > 0 && !this.capabilityInvalidation) {
+    const invalidatedAuthorities = plannedInvalidatedDerivedAuthorities(prepared);
+    const deniedRuntimeIds = runtimeIdsForDerivedAuthorities(invalidatedAuthorities);
+    if (deniedRuntimeIds.length > 0 && !this.capabilityInvalidation) {
       throw new WorkspaceStoreError("Capability invalidation runtime latch is unavailable", 503);
     }
-    let lease = runtimeAffecting || invalidatedKeys.length > 0 ? impact.acquireProfile(id) : null;
+    let lease = runtimeAffecting || invalidatedAuthorities.length > 0 ? impact.acquireProfile(id) : null;
     try {
       const result = updateAgentProfile(id, input, replacementId);
-      const runtimeIds = lease?.affected_session_ids ?? [];
-      if (invalidatedKeys.length > 0) {
-        this.capabilityInvalidation!.latchDenied({
-          associations: tombstonedAssociationRecords(invalidatedKeys), runtimeIds, reason: "ordinary_workspace_mutation",
+      if (invalidatedAuthorities.length > 0 && this.capabilityInvalidation) {
+        this.capabilityInvalidation.latchDenied({
+          associations: invalidatedAuthorities, runtimeIds: deniedRuntimeIds, reason: "ordinary_workspace_mutation",
         });
       }
       await lease?.commitAndStopIdle(); lease = null;
-      if (invalidatedKeys.length > 0) {
-        await this.capabilityInvalidation!.cleanupAfterDenial({ runtimeIds }).catch(() => undefined);
+      if (invalidatedAuthorities.length > 0 && this.capabilityInvalidation) {
+        await this.capabilityInvalidation.cleanupAfterDenial({ runtimeIds: deniedRuntimeIds }).catch(() => undefined);
       }
       return result;
     } catch (error) { lease?.release(); throw error; }
@@ -859,24 +863,24 @@ export class WorkspaceSettingsService {
       mutation: { id, replacement_agent_profile_id: replacementId ?? null },
     });
     const impact = await runtimeImpact();
-    const invalidatedKeys = plannedInvalidatedAssociationKeys(prepared);
-    const deniedRuntimeIds = runtimeIdsForAssociationKeys(invalidatedKeys);
-    if (invalidatedKeys.length > 0 && !this.capabilityInvalidation) {
+    const invalidatedAuthorities = plannedInvalidatedDerivedAuthorities(prepared);
+    const deniedRuntimeIds = runtimeIdsForDerivedAuthorities(invalidatedAuthorities);
+    if (deniedRuntimeIds.length > 0 && !this.capabilityInvalidation) {
       throw new WorkspaceStoreError("Capability invalidation runtime latch is unavailable", 503);
     }
     let lease: RuntimeMutationImpactLease | null = impact.acquireProfile(id);
     try {
       deleteAgentProfile(id, replacementId);
-      if (invalidatedKeys.length > 0) {
-        this.capabilityInvalidation!.latchDenied({
-          associations: tombstonedAssociationRecords(invalidatedKeys),
+      if (invalidatedAuthorities.length > 0 && this.capabilityInvalidation) {
+        this.capabilityInvalidation.latchDenied({
+          associations: invalidatedAuthorities,
           runtimeIds: deniedRuntimeIds,
           reason: "ordinary_workspace_mutation",
         });
       }
       await lease.commitAndStopIdle(); lease = null;
-      if (invalidatedKeys.length > 0) {
-        await this.capabilityInvalidation!.cleanupAfterDenial({ runtimeIds: deniedRuntimeIds }).catch(() => undefined);
+      if (invalidatedAuthorities.length > 0 && this.capabilityInvalidation) {
+        await this.capabilityInvalidation.cleanupAfterDenial({ runtimeIds: deniedRuntimeIds }).catch(() => undefined);
       }
     } catch (error) { lease?.release(); throw error; }
   }

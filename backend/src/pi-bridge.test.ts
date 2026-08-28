@@ -846,7 +846,7 @@ test("capability invalidation TERM/KILLs an active host process group before del
   }
 });
 
-test("starting runtime revocation fences privileged loading and publication, while a fresh generation can re-resolve the pair", async () => {
+test("starting runtime denial fences privileged loading and publication while a fresh generation re-resolves derived authority", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-starting-revocation-"));
   const cwd = path.join(dir, "project");
   const previousDataDir = process.env.WAYANG_DATA_DIR;
@@ -861,12 +861,6 @@ test("starting runtime revocation fences privileged loading and publication, whi
     access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [profile.id] },
   });
   const row = createSession(cwd, { provider: "synthetic-provider", model: "synthetic-model", agentProfileId: profile.id });
-  const initialAssociation = commitWorkspaceCapabilityActivation({
-    capability_id: "wayang.standard-resources.v1",
-    project_id: project.id,
-    agent_profile_id: profile.id,
-    operation_digest: "a".repeat(64),
-  });
   const entered = deferred();
   const release = deferred();
   const effects: string[] = [];
@@ -896,25 +890,12 @@ test("starting runtime revocation fences privileged loading and publication, whi
     assert.equal(getPiSession(row.id), undefined);
     assert.deepEqual(effects, [] as string[]);
 
-    revokeWorkspaceCapabilityAssociation({
-      capability_id: initialAssociation.capability_id,
-      project_id: initialAssociation.project_id,
-      agent_profile_id: initialAssociation.agent_profile_id,
-      expected_revision: initialAssociation.revision,
-    });
-    const currentAssociation = commitWorkspaceCapabilityActivation({
-      capability_id: "wayang.standard-resources.v1",
-      project_id: project.id,
-      agent_profile_id: profile.id,
-      operation_digest: "b".repeat(64),
-    });
     const currentResolution = resolveWorkspaceCapability({
       capability_id: "wayang.standard-resources.v1",
       project_id: project.id,
       agent_profile_id: profile.id,
     });
-    assert.equal(currentResolution.authorized && currentResolution.association.revision, currentAssociation.revision);
-    assert.ok(currentAssociation.revision > initialAssociation.revision);
+    assert.equal(currentResolution.authorized, true);
 
     let freshAuthorized = false;
     await assert.rejects(
@@ -929,7 +910,7 @@ test("starting runtime revocation fences privileged loading and publication, whi
       }),
       /synthetic fresh-generation stop/,
     );
-    assert.equal(freshAuthorized, true, "a later creation captures the advanced generation and re-resolves the current association");
+    assert.equal(freshAuthorized, true, "a later creation re-resolves current privacy/RBAC authority");
     assert.deepEqual(effects, [] as string[]);
 
     const destroyEntered = deferred();
@@ -1208,8 +1189,10 @@ test("fluid model changes preserve pair authority while destroying every old run
       project_id: project.id,
       agent_profile_id: profile.id,
     };
-    const association = commitWorkspaceCapabilityActivation({ ...capabilityBase, operation_digest: "a".repeat(64) });
-    assert.equal(resolveWorkspaceCapability(capabilityBase).authorized, true);
+    commitWorkspaceCapabilityActivation({ ...capabilityBase, operation_digest: "a".repeat(64) });
+    const initialAuthority = resolveWorkspaceCapability(capabilityBase);
+    assert.equal(initialAuthority.authorized, true);
+    const derivedRevision = initialAuthority.authorized ? initialAuthority.association.revision : 0;
     const row = createSession(cwd, { ...source, agentProfileId: profile.id });
     const handle = await createPiSession(row.id, cwd, source.provider, source.model);
     assert.equal(handle.session.sessionManager.getSessionId(), row.id,
@@ -1277,7 +1260,7 @@ test("fluid model changes preserve pair authority while destroying every old run
       }, target);
       const afterFirstSwitch = resolveWorkspaceCapability(capabilityBase);
       assert.equal(afterFirstSwitch.authorized, true);
-      assert.equal(afterFirstSwitch.authorized && afterFirstSwitch.association.revision, association.revision);
+      assert.equal(afterFirstSwitch.authorized && afterFirstSwitch.association.revision, derivedRevision);
 
       const modelBHandle = await createPiSession(row.id, cwd, target.provider, target.model);
       const modelBGeneration = modelBHandle.runtimeGeneration;
@@ -1299,7 +1282,7 @@ test("fluid model changes preserve pair authority while destroying every old run
       assert.notEqual(freshModelAHandle.runtimeGeneration, modelBGeneration);
       assert.notEqual(freshModelAHandle.runtimeGeneration, handle.runtimeGeneration);
       const afterRoundTrip = resolveWorkspaceCapability(capabilityBase);
-      assert.equal(afterRoundTrip.authorized && afterRoundTrip.association.revision, association.revision);
+      assert.equal(afterRoundTrip.authorized && afterRoundTrip.association.revision, derivedRevision);
 
       const selectedDefault = await setSessionDefaultModel(row.id);
       assert.ok(selectedDefault.provider && selectedDefault.model);
@@ -1307,7 +1290,7 @@ test("fluid model changes preserve pair authority while destroying every old run
       assert.equal(getPiSessionRuntimeState(row.id).runtime_status, "stopped");
       assert.deepEqual([getSessionById(row.id)!.provider, getSessionById(row.id)!.model], [null, null]);
       const afterDefault = resolveWorkspaceCapability(capabilityBase);
-      assert.equal(afterDefault.authorized && afterDefault.association.revision, association.revision);
+      assert.equal(afterDefault.authorized && afterDefault.association.revision, derivedRevision);
     } finally {
       cleanupRelease.resolve();
       await cleanupPiSessionCapabilityDenial([row.id]);

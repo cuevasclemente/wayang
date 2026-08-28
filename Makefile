@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help doctor bootstrap install configure local-https-check local-https setup-capability-approval pi-login browser-credentials-unlock build start dev test test-scripts test-e2e install-e2e-browser check smoke
+.PHONY: help doctor bootstrap install configure local-https-check local-https setup-owner-pin-confirmations setup-capability-approval pi-login browser-credentials-unlock build start dev test test-scripts test-e2e install-e2e-browser check smoke
 
 help: ## Show this help (the safe, non-mutating default)
 	@printf '%s\n' 'Wayang v0.1 source-checkout commands:'
@@ -29,8 +29,10 @@ local-https-check: ## Validate the optional foreground Caddy HTTPS proxy configu
 local-https: ## Run the optional Caddy HTTPS reverse proxy in the foreground
 	@node scripts/local-https.mjs
 
-setup-capability-approval: ## Optional manual preflight; service startup initializes missing cooldown state automatically
+setup-owner-pin-confirmations: ## Optional preflight for shared operation-specific owner PIN cooldown state
 	@node scripts/run-with-env.mjs -- node scripts/setup-capability-approval.mjs
+
+setup-capability-approval: setup-owner-pin-confirmations ## Deprecated compatibility alias
 
 pi-login: ## Start the checkout's pi CLI for an interactive /login
 	@test -x backend/node_modules/.bin/pi || { printf '%s\n' 'Local pi is missing; run make install first.' >&2; exit 1; }

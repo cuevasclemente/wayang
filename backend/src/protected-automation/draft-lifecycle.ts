@@ -25,8 +25,8 @@ function finiteTimestamp(value: number): number {
 }
 
 /**
- * Denial-only draft helper shared by policy, profile, and explicit capability
- * revocation transactions. It has no store singleton or capability imports, so
+ * Denial-only draft helper shared by project privacy/allowlist and profile
+ * lifecycle transactions. It has no store singleton or authority imports, so
  * callers can compose denial into one durable commit without an import cycle.
  */
 export function blockProtectedAutomationJobsDraft(

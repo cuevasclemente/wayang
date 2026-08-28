@@ -7,7 +7,7 @@ import { createAgentProfile } from "./agent-profiles.js";
 import { close, flush, getStore, getWorkspaceCapabilityStoreProjectionPath, init } from "./db.js";
 import { createProject } from "./projects.js";
 import { createSession } from "./sessions.js";
-import { commitWorkspaceCapabilityActivation } from "./workspace-capabilities.js";
+import { resolveWorkspaceCapability } from "./workspace-capabilities.js";
 import { NEUTRAL_AGENT_PROFILE_ID, STORE_SCHEMA_VERSION, WREN_AGENT_PROFILE_ID } from "./workspace-types.js";
 
 function legacySession(id: string, cwd: string) {
@@ -198,7 +198,7 @@ test("current-schema structural corruption aborts without normalization", () => 
   assert.equal(fs.readFileSync(storePath, "utf-8"), malformedCurrent);
 }));
 
-test("gate-off new stores use schema 7 with one generic restricted workspace default and empty Browser catalog", () => withDataDir((dir) => {
+test("gate-off new stores use schema 8 with one generic restricted workspace default and empty Browser catalog", () => withDataDir((dir) => {
   init();
   const store = getStore();
   assert.equal(store.agentProfiles.length, 1);
@@ -210,7 +210,7 @@ test("gate-off new stores use schema 7 with one generic restricted workspace def
   assert.deepEqual(store.workspaceCapabilityAssociations, []);
   assert.deepEqual(store.workspaceCapabilityApprovalEvents, []);
   const persisted = JSON.parse(fs.readFileSync(path.join(dir, "store.json"), "utf-8"));
-  assert.equal(persisted.schema_version, 7);
+  assert.equal(persisted.schema_version, 8);
   assert.deepEqual(persisted.browserProfiles, []);
   assert.deepEqual(persisted.projectBrowserDefaults, []);
   assert.deepEqual(persisted.sessionBrowserStates, []);
@@ -221,7 +221,7 @@ test("gate-off new stores use schema 7 with one generic restricted workspace def
   assert.deepEqual(persisted.workspaceCapabilityApprovalEvents, []);
 }));
 
-test("exact capability projection contains only its model-independent project/profile pair and no approval or instruction evidence", () => withDataDir((dir) => {
+test("exact derived-authority projection contains only its model-independent project/profile pair", () => withDataDir((dir) => {
   init();
   const exactCwd = path.join(dir, "exact-project");
   const unrelatedCwd = path.join(dir, "unrelated-project");
@@ -263,7 +263,8 @@ test("exact capability projection contains only its model-independent project/pr
     project_id: exactProject.id,
     agent_profile_id: exactProfile.id,
   };
-  commitWorkspaceCapabilityActivation({ ...binding, operation_digest: "a".repeat(64) });
+  const authority = resolveWorkspaceCapability(binding);
+  assert.equal(authority.authorized, true);
 
   const projectionPath = getWorkspaceCapabilityStoreProjectionPath(binding);
   const projection = JSON.parse(fs.readFileSync(projectionPath, "utf-8"));
@@ -272,7 +273,7 @@ test("exact capability projection contains only its model-independent project/pr
   ]);
   assert.equal(projection.active, true);
   assert.equal(projection.available, true);
-  assert.equal(projection.association_revision, 1);
+  assert.equal(projection.association_revision, authority.authorized ? authority.association.revision : -1);
   assert.equal(projection.project.id, exactProject.id);
   assert.equal(projection.agent_profile.id, exactProfile.id);
   assert.deepEqual(projection.sessions.map((item: { id: string }) => item.id), [exactSession.id]);

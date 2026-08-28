@@ -9,7 +9,7 @@ import type { CdpConnection, ChromeTarget } from "../browser/cdp.js";
 import type { ManagedChromiumRuntimeOptions } from "../browser/manager.js";
 import { close, getStore, init } from "../db.js";
 import { createProject } from "../projects.js";
-import { commitWorkspaceCapabilityActivation } from "../workspace-capabilities.js";
+import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability } from "../workspace-capabilities.js";
 import type { SettingsPinAttemptPort } from "../workspace-capability-approval/types.js";
 import type { ProtectedAutomationBinding } from "./authority.js";
 import { getProtectedAutomationPreparationPort } from "./browser-preparation.js";
@@ -164,6 +164,12 @@ function jobFixture(tombstone = true) {
     agent_profile_id: profile.id,
     operation_digest: "a".repeat(64),
   });
+  const authority = resolveWorkspaceCapability({
+    capability_id: "wayang.protected-automation.v1",
+    project_id: project.id,
+    agent_profile_id: profile.id,
+  });
+  if (!authority.authorized) throw new Error("Derived authority unavailable");
   const jobId = "synthetic-purge-job";
   const snapshot = captureProtectedAutomationSnapshot({
     projectRoot, projectId: project.id, agentProfileId: profile.id, jobId, revision: 1,
@@ -173,7 +179,7 @@ function jobFixture(tombstone = true) {
     id: jobId,
     project_id: project.id,
     agent_profile_id: profile.id,
-    capability_revision: association.revision,
+    capability_revision: authority.association.revision,
     name: "Synthetic purge job",
     source_manifest_sha256: snapshot.manifestSha256,
     entrypoint: "main.mjs",

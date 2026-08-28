@@ -7,7 +7,7 @@ import type {
 
 export type { BrowserCleanupRow, BrowserProfileRow, ProjectBrowserDefaultRow, SessionBrowserStateRow };
 
-export const STORE_SCHEMA_VERSION = 7;
+export const STORE_SCHEMA_VERSION = 8;
 
 export const SESSION_TITLE_SOURCES = ["provisional", "explicit", "pi", "legacy_unknown"] as const;
 export type SessionTitleSource = typeof SESSION_TITLE_SOURCES[number];

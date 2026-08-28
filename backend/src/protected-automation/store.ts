@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { commitStoreMutation, getStore, type StoreData } from "../db.js";
 import { validateCronExpression } from "../scheduler/cron.js";
-import { WorkspaceStoreError, type WorkspaceCapabilityAssociationRow } from "../workspace-types.js";
+import { WorkspaceStoreError } from "../workspace-types.js";
+import { deriveWorkspaceCapabilityAssociation } from "../derived-project-authority.js";
 import { verifyProtectedAutomationSnapshot } from "./snapshots.js";
 import {
   retireProtectedAutomationRunStorage,
@@ -155,10 +156,6 @@ function validateJobConfiguration(input: ProtectedAutomationJobCreateInput | Pro
     missed_run_policy: input.missed_run_policy,
   };
 }
-function associationForDraft(draft: StoreData, projectId: string, profileId: string): WorkspaceCapabilityAssociationRow | undefined {
-  return draft.workspaceCapabilityAssociations.find((row) => row.project_id === projectId && row.agent_profile_id === profileId
-    && row.capability_id === PROTECTED_AUTOMATION_CAPABILITY_ID);
-}
 function requireCurrentPair(draft: StoreData, projectId: string, profileId: string, capabilityRevision: number): void {
   const project = draft.projects.find((row) => row.id === projectId);
   const profile = draft.agentProfiles.find((row) => row.id === profileId);
@@ -167,8 +164,14 @@ function requireCurrentPair(draft: StoreData, projectId: string, profileId: stri
   if (project.access_policy.privacy_mode !== "protected") throw new WorkspaceStoreError("Protected automation requires a Protected project", 409);
   if (!profile.enabled) throw new WorkspaceStoreError("Protected automation agent profile must be enabled", 409);
   if (!project.access_policy.allowed_agent_profile_ids?.includes(profileId)) throw new WorkspaceStoreError("Protected automation agent profile is not allowed for this project", 403);
-  const association = associationForDraft(draft, projectId, profileId);
-  if (!association?.active || association.revision !== capabilityRevision) throw new WorkspaceStoreError("Protected automation capability revision is not current and active", 409);
+  const authority = deriveWorkspaceCapabilityAssociation({
+    capability_id: PROTECTED_AUTOMATION_CAPABILITY_ID,
+    project_id: projectId,
+    agent_profile_id: profileId,
+  }, project, profile);
+  if (authority.revision !== capabilityRevision) {
+    throw new WorkspaceStoreError("Protected automation derived authority revision is not current", 409);
+  }
 }
 function occurrenceKey(value: unknown, nullable: boolean): string | null {
   if (value === null && nullable) return null;
@@ -314,10 +317,10 @@ export function rebindProtectedAutomationJob(
     if (!row) throw new WorkspaceStoreError("Protected automation job not found", 404);
     if (row.revision !== expectedRevision) throw new WorkspaceStoreError("Protected automation job revision conflict", 409);
     if (row.deleted_at !== null) throw new WorkspaceStoreError("Protected automation job is tombstoned", 409);
-    if (currentCapabilityRevision <= row.capability_revision) {
-      throw new WorkspaceStoreError("Protected automation job already uses this or a newer capability revision", 409);
-    }
     requireCurrentPair(draft, row.project_id, row.agent_profile_id, currentCapabilityRevision);
+    if (currentCapabilityRevision === row.capability_revision && row.blocked_reason === "paused") {
+      throw new WorkspaceStoreError("Protected automation job already uses current derived authority", 409);
+    }
     row.revision = nextRevision(row.revision);
     row.capability_revision = currentCapabilityRevision;
     row.enabled = false;

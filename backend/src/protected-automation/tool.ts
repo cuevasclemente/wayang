@@ -303,7 +303,7 @@ function sanitizedError(error: unknown): Error {
   return new Error("Protected automation operation failed safely");
 }
 
-/** Production management composition. Capability activation remains unavailable in the public catalog. */
+/** Production management composition under current Protected Project/Profile RBAC. */
 export function createProtectedAutomationToolRuntime(options: {
   binding: ProtectedAutomationBinding;
   isRuntimeCurrent(): boolean;
@@ -518,7 +518,7 @@ export function createProtectedAutomationToolRuntime(options: {
   const tool = defineTool({
     name: PROTECTED_AUTOMATION_TOOL_NAME,
     label: "Protected Automation",
-    description: "Manage deterministic snapshot-bound automation for this exact Protected Project-Agent pair after explicit PIN-approved capability activation.",
+    description: "Manage deterministic snapshot-bound automation for this exact enabled and allowlisted Protected Project-Agent pair.",
     promptSnippet: "Manage exact-pair deterministic Protected automation jobs",
     promptGuidelines: [
       "The target Project and Agent Profile are implicit and cannot be selected in tool input.",

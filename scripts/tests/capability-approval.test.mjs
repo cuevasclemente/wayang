@@ -70,7 +70,7 @@ test("CLI reports only generic created/idempotent outcomes", () => {
     WAYANG_DATA_DIR: synthetic.dataDir,
   };
   const created = execFileSync(process.execPath, [setupScript], { encoding: "utf8", env });
-  assert.match(created, /Provisioned private workspace capability approval cooldown state/);
+  assert.match(created, /Provisioned private owner PIN confirmation cooldown state/);
   assert.doesNotMatch(created, /synthetic-pin-that-must-not-appear/);
   assert.doesNotMatch(created, new RegExp(synthetic.root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 
@@ -122,7 +122,7 @@ test("symlinked data directory is refused instead of followed", () => {
   const alternateData = join(synthetic.root, "alternate-data");
   mkdirSync(alternateData, { mode: 0o700 });
   symlinkSync(alternateData, synthetic.dataDir);
-  assert.throws(() => provisionCapabilityApprovalState(synthetic.options), /unsafe capability approval directory/);
+  assert.throws(() => provisionCapabilityApprovalState(synthetic.options), /unsafe owner PIN confirmation directory/);
   assert.throws(() => lstatSync(join(alternateData, "workspace-capability-approval")));
 });
 

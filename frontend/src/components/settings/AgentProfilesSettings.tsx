@@ -240,7 +240,7 @@ export function AgentProfilesSettings({ profiles, models, onProfilesChanged }: A
           <div className="flex items-center gap-2 py-8 text-sm text-neutral-500"><Loader2 size={15} className="animate-spin" /> Loading profile…</div>
         ) : draft ? (
           <form onSubmit={save} className="space-y-6 pb-6">
-            <SettingsSection title={draft.id ? "Agent profile" : "Create agent profile"} description="The stable profile ID—not its name, definition, provider, or model—is the agent identity used by capability associations.">
+            <SettingsSection title={draft.id ? "Agent profile" : "Create agent profile"} description="The stable profile ID—not its name, definition, provider, or model—is the identity evaluated by Project allowlists and privacy-derived authority.">
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label="Name"><input value={draft.name} onChange={(event) => patchDraft({ name: event.target.value })} required className={inputClass} autoFocus={!draft.id} /></Field>
                 <Field label="Default provider/model" hint="Optional. Projects or sessions may override this pair.">
@@ -252,7 +252,7 @@ export function AgentProfilesSettings({ profiles, models, onProfilesChanged }: A
               </div>
               <Field label="Description"><textarea value={draft.description} onChange={(event) => patchDraft({ description: event.target.value })} rows={3} className={inputClass} /></Field>
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="Resource mode" hint="This is a profile preference, not authority. Standard resources require a direct capability association for each Project-Agent pair.">
+                <Field label="Resource mode" hint="This is a profile preference, not authority. Standard projects derive global resources, browser, and host execution for every enabled allowed profile; Protected projects derive their isolated browser and automation authority.">
                   <select value={draft.resourceMode} onChange={(event) => patchDraft({ resourceMode: event.target.value as ResourceMode })} className={inputClass}>
                     <option value="standard">Standard resources</option>
                     <option value="project_only">Project only</option>
@@ -271,7 +271,7 @@ export function AgentProfilesSettings({ profiles, models, onProfilesChanged }: A
                 <>
                   <label className="flex items-center gap-2 text-xs text-neutral-300"><input type="checkbox" checked={draft.enabled} onChange={(event) => patchDraft({ enabled: event.target.checked })} className="accent-blue-500" /> Enabled</label>
                   <div className="rounded border border-amber-900/60 bg-amber-950/20 px-3 py-2 text-xs leading-relaxed text-amber-100">
-                    Capability associations follow this stable profile ID. Renaming it or changing instructions, tools, resources, memory, or defaults preserves them. Disabling blocks all runtimes but does not remove associations; re-enabling this same ID restores them through fresh runtime handles without another PIN. Choose another workspace/project default first when required. Deleting the profile tombstones its associations, and a replacement or clone never inherits them.
+                    Runtime authority is derived from each Project's privacy mode and allowlist for this stable profile ID. Renaming it or changing instructions/defaults does not change authority. Disabling blocks it everywhere; re-enabling restores authority wherever the profile remains allowed. Choose another workspace/project default first when required.
                   </div>
                 </>
               )}
@@ -283,7 +283,7 @@ export function AgentProfilesSettings({ profiles, models, onProfilesChanged }: A
             </SettingsSection>
 
             {draft.id && (
-              <SettingsSection title="Delete profile" description="In-use profiles may require an enabled replacement for ordinary references. Capability associations are tombstoned first and never transfer to the replacement.">
+              <SettingsSection title="Delete profile" description="In-use profiles may require an enabled replacement for ordinary references. A replacement is a distinct stable identity and receives authority only where Project RBAC allows it.">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
                   <div className="min-w-0 flex-1"><Field label="Replacement if in use"><select value={replacementId} onChange={(event) => setReplacementId(event.target.value)} className={inputClass}><option value="">None selected</option>{replacementProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select></Field></div>
                   <button type="button" onClick={() => void remove()} disabled={saving} className="inline-flex items-center justify-center gap-2 rounded border border-red-900/70 px-3 py-2 text-xs font-semibold text-red-300 hover:bg-red-950/40 disabled:opacity-50"><Trash2 size={13} /> Delete</button>

@@ -1987,7 +1987,7 @@ async function getSessionModelContext(_restricted: boolean): Promise<ModelContex
 }
 
 /** Deny the old runtime synchronously, then wait until every old surface and
- * independently active host child is gone. Durable pair associations are unchanged. */
+ * independently active host child is gone. Derived Project/Profile authority is unchanged. */
 async function stopRuntimeForModelChange(
   id: string,
   row: SessionRow,
@@ -2060,7 +2060,7 @@ export async function setSessionModel(
     await stopRuntimeForModelChange(id, row, provider, modelId);
     // Persistence happens only after the old loader, hooks, tools, host process,
     // browser lease, and queues have been fully destroyed. Next use constructs
-    // fresh surfaces from the unchanged Project-Agent associations.
+    // fresh surfaces from the unchanged Project privacy/RBAC decision.
     updateSessionModel(id, model.id, String(model.provider));
     return { provider: String(model.provider), model: model.id, name: model.name };
   });
@@ -2904,7 +2904,7 @@ export async function createPiSession(
               project_id: currentProject.id,
               agent_profile_id: currentProfile.id,
             })
-          : { authorized: false as const, reason: "association_missing" as const };
+          : { authorized: false as const, reason: "profile_not_found" as const };
         return resolveHostExecutionAuthorization({
           capabilityWitness: hostExecutionWitnessFromResolution(currentResolution),
           row: currentRow,
@@ -3596,8 +3596,6 @@ export function resolveProtectedBrowserAuthority(
 export type BrowserSurfaceMode = "standard" | "protected" | "unavailable";
 
 export type BrowserAgentReasonCode =
-  | "approval_required"
-  | "association_inactive"
   | "incompatible_project_mode"
   | "profile_disabled"
   | "profile_not_allowed"
@@ -3637,9 +3635,7 @@ function browserExecutableDiagnosticForProcess(): ReturnType<typeof getBrowserEx
 }
 
 const BROWSER_REMEDIATION: Readonly<Record<BrowserAgentReasonCode, string>> = Object.freeze({
-  approval_required: "Approve the compatible Browser capability for this exact Project-Agent pair, then start a fresh session runtime.",
-  association_inactive: "The Browser capability was revoked. Reapprove it only after reviewing the Project-Agent pair.",
-  incompatible_project_mode: "Use the Browser capability compatible with the project's current privacy mode.",
+  incompatible_project_mode: "Use the browser surface derived from the project's current privacy mode.",
   profile_disabled: "Enable the selected Agent Profile before using browser tools.",
   profile_not_allowed: "Allow the selected Agent Profile for this Project before using browser tools.",
   session_quarantined: "Legacy quarantined sessions cannot receive browser authority; create a fresh session.",
@@ -3680,15 +3676,13 @@ export function getPiSessionBrowserAgentDiagnostic(id: string, durableRow?: Sess
   if (row.scheduled_job_id !== null || row.scheduled_run_id !== null) return denied(capabilityId, "interactive_session_required");
   const resolution = resolveWorkspaceCapability({ capability_id: capabilityId, project_id: project.id, agent_profile_id: row.agent_profile_id });
   if (!resolution.authorized) {
-    const reason: BrowserAgentReasonCode = resolution.reason === "association_inactive"
-      ? "association_inactive"
-      : resolution.reason === "incompatible_privacy_mode"
-        ? "incompatible_project_mode"
-        : resolution.reason === "profile_disabled"
+    const reason: BrowserAgentReasonCode = resolution.reason === "incompatible_privacy_mode"
+      ? "incompatible_project_mode"
+      : resolution.reason === "profile_disabled"
           ? "profile_disabled"
           : resolution.reason === "profile_not_allowed"
             ? "profile_not_allowed"
-            : "approval_required";
+            : "incompatible_project_mode";
     return denied(capabilityId, reason);
   }
   const handle = sessions.get(id);

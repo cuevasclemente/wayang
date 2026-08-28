@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Bell, Bot, FolderCog, Globe2, Loader2, Lock, Settings, ShieldCheck, X } from "lucide-react";
+import { Bell, Bot, FolderCog, Globe2, Loader2, Lock, Settings, X } from "lucide-react";
 import {
   ApiError,
   fetchAgentProfiles,
@@ -11,11 +11,10 @@ import {
 } from "../../api/client";
 import { AgentProfilesSettings } from "./AgentProfilesSettings";
 import { ProjectSettingsForm } from "./ProjectSettingsForm";
-import { WorkspaceCapabilitiesSettings } from "./WorkspaceCapabilitiesSettings";
 import { BrowserNotificationsSettings } from "./BrowserNotificationsSettings";
 import { BrowserProfilesSettings } from "./BrowserProfilesSettings";
 
-export type SettingsTab = "projects" | "agents" | "capabilities" | "browser" | "notifications";
+export type SettingsTab = "projects" | "agents" | "browser" | "notifications";
 
 interface SettingsDialogProps {
   initialTab?: SettingsTab;
@@ -53,9 +52,8 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
     let cancelled = false;
     setLoading(true);
     setError("");
-    // Capability Settings depends only on durable projects/profiles. Model
-    // discovery is deliberately independent because models are ordinary
-    // runtime defaults, not capability authority.
+    // Project/Profile RBAC is independent of model discovery; models remain
+    // ordinary runtime defaults rather than authority inputs.
     void Promise.all([fetchProjects(), fetchAgentProfiles()]).then(([projectRows, profileRows]) => {
       if (cancelled) return;
       setProjects(projectRows);
@@ -81,8 +79,8 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
     void fetchModels().then((result) => {
       if (!cancelled) setModels(result.models);
     }).catch(() => {
-      // Project/profile model selectors remain usable with their stored values;
-      // capability Settings must not fail when provider discovery is offline.
+      // Project/profile model selectors remain usable with their stored values
+      // when provider discovery is offline.
       if (!cancelled) setModels([]);
     });
     return () => { cancelled = true; };
@@ -103,12 +101,6 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
     onChanged?.();
   };
 
-  const handleCapabilitiesChanged = () => {
-    void Promise.all([refreshProfiles(), refreshProjects()])
-      .then(() => onChanged?.())
-      .catch((caught: unknown) => setError(errorMessage(caught)));
-  };
-
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-2 sm:p-4"
@@ -121,14 +113,13 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
       <div className="flex h-[min(92dvh,900px)] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-neutral-700 bg-neutral-950 shadow-2xl" onClick={(event) => event.stopPropagation()}>
         <header className="flex shrink-0 items-center gap-3 border-b border-neutral-800 px-4 py-3 sm:px-5">
           <Settings size={18} className="text-neutral-400" />
-          <div className="min-w-0 flex-1"><h2 id="workspace-settings-title" className="text-sm font-semibold text-neutral-100">Workspace settings</h2><p className="truncate text-xs text-neutral-500">Projects, agent profiles, capabilities, Browser Profiles, and notification preferences</p></div>
+          <div className="min-w-0 flex-1"><h2 id="workspace-settings-title" className="text-sm font-semibold text-neutral-100">Workspace settings</h2><p className="truncate text-xs text-neutral-500">Projects, agent profiles, Browser Profiles, and notification preferences</p></div>
           <button ref={closeRef} type="button" onClick={onClose} className="rounded p-2 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100" aria-label="Close settings"><X size={17} /></button>
         </header>
 
         <div className="flex shrink-0 overflow-x-auto border-b border-neutral-800 px-3 sm:px-5" role="tablist" aria-label="Settings sections">
           <TabButton active={tab === "projects"} onClick={() => setTab("projects")} icon={FolderCog}>Projects</TabButton>
           <TabButton active={tab === "agents"} onClick={() => setTab("agents")} icon={Bot}>Agents</TabButton>
-          <TabButton active={tab === "capabilities"} onClick={() => setTab("capabilities")} icon={ShieldCheck}>Capabilities</TabButton>
           <TabButton active={tab === "browser"} onClick={() => setTab("browser")} icon={Globe2}>Browser Profiles</TabButton>
           <TabButton active={tab === "notifications"} onClick={() => setTab("notifications")} icon={Bell}>Notifications</TabButton>
         </div>
@@ -163,10 +154,6 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
         ) : tab === "agents" ? (
           <main className="flex min-h-0 flex-1 p-4 sm:p-5">
             <AgentProfilesSettings profiles={profiles} models={models} onProfilesChanged={handleProfilesChanged} />
-          </main>
-        ) : tab === "capabilities" ? (
-          <main className="flex min-h-0 flex-1 p-4 sm:p-5">
-            <WorkspaceCapabilitiesSettings projects={projects} profiles={profiles} onChanged={handleCapabilitiesChanged} />
           </main>
         ) : tab === "browser" ? (
           <main className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">

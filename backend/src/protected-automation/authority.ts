@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { getStore } from "../db.js";
+import { resolveWorkspaceCapability } from "../workspace-capabilities.js";
 import { PROTECTED_AUTOMATION_CAPABILITY_ID, type ProtectedAutomationJobRow } from "./types.js";
 
 export interface ProtectedAutomationBinding {
@@ -51,12 +52,15 @@ export function protectedAutomationJobAuthorityIsCurrent(job: ProtectedAutomatio
     const store = getStore();
     const project = store.projects.find((candidate) => candidate.id === job.project_id);
     const profile = store.agentProfiles.find((candidate) => candidate.id === job.agent_profile_id);
-    const association = store.workspaceCapabilityAssociations.find((candidate) =>
-      candidate.capability_id === PROTECTED_AUTOMATION_CAPABILITY_ID
-      && candidate.project_id === job.project_id && candidate.agent_profile_id === job.agent_profile_id);
+    const authority = resolveWorkspaceCapability({
+      capability_id: PROTECTED_AUTOMATION_CAPABILITY_ID,
+      project_id: job.project_id,
+      agent_profile_id: job.agent_profile_id,
+    });
     return job.deleted_at === null && project?.access_policy.privacy_mode === "protected"
       && project.access_policy.allowed_agent_profile_ids?.includes(job.agent_profile_id) === true
-      && profile?.enabled === true && association?.active === true && association.revision === job.capability_revision;
+      && profile?.enabled === true && authority.authorized
+      && authority.association.revision === job.capability_revision;
   } catch { return false; }
 }
 

@@ -7,7 +7,7 @@ import { afterEach, beforeEach, test } from "node:test";
 import { createAgentProfile } from "../agent-profiles.js";
 import { close, getStore, init } from "../db.js";
 import { createProject } from "../projects.js";
-import { commitWorkspaceCapabilityActivation } from "../workspace-capabilities.js";
+import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability } from "../workspace-capabilities.js";
 import { ProtectedAutomationManager } from "./manager.js";
 import { ProtectedAutomationScheduler, protectedAutomationOccurrenceKey } from "./scheduler.js";
 import { captureProtectedAutomationSnapshot } from "./snapshots.js";
@@ -43,21 +43,24 @@ function fixture(missed: "skip" | "run_once" = "run_once", cronExpr = "* * * * *
     access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [profile.id] } });
   const association = commitWorkspaceCapabilityActivation({ capability_id: "wayang.protected-automation.v1",
     project_id: project.id, agent_profile_id: profile.id, operation_digest: "a".repeat(64) });
+  const authority = resolveWorkspaceCapability({ capability_id: "wayang.protected-automation.v1",
+    project_id: project.id, agent_profile_id: profile.id });
+  if (!authority.authorized) throw new Error("Derived authority unavailable");
   const id = randomUUID();
   const snapshot = captureProtectedAutomationSnapshot({ projectRoot, projectId: project.id, agentProfileId: profile.id,
     jobId: id, revision: 1, sourceDirectory: "source", entrypoint: "main.mjs" });
   const input: ProtectedAutomationJobCreateInput = { id, project_id: project.id, agent_profile_id: profile.id,
-    capability_revision: association.revision, name: "Synthetic lifecycle job", source_manifest_sha256: snapshot.manifestSha256,
+    capability_revision: authority.association.revision, name: "Synthetic lifecycle job", source_manifest_sha256: snapshot.manifestSha256,
     entrypoint: "main.mjs", argv: [], uses_browser_profile: false, allowed_https_origins: [], cron_expr: cronExpr,
     timezone: "local", timeout_ms: 5_000, overlap_policy: "skip", missed_run_policy: missed };
-  const job = createProtectedAutomationJob(input, 100); return { project, profile, association, job };
+  const job = createProtectedAutomationJob(input, 100); return { project, profile, association, authorityRevision: authority.association.revision, job };
 }
 function additionalJob(owner: ReturnType<typeof fixture>, name: string, cronExpr = "* * * * *") {
   const id = randomUUID();
   const snapshot = captureProtectedAutomationSnapshot({ projectRoot, projectId: owner.project.id, agentProfileId: owner.profile.id,
     jobId: id, revision: 1, sourceDirectory: "source", entrypoint: "main.mjs" });
   return createProtectedAutomationJob({ id, project_id: owner.project.id, agent_profile_id: owner.profile.id,
-    capability_revision: owner.association.revision, name, source_manifest_sha256: snapshot.manifestSha256,
+    capability_revision: owner.authorityRevision, name, source_manifest_sha256: snapshot.manifestSha256,
     entrypoint: "main.mjs", argv: [], uses_browser_profile: false, allowed_https_origins: [], cron_expr: cronExpr,
     timezone: "local", timeout_ms: 5_000, overlap_policy: "skip", missed_run_policy: "run_once" }, 100);
 }

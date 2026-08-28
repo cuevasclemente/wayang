@@ -349,7 +349,7 @@ Messaging access is a new narrow interactive transport authority, not Wayang UI 
 - create/list/select sessions for that same pair;
 - read the projected final response/status.
 
-It does not permit project/profile settings, model changes, session deletion, apps, browser control, schedules, capability approval, workspace mutation, or arbitrary session lookup.
+It does not permit project/profile settings, model changes, session deletion, apps, browser control, schedules, privacy/RBAC changes, workspace mutation, or arbitrary session lookup.
 
 ### 11.2 Wren warning
 

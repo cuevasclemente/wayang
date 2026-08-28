@@ -989,7 +989,7 @@ test("catalog title reconciliation respects explicit and narrow legacy fallback 
   assert.equal(legacyHuman.title, "Different historical title");
 });
 
-test("schema-4 migration through schema 7 is backup-first and preserves schema-4 attention state", () => {
+test("schema-4 migration through schema 8 is backup-first and preserves schema-4 attention state", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-title-schema5-migration-"));
   const projectDir = path.join(dir, "project");
   fs.mkdirSync(projectDir, { recursive: true });
@@ -1025,7 +1025,7 @@ test("schema-4 migration through schema 7 is backup-first and preserves schema-4
     observeNextStoreMigrationPersistenceForTests((phase) => persistencePhases.push(phase));
     init();
     assert.deepEqual(persistencePhases, ["backup_durable", "store_published"]);
-    assert.equal(getStore().schema_version, 7);
+    assert.equal(getStore().schema_version, 8);
     assert.equal(getSessionById(session.id)?.title_source, "legacy_unknown");
     assert.equal(getSessionById(emptySession.id)?.title_source, "provisional");
     assert.equal(getSessionById(whitespaceSession.id)?.title_source, "provisional");

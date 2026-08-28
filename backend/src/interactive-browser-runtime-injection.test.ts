@@ -20,10 +20,6 @@ import {
 import { createProject } from "./projects.js";
 import { getBashSandboxAvailability } from "./sandbox-bash.js";
 import { createSession } from "./sessions.js";
-import {
-  commitWorkspaceCapabilityActivation,
-  revokeWorkspaceCapabilityAssociation,
-} from "./workspace-capabilities.js";
 
 function runtimeFactory(dataDir: string, captured: ProtectedBrowserBinding[]) {
   return async (binding: ProtectedBrowserBinding) => {
@@ -51,7 +47,7 @@ function runtimeFactory(dataDir: string, captured: ProtectedBrowserBinding[]) {
   };
 }
 
-test("approved Standard interactive sessions receive exact explicit browser tools while unapproved and scheduled sessions do not", async (t) => {
+test("Standard interactive sessions derive exact browser tools while scheduled sessions do not", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-standard-browser-injection-"));
   const dataDir = path.join(root, "data");
   const projectRoot = path.join(root, "project");
@@ -85,24 +81,6 @@ test("approved Standard interactive sessions receive exact explicit browser tool
   const captured: ProtectedBrowserBinding[] = [];
   const factory = runtimeFactory(dataDir, captured);
 
-  const unapproved = createSession(projectRoot, {
-    agentProfileId: profile.id,
-    provider: "anthropic",
-    model: "claude-sonnet-4-5",
-  });
-  const unapprovedHandle = await createPiSession(unapproved.id, projectRoot, unapproved.provider, unapproved.model, undefined, { protectedBrowserFactory: factory });
-  assert.equal(captured.length, 0);
-  assert.equal(getLiveProtectedBrowserRuntime(unapproved.id), undefined);
-  assert.equal(getPiSessionBrowserAgentDiagnostic(unapproved.id).reason_code, "approval_required");
-  assert.ok(INTERACTIVE_BROWSER_TOOL_NAMES.every((name) => !unapprovedHandle.session.getActiveToolNames().includes(name)));
-  await destroyPiSession(unapproved.id);
-
-  const association = commitWorkspaceCapabilityActivation({
-    capability_id: "wayang.standard-browser.v1",
-    project_id: project.id,
-    agent_profile_id: profile.id,
-    operation_digest: "a".repeat(64),
-  });
   const neutralCaptured: ProtectedBrowserBinding[] = [];
   const neutralProbe = defineTool({
     name: "browser_workspace_probe",
@@ -180,12 +158,17 @@ test("approved Standard interactive sessions receive exact explicit browser tool
     INTERACTIVE_BROWSER_TOOL_NAMES.filter((name) => approvedHandle.session.getActiveToolNames().includes(name)),
     [...INTERACTIVE_BROWSER_TOOL_NAMES],
   );
-  const expectedRestrictedTools = ["read", "edit", "write", ...INTERACTIVE_BROWSER_TOOL_NAMES];
+  const expectedRestrictedTools = [
+    "read", "edit", "write",
+    "wayang_runtime_context", "session_list", "session_read", "session_attachments",
+    "wayang_workspace_read", "wayang_workspace_change",
+    ...INTERACTIVE_BROWSER_TOOL_NAMES,
+  ];
   if (getBashSandboxAvailability().available) expectedRestrictedTools.push("bash");
   assert.deepEqual(
     new Set(approvedHandle.session.getActiveToolNames()),
     new Set(expectedRestrictedTools),
-    "restricted Browser runtime receives only reviewed built-ins, available sandboxed bash, and exact companion tools",
+    "derived Standard runtime receives reviewed resources, available host bash, and exact browser tools",
   );
   const live = getLiveInteractiveBrowserRuntime(approved.id);
   assert.ok(live);
@@ -195,7 +178,7 @@ test("approved Standard interactive sessions receive exact explicit browser tool
     assert.equal(definitions.get(tool.name)?.definition, tool, `${tool.name} definition`);
     assert.equal(registry.has(tool.name), true, `${tool.name} registry entry`);
   }
-  assert.notEqual(getPiSessionBrowserAgentDiagnostic(approved.id).reason_code, "approval_required");
+  assert.equal(getPiSessionBrowserAgentDiagnostic(approved.id).available, true);
 
   const scheduled = createSession(projectRoot, {
     agentProfileId: profile.id,
@@ -209,24 +192,4 @@ test("approved Standard interactive sessions receive exact explicit browser tool
   assert.equal(getPiSessionBrowserAgentDiagnostic(scheduled.id).reason_code, "interactive_session_required");
   assert.ok(INTERACTIVE_BROWSER_TOOL_NAMES.every((name) => !scheduledHandle.session.getActiveToolNames().includes(name)));
 
-  revokeWorkspaceCapabilityAssociation({
-    capability_id: "wayang.standard-browser.v1",
-    project_id: project.id,
-    agent_profile_id: profile.id,
-    expected_revision: association.revision,
-  });
-  assert.equal(getPiSessionBrowserAgentDiagnostic(approved.id).reason_code, "association_inactive");
-  await destroyPiSession(approved.id);
-  await destroyPiSession(scheduled.id);
-
-  const afterRevoke = createSession(projectRoot, {
-    agentProfileId: profile.id,
-    provider: "anthropic",
-    model: "claude-sonnet-4-5",
-  });
-  const revokedHandle = await createPiSession(afterRevoke.id, projectRoot, afterRevoke.provider, afterRevoke.model, undefined, { protectedBrowserFactory: factory });
-  assert.equal(captured.length, 1, "revoked capability does not construct a later runtime");
-  assert.equal(getPiSessionBrowserAgentDiagnostic(afterRevoke.id).reason_code, "association_inactive");
-  assert.ok(INTERACTIVE_BROWSER_TOOL_NAMES.every((name) => !revokedHandle.session.getActiveToolNames().includes(name)));
-  await destroyPiSession(afterRevoke.id);
 });

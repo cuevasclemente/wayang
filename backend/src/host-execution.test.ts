@@ -218,7 +218,7 @@ test("workspace capability resolution adapts to an exact pair witness without mo
       agentProfileId: profile.id,
       associationRevision: 2,
     });
-    assert.equal(hostExecutionWitnessFromResolution({ authorized: false, reason: "association_missing" }), null);
+    assert.equal(hostExecutionWitnessFromResolution({ authorized: false, reason: "profile_not_found" }), null);
     assert.equal(hostExecutionWitnessFromResolution({
       ...resolution,
       association: { ...association, active: false },

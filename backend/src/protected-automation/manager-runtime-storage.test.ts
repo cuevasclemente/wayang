@@ -7,7 +7,7 @@ import { afterEach, beforeEach, test } from "node:test";
 import { createAgentProfile } from "../agent-profiles.js";
 import { close, init } from "../db.js";
 import { createProject } from "../projects.js";
-import { commitWorkspaceCapabilityActivation } from "../workspace-capabilities.js";
+import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability } from "../workspace-capabilities.js";
 import { ProtectedAutomationManager } from "./manager.js";
 import { captureProtectedAutomationSnapshot } from "./snapshots.js";
 import { createProtectedAutomationJob, getProtectedAutomationRun, transitionProtectedAutomationJobLifecycle } from "./store.js";
@@ -53,6 +53,12 @@ function configuredJob() {
     operation_digest: "b".repeat(64),
     approved_at: 1,
   });
+  const authority = resolveWorkspaceCapability({
+    capability_id: "wayang.protected-automation.v1",
+    project_id: project.id,
+    agent_profile_id: profile.id,
+  });
+  if (!authority.authorized) throw new Error("Derived authority unavailable");
   fs.writeFileSync(path.join(projectRoot, "main.mjs"), "export default 'synthetic';\n", { mode: 0o600 });
   const id = randomUUID();
   const snapshot = captureProtectedAutomationSnapshot({
@@ -63,7 +69,7 @@ function configuredJob() {
     id,
     project_id: project.id,
     agent_profile_id: profile.id,
-    capability_revision: association.revision,
+    capability_revision: authority.association.revision,
     name: "Synthetic runtime storage",
     source_manifest_sha256: snapshot.manifestSha256,
     entrypoint: snapshot.entrypoint,

@@ -66,18 +66,18 @@ Choose pi authentication:
 
 The checkout's pinned pi CLI is used; a globally installed `pi` is not required.
 
-### Optional privileged capability approval preflight
+### Optional owner-PIN confirmation preflight
 
-Ordinary sandboxed Wayang use needs no capability approval setup. Capability approval reuses the command guard's existing identity PIN; entering it in the approval flow is the normal human action. On startup, the deployed service automatically creates missing non-secret attempt/cooldown state under `WAYANG_DATA_DIR` with owner-only permissions and preserves it across reboots. Capability associations, deterministic jobs, and schedules persist in the service store. No setup command or restart is required before approval or activation; restart only when deploying new code.
+Project-Agent runtime authority needs no PIN setup; it is derived from Project privacy and RBAC. The existing command-guard identity PIN remains available for operation-specific confirmations such as transcript mutation, external actions, and Protected-automation purge. Startup initializes the shared non-secret attempt/cooldown state owner-privately when safe.
 
-For a manual preflight or migration check, the human may run:
+For a manual metadata preflight, the human may run:
 
 ```sh
-make setup-capability-approval
+make setup-owner-pin-confirmations
 make doctor
 ```
 
-The optional initializer never reads or creates the PIN and accepts no PIN argument. It validates PIN authority by filesystem metadata, uses owner-only no-follow/no-overwrite creation when state is absent, and leaves valid existing cooldown state—including attempts or a live reservation—unchanged. Missing or unsafe PIN metadata and unsafe, symlinked, hard-linked, incorrectly permissioned, malformed, or unsupported existing state fail closed rather than being repaired or replaced. This command does not assign or activate a capability, configure a project/profile tuple, launch Wayang, or restart anything. `make doctor` checks metadata only; see [Configuration](configuration.md#capability-approval-cooldown-state) for the exact contract.
+The initializer never reads or creates the PIN and accepts no PIN argument. It validates filesystem metadata, uses owner-only no-follow/no-overwrite creation when state is absent, and preserves valid attempts or a live reservation. It creates no Project-Agent authority, service, or runtime.
 
 Wayang treats registered project folders as trusted Pi projects. Their `.pi/settings.json`, project packages, and extensions may load or execute as the Wayang host user for any agent profile. Register only reviewed folders inside the same single-user trust boundary; agent tool restrictions are not a sandbox for project-local Pi code.
 

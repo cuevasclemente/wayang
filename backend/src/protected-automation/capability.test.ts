@@ -99,14 +99,14 @@ test("protected automation authority remains an exact pair and ignores provider 
     provider: "fluid-provider",
     model: "fluid-model",
   } as never).authorized, true);
-  assert.deepEqual(resolveWorkspaceCapability({
+  assert.equal(resolveWorkspaceCapability({
     ...input,
     agent_profile_id: otherProfile.id,
-  }), { authorized: false, reason: "association_missing" });
-  assert.deepEqual(resolveWorkspaceCapability({
+  }).authorized, true, "every enabled allowlisted profile derives authority");
+  assert.equal(resolveWorkspaceCapability({
     ...input,
     project_id: otherProject.id,
-  }), { authorized: false, reason: "association_missing" });
+  }).authorized, true, "authority follows each Protected project's RBAC");
 
   const standardProject = createProject({
     cwd: temporaryDirectory("wayang-protected-automation-standard-project-"),

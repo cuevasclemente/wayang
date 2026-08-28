@@ -17,7 +17,7 @@ function cleanup(dataDir: string): void {
   fs.rmSync(dataDir, { recursive: true, force: true });
 }
 
-test("gate-off startup publishes schema 7 with empty browser authority and never inventories expected roots", () => {
+test("gate-off startup publishes schema 8 with empty browser authority and never inventories expected roots", () => {
   const dataDir = temporaryDataDir();
   try {
     const expectedRoot = path.join(dataDir, "browser-workbench", "profiles", "shared");
@@ -27,7 +27,7 @@ test("gate-off startup publishes schema 7 with empty browser authority and never
     assert.deepEqual(getStore().browserProfiles, []);
     close();
     const persisted = JSON.parse(fs.readFileSync(path.join(dataDir, "store.json"), "utf8"));
-    assert.equal(persisted.schema_version, 7);
+    assert.equal(persisted.schema_version, 8);
     assert.deepEqual(persisted.browserProfiles, []);
     assert.deepEqual(persisted.projectBrowserDefaults, []);
     assert.deepEqual(persisted.sessionBrowserStates, []);
@@ -53,7 +53,7 @@ test("gate-off startup refuses an existing legacy schema-6 browser-authority sto
   } finally { cleanup(dataDir); }
 });
 
-test("gate-off startup refuses schema 7 with nonempty browser persistence authority", () => {
+test("gate-off startup refuses schema 8 with nonempty browser persistence authority", () => {
   const dataDir = temporaryDataDir();
   try {
     init({ browserProfilesEnabled: true });
@@ -63,7 +63,7 @@ test("gate-off startup refuses schema 7 with nonempty browser persistence author
     raw.browserProfiles = [{ id: "forbidden-browser-authority" }];
     fs.writeFileSync(storePath, JSON.stringify(raw), { mode: 0o600 });
     const bytes = fs.readFileSync(storePath);
-    assert.throws(() => init(), /schema 7 browser persistence requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1/);
+    assert.throws(() => init(), /schema 8 browser persistence requires WAYANG_STANDARD_BROWSER_PROFILE_HOSTS=1/);
     assert.deepEqual(fs.readFileSync(storePath), bytes);
   } finally { cleanup(dataDir); }
 });

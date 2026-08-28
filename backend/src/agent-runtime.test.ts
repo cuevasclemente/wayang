@@ -136,15 +136,17 @@ test("interactive communication appendix reaches restricted and Standard session
     const project = createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
     const interactive = createSession(f.cwd, { agentProfileId: profile.id });
 
-    const restricted = await buildAgentResourceLoader({
+    const initial = await buildAgentResourceLoader({
       cwd: f.cwd, agentDir: f.agentDir, agentProfile: profile, project, sourceSessionId: interactive.id,
     });
-    assert.equal(restricted.restricted, true);
-    assert.deepEqual(restricted.resourceLoader.getAppendSystemPrompt(), [
+    assert.equal(initial.restricted, false);
+    assert.deepEqual(initial.resourceLoader.getAppendSystemPrompt(), [
+      "synthetic global append",
       "synthetic profile overlay",
       WAYANG_INTERACTIVE_COMMUNICATION_APPENDIX,
     ]);
 
+    // Legacy activation rows are inert; derived Standard authority is unchanged.
     commitWorkspaceCapabilityActivation({
       capability_id: "wayang.standard-resources.v1",
       project_id: project.id,
@@ -179,7 +181,7 @@ test("interactive communication appendix reaches restricted and Standard session
   }
 });
 
-test("pair association loads standard resources independent of resource mode and model", async () => {
+test("Standard privacy derives resources independent of profile preference, model, and inert legacy rows", async () => {
   const f = fixture("wayang-runtime-standard-capability-");
   try {
     fs.writeFileSync(path.join(f.agentDir, "AGENTS.md"), "synthetic global resources");
@@ -187,11 +189,11 @@ test("pair association loads standard resources independent of resource mode and
     const project = createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
     const row = createSession(f.cwd, { agentProfileId: profile.id, provider: "provider-a", model: "model-a" });
 
-    const denied = await buildAgentResourceLoader({
+    const initial = await buildAgentResourceLoader({
       cwd: f.cwd, agentDir: f.agentDir, agentProfile: profile, project, sourceSessionId: row.id,
     });
-    assert.equal(denied.restricted, true);
-    assert.equal(denied.resourceLoader.getAgentsFiles().agentsFiles.some((entry) => entry.path === path.join(f.agentDir, "AGENTS.md")), false);
+    assert.equal(initial.restricted, false);
+    assert.equal(initial.resourceLoader.getAgentsFiles().agentsFiles.some((entry) => entry.path === path.join(f.agentDir, "AGENTS.md")), true);
 
     const association = commitWorkspaceCapabilityActivation({
       capability_id: "wayang.standard-resources.v1",
@@ -203,7 +205,8 @@ test("pair association loads standard resources independent of resource mode and
       cwd: f.cwd, agentDir: f.agentDir, agentProfile: profile, project, sourceSessionId: row.id,
     });
     assert.equal(allowed.restricted, false);
-    assert.equal(allowed.standardResourcesWitness?.associationRevision, association.revision);
+    assert.notEqual(allowed.standardResourcesWitness?.associationRevision, association.revision,
+      "legacy association revision is not runtime authority");
 
     const otherModelRow = createSession(f.cwd, { agentProfileId: profile.id, provider: "provider-b", model: "model-b" });
     const otherModel = await buildAgentResourceLoader({
@@ -220,7 +223,7 @@ test("pair association loads standard resources independent of resource mode and
     const stale = await buildAgentResourceLoader({
       cwd: f.cwd, agentDir: f.agentDir, agentProfile: profile, project, sourceSessionId: row.id,
     });
-    assert.equal(stale.restricted, true);
+    assert.equal(stale.restricted, false, "legacy revocation is inert under derived Standard authority");
   } finally { f.cleanup(); }
 });
 
@@ -290,8 +293,7 @@ test("exact Wren loads standard resources for interactive and scheduled Standard
         project,
         agentProfile: profile,
       });
-      assert.equal(witness?.authoritySource, "legacy-wren",
-        "model/provider selection must recognize the same legacy Wren resource authority as runtime loading");
+      assert.ok(witness, "all enabled allowed profiles use the same privacy-derived Standard authority");
       const loaded = await buildAgentResourceLoader({
         cwd: f.cwd,
         agentDir: f.agentDir,
@@ -300,243 +302,22 @@ test("exact Wren loads standard resources for interactive and scheduled Standard
         sourceSessionId,
       });
       assert.equal(loaded.restricted, false);
-      assert.equal(loaded.standardResourcesWitness?.authoritySource, "legacy-wren");
+      assert.ok(loaded.standardResourcesWitness);
       assert.equal(loaded.resourceLoader.getAgentsFiles().agentsFiles.some(
         (entry) => entry.path === path.join(f.agentDir, "AGENTS.md")
       ), true);
     }
-  } finally { f.cleanup(); }
-});
 
-test("captured legacy-Wren standard resources survive first widening activation but fail closed on drift", async () => {
-  const f = fixture("wayang-runtime-legacy-wren-widening-");
-  try {
-    const now = Date.now();
-    commitStoreMutation((draft) => {
-      draft.agentProfiles.push({
-        id: WREN_AGENT_PROFILE_ID,
-        name: "Synthetic continuity Wren",
-        description: null,
-        builtin_kind: "wren",
-        deletable: false,
-        enabled: true,
-        resource_mode: "standard",
-        instructions: null,
-        memory_access: "read_write",
-        default_provider: null,
-        default_model: null,
-        allowed_tools: null,
-        allowed_extensions: null,
-        created_at: now,
-        updated_at: now,
-      });
+    const replacement = createAgentProfile({ name: "Wren RBAC replacement" });
+    const excluded = updateProject(project.id, {
+      default_agent_profile_id: replacement.id,
+      access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [replacement.id] },
     });
-    const profile = getAgentProfile(WREN_AGENT_PROFILE_ID)!;
-    const project = createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
-    const roles = ["continuity", "generation", "eligibility", "revision"] as const;
-    const rows = new Map(roles.map((role) => [role, createSession(f.cwd, { agentProfileId: profile.id })]));
-    const guarded = new Map<(typeof roles)[number], {
-      tool: any;
-      active: string[];
-      executions: () => number;
-      setGenerationCurrent(value: boolean): void;
-      activate(): void;
-    }>();
-    let releaseAcceptedContinuityTool!: () => void;
-    const acceptedContinuityGate = new Promise<void>((resolve) => { releaseAcceptedContinuityTool = resolve; });
-    const continuityUpdates: unknown[] = [];
-    let acceptedContinuityExecution: Promise<unknown> | undefined;
-
-    for (const role of roles) {
-      const row = rows.get(role)!;
-      const loaded = await buildAgentResourceLoader({
-        cwd: f.cwd,
-        agentDir: f.agentDir,
-        agentProfile: profile,
-        project,
-        sourceSessionId: row.id,
-      });
-      assert.ok(loaded.standardResourcesWitness);
-      assert.equal(loaded.standardResourcesWitness.authoritySource, "legacy-wren");
-      assert.equal(loaded.standardResourcesWitness.durableAssociationRevision, undefined);
-      let generationCurrent = true;
-      let executions = 0;
-      let active = ["bash"];
-      const tool: any = {
-        name: "bash",
-        async execute(_id: string, _params: unknown, _signal?: unknown, onUpdate?: (value: unknown) => void) {
-          executions++;
-          if (role === "continuity" && executions === 1) {
-            await acceptedContinuityGate;
-            onUpdate?.({ content: [{ type: "text", text: "accepted-update" }] });
-          }
-          return { content: [{ type: "text", text: "accepted-result" }] };
-        },
-      };
-      const session: any = {
-        _toolRegistry: new Map([["bash", tool]]),
-        getActiveToolNames: () => active,
-        setActiveToolsByName(names: string[]) { active = [...names]; },
-        agent: { state: { tools: [tool] }, async beforeToolCall() {} },
-      };
-      installAgentToolPolicyGuard(session, row.id, {
-        standardResourcesWitness: loaded.standardResourcesWitness,
-        standardResourcesRuntimeFence: {
-          runtimeGeneration: `${role}-generation`,
-          processBootNonce: "synthetic-boot",
-          isCurrent: () => generationCurrent,
-        },
-      });
-      if (role === "continuity") {
-        acceptedContinuityExecution = tool.execute(
-          "accepted-before-widening",
-          {},
-          undefined,
-          (update: unknown) => continuityUpdates.push(update),
-        );
-      } else {
-        await tool.execute(`before-${role}`, {});
-      }
-      guarded.set(role, {
-        tool,
-        get active() { return active; },
-        executions: () => executions,
-        setGenerationCurrent(value) { generationCurrent = value; },
-        activate() { session.setActiveToolsByName(["bash"]); },
-      });
-    }
-
-    const pair = {
-      capability_id: "wayang.standard-resources.v1" as const,
-      project_id: project.id,
-      agent_profile_id: profile.id,
-    };
-    const association = commitWorkspaceCapabilityActivation({ ...pair, operation_digest: "e".repeat(64) });
-    assert.equal(association.revision, 1);
-    for (const runtime of guarded.values()) {
-      runtime.activate();
-      assert.deepEqual(runtime.active, ["bash"], "first durable activation must preserve captured legacy tools");
-    }
-    releaseAcceptedContinuityTool();
-    assert.ok(acceptedContinuityExecution);
-    assert.deepEqual(await acceptedContinuityExecution, {
-      content: [{ type: "text", text: "accepted-result" }],
-    });
-    assert.deepEqual(continuityUpdates, [{ content: [{ type: "text", text: "accepted-update" }] }],
-      "widening activation must not suppress accepted legacy-Wren updates");
-    await guarded.get("continuity")!.tool.execute("after-widening", {});
-    assert.equal(guarded.get("continuity")!.executions(), 2);
-
-    guarded.get("generation")!.setGenerationCurrent(false);
-    await assert.rejects(
-      () => guarded.get("generation")!.tool.execute("generation-drift", {}),
-      /runtime generation is stale/,
-    );
-    commitStoreMutation((draft) => {
-      const eligibility = draft.sessions.find((candidate) => candidate.id === rows.get("eligibility")!.id)!;
-      eligibility.legacy_capability_ineligible = true;
-    });
-    await assert.rejects(
-      () => guarded.get("eligibility")!.tool.execute("eligibility-drift", {}),
-      /authority was revoked or changed/,
-    );
-
-    const revoked = revokeWorkspaceCapabilityAssociation({ ...pair, expected_revision: association.revision });
-    assert.equal(revoked.association.revision, 2);
-    await assert.rejects(
-      () => guarded.get("continuity")!.tool.execute("revoked", {}),
-      /authority was revoked or changed/,
-    );
-
-    const reactivationRow = createSession(f.cwd, { agentProfileId: profile.id });
-    const reactivationLoaded = await buildAgentResourceLoader({
-      cwd: f.cwd,
-      agentDir: f.agentDir,
+    assert.equal(resolveCurrentStandardResourcesWitness({
+      sourceSessionId: interactive.id,
+      project: excluded,
       agentProfile: profile,
-      project,
-      sourceSessionId: reactivationRow.id,
-    });
-    assert.equal(reactivationLoaded.standardResourcesWitness?.authoritySource, "legacy-wren");
-    assert.equal(reactivationLoaded.standardResourcesWitness?.durableAssociationRevision, 2);
-    let reactivationExecutions = 0;
-    const reactivationTool: any = {
-      name: "bash",
-      async execute() { reactivationExecutions++; return { content: [] }; },
-    };
-    const reactivationSession: any = {
-      _toolRegistry: new Map([["bash", reactivationTool]]),
-      getActiveToolNames: () => ["bash"],
-      setActiveToolsByName() {},
-      agent: { state: { tools: [reactivationTool] }, async beforeToolCall() {} },
-    };
-    installAgentToolPolicyGuard(reactivationSession, reactivationRow.id, {
-      standardResourcesWitness: reactivationLoaded.standardResourcesWitness,
-      standardResourcesRuntimeFence: {
-        runtimeGeneration: "reactivation-generation",
-        processBootNonce: "synthetic-boot",
-        isCurrent: () => true,
-      },
-    });
-    await reactivationTool.execute("accepted-before-reactivation", {});
-
-    const regranted = commitWorkspaceCapabilityActivation({ ...pair, operation_digest: "f".repeat(64) });
-    assert.equal(regranted.revision, 3);
-    await reactivationTool.execute("settling-after-reactivation", {});
-    assert.equal(reactivationExecutions, 2);
-    await assert.rejects(
-      () => guarded.get("revision")!.tool.execute("revision-drift", {}),
-      /authority was revoked or changed/,
-    );
-    assert.equal(guarded.get("revision")!.executions(), 1);
-    revokeWorkspaceCapabilityAssociation({ ...pair, expected_revision: regranted.revision });
-    await assert.rejects(
-      () => reactivationTool.execute("later-revision-drift", {}),
-      /authority was revoked or changed/,
-    );
-  } finally { f.cleanup(); }
-});
-
-test("revoked standard-resources witness permanently latches stale tools denied", async () => {
-  const f = fixture("wayang-runtime-standard-latch-");
-  try {
-    const profile = createAgentProfile({ name: "Standard latch", resource_mode: "standard" });
-    const project = createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
-    const row = createSession(f.cwd, { agentProfileId: profile.id, provider: "provider-a", model: "model-a" });
-    const pair = {
-      capability_id: "wayang.standard-resources.v1" as const,
-      project_id: project.id,
-      agent_profile_id: profile.id,
-    };
-    const association = commitWorkspaceCapabilityActivation({ ...pair, operation_digest: "b".repeat(64) });
-    const loaded = await buildAgentResourceLoader({ cwd: f.cwd, agentDir: f.agentDir, agentProfile: profile, project, sourceSessionId: row.id });
-    assert.ok(loaded.standardResourcesWitness);
-    let executions = 0;
-    const tool: any = { name: "bash", async execute() { executions += 1; return { content: [] }; } };
-    let active = ["bash"];
-    const session: any = {
-      model: { provider: "provider-a", id: "model-a" },
-      _toolRegistry: new Map([["bash", tool]]),
-      getActiveToolNames: () => active,
-      setActiveToolsByName(names: string[]) { active = [...names]; },
-      agent: { state: { tools: [tool] }, async beforeToolCall() {} },
-    };
-    installAgentToolPolicyGuard(session, row.id, {
-      standardResourcesWitness: loaded.standardResourcesWitness,
-      standardResourcesRuntimeFence: {
-        runtimeGeneration: "standard-latch-generation",
-        processBootNonce: "standard-latch-boot",
-        isCurrent: () => true,
-      },
-    });
-    assert.deepEqual(active, ["bash"]);
-    revokeWorkspaceCapabilityAssociation({ ...pair, expected_revision: association.revision });
-    session.setActiveToolsByName(["bash"]);
-    assert.deepEqual(active, []);
-    commitWorkspaceCapabilityActivation({ ...pair, operation_digest: "c".repeat(64) });
-    session.setActiveToolsByName(["bash"]);
-    assert.deepEqual(active, [], "a replacement activation cannot revive a stale runtime");
-    await assert.rejects(() => tool.execute("stale", {}), /Standard resource authority was revoked/);
-    assert.equal(executions, 0);
+    }), null, "exact Wren cannot bypass Standard Project RBAC");
   } finally { f.cleanup(); }
 });
 

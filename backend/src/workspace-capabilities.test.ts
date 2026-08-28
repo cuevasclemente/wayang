@@ -128,25 +128,59 @@ test("ordinary CRUD cannot smuggle authority", () => {
   );
 });
 
-test("resolver uses one exact active project/profile/capability association and ignores model variation", () => {
+test("resolver derives authority from exact project privacy and enabled allowed profile", () => {
   const input = pair();
-  assert.deepEqual(resolveWorkspaceCapability(input), { authorized: false, reason: "association_missing" });
-  const association = commitWorkspaceCapabilityActivation({ ...input, operation_digest: digest() });
-  assert.equal(association.revision, 1);
   const authorized = resolveWorkspaceCapability(input);
   assert.equal(authorized.authorized, true);
   if (!authorized.authorized) return;
-  assert.equal(authorized.association.revision, 1);
+  const derivedRevision = authorized.association.revision;
+  assert.ok(Number.isSafeInteger(derivedRevision) && derivedRevision > 0);
   assert.equal(Object.isFrozen(authorized), true);
   assert.equal(Object.isFrozen(authorized.association), true);
+  assert.equal(getStore().workspaceCapabilityAssociations.length, 0);
   updateProject(input.project_id, { default_provider: "other-provider", default_model: "other-model" });
   updateAgentProfile(input.agent_profile_id, { default_provider: "third-provider", default_model: "third-model" });
-  assert.equal(resolveWorkspaceCapability(input).authorized, true);
+  const afterDefaults = resolveWorkspaceCapability(input);
+  assert.equal(afterDefaults.authorized, true);
+  if (afterDefaults.authorized) assert.equal(afterDefaults.association.revision, derivedRevision);
   assert.equal(resolveWorkspaceCapability({ ...input, provider: "fluid", model: "fluid" } as never).authorized, true);
   assert.equal(resolveCurrentWorkspaceCapabilityWitness(authorized).authorized, true);
 });
 
-test("revocation and reactivation advance the sole association clock and stale revoke conflicts", () => {
+test("privacy directly selects the complete Standard and Protected authority sets", () => {
+  const input = pair();
+  for (const capability_id of [
+    "wayang.standard-resources.v1",
+    "wayang.standard-browser.v1",
+    "wayang.host-execution.v1",
+  ] as const) {
+    assert.equal(resolveWorkspaceCapability({ ...input, capability_id }).authorized, true, capability_id);
+  }
+  for (const capability_id of ["wayang.protected-browser.v1", "wayang.protected-automation.v1"] as const) {
+    assert.deepEqual(resolveWorkspaceCapability({ ...input, capability_id }), {
+      authorized: false,
+      reason: "incompatible_privacy_mode",
+    });
+  }
+  updateProject(input.project_id, {
+    access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [input.agent_profile_id] },
+  });
+  for (const capability_id of ["wayang.protected-browser.v1", "wayang.protected-automation.v1"] as const) {
+    assert.equal(resolveWorkspaceCapability({ ...input, capability_id }).authorized, true, capability_id);
+  }
+  for (const capability_id of [
+    "wayang.standard-resources.v1",
+    "wayang.standard-browser.v1",
+    "wayang.host-execution.v1",
+  ] as const) {
+    assert.deepEqual(resolveWorkspaceCapability({ ...input, capability_id }), {
+      authorized: false,
+      reason: "incompatible_privacy_mode",
+    });
+  }
+});
+
+test("legacy revocation and reactivation rows are inert to derived authority", () => {
   const input = pair();
   const first = commitWorkspaceCapabilityActivation({ ...input, operation_digest: digest("a"), approved_at: 10 });
   const firstWitness = resolveWorkspaceCapability(input);
@@ -162,10 +196,9 @@ test("revocation and reactivation advance the sole association clock and stale r
   const second = commitWorkspaceCapabilityActivation({ ...input, operation_digest: digest("b"), approved_at: 30 });
   assert.equal(second.revision, 3);
   if (firstWitness.authorized) {
-    assert.deepEqual(resolveCurrentWorkspaceCapabilityWitness(firstWitness), {
-      authorized: false,
-      reason: "stale_association_revision",
-    });
+    const current = resolveCurrentWorkspaceCapabilityWitness(firstWitness);
+    assert.equal(current.authorized, true);
+    if (current.authorized) assert.equal(current.association.revision, firstWitness.association.revision);
   }
   assert.throws(
     () => revokeWorkspaceCapabilityAssociation({ ...input, expected_revision: first.revision, revoked_at: 40 }),
@@ -200,8 +233,10 @@ test("audit saturation blocks activation but never blocks explicit denial", () =
   assert.equal(revoked.status, "revoked");
 });
 
-test("profile edits and disable preserve associations; reenable restores only the durable resolver", () => {
+test("profile edits preserve derived authority while disable and reenable remove and restore it", () => {
   const input = pair();
+  const before = resolveWorkspaceCapability(input);
+  assert.equal(before.authorized, true);
   const association = commitWorkspaceCapabilityActivation({ ...input, operation_digest: digest() });
   updateAgentProfile(input.agent_profile_id, { name: "Renamed", instructions: "changed", memory_access: "read" });
   assert.equal(resolveWorkspaceCapability(input).authorized, true);
@@ -211,6 +246,8 @@ test("profile edits and disable preserve associations; reenable restores only th
     privacy_mode: "standard",
     allowed_agent_profile_ids: [input.agent_profile_id, replacement.id],
   } });
+  const beforeDisable = resolveWorkspaceCapability(input);
+  const expectedRestoredRevision = beforeDisable.authorized ? beforeDisable.association.revision : 0;
   updateAgentProfile(input.agent_profile_id, { enabled: false });
   assert.deepEqual(resolveWorkspaceCapability(input), { authorized: false, reason: "profile_disabled" });
   assert.deepEqual(getStore().workspaceCapabilityAssociations[0], association);
@@ -218,10 +255,11 @@ test("profile edits and disable preserve associations; reenable restores only th
   updateAgentProfile(input.agent_profile_id, { enabled: true });
   const restored = resolveWorkspaceCapability(input);
   assert.equal(restored.authorized, true);
-  if (restored.authorized) assert.equal(restored.association.revision, association.revision);
+  if (restored.authorized) assert.equal(restored.association.revision, expectedRestoredRevision);
+  assert.equal(getStore().workspaceCapabilityAssociations[0]?.revision, association.revision, "legacy row remains inert");
 });
 
-test("allowlist mutation tombstones only newly excluded pairs and widening never revives", () => {
+test("allowlist mutation denies excluded pairs and widening restores derived authority", () => {
   const input = pair();
   const second = createAgentProfile({ name: "Second" });
   updateProject(input.project_id, { access_policy: {
@@ -245,9 +283,9 @@ test("allowlist mutation tombstones only newly excluded pairs and widening never
   assert.equal(excluded.revision, 2);
 
   updateProject(input.project_id, { access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: null } });
-  assert.deepEqual(
-    resolveWorkspaceCapability({ ...input, agent_profile_id: second.id }),
-    { authorized: false, reason: "association_inactive" },
+  assert.equal(
+    resolveWorkspaceCapability({ ...input, agent_profile_id: second.id }).authorized,
+    true,
   );
 });
 
@@ -286,6 +324,8 @@ test("privacy changes tombstone only incompatible capabilities", () => {
     () => commitWorkspaceCapabilityActivation({ ...input, operation_digest: digest("b") }),
     /incompatible with project privacy mode/,
   );
+  assert.deepEqual(resolveWorkspaceCapability(input), { authorized: false, reason: "incompatible_privacy_mode" });
+  assert.equal(resolveWorkspaceCapability({ ...input, capability_id: "wayang.protected-browser.v1" }).authorized, true);
 });
 
 test("profile deletion tombstones before cleanup and leaves orphaned tombstone/audit history valid", () => {
@@ -298,10 +338,7 @@ test("profile deletion tombstones before cleanup and leaves orphaned tombstone/a
   assert.equal(row.revision, 2);
   assert.equal(getStore().agentProfiles.some((profile) => profile.id === input.agent_profile_id), false);
   assert.equal(getStore().workspaceCapabilityApprovalEvents[0]!.agent_profile_id, input.agent_profile_id);
-  assert.deepEqual(resolveWorkspaceCapability({ ...input, agent_profile_id: replacement.id }), {
-    authorized: false,
-    reason: "association_missing",
-  });
+  assert.equal(resolveWorkspaceCapability({ ...input, agent_profile_id: replacement.id }).authorized, true);
   flush();
 });
 
@@ -316,10 +353,7 @@ test("project deletion tombstones before cleanup and retains deleted stable IDs"
     default_agent_profile_id: input.agent_profile_id,
     access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [input.agent_profile_id] },
   });
-  assert.deepEqual(resolveWorkspaceCapability({ ...input, project_id: replacement.id }), {
-    authorized: false,
-    reason: "association_missing",
-  });
+  assert.equal(resolveWorkspaceCapability({ ...input, project_id: replacement.id }).authorized, true);
   flush();
 });
 
@@ -344,12 +378,14 @@ test("pair runtime query resolves cwd from immutable Project ID", () => {
   assert.deepEqual(capabilityPairRuntimeSessionIds("unknown-project", input.agent_profile_id), []);
 });
 
-test("pair projection contains association revision and no tuple evidence", () => {
+test("pair projection contains derived-authority revision and no provider/model evidence", () => {
   const input = pair();
   commitWorkspaceCapabilityActivation({ ...input, operation_digest: digest() });
   const projectionPath = getWorkspaceCapabilityStoreProjectionPath(input);
   const projection = fs.readFileSync(projectionPath, "utf8");
-  assert.match(projection, /"association_revision": 1/);
+  const authority = resolveWorkspaceCapability(input);
+  assert.equal(authority.authorized, true);
+  assert.match(projection, new RegExp(`"association_revision": ${authority.authorized ? authority.association.revision : -1}`));
   assert.equal(projection.includes("provider"), false);
   assert.equal(projection.includes("model"), false);
   assert.equal(projection.includes("operation_digest"), false);
@@ -471,12 +507,12 @@ test("host pair projection includes only canonical pair-owned questionnaire subm
   assert.equal(browserProjection.includes("a-request"), false);
 
   revokeWorkspaceCapabilityAssociation({ ...input, expected_revision: 1 });
-  const revoked = JSON.parse(fs.readFileSync(projectionPath, "utf8")) as Record<string, unknown>;
-  assert.equal(revoked.schema_version, 3);
-  assert.equal(revoked.active, false);
-  assert.equal(revoked.available, false);
-  assert.equal(JSON.stringify(revoked).includes("a-request"), false);
-  assert.equal("questionnaire_submissions" in revoked, false);
+  const afterLegacyRevoke = JSON.parse(fs.readFileSync(projectionPath, "utf8")) as Record<string, any>;
+  assert.equal(afterLegacyRevoke.schema_version, 3);
+  assert.equal(afterLegacyRevoke.active, true);
+  assert.equal(afterLegacyRevoke.available, true);
+  assert.equal(JSON.stringify(afterLegacyRevoke).includes("a-request"), true,
+    "legacy row revocation does not alter derived host authority");
 });
 
 test("host questionnaire projection fails closed for noncanonical provenance and bounded saturation", () => {
@@ -624,7 +660,7 @@ test("startup denial-first rebuild removes stale positive questionnaire evidence
   assert.deepEqual(rebuilt.questionnaire_submissions.records, []);
 });
 
-test("unchanged association revision still reprojects profile and session eligibility changes", () => {
+test("derived projection tracks profile and session eligibility changes", () => {
   const input = pair();
   getStore().sessions.push(syntheticSession({ id: "owner", projectId: input.project_id, profileId: input.agent_profile_id }));
   flush();
@@ -636,7 +672,9 @@ test("unchanged association revision still reprojects profile and session eligib
   const opened = createOpenInterview({ requestId: "eligibility", sessionId: "owner", toolName: "questionnaire", questions });
   assert.equal(submitInterview("owner", opened.request_id, [{ id: "q", value: "yes", wasCustom: false }], WAYANG_WEBSOCKET_SUBMISSION_CONTEXT).ok, true);
   const projectionPath = getWorkspaceCapabilityStoreProjectionPath(input);
-  assert.equal(JSON.parse(fs.readFileSync(projectionPath, "utf8")).association_revision, 1);
+  const initialAuthority = resolveWorkspaceCapability(input);
+  assert.equal(JSON.parse(fs.readFileSync(projectionPath, "utf8")).association_revision,
+    initialAuthority.authorized ? initialAuthority.association.revision : -1);
 
   const replacementDefault = createAgentProfile({ name: "Replacement default", resource_mode: "standard" });
   getStore().workspaceSettings.default_agent_profile_id = replacementDefault.id;
@@ -650,13 +688,16 @@ test("unchanged association revision still reprojects profile and session eligib
   assert.equal(projection.available, false);
   updateAgentProfile(input.agent_profile_id, { enabled: true });
   projection = JSON.parse(fs.readFileSync(projectionPath, "utf8"));
-  assert.equal(projection.association_revision, 1);
+  const restoredAuthority = resolveWorkspaceCapability(input);
+  assert.equal(projection.association_revision,
+    restoredAuthority.authorized ? restoredAuthority.association.revision : -1);
   assert.equal(projection.questionnaire_submissions.records.length, 1);
 
   getStore().sessions.find((session) => session.id === "owner")!.legacy_capability_ineligible = true;
   flush();
   projection = JSON.parse(fs.readFileSync(projectionPath, "utf8"));
-  assert.equal(projection.association_revision, 1);
+  assert.equal(projection.association_revision,
+    restoredAuthority.authorized ? restoredAuthority.association.revision : -1);
   assert.deepEqual(projection.questionnaire_submissions.records, []);
 });
 
@@ -716,7 +757,7 @@ test("schema-1 migration creates zero positive authority and removes subject aut
 
   init();
   const migrated = getStore();
-  assert.equal(migrated.schema_version, 7);
+  assert.equal(migrated.schema_version, 8);
   assert.deepEqual(migrated.workspaceCapabilityAssociations, []);
   assert.deepEqual(migrated.workspaceCapabilityApprovalEvents, []);
   assert.deepEqual(migrated.protectedAutomationJobs, []);

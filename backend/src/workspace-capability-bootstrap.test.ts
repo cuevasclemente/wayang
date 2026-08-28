@@ -8,9 +8,9 @@ import { AuthService } from "./auth/service.js";
 import type { AuthConfig } from "./config.js";
 import { close, getStore, init } from "./db.js";
 import { createProject } from "./projects.js";
-import { CapabilityApprovalError } from "./workspace-capability-approval/errors.js";
 import { createProductionWorkspaceCapabilityBootstrap } from "./workspace-capability-bootstrap.js";
 import { provisionPinAttemptStateForService } from "./workspace-capability-integration.js";
+import { resolveWorkspaceCapability } from "./workspace-capabilities.js";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-production-capability-bootstrap-"));
 const dataDir = path.join(root, "data");
@@ -61,9 +61,14 @@ after(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test("production bootstrap performs no startup activation and ignores profile names and legacy authority flags", () => {
+test("production bootstrap derives authority without startup activation rows or legacy flags", () => {
   assert.equal(getStore().workspaceCapabilityAssociations.length, 0);
   assert.equal(getStore().workspaceCapabilityApprovalEvents.length, 0);
+  assert.equal(resolveWorkspaceCapability({
+    capability_id: "wayang.host-execution.v1",
+    project_id: project.id,
+    agent_profile_id: profile.id,
+  }).authorized, true);
 });
 
 test("production bootstrap rejects a relative data directory", () => {
@@ -73,19 +78,15 @@ test("production bootstrap rejects a relative data directory", () => {
   );
 });
 
-test("missing PIN leaves cooldown state unavailable without creating authority", async () => {
+test("missing PIN leaves shared confirmation attempts unavailable without affecting derived authority", async () => {
   const cooldownPath = path.join(dataDir, "workspace-capability-approval", "pin-attempt-state.json");
-  await assert.rejects(
-    bootstrap.routerOptions.service.requestActivation(
-      { sessionId: "synthetic-owner", origin: "http://127.0.0.1:8787" },
-      {
-        capabilityId: "wayang.host-execution.v1",
-        projectId: project.id,
-        agentProfileId: profile.id,
-      },
-    ),
-    (error: unknown) => error instanceof CapabilityApprovalError && error.code === "pin_unavailable" && error.statusCode === 503,
-  );
+  assert.deepEqual(await bootstrap.pinAttempts.reserve({
+    realm: "synthetic-operation",
+    reservationId: "reservation",
+    requestId: "request",
+    operationDigest: "a".repeat(64),
+    expiresAt: Date.now() + 60_000,
+  }), { status: "unavailable" });
   assert.equal(fs.existsSync(cooldownPath), false);
   assert.equal(getStore().workspaceCapabilityAssociations.length, 0);
   assert.equal(getStore().workspaceCapabilityApprovalEvents.length, 0);

@@ -46,7 +46,7 @@ test("schema 2 migrates explicitly to current schema with empty inert authority,
   init();
   const store = getStore();
   assert.equal(store.schema_version, STORE_SCHEMA_VERSION);
-  assert.equal(STORE_SCHEMA_VERSION, 7);
+  assert.equal(STORE_SCHEMA_VERSION, 8);
   assert.deepEqual(store.protectedAutomationJobs, []);
   assert.deepEqual(store.protectedAutomationRuns, []);
   assert.deepEqual(store.workspaceCapabilityAssociations, []);

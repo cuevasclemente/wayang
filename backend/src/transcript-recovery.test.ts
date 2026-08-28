@@ -69,7 +69,7 @@ function materializedSession(project: string, sessionDir: string, id: string) {
   return manager;
 }
 
-test("schema 6 migrates to strict content-free schema 7 recovery journal", () => {
+test("schema 6 migrates to strict content-free schema 8 recovery journal", () => {
   const f = environment("wayang-recovery-schema-");
   try {
     init({ browserProfilesEnabled: true });
@@ -80,7 +80,7 @@ test("schema 6 migrates to strict content-free schema 7 recovery journal", () =>
     delete raw.transcriptRecoveryJournal;
     fs.writeFileSync(storePath, JSON.stringify(raw), { mode: 0o600 });
     init({ browserProfilesEnabled: true });
-    assert.equal(getStore().schema_version, 7);
+    assert.equal(getStore().schema_version, 8);
     assert.deepEqual(getStore().transcriptRecoveryJournal, []);
     close();
 

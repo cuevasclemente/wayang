@@ -48,10 +48,10 @@ function fixture() {
   return { defaultProfile, profile, project, session };
 }
 
-test("diagnostics distinguish approval, fresh-runtime, configured-path, and revocation states without paths", () => {
+test("diagnostics expose derived fresh-runtime and configured-path states without paths", () => {
   const f = fixture();
   let diagnostic = getPiSessionBrowserAgentDiagnostic(f.session.id);
-  assert.equal(diagnostic.reason_code, "approval_required");
+  assert.equal(diagnostic.reason_code, "fresh_runtime_required");
   assert.equal(JSON.stringify(diagnostic).includes(projectRoot), false);
 
   const association = commitWorkspaceCapabilityActivation({
@@ -75,7 +75,8 @@ test("diagnostics distinguish approval, fresh-runtime, configured-path, and revo
     agent_profile_id: f.profile.id,
     expected_revision: association.revision,
   });
-  assert.equal(getPiSessionBrowserAgentDiagnostic(f.session.id).reason_code, "association_inactive");
+  assert.equal(getPiSessionBrowserAgentDiagnostic(f.session.id).reason_code, "fresh_runtime_required",
+    "legacy revocation is inert");
 });
 
 test("diagnostics distinguish disabled, disallowed, scheduled, and privacy-compatible capability IDs", () => {
@@ -99,5 +100,5 @@ test("diagnostics distinguish disabled, disallowed, scheduled, and privacy-compa
   updateProject(f.project.id, { access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [f.defaultProfile.id, f.profile.id] } });
   const protectedDiagnostic = getPiSessionBrowserAgentDiagnostic(f.session.id);
   assert.equal(protectedDiagnostic.capability_id, "wayang.protected-browser.v1");
-  assert.equal(protectedDiagnostic.reason_code, "approval_required");
+  assert.equal(protectedDiagnostic.reason_code, "fresh_runtime_required");
 });

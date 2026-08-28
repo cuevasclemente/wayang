@@ -1,7 +1,7 @@
 # Local HTTPS remote administration with Caddy
 
-Wayang can accept PIN-backed capability approvals from a non-localhost browser
-only when that browser has an authenticated Settings owner. The simplest
+Wayang can accept authenticated remote Settings changes and operation-specific
+PIN confirmations from a non-localhost browser. The simplest
 single-user local-network topology is:
 
 ```text
@@ -13,7 +13,7 @@ remote browser
 ```
 
 This keeps Wayang's backend port off the LAN, provides encrypted transport, and
-lets the verified built-in-auth cookie own Settings approval challenges. It does
+lets the verified built-in-auth cookie establish the remote owner. It does
 not turn Wayang into a multi-user service or make Internet exposure safe.
 
 ## What Wayang does and does not manage
@@ -149,14 +149,11 @@ From a non-localhost client:
 
 1. Open the exact HTTPS public origin.
 2. Sign in with the Wayang shared password.
-3. Open Settings → Capabilities.
-4. Request and PIN-approve a reviewed Project-Agent capability association.
-5. Start a fresh eligible agent runtime and confirm the capability-specific
-   diagnostic reports tools available.
+3. Open Settings and confirm Project/privacy/profile changes persist.
+4. Start a fresh eligible agent runtime and confirm its privacy/RBAC-derived browser and execution tools.
+5. Exercise an operation-specific confirmation only when needed.
 
-For Standard browser control, approve `wayang.standard-browser.v1` for the
-intended Standard Project-Agent pair. Passwords, MFA, CAPTCHA, payment, passkeys,
-and other secret-bearing browser steps remain human-only.
+Passwords, MFA, CAPTCHA, payment, passkeys, and other secret-bearing browser steps remain human-only.
 
 ## Troubleshooting
 
@@ -166,9 +163,7 @@ and other secret-bearing browser steps remain human-only.
   above. The command reports setting names but never secret values.
 - **Certificate warning:** stop. Fix hostname resolution and CA trust rather
   than bypassing TLS validation.
-- **Login succeeds but capability approval says owner unavailable:** confirm the
-  browser uses the exact HTTPS origin, cookies are enabled, Wayang built-in auth
-  is enabled, and Caddy is the only network-reachable path.
+- **Login succeeds but an owner confirmation says unavailable:** confirm the browser uses the exact HTTPS origin, cookies are enabled, Wayang built-in auth is enabled, and Caddy is the only network-reachable path.
 - **WebSocket or Browser pane fails:** ensure no additional proxy handles only
   selected paths; the generated Caddyfile intentionally proxies the complete
   origin.
@@ -181,7 +176,7 @@ Stop Caddy, stop Wayang, restore the previous private configuration from
 `.env.backup` without displaying either file, confirm mode `0600`, and restart
 Wayang. Remove client CA trust only after confirming no other local service uses
 that Caddy authority. Rollback never requires deleting Wayang data, sessions,
-projects, capability associations, or browser profiles.
+projects, inert legacy authority rows, or browser profiles.
 
 For an existing authenticated reverse proxy, use the identity-header design in
 [Configuration](configuration.md#built-in-shared-password-login) instead of this

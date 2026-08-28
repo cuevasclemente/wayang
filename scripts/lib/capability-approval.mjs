@@ -40,7 +40,7 @@ function currentUid(getUid = process.getuid) {
 export function capabilityApprovalPaths({ env = process.env, home = homedir() } = {}) {
   const configuredDataDir = env.WAYANG_DATA_DIR || env.PI_WEB_UI_DATA_DIR;
   if (configuredDataDir && !isAbsolute(configuredDataDir)) {
-    throw new Error("WAYANG_DATA_DIR must be an absolute path for capability approval setup");
+    throw new Error("WAYANG_DATA_DIR must be an absolute path for owner PIN confirmation setup");
   }
   const dataDir = resolve(configuredDataDir || join(home, ".wayang"));
   const configuredConfigHome = env.XDG_CONFIG_HOME;
@@ -119,21 +119,21 @@ export function isValidCapabilityApprovalState(value) {
 
 function readExistingStateNoFollow(statePath) {
   const metadata = inspectOwnerOnlyRegularFileMetadata(statePath, { minSize: 2, maxSize: MAX_STATE_BYTES });
-  if (!metadata.ok) throw new Error(`Existing capability approval cooldown state is unsafe: ${metadata.reason}`);
-  if (typeof constants.O_NOFOLLOW !== "number") throw new Error("This platform cannot perform no-follow capability approval setup");
+  if (!metadata.ok) throw new Error(`Existing owner PIN confirmation cooldown state is unsafe: ${metadata.reason}`);
+  if (typeof constants.O_NOFOLLOW !== "number") throw new Error("This platform cannot perform no-follow owner PIN confirmation setup");
   let descriptor = null;
   try {
     descriptor = openSync(statePath, constants.O_RDONLY | constants.O_NOFOLLOW);
     const opened = fstatSync(descriptor);
     if (opened.dev !== metadata.metadata.dev || opened.ino !== metadata.metadata.ino) {
-      throw new Error("Existing capability approval cooldown state changed during validation");
+      throw new Error("Existing owner PIN confirmation cooldown state changed during validation");
     }
     const state = JSON.parse(readFileSync(descriptor, "utf8"));
-    if (!isValidCapabilityApprovalState(state)) throw new Error("Existing capability approval cooldown state has an invalid schema");
+    if (!isValidCapabilityApprovalState(state)) throw new Error("Existing owner PIN confirmation cooldown state has an invalid schema");
     return state;
   } catch (error) {
-    if (error instanceof Error && error.message.startsWith("Existing capability approval")) throw error;
-    throw new Error("Existing capability approval cooldown state is unreadable or malformed");
+    if (error instanceof Error && error.message.startsWith("Existing owner PIN confirmation")) throw error;
+    throw new Error("Existing owner PIN confirmation cooldown state is unreadable or malformed");
   } finally {
     if (descriptor !== null) closeSync(descriptor);
   }
@@ -144,7 +144,7 @@ function ensurePrivateDirectory(directoryPath) {
   if (existing.ok) return false;
   try {
     lstatSync(directoryPath);
-    throw new Error(`Refusing unsafe capability approval directory: ${existing.reason}`);
+    throw new Error(`Refusing unsafe owner PIN confirmation directory: ${existing.reason}`);
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("Refusing")) throw error;
   }
@@ -158,28 +158,28 @@ function ensurePrivateDirectory(directoryPath) {
     } catch {
       missing.push(candidate);
       const parent = dirname(candidate);
-      if (parent === candidate) throw new Error("No existing parent is available for capability approval state");
+      if (parent === candidate) throw new Error("No existing parent is available for owner PIN confirmation state");
       candidate = parent;
     }
   }
   const parent = inspectCanonicalDirectory(candidate, { requireOwner: true });
-  if (!parent.ok) throw new Error(`Refusing unsafe capability approval parent: ${parent.reason}`);
+  if (!parent.ok) throw new Error(`Refusing unsafe owner PIN confirmation parent: ${parent.reason}`);
 
   for (const component of missing.reverse()) {
     try {
       mkdirSync(component, { mode: 0o700 });
     } catch {
       const raced = inspectCanonicalDirectory(component, { requirePrivate: true });
-      if (!raced.ok) throw new Error("Could not create an owner-only capability approval directory without replacing an existing path");
+      if (!raced.ok) throw new Error("Could not create an owner-only owner PIN confirmation directory without replacing an existing path");
     }
     const created = inspectCanonicalDirectory(component, { requirePrivate: true });
-    if (!created.ok) throw new Error(`Created capability approval directory is unsafe: ${created.reason}`);
+    if (!created.ok) throw new Error(`Created owner PIN confirmation directory is unsafe: ${created.reason}`);
   }
   return true;
 }
 
 function writeInitialStateNoReplace(statePath) {
-  if (typeof constants.O_NOFOLLOW !== "number") throw new Error("This platform cannot perform no-follow capability approval setup");
+  if (typeof constants.O_NOFOLLOW !== "number") throw new Error("This platform cannot perform no-follow owner PIN confirmation setup");
   const parent = dirname(statePath);
   const temporary = join(parent, `.pin-attempt-setup-${process.pid}-${randomBytes(8).toString("hex")}.tmp`);
   let descriptor = null;
@@ -237,7 +237,7 @@ export function provisionCapabilityApprovalState(options = {}) {
     readExistingStateNoFollow(paths.statePath);
     return { created: false, paths };
   } catch (error) {
-    if (error instanceof Error && error.message.startsWith("Existing capability approval")) throw error;
+    if (error instanceof Error && error.message.startsWith("Existing owner PIN confirmation")) throw error;
   }
 
   try {
@@ -252,7 +252,7 @@ export function provisionCapabilityApprovalState(options = {}) {
       return { created: false, paths };
     } catch {
       const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
-      throw new Error(`Could not atomically provision capability approval cooldown state${typeof code === "string" ? ` (${code})` : ""}`);
+      throw new Error(`Could not atomically provision owner PIN confirmation cooldown state${typeof code === "string" ? ` (${code})` : ""}`);
     }
   }
 }

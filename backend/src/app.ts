@@ -40,10 +40,6 @@ import {
   createStandardBrowserSelectionMiddleware,
   type StandardBrowserIntegration,
 } from "./routes/standard-browser.js";
-import {
-  createWorkspaceCapabilitiesRouter,
-  type WorkspaceCapabilitiesRouterOptions,
-} from "./routes/workspace-capabilities.js";
 import { cleanupCache } from "./tts-cache.js";
 import { attachWs } from "./routes/ws.js";
 import { installActionApprovalPinAttempts } from "./action-approval-bridge.js";
@@ -149,8 +145,6 @@ export interface CreateAppOptions {
   credentialBroker?: CredentialBroker;
   /** Exact capability/runtime bridge supplied by runtime integration. Missing means Protected browser fails closed. */
   protectedBrowser?: ProtectedBrowserIntegration;
-  /** Exact authenticated Settings owner plus workspace/PIN service. Missing means the Settings capability API fails closed. */
-  workspaceCapabilities?: WorkspaceCapabilitiesRouterOptions;
   /** Exact Standard named-profile selection/viewer integration when the startup gate is enabled. */
   standardBrowser?: StandardBrowserIntegration;
   standardBrowserService?: StandardBrowserProfileHostService;
@@ -189,21 +183,6 @@ export function createApp(options: CreateAppOptions = {}) {
   // browser cookies nor browser Origin authority. The connector router owns a
   // bounded parser after token verification and must precede generic parsers.
   app.use(options.matrixMessaging?.router ?? createUnavailableMatrixApplicationServiceRouter());
-
-  // Settings capability approval owns exact authenticated web-session+Origin
-  // resolution and a bounded parser. Mount it before broad auth/JSON so a PIN
-  // body is never parsed before that owner check. Missing runtime ports deny.
-  if (options.workspaceCapabilities) {
-    app.use("/api", createWorkspaceCapabilitiesRouter(options.workspaceCapabilities));
-  } else {
-    const unavailableSettingsCapabilities: express.RequestHandler = (_req, res) => {
-      res.setHeader("Cache-Control", "no-store");
-      res.setHeader("Pragma", "no-cache");
-      res.status(503).json({ error: "Workspace capability Settings integration is unavailable" });
-    };
-    app.use("/api/workspace-capabilities", unavailableSettingsCapabilities);
-    app.use("/api/workspace-capability-associations", unavailableSettingsCapabilities);
-  }
 
   if (options.protectedAutomation) {
     app.use("/api", createProtectedAutomationsRouter(auth, options.protectedAutomation));
@@ -435,7 +414,6 @@ export function start() {
   const { server } = createApp({
     config,
     authService,
-    workspaceCapabilities: workspaceCapabilities.routerOptions,
     protectedBrowser: protectedBrowser.integration,
     ...(standardBrowser.service ? {
       standardBrowser: createStandardBrowserIntegration(standardBrowser.service),

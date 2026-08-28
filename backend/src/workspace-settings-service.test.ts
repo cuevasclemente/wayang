@@ -16,7 +16,7 @@ import { createSession } from "./sessions.js";
 import { lockRuntimeMutationSession, unlockRuntimeMutationSession } from "./pi-bridge.js";
 import { WorkspaceSettingsService, type WorkspaceCapabilityInvalidationPort } from "./workspace-settings-service.js";
 import { createWorkspaceToolDefinitions } from "./workspace-tools.js";
-import { commitWorkspaceCapabilityActivation } from "./workspace-capabilities.js";
+import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability } from "./workspace-capabilities.js";
 import {
   canonicalizeWorkspaceMutation,
   WORKSPACE_APPROVAL_TTL_MS,
@@ -612,7 +612,10 @@ test("profile deletion always leases affected runtimes regardless of legacy dele
   const f = fixture("wayang-workspace-profile-delete-lease-");
   let affectedSessionId: string | undefined;
   try {
-    const service = new WorkspaceSettingsService();
+    const service = new WorkspaceSettingsService({
+      latchDenied() {},
+      async cleanupAfterDenial() {},
+    });
     const profile = service.createAgentProfileForUi({ name: "Legacy metadata profile" });
     const replacement = service.createAgentProfileForUi({ name: "Generic replacement" });
     const targetCwd = path.join(f.dir, "delete-lease-project");
@@ -636,15 +639,22 @@ test("profile deletion always leases affected runtimes regardless of legacy dele
   }
 });
 
-test("ordinary pair invalidation fails closed without a denial latch and latches the exact tombstone before cleanup", async () => {
+test("derived-authority removal fails closed without a denial latch and latches every removed selector before cleanup", async () => {
   const f = fixture("wayang-workspace-invalidation-");
   try {
-    const association = commitWorkspaceCapabilityActivation({
-      capability_id: "wayang.host-execution.v1",
-      project_id: f.sourceProject.id,
-      agent_profile_id: f.managementProfile.id,
-      operation_digest: "a".repeat(64),
-    });
+    const expectedRevisions = new Map([
+      "wayang.standard-resources.v1",
+      "wayang.standard-browser.v1",
+      "wayang.host-execution.v1",
+    ].map((capabilityId) => {
+      const resolution = resolveWorkspaceCapability({
+        capability_id: capabilityId as "wayang.standard-resources.v1" | "wayang.standard-browser.v1" | "wayang.host-execution.v1",
+        project_id: f.sourceProject.id,
+        agent_profile_id: f.managementProfile.id,
+      });
+      assert.equal(resolution.authorized, true);
+      return [capabilityId, resolution.authorized ? resolution.association.revision : 0] as const;
+    }));
     const replacement = createAgentProfile({ name: "Replacement default" });
     const exclusion = {
       default_agent_profile_id: replacement.id,
@@ -655,22 +665,26 @@ test("ordinary pair invalidation fails closed without a denial latch and latches
       /runtime latch is unavailable/,
     );
     assert.equal(getProject(f.sourceProject.id)?.default_agent_profile_id, f.managementProfile.id);
-    assert.equal(getStore().workspaceCapabilityAssociations[0]!.active, true);
+    assert.deepEqual(getStore().workspaceCapabilityAssociations, []);
 
     const events: string[] = [];
     const invalidation: WorkspaceCapabilityInvalidationPort = {
       latchDenied(input) {
-        assert.deepEqual(input.associations.map((row) => ({
-          projectId: row.projectId,
-          agentProfileId: row.agentProfileId,
-          revision: row.revision,
-          active: row.active,
-        })), [{
-          projectId: association.project_id,
-          agentProfileId: association.agent_profile_id,
-          revision: association.revision + 1,
-          active: false,
-        }]);
+        const managementRows = input.associations.filter((row) => row.agentProfileId === f.managementProfile.id);
+        assert.deepEqual(managementRows.map((row) => row.capabilityId), [
+          "wayang.standard-resources.v1",
+          "wayang.standard-browser.v1",
+          "wayang.host-execution.v1",
+        ]);
+        assert.equal(input.associations.some((row) => row.agentProfileId === replacement.id), false,
+          "the profile retained by the new allowlist is not invalidated");
+        for (const row of input.associations) {
+          assert.equal(row.projectId, f.sourceProject.id);
+          assert.equal(row.active, false);
+          if (row.agentProfileId === f.managementProfile.id) {
+            assert.equal(row.revision, expectedRevisions.get(row.capabilityId));
+          }
+        }
         assert.deepEqual(input.runtimeIds, [f.source.id]);
         events.push("latched");
       },
@@ -682,6 +696,45 @@ test("ordinary pair invalidation fails closed without a denial latch and latches
     await new WorkspaceSettingsService(invalidation).updateProjectForUi(f.sourceProject.id, exclusion, true);
     assert.deepEqual(events, ["latched", "cleaned"]);
     assert.equal(getProject(f.sourceProject.id)?.default_agent_profile_id, replacement.id);
+  } finally { f.cleanup(); }
+});
+
+test("profile disable latches every derived Standard selector for affected runtimes", async () => {
+  const f = fixture("wayang-workspace-profile-disable-invalidation-");
+  try {
+    const replacement = createAgentProfile({ name: "Disable replacement default" });
+    await new WorkspaceSettingsService().updateProjectForUi(
+      f.sourceProject.id,
+      { default_agent_profile_id: replacement.id },
+      true,
+    );
+    const events: string[] = [];
+    const service = new WorkspaceSettingsService({
+      latchDenied(input) {
+        assert.deepEqual(input.associations
+          .filter((row) => row.agentProfileId === f.managementProfile.id)
+          .map((row) => row.capabilityId), [
+          "wayang.standard-resources.v1",
+          "wayang.standard-browser.v1",
+          "wayang.host-execution.v1",
+        ]);
+        assert.deepEqual(input.runtimeIds, [f.source.id]);
+        assert.ok(input.associations.every((row) => row.active === false));
+        events.push("latched");
+      },
+      async cleanupAfterDenial(input) {
+        assert.deepEqual(input.runtimeIds, [f.source.id]);
+        events.push("cleaned");
+      },
+    });
+    await service.updateAgentProfileForUi(
+      f.managementProfile.id,
+      { enabled: false },
+      undefined,
+      true,
+    );
+    assert.deepEqual(events, ["latched", "cleaned"]);
+    assert.equal(getStore().agentProfiles.find((row) => row.id === f.managementProfile.id)?.enabled, false);
   } finally { f.cleanup(); }
 });
 

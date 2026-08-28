@@ -423,7 +423,7 @@ test("actual concurrent sandboxes isolate an allowed Standard project from an un
   assert.equal(fs.readFileSync(path.join(projectB, "b-write.txt"), "utf8"), "ok");
 });
 
-test("sandbox global Pi visibility requires the live standard-resources pair association", (t) => {
+test("Standard sandbox global Pi visibility is derived from privacy and allowed profile", (t) => {
   close();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-sandbox-projection-"));
   const projectRoot = path.join(root, "project");
@@ -470,9 +470,8 @@ test("sandbox global Pi visibility requires the live standard-resources pair ass
   };
   const canonicalPiRoot = fs.realpathSync(getPiAgentRoot());
 
-  const unactivated = buildBashSandboxPolicy(session.id);
-  assert.ok(unactivated.deniedReadRoots.includes(canonicalPiRoot));
-  assert.deepEqual(unactivated.config.filesystem.allowRead, []);
+  const initial = buildBashSandboxPolicy(session.id);
+  assert.equal(initial.deniedReadRoots.includes(canonicalPiRoot), false);
 
   const association = commitWorkspaceCapabilityActivation({ ...binding, operation_digest: "a".repeat(64) });
   const exactProjection = getWorkspaceCapabilityStoreProjectionPath(binding);
@@ -486,8 +485,8 @@ test("sandbox global Pi visibility requires the live standard-resources pair ass
 
   revokeWorkspaceCapabilityAssociation({ ...binding, expected_revision: association.revision });
   const revoked = buildBashSandboxPolicy(session.id);
-  assert.ok(revoked.deniedReadRoots.includes(canonicalPiRoot));
-  assert.equal(revoked.config.filesystem.allowRead?.includes(exactProjection), false);
+  assert.equal(revoked.deniedReadRoots.includes(canonicalPiRoot), false, "legacy revocation is inert");
+  assert.ok(revoked.config.filesystem.allowRead?.includes(exactProjection));
 });
 
 test("only exact seeded Wren receives broad Standard compatibility, including scheduled runs", () => {

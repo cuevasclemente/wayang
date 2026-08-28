@@ -6,23 +6,20 @@ import {
   latchPiSessionCapabilityActivation,
   latchPiSessionCapabilityDenial,
 } from "./pi-bridge.js";
-import type { WorkspaceCapabilitiesRouterOptions } from "./routes/workspace-capabilities.js";
 import type {
   CapabilityActivationIntent,
   CapabilityAssociationRecord,
 } from "./workspace-capability-approval/types.js";
 import {
-  createWorkspaceCapabilityApprovalIntegration,
+  HardenedSettingsPinAttemptAdapter,
   provisionPinAttemptStateForService,
-  type HardenedSettingsPinAttemptAdapter,
+  WorkspaceCapabilityIntegration,
   type WorkspaceCapabilityRuntimeLifecyclePort,
 } from "./workspace-capability-integration.js";
 import { workspaceSettingsService } from "./workspace-settings-service.js";
 
 export interface ProductionWorkspaceCapabilityBootstrap {
-  /** Pass directly as createApp({ workspaceCapabilities: routerOptions }). */
-  routerOptions: WorkspaceCapabilitiesRouterOptions;
-  /** Shared durable PIN-attempt authority for other owner/Origin-bound Settings confirmations. */
+  /** Shared durable PIN-attempt authority for owner/Origin-bound confirmations. */
   pinAttempts: HardenedSettingsPinAttemptAdapter;
   /** Best-effort completion of runtime/browser cleanup begun by denial latches. */
   close(): Promise<void>;
@@ -73,10 +70,10 @@ class ProductionCapabilityRuntimeLifecycle implements WorkspaceCapabilityRuntime
 }
 
 /**
- * Compose the production Settings capability ports without activating anything.
- * The existing command-guard PIN remains external and is checked by metadata
- * only. Missing non-secret cooldown state is initialized owner-privately and
- * then persists across restarts; unsafe existing authority is never repaired.
+ * Compose shared owner-PIN attempts plus legacy-row denial cleanup. Per-pair
+ * capability activation/revocation is retired; Project privacy and RBAC derive
+ * live authority. Missing non-secret cooldown state is initialized privately
+ * for the remaining operation-specific confirmation flows.
  */
 export function createProductionWorkspaceCapabilityBootstrap(
   auth: AuthService,
@@ -90,28 +87,25 @@ export function createProductionWorkspaceCapabilityBootstrap(
   const pinAttemptStatePath = path.join(dataDir, "workspace-capability-approval", "pin-attempt-state.json");
   const provisioned = provisionPinAttemptStateForService(pinAttemptStatePath);
   if (provisioned.status === "unavailable") {
-    console.warn(`[workspace-capabilities] PIN approval remains unavailable (${provisioned.reason}); run make doctor and optionally make setup-capability-approval`);
+    console.warn(`[owner-pin] confirmation attempts remain unavailable (${provisioned.reason}); run make doctor and optionally make setup-owner-pin-confirmations`);
   }
   const lifecycle = new ProductionCapabilityRuntimeLifecycle();
-  const { integration, service, pinAttempts } = createWorkspaceCapabilityApprovalIntegration({
-    lifecycle,
+  const integration = new WorkspaceCapabilityIntegration(lifecycle);
+  const pinAttempts = new HardenedSettingsPinAttemptAdapter(
     pinAttemptStatePath,
     // A failed initialization stays unavailable for this process even if a
     // partial publication happens to look valid afterward. Restart performs a
     // fresh full validation; no request may bypass the startup decision.
-    pinAttemptReady: provisioned.status === "ready",
-  });
+    provisioned.status === "ready",
+  );
 
-  // Ordinary Settings mutations and dedicated revocation now share the exact
-  // same denial-first runtime port. Installation is intentionally one-way for
+  // Ordinary Settings mutations use the denial-first runtime port retained by
+  // the compatibility integration. Installation is intentionally one-way for
   // the process lifetime: production has one workspace settings service.
   workspaceSettingsService.installCapabilityInvalidationPort(integration);
 
+  void auth; // retained parameter keeps production bootstrap call sites stable.
   return {
-    routerOptions: {
-      service,
-      owners: { resolve: (request) => auth.resolveSettingsOwner(request) },
-    },
     pinAttempts,
     close: () => lifecycle.close(),
   };

@@ -12,7 +12,7 @@ import {
   getProjectRegistrationReferences,
   updateProject,
 } from "../projects.js";
-import { commitWorkspaceCapabilityActivation } from "../workspace-capabilities.js";
+import { commitWorkspaceCapabilityActivation, resolveWorkspaceCapability } from "../workspace-capabilities.js";
 import { WorkspaceSettingsService } from "../workspace-settings-service.js";
 import { captureProtectedAutomationSnapshot } from "./snapshots.js";
 import {
@@ -76,6 +76,9 @@ function fixture(withRun = false) {
     agent_profile_id: owner.id,
     operation_digest: "c".repeat(64),
   });
+  const authority = resolveWorkspaceCapability({ capability_id: "wayang.protected-automation.v1",
+    project_id: project.id, agent_profile_id: owner.id });
+  if (!authority.authorized) throw new Error("Derived authority unavailable");
   const jobId = randomUUID();
   const snapshot = captureFixtureSnapshot({
     projectRoot,
@@ -87,7 +90,7 @@ function fixture(withRun = false) {
     id: jobId,
     project_id: project.id,
     agent_profile_id: owner.id,
-    capability_revision: association.revision,
+    capability_revision: authority.association.revision,
     name: "Reference owner",
     source_manifest_sha256: snapshot.manifestSha256,
     entrypoint: snapshot.entrypoint,
@@ -164,7 +167,7 @@ test("privacy/allowlist incompatibility and profile disable persistently block w
   assert.equal(row.enabled, false);
   assert.equal(row.blocked_reason, "project_policy_incompatible");
   assert.equal(row.agent_profile_id, f.owner.id);
-  assert.equal(row.capability_revision, f.association.revision);
+  assert.equal(row.capability_revision, f.job.capability_revision);
 
   // A separate exact pair proves profile disable is also a durable denial and
   // never rewrites ownership through project/profile defaults.
@@ -182,6 +185,9 @@ test("privacy/allowlist incompatibility and profile disable persistently block w
       agent_profile_id: profile.id,
       operation_digest: "e".repeat(64),
     });
+    const authority = resolveWorkspaceCapability({ capability_id: "wayang.protected-automation.v1",
+      project_id: project.id, agent_profile_id: profile.id });
+    if (!authority.authorized) throw new Error("Derived authority unavailable");
     const jobId = randomUUID();
     const snapshot = captureFixtureSnapshot({
       projectRoot: otherRoot,
@@ -193,7 +199,7 @@ test("privacy/allowlist incompatibility and profile disable persistently block w
       id: jobId,
       project_id: project.id,
       agent_profile_id: profile.id,
-      capability_revision: association.revision,
+      capability_revision: authority.association.revision,
       name: "Disable reference",
       source_manifest_sha256: snapshot.manifestSha256,
       entrypoint: snapshot.entrypoint,

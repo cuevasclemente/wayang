@@ -111,7 +111,7 @@ test("trash is recoverable, reference-safe, and does not mutate profile bytes", 
   assert.equal(fs.readFileSync(sentinel, "utf8"), "do-not-read-or-change");
 });
 
-test("schema 5 to 7 migration preserves title provenance and inventories only expected profile directory metadata", () => {
+test("schema 5 to 8 migration preserves title provenance and inventories only expected profile directory metadata", () => {
   const agent = createAgentProfile({ name: "Migrated agent" });
   const project = createProject({ cwd: projectRoot, name: "Migrated project", default_agent_profile_id: agent.id });
   commitWorkspaceCapabilityActivation({
@@ -142,7 +142,7 @@ test("schema 5 to 7 migration preserves title provenance and inventories only ex
 
   init({ browserProfilesEnabled: true });
   const store = getStore();
-  assert.equal(store.schema_version, 7);
+  assert.equal(store.schema_version, 8);
   assert.deepEqual(store.browserProfiles.map((row) => row.storage_source.kind).sort(), ["legacy_shared", "standard_pair_v1"]);
   assert.deepEqual(store.projectBrowserDefaults, []);
   assert.deepEqual(store.sessionBrowserStates, []);

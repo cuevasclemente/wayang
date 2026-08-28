@@ -36,19 +36,10 @@ function currentPolicyFingerprint(): string {
       allowed_extensions: profile.allowed_extensions ? [...profile.allowed_extensions].sort() : null,
     }))
     .sort((a, b) => a.id.localeCompare(b.id));
-  const associations = store.workspaceCapabilityAssociations
-    .map((association) => ({
-      project_id: association.project_id,
-      agent_profile_id: association.agent_profile_id,
-      capability_id: association.capability_id,
-      revision: association.revision,
-      active: association.active,
-    }))
-    .sort((a, b) => a.project_id.localeCompare(b.project_id)
-      || a.agent_profile_id.localeCompare(b.agent_profile_id)
-      || a.capability_id.localeCompare(b.capability_id));
-  // Approval events are audit-only and deliberately cannot affect live policy.
-  return createHash("sha256").update(JSON.stringify({ projects, profiles, associations })).digest("hex");
+  // Legacy capability associations and PIN events are inert migration data.
+  // Project privacy plus enabled/allowed profile state are the complete live
+  // authority inputs.
+  return createHash("sha256").update(JSON.stringify({ projects, profiles })).digest("hex");
 }
 
 function reportPolicyListenerFailure(): void {
