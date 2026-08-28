@@ -21,7 +21,7 @@ Clemente chose a session-row **Generate title** action beside Archive/Delete usi
 - Existing session runtime projection: 4/4 passed.
 - Frontend tests: 4/4 passed.
 - Focused Playwright Generate title flow: 1/1 passed.
-- Backend aggregate under synthetic-compatible operational flags: 1092 passed, 0 failed, 6 skipped.
+- Post-merge backend aggregate under synthetic-compatible operational flags: 1106 passed, 0 failed, 6 skipped.
 - Backend and frontend TypeScript/production builds passed.
 - Frontend lint: 0 errors, one pre-existing Fast Refresh warning.
 
