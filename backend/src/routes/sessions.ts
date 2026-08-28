@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createSession, listSessions, syncPiSessionFiles, persistManualSessionTitle, archiveSession, deleteSession, getSessionById, updateGoal, getSessionCatalogGeneration, getSessionCatalogStatus, onSessionCatalogGeneration, validateManualSessionTitle, type SessionRow } from "../sessions.js";
-import { classifyAssistantErrorKind, getPiSession, getPiSessionBashMode, getPiSessionBrowserAgentDiagnostic, getPiSessionBrowserMode, getPiSessionRuntimeState, listModels, listSlashCommands, previewSessionAgentSwitch, setSessionDefaultModel, setSessionModel, stopPiSession, switchSessionAgent } from "../pi-bridge.js";
+import { classifyAssistantErrorKind, getPiSession, getPiSessionBashMode, getPiSessionBrowserAgentDiagnostic, getPiSessionBrowserMode, getPiSessionRuntimeState, getRuntimeMutationSessionState, invalidateSessionFileSnapshot, listModels, listSlashCommands, previewSessionAgentSwitch, setSessionDefaultModel, setSessionModel, stopPiSession, switchSessionAgent } from "../pi-bridge.js";
 import {
   indexSession as forceIndexSession,
   removeSession as removeSearchSession,
@@ -17,6 +17,13 @@ import {
 import { validateSessionDeletionPinAttempt } from "../transcript-mutations.js";
 import { invalidateTranscriptPaginationSession } from "../transcript-pagination/service.js";
 import { classifySessionPrivacy } from "../session-interop.js";
+import {
+  cancelManualTitleGeneration,
+  enqueueManualTitleGeneration,
+  getManualTitleGeneration,
+  ManualTitleGenerationError,
+  type ManualTitleGenerationProjection,
+} from "../manual-title-generation.js";
 
 export const router = Router();
 
@@ -26,6 +33,7 @@ type SessionResponse = ProtocolSession & SessionRow & ReturnType<typeof getPiSes
   browser_agent: ReturnType<typeof getPiSessionBrowserAgentDiagnostic>;
   error_kind: ReturnType<typeof classifyAssistantErrorKind>;
   humanAttention: HumanAttentionSummary[];
+  title_generation: ManualTitleGenerationProjection;
 };
 
 /** @internal Exported for focused response-projection tests. */
@@ -42,6 +50,7 @@ export function serializeSession(session: SessionRow): SessionResponse {
     browser_agent: getPiSessionBrowserAgentDiagnostic(session.id, session),
     error_kind: classifyAssistantErrorKind(error),
     humanAttention: listHumanAttentionForSession(session.id),
+    title_generation: getManualTitleGeneration(session.id),
   };
 }
 
@@ -218,10 +227,57 @@ router.put("/sessions/:id/title", (req: Request, res: Response) => {
         ? (name: string) => writeStoppedPiSessionName(session, name)
         : undefined;
     persistManualSessionTitle(session.id, title, writePiName);
+    cancelManualTitleGeneration(session.id, "title_changed");
     res.status(204).end();
   } catch (err: any) {
     res.status(err?.statusCode || 500).json({ error: err?.message || String(err) });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Explicit Terra title generation
+// ---------------------------------------------------------------------------
+
+function manualTitleGenerationBusy(sessionId: string): boolean {
+  const mutation = getRuntimeMutationSessionState(sessionId);
+  const runtime = getPiSessionRuntimeState(sessionId);
+  return mutation.runtime_status === "starting"
+    || mutation.streaming
+    || mutation.queued
+    || mutation.mutation_locked
+    || runtime.runtime_is_compacting;
+}
+
+router.post("/sessions/:id/title-generation", (req: Request, res: Response) => {
+  try {
+    if (typeof req.body?.expected_title !== "string") {
+      res.status(400).json({ error: "expected_title is required", code: "invalid_request" });
+      return;
+    }
+    const result = enqueueManualTitleGeneration(
+      req.params.id,
+      { expectedTitle: req.body.expected_title },
+      {
+        isBusy: manualTitleGenerationBusy,
+        onCommitted: invalidateSessionFileSnapshot,
+      },
+    );
+    res.status(202).json(result);
+  } catch (err: any) {
+    if (err instanceof ManualTitleGenerationError) {
+      res.status(err.statusCode).json({ error: err.message, code: err.code });
+      return;
+    }
+    res.status(500).json({ error: "Title generation could not be queued", code: "title_generation_failed" });
+  }
+});
+
+router.get("/sessions/:id/title-generation", (req: Request, res: Response) => {
+  if (!getSessionById(req.params.id)) {
+    res.status(404).json({ error: "Session not found", code: "session_not_found" });
+    return;
+  }
+  res.json(getManualTitleGeneration(req.params.id));
 });
 
 // ---------------------------------------------------------------------------
@@ -239,6 +295,7 @@ router.delete("/sessions/:id", async (req: Request, res: Response) => {
       res.status(409).json({ error: "Session transcript mutation is in progress" });
       return;
     }
+    cancelManualTitleGeneration(session.id);
     archiveSession(req.params.id);
     await stopPiSession(req.params.id, { kind: "close_session", reason: "archive" });
     res.status(204).end();
@@ -301,6 +358,7 @@ router.post("/sessions/:id/delete", async (req: Request, res: Response) => {
         return;
       }
 
+      cancelManualTitleGeneration(session.id);
       await stopPiSession(req.params.id, { kind: "close_session", reason: "session_delete" });
       await removeSearchSession(req.params.id);
       let deleted: ReturnType<typeof deleteSession>;
