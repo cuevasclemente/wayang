@@ -15,6 +15,7 @@ import { createProject, deleteProjectRegistration, getProject, getProjectRegistr
 import { createSession } from "./sessions.js";
 import { lockRuntimeMutationSession, unlockRuntimeMutationSession } from "./pi-bridge.js";
 import { WorkspaceSettingsService, type WorkspaceCapabilityInvalidationPort } from "./workspace-settings-service.js";
+import { createWorkspaceToolDefinitions } from "./workspace-tools.js";
 import { commitWorkspaceCapabilityActivation } from "./workspace-capabilities.js";
 import {
   canonicalizeWorkspaceMutation,
@@ -24,6 +25,7 @@ import {
   workspaceSha256,
   type WorkspaceApprovalPreview,
   type WorkspaceMutationEnvelope,
+  WAYANG_WORKSPACE_CHANGE_TOOL_NAME,
 } from "./workspace-control.js";
 
 function fixture(name: string) {
@@ -144,6 +146,74 @@ test("exact server-issued preview and WebSocket approval succeeds, is redacted, 
       submissionId,
       expiresAt: preview.expires_at,
     }), /already exists/);
+  } finally { f.cleanup(); }
+});
+
+test("separate tool calls retain an issued profile preview across unrelated referenced-session activity", async () => {
+  const f = fixture("wayang-workspace-tool-preview-lifecycle-");
+  try {
+    const service = new WorkspaceSettingsService();
+    const targetProfile = createAgentProfile({ name: "Tool Boundary Target" });
+    const targetCwd = path.join(f.dir, "tool-boundary-target");
+    fs.mkdirSync(targetCwd);
+    createProject({ cwd: targetCwd, default_agent_profile_id: targetProfile.id });
+    const referencedSession = createSession(targetCwd, { agentProfileId: targetProfile.id });
+    const proposal = {
+      mutation_type: "agent_profile_update",
+      mutation: { id: targetProfile.id, updates: { description: "approved across tool calls" } },
+    };
+    const previewTool = createWorkspaceToolDefinitions({ sourceSessionId: f.source.id, service })
+      .find((tool) => tool.name === WAYANG_WORKSPACE_CHANGE_TOOL_NAME)!;
+    const previewResult = await (previewTool.execute as any)("preview-call", { mode: "preview", proposal });
+    const preview = JSON.parse(previewResult.content[0].text) as WorkspaceApprovalPreview;
+    const submissionId = approve(f.source.id, preview, "tool-boundary-approval");
+
+    // Transcript/catalog reconciliation may update these ordinary session
+    // projection fields while the owner answers the questionnaire. None changes
+    // which profile the session references or the approved mutation's effect.
+    const storedSession = getStore().sessions.find((row) => row.id === referencedSession.id)!;
+    storedSession.last_active += 1;
+    storedSession.catalog_mutation_version = (storedSession.catalog_mutation_version ?? 0) + 1;
+    storedSession.title = "Unrelated catalog title";
+
+    const commitTool = createWorkspaceToolDefinitions({ sourceSessionId: f.source.id, service })
+      .find((tool) => tool.name === WAYANG_WORKSPACE_CHANGE_TOOL_NAME)!;
+    const commitResult = await (commitTool.execute as any)("commit-call", {
+      mode: "commit",
+      proposal,
+      request_id: "tool-boundary-approval",
+      submission_id: submissionId,
+      expires_at: preview.expires_at,
+    });
+    const committed = JSON.parse(commitResult.content[0].text);
+    assert.equal(committed.mutation_type, "agent_profile_update");
+    assert.equal(getStore().agentProfiles.find((profile) => profile.id === targetProfile.id)?.description, "approved across tool calls");
+  } finally { f.cleanup(); }
+});
+
+test("genuine profile-reference topology drift still invalidates an issued approval", async () => {
+  const f = fixture("wayang-workspace-profile-reference-drift-");
+  try {
+    const service = new WorkspaceSettingsService();
+    const targetProfile = createAgentProfile({ name: "Reference Drift Target" });
+    const proposal = {
+      mutation_type: "agent_profile_update",
+      mutation: { id: targetProfile.id, updates: { description: "must remain uncommitted" } },
+    };
+    const preview = service.previewAgentMutation(f.source.id, proposal);
+    const submissionId = approve(f.source.id, preview, "profile-reference-drift");
+    const newReferenceCwd = path.join(f.dir, "new-reference");
+    fs.mkdirSync(newReferenceCwd);
+    createProject({ cwd: newReferenceCwd, default_agent_profile_id: targetProfile.id });
+
+    await assert.rejects(() => service.commitAgentMutation({
+      sourceSessionId: f.source.id,
+      raw: proposal,
+      requestId: "profile-reference-drift",
+      submissionId,
+      expiresAt: preview.expires_at,
+    }), /server-issued preview|state changed/);
+    assert.equal(getStore().agentProfiles.find((profile) => profile.id === targetProfile.id)?.description, null);
   } finally { f.cleanup(); }
 });
 

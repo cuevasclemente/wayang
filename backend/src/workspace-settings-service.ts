@@ -176,30 +176,48 @@ function canonicalProfileState(profile: AgentProfileRow): AgentProfileRow {
   };
 }
 
+// Bind the reference topology that can change profile update/delete semantics,
+// not volatile display/runtime fields on the referenced rows. Transcript and
+// catalog activity must not invalidate an otherwise exact human approval.
 function profileReferences(id: string): unknown {
   const store = getStore();
+  const byId = <T extends { id: string }>(a: T, b: T) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   return {
     workspace_default: store.workspaceSettings.default_agent_profile_id === id,
     projects: store.projects
       .filter((project) => project.default_agent_profile_id === id || project.access_policy.allowed_agent_profile_ids?.includes(id))
-      .map(canonicalProjectState)
-      .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+      .map((project) => ({
+        id: project.id,
+        default_agent_profile_id: project.default_agent_profile_id,
+        allowed_agent_profile_ids: project.access_policy.allowed_agent_profile_ids
+          ? [...project.access_policy.allowed_agent_profile_ids].sort()
+          : null,
+      }))
+      .sort(byId),
     sessions: store.sessions
       .filter((session) => session.agent_profile_id === id || session.pending_agent_switch?.from_agent_profile_id === id || session.pending_agent_switch?.to_agent_profile_id === id)
-      .map((session) => structuredClone(session))
-      .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+      .map((session) => ({
+        id: session.id,
+        agent_profile_id: session.agent_profile_id ?? null,
+        pending_agent_switch: session.pending_agent_switch ? {
+          switch_id: session.pending_agent_switch.switch_id,
+          from_agent_profile_id: session.pending_agent_switch.from_agent_profile_id,
+          to_agent_profile_id: session.pending_agent_switch.to_agent_profile_id,
+        } : null,
+      }))
+      .sort(byId),
     scheduled_jobs: store.scheduledJobs
       .filter((job) => job.agent_profile_id === id)
-      .map((job) => structuredClone(job))
-      .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+      .map((job) => ({ id: job.id, agent_profile_id: job.agent_profile_id }))
+      .sort(byId),
     protected_automation_jobs: store.protectedAutomationJobs
       .filter((job) => job.agent_profile_id === id)
-      .map((job) => structuredClone(job))
-      .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+      .map((job) => ({ id: job.id, agent_profile_id: job.agent_profile_id }))
+      .sort(byId),
     protected_automation_runs: store.protectedAutomationRuns
       .filter((run) => run.agent_profile_id === id)
-      .map((run) => structuredClone(run))
-      .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+      .map((run) => ({ id: run.id, agent_profile_id: run.agent_profile_id }))
+      .sort(byId),
   };
 }
 
