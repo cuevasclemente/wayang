@@ -36,6 +36,28 @@ test("title policy counts only marked terminal exchanges and sends only first-th
   assert.doesNotMatch(projection.boundedInput, /private|never|raw user 5|decorated user/);
 });
 
+test("transient assistant errors preserve a later recovered terminal response", () => {
+  const userId = "recovered-user";
+  const entries = [
+    { type: "message", id: userId, message: { role: "user", content: "decorated recovered user" } },
+    { type: "message", id: "before-error", message: { role: "assistant", content: [{ type: "text", text: "before error" }], stopReason: "toolUse" } },
+    { type: "message", id: "transient-error", message: { role: "assistant", content: [{ type: "text", text: "provider failure detail" }], stopReason: "error" } },
+    { type: "message", id: "after-error", message: { role: "assistant", content: [{ type: "text", text: "after recovery" }], stopReason: "toolUse" } },
+    { type: "message", id: "recovered-stop", message: { role: "assistant", content: [{ type: "text", text: "final response" }], stopReason: "stop" } },
+    { type: "custom", id: "recovered-marker", customType: WAYANG_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE, data: { user_entry_id: userId, raw_user_text: "raw recovered user", accepted_at: 1, client_message_id: "recovered-client" } },
+  ];
+
+  const projection = extractCompletedTitleExchanges(entries);
+  assert.ok(projection);
+  assert.equal(projection.completedExchangeCount, 1);
+  assert.deepEqual(projection.firstThree, [{
+    userEntryId: userId,
+    userText: "raw recovered user",
+    assistantText: "before error\nafter recovery\nfinal response",
+  }]);
+  assert.doesNotMatch(projection.boundedInput, /provider failure detail/);
+});
+
 test("accepted browser text builds the standard bounded title request before settlement", () => {
   const projection = acceptedTurnTitleProjection("browser-message-1", "first accepted browser request");
   assert.ok(projection);

@@ -89,6 +89,48 @@ function appendExchange(manager: SessionManager, index: number): void {
   });
 }
 
+function appendFailedExchange(manager: SessionManager, index: number): void {
+  const userEntryId = manager.appendMessage({ role: "user", content: `decorated ${index}`, timestamp: Date.now() } as any);
+  manager.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: `failed assistant ${index}` }],
+    provider: "synthetic",
+    model: "synthetic",
+    stopReason: "error",
+    timestamp: Date.now(),
+  } as any);
+  manager.appendCustomEntry(WAYANG_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE, {
+    user_entry_id: userEntryId,
+    raw_user_text: `raw ${index}`,
+    accepted_at: index,
+    client_message_id: `manual-title-${index}`,
+  });
+}
+
+function appendRecoveredExchange(manager: SessionManager, index: number): void {
+  const userEntryId = manager.appendMessage({ role: "user", content: `decorated ${index}`, timestamp: Date.now() } as any);
+  for (const [text, stopReason] of [
+    [`checkpoint ${index}`, "toolUse"],
+    ["", "error"],
+    [`recovered ${index}`, "stop"],
+  ] as const) {
+    manager.appendMessage({
+      role: "assistant",
+      content: text ? [{ type: "text", text }] : [],
+      provider: "synthetic",
+      model: "synthetic",
+      stopReason,
+      timestamp: Date.now(),
+    } as any);
+  }
+  manager.appendCustomEntry(WAYANG_INTERACTIVE_TURN_SOURCE_CUSTOM_TYPE, {
+    user_entry_id: userEntryId,
+    raw_user_text: `raw ${index}`,
+    accepted_at: index,
+    client_message_id: `manual-title-${index}`,
+  });
+}
+
 class FakeProvider implements TitleProvider {
   prepareCalls = 0;
   dispatchCalls = 0;
@@ -173,6 +215,43 @@ test("only the first three completed exchanges are disclosed", async () => {
     assert.match(fake.inputs[0]!, /raw 2/);
     assert.match(fake.inputs[0]!, /raw 3/);
     assert.doesNotMatch(fake.inputs[0]!, /raw 4|private|decorated/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("transient assistant errors remain eligible when the same turn recovers", async () => {
+  const f = fixture();
+  try {
+    appendRecoveredExchange(f.manager, 1);
+    const fake = new FakeProvider(() => "Recovered exchange title");
+    setManualTitleProviderForTests(fake);
+    enqueueManualTitleGeneration(f.rowId, { expectedTitle: "" }, f.dependencies);
+    await runManualTitleGenerationNowForTests(f.rowId);
+
+    assert.equal(getManualTitleGeneration(f.rowId).state, "completed");
+    assert.equal(fake.dispatchCalls, 1);
+    assert.match(fake.inputs[0]!, /raw 1/);
+    assert.match(fake.inputs[0]!, /checkpoint 1\s+recovered 1/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a failed first exchange does not block the earliest completed exchange", async () => {
+  const f = fixture();
+  try {
+    appendFailedExchange(f.manager, 1);
+    appendExchange(f.manager, 2);
+    const fake = new FakeProvider(() => "Later completed title");
+    setManualTitleProviderForTests(fake);
+    enqueueManualTitleGeneration(f.rowId, { expectedTitle: "" }, f.dependencies);
+    await runManualTitleGenerationNowForTests(f.rowId);
+
+    assert.equal(getManualTitleGeneration(f.rowId).state, "completed");
+    assert.equal(fake.dispatchCalls, 1);
+    assert.match(fake.inputs[0]!, /raw 2/);
+    assert.doesNotMatch(fake.inputs[0]!, /raw 1|failed assistant 1/);
   } finally {
     f.cleanup();
   }

@@ -25,6 +25,14 @@ Clemente chose a session-row **Generate title** action beside Archive/Delete usi
 - Backend and frontend TypeScript/production builds passed.
 - Frontend lint: 0 errors, one pre-existing Fast Refresh warning.
 
+## Live recovered-turn regression
+
+The first live attempt on session `80b41740-1768-459d-93de-6de01e77e7e9` failed with `title_input_unavailable` despite a substantial transcript. Structural inspection found transient Together assistant `error` entries inside turns that later recovered to terminal `stop` responses. The extractor discarded the user witness at each transient error, and the explicit service additionally required the earliest eligible exchange to be the first physical user message.
+
+The repair keeps an authenticated user witness across assistant error/abort entries until the same turn recovers or a later user supersedes it, excludes provider-error payloads from title prose, and lets irrecoverably failed early turns yield to the earliest completed exchange. Browser provenance, bounded disclosure, active-branch revalidation, and title CAS remain unchanged.
+
+Regression validation: focused policy/manual generation tests 17/17; the affected physical transcript now projects three eligible completed exchanges; backend build passed. The aggregate backend run reached 1108 passed, 1 failed, 6 skipped; the sole exact-tool-set failure was reproduced unchanged on base `main` and was caused by the live memory-review tool injection, outside this title patch.
+
 ## Operational note
 
-The queue has no persistent schema and is lost on service restart by design. Deployment requires integration, production build, restart, and live verification.
+The queue has no persistent schema and is lost on service restart by design. Deployment of the recovered-turn repair requires integration, production build, restart, and a confirmed retry on the affected session.

@@ -128,9 +128,15 @@ export function extractCompletedTitleExchanges(
       continue;
     }
     if (message.role !== "assistant" || !current) continue;
+    const stopReason = message.stopReason;
+    if (stopReason === "error" || stopReason === "aborted") {
+      // A provider failure can be followed by an automatic recovery in the
+      // same logical turn. Preserve the user witness, but never disclose error
+      // payloads as assistant conversation prose.
+      continue;
+    }
     const text = titleTextBlocks(message.content);
     if (text) current.assistant.push(text);
-    const stopReason = message.stopReason;
     if (stopReason === "stop" || stopReason === "length") {
       completed.push({
         userEntryId: current.userEntryId,
@@ -138,8 +144,6 @@ export function extractCompletedTitleExchanges(
         assistantText: current.assistant.join("\n"),
       });
       legacySourceUsed ||= current.legacy;
-      current = null;
-    } else if (stopReason === "error" || stopReason === "aborted") {
       current = null;
     }
   }

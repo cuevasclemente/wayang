@@ -162,9 +162,8 @@ function readPhysicalCandidate(
     if (manager.getSessionId() !== witness.sessionId || manager.getHeader()?.cwd !== witness.cwd) return null;
     const branch = manager.getBranch();
     const entries = branch.length > 0 ? branch : manager.getEntries();
-    const firstPhysicalUser = entries.find((entry: any) => entry?.type === "message" && entry.message?.role === "user");
     const projection = extractCompletedTitleExchanges(entries, { allowSafeLegacyUserText: true });
-    if (!projection || !firstPhysicalUser || projection.firstThree[0]?.userEntryId !== firstPhysicalUser.id) return null;
+    if (!projection) return null;
     const nameState = manager.getSessionNameState();
     if (!physicalNameMatchesWitness(witness, nameState)) return null;
     if (expected && (
