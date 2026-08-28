@@ -14,6 +14,7 @@ import {
   Plus,
   Search,
   Settings,
+  Sparkles,
   Square,
   Trash2,
   X,
@@ -25,6 +26,8 @@ import {
   canRetryAuthenticatedTransport,
   deleteSession,
   fetchProjects,
+  generateSessionTitle,
+  getSessionTitleGeneration,
   listProtectedAutomations,
   listScheduledAgentJobs,
   listSessions,
@@ -32,6 +35,7 @@ import {
   searchSessions,
   stopSession,
   updateSessionTitle,
+  type ManualTitleGenerationProjection,
   type Project,
   type ProtectedAutomationCatalog,
   type ScheduledAgentJob,
@@ -114,6 +118,9 @@ function sessionListsEqual(a: Session[], b: Session[]): boolean {
       || left.runtime_subscriber_count !== right.runtime_subscriber_count
       || left.runtime_last_activity_at !== right.runtime_last_activity_at
       || left.bash_mode !== right.bash_mode
+      || left.title_generation?.request_id !== right.title_generation?.request_id
+      || left.title_generation?.state !== right.title_generation?.state
+      || left.title_generation?.updated_at !== right.title_generation?.updated_at
       || !attentionListsEqual(left.humanAttention, right.humanAttention)
     ) return false;
   }
@@ -191,6 +198,9 @@ export function SessionsPanel({
   const [deletePin, setDeletePin] = useState("");
   const [deleteSubmitting, setDeleteSubmitting] = useState(false);
   const [deleteError, setDeleteError] = useState("");
+  const [titleGenerations, setTitleGenerations] = useState<Record<string, ManualTitleGenerationProjection>>({});
+  const [titleGenerationNotice, setTitleGenerationNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const titlePollRequestsRef = useRef(new Map<string, string>());
 
   const projectListSessions = useMemo(
     () => (showScheduledProjectRuns
@@ -514,6 +524,67 @@ export function SessionsPanel({
     [creatingProjectCwd, onNewSessionForProject],
   );
 
+  const pollTitleGeneration = useCallback(async (sessionId: string, requestId: string) => {
+    titlePollRequestsRef.current.set(sessionId, requestId);
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      if (titlePollRequestsRef.current.get(sessionId) !== requestId) return;
+      try {
+        const status = await getSessionTitleGeneration(sessionId);
+        if (status.request_id && status.request_id !== requestId) return;
+        setTitleGenerations((previous) => ({ ...previous, [sessionId]: status }));
+        if (status.state === "queued" || status.state === "running") continue;
+        titlePollRequestsRef.current.delete(sessionId);
+        if (status.state === "completed") {
+          await refresh(true);
+          setTitleGenerationNotice({ kind: "success", text: `Generated title: ${status.title ?? "complete"}` });
+        } else if (status.state === "idle") {
+          setTitleGenerationNotice({ kind: "error", text: "Queued title generation was lost when Wayang restarted." });
+        } else {
+          setTitleGenerationNotice({ kind: "error", text: status.message || "Title generation failed." });
+        }
+        return;
+      } catch (err) {
+        titlePollRequestsRef.current.delete(sessionId);
+        setTitleGenerationNotice({
+          kind: "error",
+          text: `Title status failed: ${err instanceof ApiError ? err.message || `HTTP ${err.status}` : String(err)}`,
+        });
+        return;
+      }
+    }
+  }, [refresh]);
+
+  const handleGenerateTitle = useCallback(async (session: Session) => {
+    const currentTitle = session.title.trim();
+    const replacement = currentTitle ? `replace “${currentTitle}”` : "name this untitled session";
+    if (!window.confirm(
+      `Generate a title with openai-codex/gpt-5.6-terra and ${replacement}?\n\n`
+      + "This sends bounded prose from the first one to three completed turns to Terra. "
+      + "A newer title change will win instead of being overwritten.",
+    )) return;
+    setTitleGenerationNotice(null);
+    try {
+      const status = await generateSessionTitle(session.id, session.title);
+      setTitleGenerations((previous) => ({ ...previous, [session.id]: status }));
+      if (status.state === "queued" || status.state === "running") {
+        if (status.request_id) void pollTitleGeneration(session.id, status.request_id);
+        return;
+      }
+      if (status.state === "completed") {
+        await refresh(true);
+        setTitleGenerationNotice({ kind: "success", text: `Generated title: ${status.title ?? "complete"}` });
+      } else {
+        setTitleGenerationNotice({ kind: "error", text: status.message || "Title generation failed." });
+      }
+    } catch (err) {
+      setTitleGenerationNotice({
+        kind: "error",
+        text: `Generate title failed: ${err instanceof ApiError ? err.message || `HTTP ${err.status}` : String(err)}`,
+      });
+    }
+  }, [pollTitleGeneration, refresh]);
+
   const handleArchive = useCallback(
     async (id: string) => {
       if (!window.confirm("Archive this session?")) return;
@@ -745,6 +816,29 @@ export function SessionsPanel({
         )}
       </div>
 
+      {titleGenerationNotice && (
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="session-title-generation-notice"
+          className={`mx-3 mt-2 flex items-start justify-between gap-2 rounded border px-2 py-1.5 text-[11px] ${
+            titleGenerationNotice.kind === "success"
+              ? "border-emerald-900/70 bg-emerald-950/30 text-emerald-200"
+              : "border-red-900/70 bg-red-950/30 text-red-200"
+          }`}
+        >
+          <span>{titleGenerationNotice.text}</span>
+          <button
+            type="button"
+            onClick={() => setTitleGenerationNotice(null)}
+            className="shrink-0 rounded p-0.5 text-current opacity-70 hover:opacity-100"
+            aria-label="Dismiss title generation notice"
+          >
+            <X size={11} />
+          </button>
+        </div>
+      )}
+
       <div className="flex-1 overflow-y-auto">
         <ScheduledJobsSection
           jobs={scheduledJobs}
@@ -850,6 +944,8 @@ export function SessionsPanel({
                         onArchive={handleArchive}
                         onDelete={openDeleteDialog}
                         onStop={handleStop}
+                        onGenerateTitle={handleGenerateTitle}
+                        titleGeneration={titleGenerations[session.id] ?? session.title_generation}
                         onTitleChanged={refresh}
                       />
                     ))}
@@ -1368,6 +1464,8 @@ interface SessionRowProps {
   onArchive: (id: string) => void;
   onDelete: (session: Session) => void;
   onStop: (id: string) => void;
+  onGenerateTitle: (session: Session) => void;
+  titleGeneration?: ManualTitleGenerationProjection;
   onTitleChanged: () => void;
 }
 
@@ -1378,6 +1476,8 @@ function SessionRow({
   onArchive,
   onDelete,
   onStop,
+  onGenerateTitle,
+  titleGeneration,
   onTitleChanged,
 }: SessionRowProps) {
   const displayTitle =
@@ -1394,6 +1494,8 @@ function SessionRow({
     : session.runtime_is_streaming
       ? "running"
       : "active";
+  const titleGenerationPending = titleGeneration?.state === "queued" || titleGeneration?.state === "running";
+  const titleGenerationDisabled = titleGenerationPending || !session.pi_session_file || session.archived !== 0;
 
   const startEditing = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -1513,6 +1615,22 @@ function SessionRow({
             <Square size={12} />
           </button>
         )}
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onGenerateTitle(session);
+          }}
+          disabled={titleGenerationDisabled}
+          className="rounded p-1 text-neutral-500 hover:bg-neutral-800 hover:text-violet-300 disabled:cursor-not-allowed disabled:opacity-40"
+          title={titleGenerationPending ? "Title generation queued or running" : "Generate title from the first three turns"}
+          aria-label={titleGenerationPending ? "Generating session title" : "Generate session title"}
+          data-testid="generate-session-title"
+        >
+          {titleGenerationPending
+            ? <Loader2 size={12} className="animate-spin" />
+            : <Sparkles size={12} />}
+        </button>
         <button
           type="button"
           onClick={(e) => {
