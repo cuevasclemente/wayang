@@ -39,6 +39,13 @@ import {
   resolveWorkspaceCapability,
   type WorkspaceCapabilityResolution,
 } from "./workspace-capabilities.js";
+import {
+  createMemoryFirstCompactionExtension,
+  DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
+  MEMORY_REVIEW_COMPLETE_TOOL_NAME,
+  type MemoryFirstCompactionConfig,
+  type MemoryFirstExecutionMode,
+} from "./memory-first-compaction.js";
 
 export const STANDARD_RESOURCES_CAPABILITY_ID = "wayang.standard-resources.v1" as const;
 
@@ -224,6 +231,9 @@ export function authorizeAgentToolCall(options: {
   }
   if (toolName === FILE_AUDIO_EXPERIMENT_TOOL_NAME) {
     return { allowed: false, reason: "The file-audio experiment requires its exact source-bound runtime object" };
+  }
+  if (toolName === MEMORY_REVIEW_COMPLETE_TOOL_NAME) {
+    return { allowed: true };
   }
 
   // These SDK-injected tools are immutable, read-only, and source-session-bound.
@@ -845,9 +855,28 @@ export async function buildAgentResourceLoader(options: {
   project: ProjectRow;
   sourceSessionId?: string;
   forceInMemorySettings?: boolean;
+  memoryFirstCompaction?: MemoryFirstCompactionConfig;
+  /** Explicit future coordinator seam; current Wayang Pi sessions derive interactive/scheduled. */
+  executionMode?: MemoryFirstExecutionMode;
 }): Promise<AgentResourceLoaderResult> {
   const communicationAppendix = interactiveCommunicationAppendix(options.sourceSessionId);
   const profileInstructions = options.agentProfile.instructions;
+  const memoryFirstCompaction = options.memoryFirstCompaction ?? DISABLED_MEMORY_FIRST_COMPACTION_CONFIG;
+  const sourceRow = options.sourceSessionId ? getSessionById(options.sourceSessionId) : undefined;
+  if (memoryFirstCompaction.enabled && (!options.sourceSessionId || !sourceRow)) {
+    throw new Error("Memory-first compaction requires an exact durable source session");
+  }
+  const executionMode: MemoryFirstExecutionMode = options.executionMode
+    ?? (sourceRow && (sourceRow.scheduled_job_id !== null || sourceRow.scheduled_run_id !== null) ? "scheduled" : "interactive");
+  const memoryFirstExtensionEnabled = memoryFirstCompaction.guidanceEnabled
+    || memoryFirstCompaction.reviewEnabled || memoryFirstCompaction.ledgerEnabled;
+  const memoryFirstFactory = memoryFirstExtensionEnabled && options.sourceSessionId
+    ? createMemoryFirstCompactionExtension({
+        privacyMode: options.project.access_policy.privacy_mode,
+        executionMode,
+        memoryAccess: options.agentProfile.memory_access,
+      }, memoryFirstCompaction)
+    : undefined;
   const standardResourcesWitness = options.sourceSessionId
     ? resolveCurrentStandardResourcesWitness({
         sourceSessionId: options.sourceSessionId,
@@ -857,6 +886,7 @@ export async function buildAgentResourceLoader(options: {
     : undefined;
   const restricted = !standardResourcesWitness;
   let settingsManager = restricted || options.forceInMemorySettings
+    || (memoryFirstCompaction.enabled && memoryFirstCompaction.compactionControlsEnabled)
     ? createInMemorySettingsSnapshot(options.cwd, options.agentDir)
     : SettingsManager.create(options.cwd, options.agentDir);
 
@@ -865,6 +895,7 @@ export async function buildAgentResourceLoader(options: {
       cwd: options.cwd,
       agentDir: options.agentDir,
       settingsManager,
+      extensionFactories: memoryFirstFactory ? [memoryFirstFactory] : undefined,
       appendSystemPromptOverride: (base) => [
         ...base,
         ...(profileInstructions ? [profileInstructions] : []),
@@ -901,6 +932,7 @@ export async function buildAgentResourceLoader(options: {
     cwd: options.cwd,
     agentDir: options.agentDir,
     settingsManager,
+    extensionFactories: memoryFirstFactory ? [memoryFirstFactory] : undefined,
     noContextFiles: true,
     agentsFilesOverride: () => ({ agentsFiles: exactProjectAgentsFile(options.cwd) }),
     systemPromptOverride: () => undefined,
@@ -918,6 +950,8 @@ export async function buildAgentResourceLoader(options: {
     resourceLoader,
     settingsManager,
     restricted: true,
-    tools: [...reviewed],
+    tools: memoryFirstCompaction.reviewEnabled
+      ? [...new Set([...reviewed, MEMORY_REVIEW_COMPLETE_TOOL_NAME])]
+      : [...reviewed],
   };
 }
