@@ -43,6 +43,12 @@ Broad mypi deployment is deferred until Clemente chooses whether consolidation i
 
 Clemente starts or selects a Loom-owned Wayang session on Tribe-Mac and directs it to execute plan M0, then M1–M3 only if each gate passes. Loom returns exact versions, commits, hashes, backup paths, validation results, and blockers without protected content. M4 mypi deployment remains blocked pending clean release consolidation and scope confirmation.
 
+## Returned Loom preflight
+
+Loom correctly refused to substitute an older Wren-neutralization procedure when the authoritative M0–M4 plan was missing from its session. It reported Pi `0.84.1`, Node `v25.9.0`, npm `11.12.1`, healthy Wayang HTTP 200, deployed checkout `7e104578062a4f0fec798bce34c0db5782708774`, enabled Wren and Loom profiles, no historical activation witness, retained private neutralization backups, and no Git worktree at `~/src/mypi`.
+
+The deployed commit is absent from the source lead's local Wayang object database, so the plan now requires Loom to preserve it and determine its relationship to the staged target locally. Because the exact Wren profile remains enabled, the plan also adds a pre-M3 metadata gate: Loom must establish whether it remains a default, allowlisted profile, or scheduled-job reference and stop for Clemente if target activation would newly authorize or retain it as active. No profile instructions or Protected state return to Wren.
+
 ## Remote mutation status
 
-No Tribe-Mac files, services, identity state, credentials, configuration, or network settings were changed by this session.
+No Tribe-Mac files, services, identity state, credentials, configuration, or network settings were changed before Loom stopped.

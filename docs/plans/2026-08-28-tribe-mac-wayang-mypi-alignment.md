@@ -29,6 +29,25 @@ Success means:
 
 These target facts must be re-inventoried locally on Tribe-Mac before mutation; historical records are not proof of current state.
 
+## Loom preflight amendment — 2026-08-28
+
+Loom correctly stopped before M0 because the original report was not available in its session. No mutation occurred. Its partial non-secret preflight reported:
+
+- Pi `0.84.1`, Node `v25.9.0`, and npm `11.12.1`;
+- healthy Wayang HTTP 200 at deployed checkout `7e104578062a4f0fec798bce34c0db5782708774`;
+- an enabled exact Wren profile and enabled Loom profile `86bec3d3-6b18-440b-b256-d236d281ae51`;
+- no historical activation witness;
+- retained private Wren-neutralization backups; and
+- no Git worktree at `~/src/mypi`.
+
+Commit `7e104578062a4f0fec798bce34c0db5782708774` is not present in the source lead's local Wayang object database, so its relationship to the target cannot be inferred. Loom must finish M0 and preserve the exact active runtime and prior launchd target. Before M3 activation, compare the active and staged repositories locally; report whether the histories are ancestor, descendant, divergent, or unrelated without printing private remotes or configuration. If provenance remains unknown, retain the complete active repository/runtime as the rollback source and do not overwrite it.
+
+The enabled Wren profile is not permission for Wren to inspect or mutate Tribe-Mac. Before M3 activation, Loom must use its locally authorized metadata/control plane to determine whether that profile is a project/workspace default, appears in project allowlists, or is referenced by scheduled jobs. Do not expose profile instructions or Protected state. If the target migration would newly authorize, select, or preserve the Wren profile as an active default, stop before activation for Clemente's local Settings decision; use supported Wayang controls rather than raw database edits. An absent historical witness alone is not sufficient proof under the target's derived-authority model.
+
+Node 25 satisfies the declared minimum but is not the repository's preferred Node 26.4.0 or an LTS baseline. Do not perform a blanket Homebrew upgrade. M3 remains gated on a fresh deterministic install for the selected active Node ABI and a passing `make doctor`; any prerequisite or Node change that requires package-manager or privileged mutation returns to Clemente.
+
+M4 remains blocked: do not infer a mypi release from the non-Git directory.
+
 ## Current mypi release caveat
 
 The checked-out `~/src/mypi` feature worktree is not a deployment source: it is 22 commits behind `main` and has a large staged/unstaged partial integration. The clean `mypi/main` head is `b53fc26a77af294e7bb6008e0a6e2810ff639828`, but the broader parity work is split across:
