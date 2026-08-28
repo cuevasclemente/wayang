@@ -1,4 +1,3 @@
-import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type {
   ExtensionFactory,
   SettingsManager,
@@ -371,16 +370,22 @@ export function createMemoryFirstCompactionExtension(
         name: MEMORY_REVIEW_COMPLETE_TOOL_NAME,
         label: "Complete memory review",
         description: "Record a bounded enum-only short/long-term wiki review outcome. Never pass memory content, paths, or identifiers.",
-        parameters: Type.Object({
-          outcome: StringEnum(REVIEW_OUTCOMES),
-          short_term: StringEnum(WIKI_RESULTS),
-          long_term: StringEnum(WIKI_RESULTS),
-        }, { additionalProperties: false }),
+        parameters: {
+          type: "object",
+          properties: {
+            outcome: { type: "string", enum: [...REVIEW_OUTCOMES] },
+            short_term: { type: "string", enum: [...WIKI_RESULTS] },
+            long_term: { type: "string", enum: [...WIKI_RESULTS] },
+          },
+          required: ["outcome", "short_term", "long_term"],
+          additionalProperties: false,
+        } as any,
         async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+          const reviewParams = params as Record<string, unknown>;
           const data: MemoryReviewCompleteEntryData = {
-            outcome: params.outcome as MemoryReviewOutcome,
-            short_term: params.short_term as MemoryWikiResult,
-            long_term: params.long_term as MemoryWikiResult,
+            outcome: reviewParams.outcome as MemoryReviewOutcome,
+            short_term: reviewParams.short_term as MemoryWikiResult,
+            long_term: reviewParams.long_term as MemoryWikiResult,
           };
           validateCompletionCombination(data);
           const existing = currentCycle(ctx);
