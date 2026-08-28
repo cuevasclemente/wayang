@@ -504,6 +504,15 @@ export interface QueuedMessageSnapshotMessage {
   type: "queued_message_snapshot";
   session_id: string;
   selection_id?: string;
+  reason?: "attach" | "post_message";
+  client_message_id?: string;
+  message_status?: "queued" | "accepted" | "rejected";
+  accepted_user_turn?: boolean;
+  outcomes?: Array<{
+    client_message_id: string;
+    status: "accepted" | "rejected";
+    accepted_user_turn: boolean;
+  }>;
   messages: QueuedBrowserMessage[];
 }
 

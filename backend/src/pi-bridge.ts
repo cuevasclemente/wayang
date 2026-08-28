@@ -208,6 +208,8 @@ export interface PiSessionHandle {
   interactiveMutationTurnToken?: string;
   /** Browser-local IDs bound to exact pending pi steering message objects. */
   queuedBrowserMessages: Map<string, QueuedBrowserMessageRecord>;
+  /** One non-streaming prompt accepted by Pi but not yet echoed as message_start. */
+  activeIdleBrowserClientMessageId?: string;
   /** Latest in-progress Pi message, retained across the pre-persistence message_end gap. */
   liveStreamingMessage?: any;
   /** Successful overflow compaction awaiting a successful SDK continuation. */
@@ -301,6 +303,10 @@ const SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SESSION_IDLE_CHECK_INTERVAL_MS = 30 * 1000;
 const sessions = new Map<string, PiSessionHandle>();
 const queuedBrowserClientMessageIds = new WeakMap<object, string>();
+const recentBrowserMessageOutcomes = new Map<string, Map<string, {
+  status: "accepted" | "rejected";
+  acceptedUserTurn: boolean;
+}>>();
 const sessionCreations = new Map<string, Promise<PiSessionHandle>>();
 /** Monotonic process-local denial epoch. A creation may publish only while the
  * exact epoch captured before its first await remains current. */
@@ -869,6 +875,38 @@ function queuedUserMessageText(message: unknown): string | undefined {
     .join("");
 }
 
+export interface BrowserMessageOutcomeProjection {
+  client_message_id: string;
+  status: "accepted" | "rejected";
+  accepted_user_turn: boolean;
+}
+
+export function recordBrowserMessageOutcome(
+  sessionId: string,
+  clientMessageId: string,
+  status: "accepted" | "rejected",
+  acceptedUserTurn: boolean,
+): void {
+  let outcomes = recentBrowserMessageOutcomes.get(sessionId);
+  if (!outcomes) outcomes = new Map();
+  outcomes.delete(clientMessageId);
+  outcomes.set(clientMessageId, { status, acceptedUserTurn });
+  while (outcomes.size > 128) outcomes.delete(outcomes.keys().next().value!);
+  recentBrowserMessageOutcomes.delete(sessionId);
+  recentBrowserMessageOutcomes.set(sessionId, outcomes);
+  while (recentBrowserMessageOutcomes.size > 64) {
+    recentBrowserMessageOutcomes.delete(recentBrowserMessageOutcomes.keys().next().value!);
+  }
+}
+
+export function getRecentBrowserMessageOutcomes(sessionId: string): BrowserMessageOutcomeProjection[] {
+  return [...(recentBrowserMessageOutcomes.get(sessionId) ?? [])].map(([client_message_id, outcome]) => ({
+    client_message_id,
+    status: outcome.status,
+    accepted_user_turn: outcome.acceptedUserTurn,
+  }));
+}
+
 /**
  * Mark a queued browser message accepted as soon as Pi starts its user turn.
  * Identity is authoritative when preserved. Pi 0.84.1 clones steering messages
@@ -905,10 +943,20 @@ export function markQueuedBrowserMessageStarted(handle: PiSessionHandle, message
       }
     }
   }
-  if (!matchedRecord) return undefined;
+  if (!matchedRecord) {
+    const idleClientMessageId = handle.activeIdleBrowserClientMessageId;
+    if (!idleClientMessageId) return undefined;
+    handle.activeIdleBrowserClientMessageId = undefined;
+    queuedBrowserClientMessageIds.set(message, idleClientMessageId);
+    recordBrowserMessageOutcome(handle.id, idleClientMessageId, "accepted", true);
+    return idleClientMessageId;
+  }
   matchedRecord.startCorrelated = true;
   matchedRecord.clientVisible = false;
-  if (clientMessageId) queuedBrowserClientMessageIds.set(message, clientMessageId);
+  if (clientMessageId) {
+    queuedBrowserClientMessageIds.set(message, clientMessageId);
+    recordBrowserMessageOutcome(handle.id, clientMessageId, "accepted", true);
+  }
   return clientMessageId;
 }
 
@@ -4208,6 +4256,7 @@ export async function sendBrowserMessageTurn(
     }
   } else {
     try {
+      if (clientMessageId) handle.activeIdleBrowserClientMessageId = clientMessageId;
       await handle.session.prompt(content, {
         expandPromptTemplates: true,
         images,
@@ -4227,6 +4276,10 @@ export async function sendBrowserMessageTurn(
     } catch (error) {
       retireInteractiveTurn(handle, turn.token);
       throw error;
+    } finally {
+      if (handle.activeIdleBrowserClientMessageId === clientMessageId) {
+        handle.activeIdleBrowserClientMessageId = undefined;
+      }
     }
   }
 }

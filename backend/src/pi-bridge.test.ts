@@ -24,6 +24,7 @@ import {
   getPiSessionBashMode,
   getPiSessionRuntimeState,
   getQueuedBrowserMessages,
+  getRecentBrowserMessageOutcomes,
   getSessionFileMessageHistory,
   getSessionFileSnapshot,
   invalidateSessionFileSnapshot,
@@ -1383,6 +1384,11 @@ test("queued browser message_start hides the exact queue item and projects its c
 
     assert.equal(markQueuedBrowserMessageStarted(handle, queuedMessage), "accepted-client-message");
     assert.equal([...handle.queuedBrowserMessages.values()][0]?.clientVisible, false);
+    assert.deepEqual(getRecentBrowserMessageOutcomes(handle.id), [{
+      client_message_id: "accepted-client-message",
+      status: "accepted",
+      accepted_user_turn: true,
+    }]);
     const serialized = serializeEvent({ type: "message_start", message: queuedMessage } as any);
     assert.equal(serialized?.client_message_id, "accepted-client-message");
   } finally {

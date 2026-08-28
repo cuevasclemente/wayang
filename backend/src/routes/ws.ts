@@ -64,6 +64,8 @@ import {
   abortSession,
   cancelQueuedBrowserMessage,
   getQueuedBrowserMessages,
+  getRecentBrowserMessageOutcomes,
+  recordBrowserMessageOutcome,
   subscribeToSession,
   getMessageHistory,
   getLiveMessageHistory,
@@ -1226,6 +1228,8 @@ function handleConnection(
         type: "queued_message_snapshot",
         session_id: nextSessionId,
         ...(selectionId ? { selection_id: selectionId } : {}),
+        reason: "attach",
+        outcomes: getRecentBrowserMessageOutcomes(nextSessionId),
         messages: getQueuedBrowserMessages(nextSessionId),
       });
     }
@@ -1582,6 +1586,8 @@ function handleConnection(
                 type: "queued_message_snapshot",
                 session_id: nextSessionId,
                 selection_id: selectionId,
+                reason: "attach",
+                outcomes: getRecentBrowserMessageOutcomes(nextSessionId),
                 messages: [],
               });
               wsProfile(nextSessionId, "sent_transcript_window", `duration=${elapsedMs(fileHistoryStart)} messages=${window.message_count}`);
@@ -1613,6 +1619,8 @@ function handleConnection(
                 type: "queued_message_snapshot",
                 session_id: nextSessionId,
                 ...(selectionId ? { selection_id: selectionId } : {}),
+                reason: "attach",
+                outcomes: getRecentBrowserMessageOutcomes(nextSessionId),
                 messages: [],
               });
               wsProfile(nextSessionId, "sent_history", `duration=${elapsedMs(sendHistoryStart)} messages=${messages.length}`);
@@ -2199,6 +2207,18 @@ export function applyWebSocketClientFailure(input: {
     catch { /* malformed IDs receive only the generic protocol error */ }
   }
   if (messageId) {
+    recordBrowserMessageOutcome(sessionId, messageId, "rejected", false);
+    send({
+      type: "queued_message_snapshot",
+      session_id: sessionId,
+      ...(selectionId ? { selection_id: selectionId } : {}),
+      reason: "post_message",
+      client_message_id: messageId,
+      message_status: "rejected",
+      accepted_user_turn: false,
+      outcomes: getRecentBrowserMessageOutcomes(sessionId),
+      messages: getQueuedBrowserMessages(sessionId),
+    });
     send({
       type: "queued_message_ack",
       session_id: sessionId,
@@ -2230,14 +2250,28 @@ export function serializeMutationLockedRejection(
   if (value?.type === "message") {
     try {
       const clientMessageId = optionalClientMessageId(value.client_message_id);
-      if (clientMessageId) response.push({
-        type: "queued_message_ack",
-        session_id: sessionId,
-        client_message_id: clientMessageId,
-        status: "rejected",
-        error_code: "mutation_locked",
-        error,
-      });
+      if (clientMessageId) {
+        recordBrowserMessageOutcome(sessionId, clientMessageId, "rejected", false);
+        response.push({
+          type: "queued_message_snapshot",
+          session_id: sessionId,
+          ...(selectionId ? { selection_id: selectionId } : {}),
+          reason: "post_message",
+          client_message_id: clientMessageId,
+          message_status: "rejected",
+          accepted_user_turn: false,
+          outcomes: getRecentBrowserMessageOutcomes(sessionId),
+          messages: getQueuedBrowserMessages(sessionId),
+        });
+        response.push({
+          type: "queued_message_ack",
+          session_id: sessionId,
+          client_message_id: clientMessageId,
+          status: "rejected",
+          error_code: "mutation_locked",
+          error,
+        });
+      }
     } catch { /* malformed correlation receives only the generic coded error */ }
   }
   response.push({
@@ -2284,6 +2318,23 @@ async function handleClientMessage(
         const hasAttachmentInput = Array.isArray(msg.attachments) && msg.attachments.length > 0;
         const acceptedAt = Date.now();
         if (!trimmedContent && !hasAttachmentInput) return;
+        const sendPostMessageQueueSnapshot = (
+          messageStatus: "queued" | "accepted" | "rejected",
+          acceptedUserTurn: boolean,
+        ) => {
+          if (!clientMessageId || !selectionId || !isSelectionCurrent()) return;
+          sendSafe(ws, {
+            type: "queued_message_snapshot",
+            session_id: sessionId,
+            selection_id: selectionId,
+            reason: "post_message",
+            client_message_id: clientMessageId,
+            message_status: messageStatus,
+            accepted_user_turn: acceptedUserTurn,
+            outcomes: getRecentBrowserMessageOutcomes(sessionId),
+            messages: getQueuedBrowserMessages(sessionId),
+          });
+        };
 
         touchSession(sessionId);
 
@@ -2302,6 +2353,8 @@ async function handleClientMessage(
 
         if (trimmedContent && await handleBuiltinSlashCommand(ws, sessionId, trimmedContent)) {
           if (clientMessageId) {
+            recordBrowserMessageOutcome(sessionId, clientMessageId, "accepted", false);
+            sendPostMessageQueueSnapshot("accepted", false);
             sendSafe(ws, {
               type: "queued_message_ack",
               session_id: sessionId,
@@ -2343,11 +2396,16 @@ async function handleClientMessage(
           },
         ).then((result) => {
           if (clientMessageId) {
+            const messageStatus = result.queued ? "queued" : "accepted";
+            if (messageStatus === "accepted") {
+              recordBrowserMessageOutcome(sessionId, clientMessageId, "accepted", true);
+            }
+            sendPostMessageQueueSnapshot(messageStatus, true);
             sendSafe(ws, {
               type: "queued_message_ack",
               session_id: sessionId,
               client_message_id: clientMessageId,
-              status: result.queued ? "queued" : "accepted",
+              status: messageStatus,
               cancellable: result.cancellable,
             });
           }
@@ -2355,6 +2413,8 @@ async function handleClientMessage(
           const error = safeSessionError(sessionId, err, "Agent turn failed: ");
           updateSessionError(sessionId, error);
           if (clientMessageId) {
+            recordBrowserMessageOutcome(sessionId, clientMessageId, "rejected", false);
+            sendPostMessageQueueSnapshot("rejected", false);
             sendSafe(ws, {
               type: "queued_message_ack",
               session_id: sessionId,

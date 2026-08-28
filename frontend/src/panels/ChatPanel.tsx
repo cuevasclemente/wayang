@@ -4040,6 +4040,12 @@ export function ChatPanel({
             || msg.selection_id !== selectionIdRef.current
             || !Array.isArray(msg.messages)
           ) return;
+          const postMessageId = msg.reason === "post_message"
+            && typeof msg.client_message_id === "string"
+            && ["queued", "accepted", "rejected"].includes(String(msg.message_status))
+            ? msg.client_message_id
+            : null;
+          if (msg.reason === "post_message" && !postMessageId) return;
           const snapshot = msg.messages.flatMap((candidate: unknown) => {
             if (!candidate || typeof candidate !== "object") return [];
             const record = candidate as Record<string, unknown>;
@@ -4058,6 +4064,65 @@ export function ChatPanel({
             }];
           });
           const snapshotIds = new Set(snapshot.map((message) => message.id));
+          const rawOutcomes = msg.outcomes === undefined ? [] : msg.outcomes;
+          if (!Array.isArray(rawOutcomes)) return;
+          const outcomes = rawOutcomes.flatMap((candidate: unknown) => {
+            if (!candidate || typeof candidate !== "object") return [];
+            const record = candidate as Record<string, unknown>;
+            if (
+              typeof record.client_message_id !== "string"
+              || (record.status !== "accepted" && record.status !== "rejected")
+              || typeof record.accepted_user_turn !== "boolean"
+            ) return [];
+            return [{
+              clientMessageId: record.client_message_id,
+              status: record.status,
+              acceptedUserTurn: record.accepted_user_turn,
+            }];
+          });
+          if (outcomes.length !== rawOutcomes.length) return;
+          if (
+            postMessageId
+            && (msg.message_status === "accepted" || msg.message_status === "rejected")
+            && !snapshotIds.has(postMessageId)
+            && !outcomes.some((outcome) => outcome.clientMessageId === postMessageId)
+          ) {
+            outcomes.push({
+              clientMessageId: postMessageId,
+              status: msg.message_status === "rejected" ? "rejected" : "accepted",
+              acceptedUserTurn: msg.accepted_user_turn === true,
+            });
+          }
+          const terminalOutcomeIds = new Set<string>();
+          for (const outcome of outcomes) {
+            if (snapshotIds.has(outcome.clientMessageId)) continue;
+            terminalOutcomeIds.add(outcome.clientMessageId);
+            const submitted = submittedUserMessagesRef.current.get(outcome.clientMessageId);
+            if (outcome.status === "rejected") {
+              setMessages((current) => current.filter((message) => !(
+                message.__localPending === true && message.__localId === outcome.clientMessageId
+              )));
+              if (submitted && submitted.sessionId === msg.session_id) {
+                submittedUserMessagesRef.current.delete(outcome.clientMessageId);
+                restoreRejectedSubmission(submitted);
+              }
+              continue;
+            }
+            if (submitted && submitted.sessionId === msg.session_id && outcome.acceptedUserTurn) {
+              const displayContent = submitted.draft || submitted.attachments
+                .map((attachment) => `[Attached: ${attachment.fileName}]`)
+                .join("\n");
+              insertAcceptedUsersAfterActiveStreaming([{
+                type: "user",
+                message: { role: "user", content: displayContent, timestamp: Date.now() },
+                __localPending: true,
+                __localId: outcome.clientMessageId,
+              }]);
+            }
+            if (!acceptSubmittedUserMessage(msg.session_id, outcome.clientMessageId)) {
+              markClientMessageAccepted(msg.session_id, outcome.clientMessageId);
+            }
+          }
           setMessages((current) => current.filter((message) => !(
             message.__localPending === true
             && typeof message.__localId === "string"
@@ -4079,6 +4144,7 @@ export function ChatPanel({
               }),
               ...current.filter((message) => (
                 !snapshotIds.has(message.id)
+                && !terminalOutcomeIds.has(message.id)
                 && message.cancelStatus === "registering"
                 && message.transportGeneration === transportGeneration
               )),

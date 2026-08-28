@@ -11,6 +11,11 @@ async function installQueuedMessageSocket(
 ): Promise<void> {
   await page.addInitScript(({ queuedSnapshot, deferFirstStart, rejectQueued, suppressQueuedAck, suppressInitialEcho }) => {
     type Handler<T> = ((event: T) => void) | null;
+    let reconnectOutcomes: Array<{
+      client_message_id: string;
+      status: "accepted" | "rejected";
+      accepted_user_turn: boolean;
+    }> = [];
 
     class QueuedMessageWebSocket {
       static readonly CONNECTING = 0;
@@ -43,6 +48,17 @@ async function installQueuedMessageSocket(
         };
         (window as unknown as { forceNextQueuedCancelNotFound: () => void }).forceNextQueuedCancelNotFound = () => {
           this.nextCancelNotFound = true;
+        };
+        (window as unknown as { disconnectAfterQueuedOutcome: (status: "accepted" | "rejected") => void }).disconnectAfterQueuedOutcome = (status) => {
+          if (!this.pendingQueuedAcceptance) return;
+          reconnectOutcomes = [{
+            client_message_id: this.pendingQueuedAcceptance.clientMessageId,
+            status,
+            accepted_user_turn: status === "accepted",
+          }];
+          this.pendingQueuedAcceptance = null;
+          this.readyState = QueuedMessageWebSocket.CLOSED;
+          this.onclose?.(new CloseEvent("close"));
         };
         (window as unknown as { startDeferredQueuedTurn: () => void }).startDeferredQueuedTurn = () => {
           this.emit({ type: "agent_start" });
@@ -119,6 +135,26 @@ async function installQueuedMessageSocket(
           });
           this.pendingQueuedAcceptance = null;
         };
+        (window as unknown as { acceptQueuedSendWithPostSnapshot: () => void }).acceptQueuedSendWithPostSnapshot = () => {
+          if (!this.pendingQueuedAcceptance) return;
+          const accepted = this.pendingQueuedAcceptance;
+          this.emit({
+            type: "queued_message_snapshot",
+            session_id: this.sessionId,
+            selection_id: this.selectionId,
+            reason: "post_message",
+            client_message_id: accepted.clientMessageId,
+            message_status: "queued",
+            accepted_user_turn: true,
+            outcomes: [{
+              client_message_id: accepted.clientMessageId,
+              status: "accepted",
+              accepted_user_turn: true,
+            }],
+            messages: [],
+          });
+          this.pendingQueuedAcceptance = null;
+        };
         (window as unknown as { acceptQueuedSendWithoutAck: () => void }).acceptQueuedSendWithoutAck = () => {
           if (!this.pendingQueuedAcceptance) return;
           this.emit({
@@ -146,6 +182,7 @@ async function installQueuedMessageSocket(
             type: "queued_message_snapshot",
             session_id: this.sessionId,
             selection_id: this.selectionId,
+            outcomes: reconnectOutcomes,
             messages: queuedSnapshot,
           });
           if (queuedSnapshot.length > 0) {
@@ -586,6 +623,69 @@ test("exact live acceptance prevents a stale queue snapshot from re-adding the s
   await expect.poll(() => page.evaluate((sessionId) => (
     window.localStorage.getItem(`wayang:chat-draft:${sessionId}`)
   ), session.id)).toBeNull();
+});
+
+test("a post-message snapshot retires a registering card when its acknowledgement was lost", async ({ page, request }) => {
+  await installQueuedMessageSocket(page, [], false, false, true);
+  const session = await createE2eSession(request, "e2e post-message queue convergence");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Start active output before the post-message snapshot.");
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  const queuedText = "Converge this registering card from the correlated post-message snapshot.";
+  await page.getByTestId("chat-input").fill(queuedText);
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-queued-user-message")).toContainText(queuedText);
+
+  await page.evaluate(() => (
+    window as unknown as { acceptQueuedSendWithPostSnapshot: () => void }
+  ).acceptQueuedSendWithPostSnapshot());
+  await expect(page.getByTestId("chat-queued-user-message")).toHaveCount(0);
+  await expect(page.locator('[data-testid="chat-message"][data-role="user"]').filter({ hasText: queuedText })).toBeVisible();
+  await expect.poll(() => page.evaluate((sessionId) => (
+    window.localStorage.getItem(`wayang:chat-draft:${sessionId}`)
+  ), session.id)).toBeNull();
+});
+
+test("reconnect outcome retires a registering card when both live signals were lost", async ({ page, request }) => {
+  await installQueuedMessageSocket(page, [], false, false, true);
+  const session = await createE2eSession(request, "e2e reconnect accepted queue outcome");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Start active output before losing both acceptance signals.");
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  const queuedText = "Recover this accepted turn from the reconnect outcome ledger.";
+  await page.getByTestId("chat-input").fill(queuedText);
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-queued-user-message")).toContainText(queuedText);
+
+  await page.evaluate(() => (
+    window as unknown as { disconnectAfterQueuedOutcome: (status: "accepted") => void }
+  ).disconnectAfterQueuedOutcome("accepted"));
+  await expect(page.getByTestId("chat-queued-user-message")).toHaveCount(0, { timeout: 10_000 });
+  await expect(page.locator('[data-testid="chat-message"][data-role="user"]').filter({ hasText: queuedText })).toBeVisible();
+  await expect.poll(() => page.evaluate((sessionId) => (
+    window.localStorage.getItem(`wayang:chat-draft:${sessionId}`)
+  ), session.id)).toBeNull();
+});
+
+test("reconnect rejection restores a registering draft after both live signals were lost", async ({ page, request }) => {
+  await installQueuedMessageSocket(page, [], false, false, true);
+  const session = await createE2eSession(request, "e2e reconnect rejected queue outcome");
+  await openSessionInUi(page, session);
+
+  await sendPrompt(page, "Start active output before losing both rejection signals.");
+  await expect(page.getByTestId("chat-streaming")).toContainText("remains in progress");
+  const queuedText = "Restore this rejected turn from the reconnect outcome ledger.";
+  await page.getByTestId("chat-input").fill(queuedText);
+  await page.getByTestId("chat-send-button").click();
+  await expect(page.getByTestId("chat-queued-user-message")).toContainText(queuedText);
+
+  await page.evaluate(() => (
+    window as unknown as { disconnectAfterQueuedOutcome: (status: "rejected") => void }
+  ).disconnectAfterQueuedOutcome("rejected"));
+  await expect(page.getByTestId("chat-queued-user-message")).toHaveCount(0, { timeout: 10_000 });
+  await expect(page.getByTestId("chat-input")).toHaveValue(queuedText);
 });
 
 test("exact acceptance renders a temporary user row after local queue state was lost", async ({ page, request }) => {
