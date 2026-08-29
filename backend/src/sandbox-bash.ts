@@ -20,9 +20,7 @@ import { getRegisteredMemoryRoots } from "./agent-runtime.js";
 import { listProjects } from "./projects.js";
 import { authorizeProjectAction, pathIsWithin, projectAllowsAgentProfile } from "./policy.js";
 import {
-  getProtectedArtifactReadRoots,
-  getProtectedArtifactWriteRoots,
-  getRestrictedAgentArtifactRoots,
+  getProtectedArtifactRootSnapshot,
   getSessionAttachmentRoot,
 } from "./protected-artifacts.js";
 import type { SandboxExecRequest, SandboxNetworkMode } from "./sandbox-exec-protocol.js";
@@ -158,8 +156,9 @@ export function buildBashSandboxPolicy(
     if (otherProtectedProject || excludedByAllowlist) deniedWrite.add(project.cwd);
   }
 
-  for (const root of getProtectedArtifactReadRoots()) deniedRead.add(root);
-  for (const root of getProtectedArtifactWriteRoots()) deniedWrite.add(root);
+  const protectedArtifacts = getProtectedArtifactRootSnapshot();
+  for (const root of protectedArtifacts.readRoots) deniedRead.add(root);
+  for (const root of protectedArtifacts.writeRoots) deniedWrite.add(root);
 
   // resource_mode and provider/model are profile/runtime preferences, not
   // filesystem authority. Only live privacy/RBAC-derived pair authority opens global Pi roots.
@@ -174,7 +173,7 @@ export function buildBashSandboxPolicy(
     : null;
   const standardResourcesAuthorized = standardResources?.authorized === true || legacyWrenStandard;
   if (!standardResourcesAuthorized) {
-    for (const root of getRestrictedAgentArtifactRoots()) {
+    for (const root of protectedArtifacts.restrictedAgentRoots) {
       deniedRead.add(root);
       deniedWrite.add(root);
     }

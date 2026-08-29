@@ -10,9 +10,7 @@ import {
 import { getSessionById } from "./sessions.js";
 import { isLegacyWrenStandardRuntime } from "./legacy-wren.js";
 import {
-  getProtectedArtifactReadRoots,
-  getProtectedArtifactWriteRoots,
-  getRestrictedAgentArtifactRoots,
+  getProtectedArtifactRootSnapshot,
   getSessionAttachmentRoot,
 } from "./protected-artifacts.js";
 import {
@@ -299,15 +297,16 @@ export function authorizeAgentToolCall(options: {
     ? classifyReadableStandardArtifact(canonicalPath)
     : null;
   const inReadableSessionArtifact = inOwnAttachments || Boolean(sharedStandardArtifact);
+  const protectedArtifacts = getProtectedArtifactRootSnapshot();
   if (isMutation) {
-    if (getProtectedArtifactWriteRoots().some((root) => pathIsWithin(canonicalPath, root))) {
+    if (protectedArtifacts.writeRoots.some((root) => pathIsWithin(canonicalPath, root))) {
       return { allowed: false, reason: "Agent writes to protected transcript/Wayang/attachment storage are denied", canonicalPath };
     }
-  } else if (!inReadableSessionArtifact && getProtectedArtifactReadRoots().some(intersects)) {
+  } else if (!inReadableSessionArtifact && protectedArtifacts.readRoots.some(intersects)) {
     return { allowed: false, reason: "Agent access to Protected or unclassified transcript/Wayang/attachment storage is denied", canonicalPath };
   }
 
-  if (restricted && !(inReadableSessionArtifact && !isMutation) && getRestrictedAgentArtifactRoots().some(intersects)) {
+  if (restricted && !(inReadableSessionArtifact && !isMutation) && protectedArtifacts.restrictedAgentRoots.some(intersects)) {
     return { allowed: false, reason: "Restricted agents cannot access global Pi or control-plane storage", canonicalPath };
   }
 

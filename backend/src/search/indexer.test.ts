@@ -34,6 +34,26 @@ const transcriptAuthorizationMod = await import("../standard-transcript-authoriz
 
 dbMod.init();
 
+test("policy purge contains search DB initialization failure to one attempt", () => {
+  let attempts = 0;
+  let reports = 0;
+  const previousError = console.error;
+  console.error = () => { reports++; };
+  try {
+    const result = indexerMod.purgePolicyDeniedSessions({
+      ensureSearchDb: () => {
+        attempts++;
+        throw new Error("synthetic native binding unavailable");
+      },
+    });
+    assert.deepEqual(result, { purged: 0, errors: 1 });
+    assert.equal(attempts, 1);
+    assert.equal(reports, 1);
+  } finally {
+    console.error = previousError;
+  }
+});
+
 test("background search indexing pause is explicit and fail-safe", () => {
   assert.equal(watcherMod.isSearchBackgroundIndexingEnabled(undefined), true);
   assert.equal(watcherMod.isSearchBackgroundIndexingEnabled("1"), true);

@@ -3,8 +3,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getStore, type SessionRow } from "./db.js";
 import {
-  getNonTranscriptUniversalReadDenyRoots,
-  getPiSessionStorageRoots,
+  getProtectedArtifactRootSnapshot,
+  type ProtectedArtifactRootSnapshot,
 } from "./protected-artifacts.js";
 import { authorizeProjectAction, pathIsWithin } from "./policy.js";
 import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
@@ -134,9 +134,12 @@ export function readBoundedSessionHeader(
   }
 }
 
-export function universallyDeniedTranscriptPath(target: string): boolean {
-  if (!getPiSessionStorageRoots().some((root) => pathIsWithin(target, root))) return true;
-  if (getNonTranscriptUniversalReadDenyRoots().some((root) => pathIsWithin(target, root))) return true;
+export function universallyDeniedTranscriptPath(
+  target: string,
+  protectedArtifacts = getProtectedArtifactRootSnapshot(),
+): boolean {
+  if (!protectedArtifacts.piSessionStorageRoots.some((root) => pathIsWithin(target, root))) return true;
+  if (protectedArtifacts.nonTranscriptReadDenyRoots.some((root) => pathIsWithin(target, root))) return true;
   return getStore().projects.some((project) => (
     project.access_policy.privacy_mode === "protected" && pathIsWithin(target, project.cwd)
   ));
@@ -147,7 +150,8 @@ export function classifyExternalStandardTranscriptHeader(
   header: BoundedSessionHeader,
 ): ProjectRow | null {
   const target = path.resolve(filePath);
-  if (universallyDeniedTranscriptPath(target)) return null;
+  const protectedArtifacts = getProtectedArtifactRootSnapshot();
+  if (universallyDeniedTranscriptPath(target, protectedArtifacts)) return null;
   const store = getStore();
   if (store.sessions.some((row) => row.pi_session_file === target || row.id === header.id)) return null;
   const cwd = lexicalHeaderCwd(header.cwd);
@@ -163,17 +167,19 @@ function authorizeExactDurableTranscriptIdentity(
     expectedSessionId?: string;
     expectedFingerprint?: FileFingerprint;
     observedHeader?: ReturnType<typeof readBoundedSessionHeader>;
+    protectedArtifacts?: ProtectedArtifactRootSnapshot;
   } = {},
 ): ExactDurableTranscriptIdentity | null {
+  const protectedArtifacts = options.protectedArtifacts ?? getProtectedArtifactRootSnapshot();
   const requestedPath = path.resolve(filePath);
-  if (universallyDeniedTranscriptPath(requestedPath)) return null;
+  if (universallyDeniedTranscriptPath(requestedPath, protectedArtifacts)) return null;
   let observed: ReturnType<typeof readBoundedSessionHeader>;
   try {
     observed = options.observedHeader ?? readBoundedSessionHeader(requestedPath, options.expectedFingerprint);
   } catch {
     return null;
   }
-  if (requestedPath !== observed.path || universallyDeniedTranscriptPath(observed.path)) return null;
+  if (requestedPath !== observed.path || universallyDeniedTranscriptPath(observed.path, protectedArtifacts)) return null;
   if (options.expectedFingerprint && !fingerprintsEqual(observed.fingerprint, options.expectedFingerprint)) return null;
   if (options.expectedSessionId !== undefined && observed.header.id !== options.expectedSessionId) return null;
 
@@ -198,6 +204,7 @@ export function authorizeExactStandardTranscript(
     expectedSessionId?: string;
     expectedFingerprint?: FileFingerprint;
     observedHeader?: ReturnType<typeof readBoundedSessionHeader>;
+    protectedArtifacts?: ProtectedArtifactRootSnapshot;
   } = {},
 ): ExactStandardTranscriptAuthorization | null {
   const identity = authorizeExactDurableTranscriptIdentity(filePath, options);
@@ -212,6 +219,7 @@ export function authorizeExactUiTranscript(
     expectedSessionId?: string;
     expectedFingerprint?: FileFingerprint;
     observedHeader?: ReturnType<typeof readBoundedSessionHeader>;
+    protectedArtifacts?: ProtectedArtifactRootSnapshot;
   } = {},
 ): ExactUiTranscriptAuthorization | null {
   const identity = authorizeExactDurableTranscriptIdentity(filePath, options);

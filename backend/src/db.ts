@@ -2151,6 +2151,16 @@ function loadStore(storePath: string, browserProfilesEnabled = _browserProfilesE
 let _store: StoreData | null = null;
 let _storePath: string | null = null;
 let _browserProfilesEnabled = false;
+let _storePublicationGeneration = 0;
+
+/** Cheap in-process stamp for caches derived only from durably published store state. */
+export function getStorePublicationGeneration(): number {
+  return _storePublicationGeneration;
+}
+
+function bumpStorePublicationGeneration(): void {
+  _storePublicationGeneration = (_storePublicationGeneration + 1) % Number.MAX_SAFE_INTEGER;
+}
 
 function ensureStoreLock(storePath: string): boolean {
   if (_storeLock) {
@@ -2176,6 +2186,7 @@ export function getStore(): StoreData {
       writeHostExecutionProjectionDenials(_store);
       writeWorkspaceCapabilityStoreProjections(_store);
       _storePath = storePath;
+      bumpStorePublicationGeneration();
     } catch (error) {
       if (acquiredHere) releaseStoreLock();
       throw error;
@@ -2185,7 +2196,10 @@ export function getStore(): StoreData {
 }
 
 export function flush(): void {
-  if (_store && _storePath) saveStoreAtPath(_store, _storePath);
+  if (_store && _storePath) {
+    saveStoreAtPath(_store, _storePath);
+    bumpStorePublicationGeneration();
+  }
 }
 
 /**
@@ -2215,6 +2229,7 @@ export function commitStoreMutation<T>(mutate: (draft: StoreData) => T): T {
   // fields until persistence has succeeded.
   Object.assign(current, draft);
   _store = current;
+  bumpStorePublicationGeneration();
   return result;
 }
 
@@ -2228,6 +2243,7 @@ export function init(options: { browserProfilesEnabled?: boolean } = {}): void {
     writeWorkspaceCapabilityStoreProjections(loaded);
     _store = loaded;
     _storePath = storePath;
+    bumpStorePublicationGeneration();
     console.log(`[db] Store initialized at ${storePath}`);
   } catch (error) {
     storeMigrationPersistenceObserverForTests = null;
@@ -2243,6 +2259,7 @@ export function close(): void {
     _store = null;
     _storePath = null;
     _browserProfilesEnabled = false;
+    bumpStorePublicationGeneration();
     commitStoreMutationPersistenceFailureForTests = null;
     storeMigrationPersistenceObserverForTests = null;
     pendingHostExecutionPositiveProjectionFailureForTests = null;

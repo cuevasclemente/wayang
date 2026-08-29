@@ -451,7 +451,15 @@ export function endTranscriptMutationSearchFence(sessionId: string): void {
   transcriptMutationFences.delete(sessionId);
 }
 
-export function purgePolicyDeniedSessions(): { purged: number; errors: number } {
+export function purgePolicyDeniedSessions(options: {
+  ensureSearchDb?: () => unknown;
+} = {}): { purged: number; errors: number } {
+  try {
+    (options.ensureSearchDb ?? getSearchDb)();
+  } catch (error) {
+    console.error("[search] policy purge unavailable:", error);
+    return { purged: 0, errors: 1 };
+  }
   let purged = 0;
   let errors = 0;
   for (const row of listSessions(true)) {
