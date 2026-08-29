@@ -34,6 +34,23 @@ No store schema, Project registration, transcript, browser profile, credential, 
 - Backend TypeScript build: pass.
 - `make check`: backend 1,114 pass / 0 fail / 6 skip; frontend 4/4; scripts 63/63; backend/frontend production builds pass. One pre-existing frontend fast-refresh warning and existing Vite chunk-size warnings remain.
 
-## Rollout/rollback
+## Production rollout and validation
 
-The change is binary-only and migration-free. After integration, rebuild canonical backend/frontend, verify the pinned `better-sqlite3` binding under the service Node ABI, restart Wayang, and measure listen/session/search latency plus journal/backlog/CPU behavior. Rollback is a source/binary rollback and restart; private data restoration is not required.
+Canonical main fast-forwarded to `b232054`, the backend/frontend production builds completed, and the pinned `better-sqlite3` binding loaded successfully under Node 26 before restart.
+
+Production results:
+
+- pre-fix restart: approximately 16 minutes before the listener callback; ordinary Projects and search-health requests timed out at 10 seconds;
+- first cached-root deployment: port usable in 13.1 seconds; search/project/session-route responses returned HTTP 200/200/400 rather than 5xx, but one mergerfs Project could not install an `fs.watch`, so concurrent search still caused per-turn root rebuilds;
+- final identity-probe deployment: port usable in 13.4 seconds and listener callback at 29 seconds while startup services completed;
+- warm Projects: HTTP 200 in about 1 ms;
+- synthetic malformed session-create validation: expected HTTP 400 in about 7 ms, proving the route/event loop is responsive without creating a durable test session;
+- synthetic no-result search: HTTP 200 in about 1.1 seconds;
+- post-fix syscall trace during search: eight `statx` calls and zero `readlink`/all-Project canonicalization storm;
+- service journal after final restart: no SQLite binding, policy-purge, catalog, or search errors.
+
+Five concurrent search requests still serialize at roughly 1.1 seconds each and can delay health by about 5.9 seconds. The post-fix trace shows this is no longer protected-root filesystem work; it is the existing synchronous search/SQLite query path over the large index. It no longer produces the reported 500 and is a separate future search-latency optimization, not a rollback blocker for this incident.
+
+## Rollback
+
+The change is binary-only and migration-free. Rollback is a source/binary rollback and restart; private data restoration is not required.

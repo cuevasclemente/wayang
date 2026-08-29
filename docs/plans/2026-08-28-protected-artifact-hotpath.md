@@ -1,7 +1,7 @@
 # Protected-artifact authorization hot-path repair
 
 Date: 2026-08-28
-Status: Approved for implementation
+Status: Implemented and deployed at `b232054`
 Base: `ff8b15e`
 Branch: `fix/protected-artifact-hotpath-20260828`
 
