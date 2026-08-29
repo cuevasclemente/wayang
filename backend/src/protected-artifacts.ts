@@ -37,6 +37,7 @@ export interface ProtectedArtifactRootSnapshot {
 interface SnapshotCacheEntry {
   snapshot: ProtectedArtifactRootSnapshot;
   watchers: fs.FSWatcher[];
+  fallbackProbes: Map<string, string>;
   transientInvalidation: NodeJS.Immediate | null;
 }
 
@@ -143,6 +144,7 @@ function invalidateSnapshot(reason: string, expected?: SnapshotCacheEntry): void
     try { watcher.close(); } catch { /* already closed */ }
   }
   entry.watchers.length = 0;
+  entry.fallbackProbes.clear();
   testHooks?.observeInvalidation?.(reason);
 }
 
@@ -174,6 +176,28 @@ function addWatchSpec(specs: Map<string, WatchSpec>, directory: string, names: I
   }
 }
 
+function fallbackProbeFingerprint(target: string): string | null {
+  try {
+    const metadata = fs.lstatSync(target);
+    const kind = metadata.isSymbolicLink() ? "symlink"
+      : metadata.isDirectory() ? "directory"
+        : metadata.isFile() ? "file" : "other";
+    let link = "";
+    if (metadata.isSymbolicLink()) link = fs.readlinkSync(target);
+    return JSON.stringify({ kind, dev: metadata.dev, ino: metadata.ino, nlink: metadata.nlink, link });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+    return null;
+  }
+}
+
+function fallbackProbesCurrent(entry: SnapshotCacheEntry): boolean {
+  for (const [target, expected] of entry.fallbackProbes) {
+    if (fallbackProbeFingerprint(target) !== expected) return false;
+  }
+  return true;
+}
+
 function installSnapshotWatchers(
   entry: SnapshotCacheEntry,
   manifest: ProtectedArtifactManifest,
@@ -202,7 +226,7 @@ function installSnapshotWatchers(
   }
   for (const [parent, names] of transcriptNamesByParent) addWatchSpec(specs, parent, names, true);
 
-  let reusable = !forceTurnScoped;
+  let turnScoped = forceTurnScoped;
   const watch = testHooks?.watch
     ?? ((target: string, listener: fs.WatchListener<string>) => fs.watch(target, { persistent: false }, listener));
   for (const [directory, spec] of specs) {
@@ -217,11 +241,17 @@ function installSnapshotWatchers(
       watcher.on("error", () => invalidateSnapshot("watch_error", entry));
       entry.watchers.push(watcher);
     } catch {
-      if (spec.required) reusable = false;
+      const names = spec.names.size > 0 ? spec.names : new Set([""]);
+      for (const name of names) {
+        const target = name ? path.join(directory, name) : directory;
+        const fingerprint = fallbackProbeFingerprint(target);
+        if (fingerprint === null) turnScoped = true;
+        else entry.fallbackProbes.set(target, fingerprint);
+      }
     }
   }
-  if (!reusable) {
-    const reason = forceTurnScoped ? "symlink_alias" : "unwatchable_root";
+  if (turnScoped) {
+    const reason = forceTurnScoped ? "symlink_alias" : "uninspectable_root";
     entry.transientInvalidation = setImmediate(() => invalidateSnapshot(reason, entry));
     entry.transientInvalidation.unref?.();
   }
@@ -304,7 +334,12 @@ function buildSnapshot(manifest: ProtectedArtifactManifest): SnapshotCacheEntry 
     writeRoots: readRoots,
     restrictedAgentRoots,
   });
-  const entry: SnapshotCacheEntry = { snapshot, watchers: [], transientInvalidation: null };
+  const entry: SnapshotCacheEntry = {
+    snapshot,
+    watchers: [],
+    fallbackProbes: new Map(),
+    transientInvalidation: null,
+  };
   snapshotCache = entry;
   installSnapshotWatchers(entry, manifest, hasCanonicalAlias);
   return entry;
@@ -315,6 +350,8 @@ export function getProtectedArtifactRootSnapshot(): ProtectedArtifactRootSnapsho
   const manifest = captureManifest();
   if (snapshotCache?.snapshot.manifestKey !== manifest.key) {
     invalidateSnapshot("manifest_change");
+  } else if (snapshotCache && !fallbackProbesCurrent(snapshotCache)) {
+    invalidateSnapshot("fallback_probe_change", snapshotCache);
   }
   return (snapshotCache ?? buildSnapshot(manifest)).snapshot;
 }

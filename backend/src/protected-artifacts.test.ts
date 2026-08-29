@@ -66,22 +66,27 @@ test("one protected-artifact snapshot serves overlapping getters until the manif
   assert.ok(canonicalizations > afterFirst, "Project registration must rebuild the protected-root snapshot");
 });
 
-test("unwatchable roots reuse only the current event-loop turn", async () => {
+test("unwatchable roots use identity probes and rebuild only after a protected entry changes", async () => {
   let canonicalizations = 0;
   artifactsMod.setProtectedArtifactTestHooksForTests({
     observeCanonicalize: () => { canonicalizations++; },
     watch: () => { throw new Error("synthetic watch unavailable"); },
   });
+  const project = createProject("unwatchable-fallback");
 
   artifactsMod.getProtectedArtifactReadRoots();
   const firstPass = canonicalizations;
   artifactsMod.getProtectedArtifactWriteRoots();
   artifactsMod.getRestrictedAgentArtifactRoots();
-  assert.equal(canonicalizations, firstPass, "nested checks in one turn must share the snapshot");
-
   await new Promise<void>((resolve) => setImmediate(resolve));
   artifactsMod.getProtectedArtifactReadRoots();
-  assert.ok(canonicalizations > firstPass, "the next turn must rebuild when change observation is unavailable");
+  assert.equal(canonicalizations, firstPass, "unchanged fallback probes must preserve the snapshot across turns");
+
+  const projectEnv = path.join(project.cwd, ".env");
+  fs.writeFileSync(projectEnv, "synthetic\n");
+  const refreshed = artifactsMod.getProtectedArtifactReadRoots();
+  assert.ok(canonicalizations > firstPass, "a newly created protected entry must rebuild the snapshot");
+  assert.ok(refreshed.includes(fs.realpathSync(projectEnv)));
 });
 
 test("registered secret symlink retargeting invalidates canonical deny roots", async () => {

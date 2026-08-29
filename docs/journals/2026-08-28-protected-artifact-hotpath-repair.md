@@ -14,7 +14,7 @@ The first recovery restart exposed a separate latent deployment problem: the `be
 - Added a cheap durable store-publication generation so the lexical manifest is rebuilt only after a published store change, not per transcript/path check.
 - Derived one manifest fingerprint from current Project/session/config path inputs and canonicalized each unique input once per snapshot.
 - Added targeted unreferenced filesystem watchers for relevant directory entries. Store writes and ordinary Project edits do not invalidate the snapshot.
-- Kept unwatchable roots fail-closed and fresh: their snapshot expires at the next event-loop turn, allowing nested synchronous checks to share work without carrying authority into a later operation.
+- Kept unwatchable roots fail-closed and fresh with compact no-follow identity probes for only the exact protected entries covered by a failed watcher. Changed probes rebuild the snapshot; uninspectable probes become turn-scoped.
 - Kept any symlink-derived canonical snapshot turn-scoped even when watches appear available, covering nested symlink-chain retargeting that a lexical-parent watcher cannot prove unchanged.
 - Consolidated direct tool, sandbox, and transcript authorization call sites onto one coherent snapshot.
 - Made search policy purge validate search DB availability once before iterating sessions.
@@ -25,7 +25,7 @@ No store schema, Project registration, transcript, browser profile, credential, 
 
 - `make doctor`: 0 failures (expected isolated-worktree configuration/build warnings before install).
 - `make install`: completed from committed lockfiles.
-- Focused protected-artifact tests: 5/5.
+- Focused protected-artifact tests: 5/5, including FUSE-like watch failure with unchanged/changed identity probes.
 - Focused agent-runtime tests: 23/23.
 - Focused search indexer tests: 25/25.
 - Focused session catalog/session tests: 38/38.

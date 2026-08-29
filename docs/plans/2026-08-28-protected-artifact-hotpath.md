@@ -20,7 +20,7 @@ The repair must not weaken these existing boundaries:
 3. Wayang data, global Pi credentials/configuration, the command-guard identity PIN, Pi session roots, known transcript paths, launcher configuration, and pseudo-control roots retain their current lexical and canonical denials.
 4. Symlink creation or retargeting invalidates a reusable snapshot before a later cooperative authorization decision. A same-UID process racing after the final check remains outside Wayang's documented isolation boundary.
 5. Store/config changes cannot reuse a snapshot derived from older Project/session inputs.
-6. If filesystem change observation is unavailable, a snapshot may be reused only within the current event-loop turn; the next turn must rebuild it. This preserves fresh fail-closed behavior without multiplying canonicalization inside one synchronous authorization phase.
+6. If filesystem change observation is unavailable, later calls must revalidate compact no-follow identity probes for the exact protected directory entries. A changed probe rebuilds the snapshot; an uninspectable probe fails back to a current-turn-only snapshot. This preserves fresh fail-closed behavior without repeating all-project canonicalization.
 7. Search/native dependency failure must not be retried or logged once per session.
 
 ## Design
@@ -52,7 +52,7 @@ Each getter recomputes only this lexical key. A changed key closes snapshot watc
 
 Install unreferenced `fs.watch` observers on the minimum existing parent directories that can change canonical targets: registered Project roots, session roots, Pi/config roots, the checkout root, and Wayang data root. Any event invalidates the snapshot synchronously.
 
-If one or more required roots cannot be watched, schedule snapshot invalidation with `setImmediate`. All nested getters and repeated checks in the current synchronous phase share one exact snapshot; after the event loop yields, the next authorization rebuilds. This is especially important for FUSE-like filesystems that may not support reliable watch setup.
+If a required root cannot be watched, retain compact `lstat`/symlink identity probes only for the exact protected entries covered by that failed watcher. Each later getter validates those probes without traversing every canonical root; a changed identity invalidates and rebuilds the snapshot. If a probe itself cannot be inspected, the snapshot expires with `setImmediate` and is never reused in a later event-loop turn. Any snapshot containing a symlink-derived canonical target is likewise turn-scoped because a lexical-parent watcher cannot prove that every nested symlink component remained unchanged.
 
 Provide a bounded test-only reset/observer seam; no production caller can mark an unsafe snapshot valid.
 
@@ -76,7 +76,7 @@ Focused synthetic tests will cover:
 2. unchanged manifest reuses the snapshot;
 3. Project/session manifest mutation rebuilds it;
 4. watched `.env` and browser-root symlink retargeting invalidates and recomputes canonical targets;
-5. watch-unavailable mode reuses only within one event-loop turn and rebuilds after `setImmediate`;
+5. watch-unavailable mode reuses unchanged identity probes across turns, rebuilds after a protected entry changes, and becomes turn-scoped when a probe is uninspectable;
 6. repeated transcript authorization does not scale canonicalization with transcript count inside a phase;
 7. direct path and bash policies retain every existing universal denial;
 8. a missing/unloadable search DB is attempted once, not once per session;
