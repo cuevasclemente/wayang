@@ -44,7 +44,8 @@ Production results:
 - first cached-root deployment: port usable in 13.1 seconds; search/project/session-route responses returned HTTP 200/200/400 rather than 5xx, but one mergerfs Project could not install an `fs.watch`, so concurrent search still caused per-turn root rebuilds;
 - final identity-probe deployment: port usable in 13.4 seconds and listener callback at 29 seconds while startup services completed;
 - warm Projects: HTTP 200 in about 1 ms;
-- synthetic malformed session-create validation: expected HTTP 400 in about 7 ms, proving the route/event loop is responsive without creating a durable test session;
+- synthetic malformed session-create validation: expected HTTP 400 in about 7 ms;
+- real Memoriki session smoke: HTTP 201 followed by reversible archive HTTP 204, 5.1 seconds combined; the archived row is titled `Wayang repair validation (archived)`;
 - synthetic no-result search: HTTP 200 in about 1.1 seconds;
 - post-fix syscall trace during search: eight `statx` calls and zero `readlink`/all-Project canonicalization storm;
 - service journal after final restart: no SQLite binding, policy-purge, catalog, or search errors.
