@@ -6,6 +6,7 @@ import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   CanonicalKvWarmupCoordinator,
+  relocateDynamicCoordinationContext,
   sanitizeCanonicalWarmPayload,
   validateCanonicalKvWarmupConfig,
   type CanonicalKvWarmupConfig,
@@ -91,6 +92,60 @@ test("sanitizer retains only the stable system/tool prefix and produces a histor
   assert.equal(first.payload.n, 1);
   assert.equal("stream_options" in first.payload, false);
   assert.equal("metadata" in first.payload, false);
+});
+
+test("dynamic coordination context is preserved after the stable developer/tool prefix", () => {
+  const guideline = "Guideline: coordination is advisory. Check peers before broad edits, claim intended work, share useful blockers, avoid secrets, and use separate Git worktrees/branches for concurrent implementation.";
+  const withCoordination = (peer: string) => ({
+    ...providerPayload("real-private-user"),
+    messages: [
+      { role: "system", content: SYSTEM },
+      {
+        role: "developer",
+        content: `stable-developer-prefix\n## Cross-session coordination\nOther active Pi sessions:\n- ${peer}\n${guideline}\n\n## Current TODO List\n- stable task`,
+      },
+      { role: "user", content: "real-private-user" },
+    ],
+  });
+  const firstOriginal = withCoordination("synthetic-peer-a");
+  const first = relocateDynamicCoordinationContext(firstOriginal);
+  const second = relocateDynamicCoordinationContext(withCoordination("synthetic-peer-b-with-different-length"));
+  assert.equal(first.relocated, true);
+  assert.equal(first.malformed, false);
+  assert.equal(second.relocated, true);
+  assert.equal((firstOriginal.messages[1] as { content: string }).content.includes("synthetic-peer-a"), true, "input remains unchanged");
+  const firstMessages = (first.payload as { messages: Array<{ role: string; content: string }> }).messages;
+  assert.deepEqual(firstMessages.map((message) => message.role), ["system", "developer", "user", "user"]);
+  assert.equal(firstMessages[1].content, "stable-developer-prefix\n\n## Current TODO List\n- stable task");
+  assert.match(firstMessages[2].content, /synthetic-peer-a/u);
+  assert.equal(firstMessages[3].content, "real-private-user");
+
+  const firstWarm = sanitizeCanonicalWarmPayload(first.payload, "qwen3.8-flash-next", 8 * 1024 * 1024);
+  const secondWarm = sanitizeCanonicalWarmPayload(second.payload, "qwen3.8-flash-next", 8 * 1024 * 1024);
+  assert.ok(firstWarm);
+  assert.ok(secondWarm);
+  assert.equal(firstWarm.bundleHash, secondWarm.bundleHash);
+  const warmBody = JSON.stringify(firstWarm.payload);
+  assert.doesNotMatch(warmBody, /synthetic-peer-a|real-private-user/u);
+  assert.match(warmBody, /Current TODO List/u);
+});
+
+test("coordination relocation fails closed on ambiguous or unterminated blocks", () => {
+  const unterminated = providerPayload();
+  unterminated.messages = [
+    { role: "developer", content: "stable\n## Cross-session coordination\nunbounded dynamic text" },
+    { role: "user", content: "ordinary" },
+  ];
+  const result = relocateDynamicCoordinationContext(unterminated);
+  assert.equal(result.relocated, false);
+  assert.equal(result.malformed, true);
+  assert.equal(result.payload, unterminated);
+
+  const ordinary = providerPayload();
+  const unchanged = relocateDynamicCoordinationContext(ordinary);
+  assert.equal(unchanged.relocated, false);
+  assert.equal(unchanged.malformed, false);
+  assert.equal(unchanged.payload, ordinary);
 });
 
 test("sanitizer fails closed for wrong models, missing leading system roles, malformed tools, and bounds", () => {

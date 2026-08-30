@@ -3,7 +3,7 @@
 Date: 2026-08-29
 Branch: `feat/canonical-kv-warmer-20260829`
 Base: `f840101d13e0c442c9578800c8ae54371480974b`
-Status: common Wayang implementation complete and tested; not integrated, configured, deployed, or restarted
+Status: integrated and enabled; live prompt-stability follow-up implemented and gate-complete, pending restart/revalidation
 
 ## Scope
 
@@ -19,7 +19,7 @@ The final inline provider hook:
 - drops every real user, assistant, tool-result, session/account metadata, cache key, and conversation-history message;
 - appends one fixed public synthetic user message;
 - forces the warm copy to non-streaming, one output token, and `tool_choice=none`;
-- leaves the real foreground request payload unchanged;
+- leaves ordinary real conversation content unchanged while relocating only the exact bounded dynamic coordination snapshot after the stable developer/tool prefix;
 - keeps the sanitized template only in Wayang process memory;
 - tags later canonical Ruminant requests only with a family label and SHA-256 bundle identifier.
 
@@ -52,20 +52,21 @@ The process controller:
 Passed:
 
 - backend TypeScript production build;
-- focused canonical/config/resource-loader tests: 41 passed;
-- full backend suite under documented test-default feature selectors: 1122 passed, 0 failed, 8 skipped;
+- focused canonical/config/resource-loader tests: 43 passed;
+- full backend suite under documented test-default feature selectors after the live follow-up: 1126 passed, 0 failed, 8 skipped;
 - direct route exclusion, interactive-only scope, hidden extension ordering, history-independent bundle hashing, strict key-file permissions, disabled inertness, bounded controller behavior, and sanitizer privacy tests;
 - cross-service alternate-port integration using the compiled Wayang coordinator, the actual Ruminant branch, and a synthetic mock upstream: one authenticated warm attempt completed; only `system` + synthetic `user` roles and one tool schema reached the mock; the synthetic private-history canary was absent; output controls were forced; internal family/bundle headers were stripped; Ruminant reported `warmup_completed` with no active lease.
+
+The first live production canary found one material prompt-stability defect before acceptance: three fresh canonical sessions each produced a different bundle and remained fully cold (~13.9K evaluated tokens / 86–94 seconds). Content-free component hashes showed all 49 tool schemas and chat-template fields were identical; only the leading developer message varied. Temporary memory-only prefix/suffix diagnostics localized the change to the session-coordinator's live peer/claim/message snapshot about 20.4 KB into that message. The follow-up fix recognizes only the extension's exact bounded heading and terminal guideline, removes that advisory snapshot from the canonical developer message, and inserts it unchanged as a provider-only user-context message before the real conversation. The authoritative developer text and schemas become stable; the model still receives coordination context; the warm sanitizer discards it with all other user content; malformed or ambiguous sentinels leave the real request unchanged and reject capture. Focused relocation/privacy tests were added. Live revalidation remains required after restart.
 
 The first aggregate attempt inherited production feature flags and produced one Standard-browser startup fixture failure plus cascading store failures. Re-running with only known non-secret feature selectors forced to their documented test defaults passed completely. No environment or credential value was read or printed.
 
 ## Pending cross-service work
 
-- owner answer for event-driven dirty restoration versus restart-only;
-- owner answer for memory-only versus private persistent template;
-- apply the answer to Ruminant configuration/default documentation and Wayang storage design;
-- mock/live cross-service integration and prompt-leak scan;
-- current-main reconciliation and independent review;
-- disabled-by-default integration, then controlled Ruminant/Wayang/Narwhal canary.
+- commit, fast-forward integrate, build, and restart the gate-complete prompt-stability follow-up;
+- repeat two fresh canonical sessions and require a stable bundle plus >90% prefix reuse / <5-second prompt processing;
+- exercise noncanonical eviction with event-driven idle restoration and live foreground preemption;
+- complete unauthenticated-denial, durable-store/log absence, normal streaming/tool/vision/cancellation, and Narwhal error-log gates;
+- retain memory-only template storage and existing rollback bundles.
 
-No production source edit, service restart, credential read by the agent, prompt persistence, session mutation, or Narwhal change was performed.
+Production currently runs the reviewed common warmer with event-driven restoration and memory-only Wayang storage. No prompt template was persisted or logged. The follow-up changes above remain isolated until commit/integration/restart.

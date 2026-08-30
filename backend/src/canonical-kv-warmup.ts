@@ -7,6 +7,8 @@ const FAMILY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const BUNDLE_PATTERN = /^[a-f0-9]{64}$/u;
 const GENERATION_PATTERN = /^[a-f0-9]{32}$/u;
 const SYNTHETIC_USER_MESSAGE = "Warm this stable prefix without taking action or calling tools.";
+const COORDINATION_BLOCK_START = "\n## Cross-session coordination\n";
+const COORDINATION_BLOCK_END = "Guideline: coordination is advisory. Check peers before broad edits, claim intended work, share useful blockers, avoid secrets, and use separate Git worktrees/branches for concurrent implementation.";
 const RETAINED_OPTION_FIELDS = [
   "chat_template_kwargs",
   "reasoning_effort",
@@ -33,6 +35,12 @@ export interface CanonicalWarmTemplate {
   readonly payload: Readonly<Record<string, unknown>>;
   readonly bundleHash: string;
   readonly byteLength: number;
+}
+
+export interface CanonicalProviderPayloadRelocation {
+  readonly payload: unknown;
+  readonly relocated: boolean;
+  readonly malformed: boolean;
 }
 
 export interface CanonicalKvWarmupIdentity {
@@ -97,7 +105,13 @@ export class CanonicalKvWarmupSessionBinding {
       });
       pi.on("before_provider_request", (event) => {
         if (!this.isEligible()) return;
-        this.coordinator.capture(event.payload);
+        const relocation = relocateDynamicCoordinationContext(event.payload);
+        if (relocation.malformed) {
+          this.coordinator.capture(undefined);
+          return;
+        }
+        this.coordinator.capture(relocation.payload);
+        return relocation.relocated ? relocation.payload : undefined;
       });
       pi.on("model_select", (event) => {
         this.bindModel(String(event.model.provider), event.model.id, event.model.baseUrl);
@@ -370,6 +384,61 @@ export class CanonicalKvWarmupCoordinator {
     this.consecutiveFailures = 0;
     this.nextAllowedAt = 0;
   }
+}
+
+export function relocateDynamicCoordinationContext(
+  payload: unknown,
+): CanonicalProviderPayloadRelocation {
+  const unchanged = (malformed = false): CanonicalProviderPayloadRelocation => ({
+    payload,
+    relocated: false,
+    malformed,
+  });
+  if (!isRecord(payload) || !Array.isArray(payload.messages)) return unchanged();
+
+  let sourceIndex = -1;
+  let sourceContent = "";
+  let blockStart = -1;
+  let blockEnd = -1;
+  for (let index = 0; index < payload.messages.length; index += 1) {
+    const candidate = payload.messages[index];
+    if (!isRecord(candidate)) return unchanged(true);
+    if (candidate.role !== "system" && candidate.role !== "developer") break;
+    if (typeof candidate.content !== "string") continue;
+    const start = candidate.content.indexOf(COORDINATION_BLOCK_START);
+    if (start < 0) continue;
+    if (sourceIndex >= 0 || candidate.content.indexOf(COORDINATION_BLOCK_START, start + 1) >= 0) {
+      return unchanged(true);
+    }
+    const endStart = candidate.content.indexOf(COORDINATION_BLOCK_END, start + COORDINATION_BLOCK_START.length);
+    if (endStart < 0 || candidate.content.indexOf(COORDINATION_BLOCK_END, endStart + 1) >= 0) {
+      return unchanged(true);
+    }
+    sourceIndex = index;
+    sourceContent = candidate.content;
+    blockStart = start;
+    blockEnd = endStart + COORDINATION_BLOCK_END.length;
+  }
+  if (sourceIndex < 0) return unchanged();
+
+  const messages = payload.messages.map((message) => isRecord(message) ? { ...message } : message);
+  const source = messages[sourceIndex] as Record<string, unknown>;
+  source.content = `${sourceContent.slice(0, blockStart)}${sourceContent.slice(blockEnd)}`;
+  let firstConversationIndex = 0;
+  while (firstConversationIndex < messages.length) {
+    const message = messages[firstConversationIndex];
+    if (!isRecord(message) || (message.role !== "system" && message.role !== "developer")) break;
+    firstConversationIndex += 1;
+  }
+  messages.splice(firstConversationIndex, 0, {
+    role: "user",
+    content: sourceContent.slice(blockStart + 1, blockEnd),
+  });
+  return {
+    payload: { ...payload, messages },
+    relocated: true,
+    malformed: false,
+  };
 }
 
 export function sanitizeCanonicalWarmPayload(
