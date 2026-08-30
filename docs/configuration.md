@@ -140,6 +140,31 @@ At the review threshold, `agent_end` queues a `followUp` custom reminder with `t
 
 Lifecycle events contain only a fixed event type, privacy/route/execution classifications, timestamp, and optional token count/reason. They contain no session or Project identity, prompts, summaries, tool data, memory content, paths, or transcript bytes; they are capped at 64 emissions per runtime, and consumer failure never affects the session. Wayang publishes the same frozen aggregate contract on Pi's `wayang:memory-first-lifecycle:v1` event bus and through the optional exported sink; it does not persist the events itself. A reviewed mypi extension may consume that interface and remain the sole owner of any richer content ledger.
 
+### Canonical Ruminant KV-prefix warming
+
+This integration is disabled by default. It targets one exact authorized Standard interactive Project/Profile plus one exact provider/model routed through the configured Ruminant origin. Protected, scheduled, subagent, restricted-resource, other-project/profile, other-model, and direct-to-Narwhal requests never install the capture hook.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `WAYANG_CANONICAL_KV_WARMUP_ENABLED` | `0` | Master gate. `1` requires every exact selector and private key path below. |
+| `WAYANG_CANONICAL_KV_WARMUP_PROJECT_ID` | empty | Exact authorized Standard Project ID whose stable prefix may be captured. |
+| `WAYANG_CANONICAL_KV_WARMUP_AGENT_PROFILE_ID` | empty | Exact enabled Agent Profile ID authorized for that Project. |
+| `WAYANG_CANONICAL_KV_WARMUP_PROVIDER` | empty | Exact Pi provider ID, normally `narwhal-horn`. |
+| `WAYANG_CANONICAL_KV_WARMUP_MODEL` | empty | Exact Pi model ID, normally `qwen3.8-flash-next`. |
+| `WAYANG_CANONICAL_KV_WARMUP_FAMILY` | empty | Bounded opaque family label shared with Ruminant. |
+| `WAYANG_CANONICAL_KV_WARMUP_RUMINANT_BASE_URL` | empty | Exact HTTP(S) Ruminant origin without `/v1`, credentials, path, query, fragment, or trailing slash. The selected model's base URL must be this origin plus `/v1`. |
+| `WAYANG_CANONICAL_KV_WARMUP_API_KEY_FILE` | empty | Absolute private regular non-symlink mode-0600 file containing the Ruminant client bearer. |
+| `WAYANG_CANONICAL_KV_WARMUP_POLL_MS` | `2000` | Content-free Ruminant warm-status poll/retry interval, integer 250–300000. |
+| `WAYANG_CANONICAL_KV_WARMUP_STATUS_TIMEOUT_MS` | `2000` | Status request/body timeout, integer 250–30000. |
+| `WAYANG_CANONICAL_KV_WARMUP_REQUEST_TIMEOUT_MS` | `180000` | End-to-end warm request/response timeout, integer 1000–600000. |
+| `WAYANG_CANONICAL_KV_WARMUP_MAX_TEMPLATE_BYTES` | `8388608` | Maximum sanitized in-memory template, integer 1024–33554432. |
+
+The final hidden inline provider hook sees the payload only after ordinary extension payload handlers. It creates a new positive-field template containing contiguous leading `system`/`developer` messages, exact tool schemas, selected chat-template fields, and one fixed public synthetic user message. It drops every real user, assistant, tool-result, session/account metadata, cache key, and conversation-history message. The copy is forced to non-streaming, one output token, and `tool_choice=none`; the original foreground payload is not changed. A SHA-256 bundle identifier and family label are the only metadata added to later canonical Ruminant requests, and Ruminant consumes rather than forwards them.
+
+The template is process-memory-only in the initial implementation. It is not written to Wayang's database, Pi JSONL, search index, browser state, logs, or Ruminant's durable queue. After a simultaneous Wayang/template loss and cold model cache, the first eligible foreground request remains cold but reseeds the template; later Narwhal or Ruminant generations can then be restored while Wayang remains running. Persisting the derived rendered template is not implied by enabling this gate and requires a separate privacy/reliability decision.
+
+The controller never creates an AgentSession and never owns a tool dispatcher. It sends the sanitized payload directly to Ruminant's authenticated internal warm endpoint, where foreground traffic revokes the idle lease before dispatch. Polling, capture rejection, Ruminant outage, timeout, or warm failure cannot block ordinary session creation or provider calls. Disable and restart Wayang to stop capture/tagging/network work; disable the matching Ruminant gate separately to remove the warm endpoint. No llama.cpp service change or cache-file deletion is required.
+
 ### Automatic Terra session titles
 
 Automatic titles are disabled unless explicitly enabled:

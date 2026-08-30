@@ -85,6 +85,11 @@ import {
 import { getProject } from "./projects.js";
 import { recoverTranscriptRecoveryJournal } from "./transcript-recovery.js";
 import { authorizeProjectAction } from "./policy.js";
+import { getAgentProfile } from "./agent-profiles.js";
+import {
+  CanonicalKvWarmupCoordinator,
+  installProductionCanonicalKvWarmup,
+} from "./canonical-kv-warmup.js";
 import { closeTranscriptPagination } from "./transcript-pagination/service.js";
 import { closeDerivedTodoProjectionService } from "./transcript-pagination/derived-todo.js";
 
@@ -370,6 +375,25 @@ export function start() {
   // durable-backup-first and aborts before replacement if that backup fails.
   init({ browserProfilesEnabled: config.standardBrowserProfileHosts });
   console.log(`[db] Store at ${config.dbPath}`);
+  const canonicalKvWarmup = new CanonicalKvWarmupCoordinator(config.canonicalKvWarmup);
+  if (config.canonicalKvWarmup.enabled) {
+    const project = getProject(config.canonicalKvWarmup.projectId);
+    const profile = getAgentProfile(config.canonicalKvWarmup.agentProfileId);
+    const decision = project && profile
+      ? authorizeProjectAction({
+          cwd: project.cwd,
+          actor: "interactive",
+          agentProfileId: profile.id,
+        })
+      : { allowed: false as const, project: undefined, agentProfile: undefined };
+    if (!project || !profile || project.access_policy.privacy_mode !== "standard"
+      || !decision.allowed || decision.project?.id !== project.id
+      || decision.agentProfile?.id !== profile.id) {
+      throw new Error("canonical KV warmup requires an authorized exact Standard Project/Profile target");
+    }
+  }
+  installProductionCanonicalKvWarmup(canonicalKvWarmup);
+  canonicalKvWarmup.start();
   const workspaceCapabilities = createProductionWorkspaceCapabilityBootstrap(authService, config);
   installActionApprovalPinAttempts(workspaceCapabilities.pinAttempts);
   installTranscriptMutationPinAttempts(workspaceCapabilities.pinAttempts);
@@ -434,6 +458,7 @@ export function start() {
     protectedAutomation,
     fileAudioExperiment,
     matrixMessaging,
+    canonicalKvWarmup,
   );
   protectedAutomation.start();
   browserProfileCleanup?.start();

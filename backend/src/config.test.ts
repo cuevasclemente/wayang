@@ -124,6 +124,71 @@ test("messaging is disabled by default and strict flags expose only a private co
   }
 });
 
+test("canonical KV warming is default-off and requires exact bounded selectors", () => {
+  const names = [
+    "WAYANG_CANONICAL_KV_WARMUP_ENABLED",
+    "WAYANG_CANONICAL_KV_WARMUP_PROJECT_ID",
+    "WAYANG_CANONICAL_KV_WARMUP_AGENT_PROFILE_ID",
+    "WAYANG_CANONICAL_KV_WARMUP_PROVIDER",
+    "WAYANG_CANONICAL_KV_WARMUP_MODEL",
+    "WAYANG_CANONICAL_KV_WARMUP_FAMILY",
+    "WAYANG_CANONICAL_KV_WARMUP_RUMINANT_BASE_URL",
+    "WAYANG_CANONICAL_KV_WARMUP_API_KEY_FILE",
+    "WAYANG_CANONICAL_KV_WARMUP_POLL_MS",
+    "WAYANG_CANONICAL_KV_WARMUP_STATUS_TIMEOUT_MS",
+    "WAYANG_CANONICAL_KV_WARMUP_REQUEST_TIMEOUT_MS",
+    "WAYANG_CANONICAL_KV_WARMUP_MAX_TEMPLATE_BYTES",
+  ];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  try {
+    for (const name of names) delete process.env[name];
+    assert.deepEqual(getConfig().canonicalKvWarmup, {
+      enabled: false,
+      projectId: "",
+      agentProfileId: "",
+      provider: "",
+      model: "",
+      family: "",
+      ruminantBaseUrl: "",
+      apiKeyFile: "",
+      pollMs: 2_000,
+      statusTimeoutMs: 2_000,
+      requestTimeoutMs: 180_000,
+      maxTemplateBytes: 8 * 1024 * 1024,
+    });
+
+    process.env.WAYANG_CANONICAL_KV_WARMUP_ENABLED = "1";
+    assert.throws(() => getConfig(), /projectId/u);
+    Object.assign(process.env, {
+      WAYANG_CANONICAL_KV_WARMUP_PROJECT_ID: "project-memoriki",
+      WAYANG_CANONICAL_KV_WARMUP_AGENT_PROFILE_ID: "profile-wren",
+      WAYANG_CANONICAL_KV_WARMUP_PROVIDER: "narwhal-horn",
+      WAYANG_CANONICAL_KV_WARMUP_MODEL: "qwen3.8-flash-next",
+      WAYANG_CANONICAL_KV_WARMUP_FAMILY: "wren-memoriki-v1",
+      WAYANG_CANONICAL_KV_WARMUP_RUMINANT_BASE_URL: "http://127.0.0.1:8055",
+      WAYANG_CANONICAL_KV_WARMUP_API_KEY_FILE: "/private/ruminant-key",
+    });
+    const enabled = getConfig().canonicalKvWarmup;
+    assert.equal(enabled.enabled, true);
+    assert.equal(enabled.projectId, "project-memoriki");
+    assert.equal(enabled.ruminantBaseUrl, "http://127.0.0.1:8055");
+
+    process.env.WAYANG_CANONICAL_KV_WARMUP_FAMILY = "contains spaces";
+    assert.throws(() => getConfig(), /family is invalid/u);
+    process.env.WAYANG_CANONICAL_KV_WARMUP_FAMILY = "wren-memoriki-v1";
+    process.env.WAYANG_CANONICAL_KV_WARMUP_RUMINANT_BASE_URL = "http://127.0.0.1:8055/v1";
+    assert.throws(() => getConfig(), /without credentials, path/u);
+    process.env.WAYANG_CANONICAL_KV_WARMUP_RUMINANT_BASE_URL = "http://127.0.0.1:8055";
+    process.env.WAYANG_CANONICAL_KV_WARMUP_ENABLED = "true";
+    assert.throws(() => getConfig(), /WAYANG_CANONICAL_KV_WARMUP_ENABLED must be 0 or 1/u);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
 test("memory-first traditional compaction is default-off with independently validated controls", () => {
   const names = [
     "WAYANG_MEMORY_FIRST_ENABLED",

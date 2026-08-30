@@ -49,6 +49,7 @@ import {
   installAgentToolPolicyGuard,
   resolveCurrentStandardResourcesWitness,
 } from "./agent-runtime.js";
+import { createProductionCanonicalKvWarmupBinding } from "./canonical-kv-warmup.js";
 import {
   createPolicySandboxedBashToolDefinition,
   getBashSandboxAvailability,
@@ -2596,6 +2597,10 @@ export async function createPiSession(
     runtimeOptions.testHooks?.onPrivilegedEffect?.("resource_loader");
     assertCreationCurrent();
     const runtimeConfig = getConfig();
+    const canonicalKvWarmup = createProductionCanonicalKvWarmupBinding({
+      projectId: runtimeIdentity.project.id,
+      agentProfileId: runtimeIdentity.agentProfile.id,
+    });
     const runtimeResources = await buildAgentResourceLoader({
       cwd,
       agentDir: getAgentDirPath(),
@@ -2604,6 +2609,7 @@ export async function createPiSession(
       sourceSessionId: id,
       forceInMemorySettings: runtimeOptions.forceInMemorySettings,
       memoryFirstCompaction: runtimeConfig.memoryFirstCompaction,
+      canonicalKvWarmup,
     });
     assertRuntimeIdentityCurrent();
     recordLatencyMetric("lazy_extensions_ms", performance.now() - extensionsStartedAt);
@@ -2654,6 +2660,7 @@ export async function createPiSession(
         );
       }
     }
+    runtimeResources.canonicalKvWarmup?.bindModel(String(model.provider), model.id, model.baseUrl);
     validateMemoryFirstModel(runtimeResources.memoryFirstCompaction, {
       provider: String(model.provider), id: model.id, contextWindow: model.contextWindow,
     });

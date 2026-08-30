@@ -38,6 +38,10 @@ import { RESTRICTED_MCP_TOOL_NAME, type RestrictedMcpRuntime } from "./restricte
 import { FILE_AUDIO_EXPERIMENT_TOOL_NAME, type FileAudioExperimentRuntime } from "./audio-experiment/types.js";
 import type { InteractiveBrowserToolRuntime } from "./browser/interactive-runtime.js";
 import {
+  CanonicalKvWarmupCoordinator,
+  type CanonicalKvWarmupConfig,
+} from "./canonical-kv-warmup.js";
+import {
   buildMemoryFirstGuidance,
   DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
   MEMORY_REVIEW_COMPLETE_TOOL_NAME,
@@ -178,6 +182,85 @@ test("memory-first factory is absent when disabled and injected into eligible St
     assert.equal(enabled.memoryFirstCompaction.enabled, true);
     assert.notEqual(enabled.settingsManager, disabled.settingsManager,
       "enabled compaction controls receive a per-runtime in-memory settings snapshot");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("canonical KV warmup inline factory is last and limited to an exact Standard resource witness", async () => {
+  const f = fixture("wayang-runtime-canonical-kv-warmup-");
+  try {
+    const profile = createAgentProfile({ name: "Canonical warm loader" });
+    const project = createProject({ cwd: f.cwd, default_agent_profile_id: profile.id });
+    const source = createSession(f.cwd, { agentProfileId: profile.id });
+    const warmConfig: CanonicalKvWarmupConfig = {
+      enabled: true,
+      projectId: project.id,
+      agentProfileId: profile.id,
+      provider: "narwhal-horn",
+      model: "qwen3.8-flash-next",
+      family: "wren-memoriki-v1",
+      ruminantBaseUrl: "http://127.0.0.1:8055",
+      apiKeyFile: path.join(f.dir, "not-opened-by-loader"),
+      pollMs: 2_000,
+      statusTimeoutMs: 2_000,
+      requestTimeoutMs: 180_000,
+      maxTemplateBytes: 8 * 1024 * 1024,
+    };
+    const coordinator = new CanonicalKvWarmupCoordinator(warmConfig);
+    const binding = coordinator.createSessionBinding({
+      projectId: project.id,
+      agentProfileId: profile.id,
+    });
+    assert.ok(binding);
+
+    const standard = await buildAgentResourceLoader({
+      cwd: f.cwd,
+      agentDir: f.agentDir,
+      agentProfile: profile,
+      project,
+      sourceSessionId: source.id,
+      memoryFirstCompaction: enabledMemoryFirstConfig,
+      canonicalKvWarmup: binding,
+    });
+    assert.equal(standard.restricted, false);
+    assert.equal(standard.resourceLoader.getExtensions().extensions.length, 2);
+    assert.equal(standard.resourceLoader.getExtensions().extensions.at(-1)?.path, "<inline:canonical-kv-warmup>");
+    assert.equal(standard.canonicalKvWarmup, binding);
+
+    const restricted = await buildAgentResourceLoader({
+      cwd: f.cwd,
+      agentDir: f.agentDir,
+      agentProfile: profile,
+      project,
+      canonicalKvWarmup: binding,
+    });
+    assert.equal(restricted.restricted, true);
+    assert.equal(restricted.resourceLoader.getExtensions().extensions.length, 0);
+    assert.equal(restricted.canonicalKvWarmup, undefined);
+
+    const scheduledSource = createSession(f.cwd, { agentProfileId: profile.id });
+    commitStoreMutation((draft) => {
+      const row = draft.sessions.find((candidate) => candidate.id === scheduledSource.id)!;
+      row.scheduled_job_id = "synthetic-job";
+      row.scheduled_run_id = "synthetic-run";
+    });
+    const scheduledBinding = coordinator.createSessionBinding({
+      projectId: project.id,
+      agentProfileId: profile.id,
+    });
+    assert.ok(scheduledBinding);
+    const scheduled = await buildAgentResourceLoader({
+      cwd: f.cwd,
+      agentDir: f.agentDir,
+      agentProfile: profile,
+      project,
+      sourceSessionId: scheduledSource.id,
+      canonicalKvWarmup: scheduledBinding,
+    });
+    assert.equal(scheduled.restricted, false);
+    assert.equal(scheduled.resourceLoader.getExtensions().extensions.length, 0);
+    assert.equal(scheduled.canonicalKvWarmup, undefined);
   } finally {
     f.cleanup();
   }

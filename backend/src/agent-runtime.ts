@@ -5,6 +5,7 @@ import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import {
   DefaultResourceLoader,
   SettingsManager,
+  type InlineExtension,
   type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
 import { getSessionById } from "./sessions.js";
@@ -37,6 +38,7 @@ import {
   resolveWorkspaceCapability,
   type WorkspaceCapabilityResolution,
 } from "./workspace-capabilities.js";
+import type { CanonicalKvWarmupSessionBinding } from "./canonical-kv-warmup.js";
 import {
   createMemoryFirstCompactionExtension,
   DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
@@ -845,6 +847,7 @@ export interface AgentResourceLoaderResult {
   restricted: boolean;
   standardResourcesWitness?: ExactStandardResourcesWitness;
   memoryFirstCompaction: MemoryFirstCompactionConfig;
+  canonicalKvWarmup?: CanonicalKvWarmupSessionBinding;
   tools?: string[];
   excludeTools?: string[];
 }
@@ -857,6 +860,7 @@ export async function buildAgentResourceLoader(options: {
   sourceSessionId?: string;
   forceInMemorySettings?: boolean;
   memoryFirstCompaction?: MemoryFirstCompactionConfig;
+  canonicalKvWarmup?: CanonicalKvWarmupSessionBinding;
   /** Explicit future coordinator seam; current Wayang Pi sessions derive interactive/scheduled. */
   executionMode?: MemoryFirstExecutionMode;
 }): Promise<AgentResourceLoaderResult> {
@@ -882,6 +886,18 @@ export async function buildAgentResourceLoader(options: {
         memoryAccess: options.agentProfile.memory_access,
       }, memoryFirstCompaction)
     : undefined;
+  const canonicalKvWarmup = executionMode === "interactive"
+    ? options.canonicalKvWarmup
+    : undefined;
+  const standardInlineExtensions: InlineExtension[] = [
+    ...(memoryFirstFactory ? [memoryFirstFactory] : []),
+    ...(canonicalKvWarmup ? [{
+      name: "canonical-kv-warmup",
+      factory: canonicalKvWarmup.extensionFactory,
+      hidden: true,
+    }] : []),
+  ];
+  const restrictedInlineExtensions: InlineExtension[] = memoryFirstFactory ? [memoryFirstFactory] : [];
   const standardResourcesWitness = options.sourceSessionId
     ? resolveCurrentStandardResourcesWitness({
         sourceSessionId: options.sourceSessionId,
@@ -900,7 +916,7 @@ export async function buildAgentResourceLoader(options: {
       cwd: options.cwd,
       agentDir: options.agentDir,
       settingsManager,
-      extensionFactories: memoryFirstFactory ? [memoryFirstFactory] : undefined,
+      extensionFactories: standardInlineExtensions.length > 0 ? standardInlineExtensions : undefined,
       appendSystemPromptOverride: (base) => [
         ...base,
         ...(profileInstructions ? [profileInstructions] : []),
@@ -922,6 +938,7 @@ export async function buildAgentResourceLoader(options: {
         restricted: false,
         standardResourcesWitness,
         memoryFirstCompaction,
+        ...(canonicalKvWarmup ? { canonicalKvWarmup } : {}),
         excludeTools: options.project.access_policy.privacy_mode === "protected" ? [...SUBAGENT_TOOLS] : undefined,
       };
     }
@@ -938,7 +955,7 @@ export async function buildAgentResourceLoader(options: {
     cwd: options.cwd,
     agentDir: options.agentDir,
     settingsManager,
-    extensionFactories: memoryFirstFactory ? [memoryFirstFactory] : undefined,
+    extensionFactories: restrictedInlineExtensions.length > 0 ? restrictedInlineExtensions : undefined,
     noContextFiles: true,
     agentsFilesOverride: () => ({ agentsFiles: exactProjectAgentsFile(options.cwd) }),
     systemPromptOverride: () => undefined,

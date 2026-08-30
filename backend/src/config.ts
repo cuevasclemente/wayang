@@ -3,6 +3,10 @@ import * as os from "node:os";
 import { isPasswordHashRecord } from "./auth/password.js";
 import { isLoopbackHost } from "./loopback.js";
 import {
+  type CanonicalKvWarmupConfig,
+  validateCanonicalKvWarmupConfig,
+} from "./canonical-kv-warmup.js";
+import {
   DEFAULT_MEMORY_COMPACTION_TRIGGER_TOKENS,
   DEFAULT_MEMORY_KEEP_RECENT_TOKENS,
   DEFAULT_MEMORY_REVIEW_TOKENS,
@@ -91,6 +95,7 @@ export interface Config {
   browser: BrowserConfig;
   messaging: MessagingConfig;
   memoryFirstCompaction: MemoryFirstCompactionConfig;
+  canonicalKvWarmup: CanonicalKvWarmupConfig;
   fileAudioExperiment: FileAudioExperimentConfig;
 }
 
@@ -364,6 +369,20 @@ export function getConfig(overrides?: Partial<Config>): Config {
       configPath: process.env.WAYANG_MESSAGING_CONFIG_PATH?.trim() || "",
     },
     memoryFirstCompaction: memoryFirstCompactionConfig(),
+    canonicalKvWarmup: {
+      enabled: envFlag("WAYANG_CANONICAL_KV_WARMUP_ENABLED"),
+      projectId: process.env.WAYANG_CANONICAL_KV_WARMUP_PROJECT_ID || "",
+      agentProfileId: process.env.WAYANG_CANONICAL_KV_WARMUP_AGENT_PROFILE_ID || "",
+      provider: process.env.WAYANG_CANONICAL_KV_WARMUP_PROVIDER || "",
+      model: process.env.WAYANG_CANONICAL_KV_WARMUP_MODEL || "",
+      family: process.env.WAYANG_CANONICAL_KV_WARMUP_FAMILY || "",
+      ruminantBaseUrl: process.env.WAYANG_CANONICAL_KV_WARMUP_RUMINANT_BASE_URL || "",
+      apiKeyFile: process.env.WAYANG_CANONICAL_KV_WARMUP_API_KEY_FILE || "",
+      pollMs: getPositiveEnvInt("WAYANG_CANONICAL_KV_WARMUP_POLL_MS", 2_000, 250, 300_000),
+      statusTimeoutMs: getPositiveEnvInt("WAYANG_CANONICAL_KV_WARMUP_STATUS_TIMEOUT_MS", 2_000, 250, 30_000),
+      requestTimeoutMs: getPositiveEnvInt("WAYANG_CANONICAL_KV_WARMUP_REQUEST_TIMEOUT_MS", 180_000, 1_000, 600_000),
+      maxTemplateBytes: getPositiveEnvInt("WAYANG_CANONICAL_KV_WARMUP_MAX_TEMPLATE_BYTES", 8 * 1024 * 1024, 1_024, 32 * 1024 * 1024),
+    },
     fileAudioExperiment: {
       enabled: envFlag("WAYANG_FILE_AUDIO_EXPERIMENT_ENABLED"),
       permitTtlMs: getPositiveEnvInt("WAYANG_FILE_AUDIO_EXPERIMENT_PERMIT_TTL_MS", 60_000, 1_000, 120_000),
@@ -384,5 +403,6 @@ export function getConfig(overrides?: Partial<Config>): Config {
     ...overrides,
   };
   validateAuthConfig(config.auth);
+  validateCanonicalKvWarmupConfig(config.canonicalKvWarmup);
   return config;
 }
