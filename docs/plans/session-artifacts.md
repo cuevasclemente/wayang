@@ -1,8 +1,8 @@
 # Session Artifacts Pane: Preview, Presentation, and Download Plan
 
 **Date:** 2026-08-26
-**Status:** Implementation-ready; terminal architecture/security review GO; awaiting Clemente's implementation approval
-**Scope:** Plan only. This document does not authorize implementation.
+**Status:** Implemented and validated on `feat/session-artifacts-20260830`; terminal architecture/security review GO; awaiting integration/deployment review
+**Scope:** Canonical design and implementation contract. Clemente authorized full implementation on 2026-08-30; deployment/restart remains separate.
 
 ## 1. Product goal
 
@@ -872,4 +872,4 @@ Update:
 
 A read-only terminal architecture/security review reached **GO** after the plan froze exact tool-object authority, archived/live session gates, registry/deletion failure semantics, descriptor streaming, response policy, renderer containment, shared protocol correlation, upload completion, and post-commit event behavior. No tests were run during planning.
 
-This plan does not authorize code implementation, dependency additions, Files-route removal, merge, deployment, or service restart. After Clemente accepts the plan and explicitly approves implementation, execution should begin from an explicit current base in separate worktrees using the roles above.
+This plan originally did not authorize implementation. Clemente explicitly authorized the full feature on 2026-08-30. Implementation and validation were completed in the isolated worktree documented by `docs/journals/2026-08-30-session-artifacts-implementation.md`; merge, production deployment, and service restart remain separately controlled.

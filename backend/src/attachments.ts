@@ -29,6 +29,30 @@ const MIME_EXTENSION_HINTS = new Map([
 const MAX_REGISTERED_ATTACHMENTS = 8192;
 const attachmentRegistry = new Map<string, PrivateAttachmentRecord>();
 
+type AttachmentArtifactObserver = (sessionId: string, uploads: readonly {
+  filePath: string;
+  displayName: string;
+  attachmentId: string;
+}[]) => readonly { attachmentId: string; artifactId: string }[];
+let attachmentArtifactObserver: AttachmentArtifactObserver | null = null;
+let attachmentArtifactObserverUsers = 0;
+
+/** Install the backend-owned durable artifact registration hook. Repeated installs of the same callback are reference-counted. */
+export function installAttachmentArtifactObserver(observer: AttachmentArtifactObserver): () => void {
+  if (attachmentArtifactObserver && attachmentArtifactObserver !== observer) {
+    throw new Error("Attachment artifact observer is already installed");
+  }
+  attachmentArtifactObserver = observer;
+  attachmentArtifactObserverUsers += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    attachmentArtifactObserverUsers = Math.max(0, attachmentArtifactObserverUsers - 1);
+    if (attachmentArtifactObserverUsers === 0 && attachmentArtifactObserver === observer) attachmentArtifactObserver = null;
+  };
+}
+
 function pruneAttachmentRegistry(): void {
   while (attachmentRegistry.size > MAX_REGISTERED_ATTACHMENTS) {
     const oldest = attachmentRegistry.keys().next().value as string | undefined;
@@ -85,6 +109,7 @@ export interface PreparedAttachments {
   images: ImageContent[];
   notes: string[];
   attachmentIds: string[];
+  artifactIds: string[];
   count: number;
 }
 
@@ -201,7 +226,7 @@ function validateAttachments(attachments: unknown): ValidatedAttachment[] {
 /** Validate first, then persist only into the source Wayang session's private subtree. */
 export function prepareAttachments(sessionId: string, attachments: unknown): PreparedAttachments {
   const validated = validateAttachments(attachments);
-  if (validated.length === 0) return { images: [], notes: [], attachmentIds: [], count: 0 };
+  if (validated.length === 0) return { images: [], notes: [], attachmentIds: [], artifactIds: [], count: 0 };
 
   const attachmentsRoot = getAttachmentsRoot();
   const sessionRoot = getSessionAttachmentRoot(sessionId);
@@ -211,7 +236,9 @@ export function prepareAttachments(sessionId: string, attachments: unknown): Pre
   const images: ImageContent[] = [];
   const notes: string[] = [];
   const attachmentIds: string[] = [];
+  const artifactIds: string[] = [];
   const created: Array<{ filePath: string; attachmentId: string }> = [];
+  const artifactUploads: Array<{ filePath: string; displayName: string; attachmentId: string }> = [];
   try {
     for (const attachment of validated) {
       const attachmentId = randomUUID();
@@ -237,6 +264,7 @@ export function prepareAttachments(sessionId: string, attachments: unknown): Pre
       attachmentRegistry.set(attachmentId, record);
       pruneAttachmentRegistry();
       attachmentIds.push(attachmentId);
+      artifactUploads.push({ filePath, displayName: attachment.originalName, attachmentId });
       const promptPath = escapeXmlAttribute(filePath);
       if (attachment.isImage) {
         images.push({ type: "image", mimeType: attachment.mimeType, data: attachment.buffer.toString("base64") });
@@ -245,6 +273,17 @@ export function prepareAttachments(sessionId: string, attachments: unknown): Pre
         notes.push(`<file name="${promptPath}" attachment_id="${attachmentId}">[Uploaded file ${attachment.originalName}; ${attachment.mimeType}; ${formatBytes(attachment.buffer.length)}. Saved at this path for tool access. Use attachment_id for backend-owned capabilities.]</file>`);
       }
     }
+    const published = attachmentArtifactObserver?.(sessionId, artifactUploads) ?? [];
+    const artifactByAttachment = new Map(published.map((item) => [item.attachmentId, item.artifactId]));
+    for (let index = 0; index < attachmentIds.length; index += 1) {
+      const artifactId = artifactByAttachment.get(attachmentIds[index]);
+      if (!artifactId) continue;
+      artifactIds.push(artifactId);
+      notes[index] = notes[index].replace(
+        `attachment_id="${attachmentIds[index]}"`,
+        `attachment_id="${attachmentIds[index]}" artifact_id="${artifactId}"`,
+      );
+    }
   } catch (error) {
     for (const createdAttachment of created) {
       attachmentRegistry.delete(createdAttachment.attachmentId);
@@ -252,5 +291,5 @@ export function prepareAttachments(sessionId: string, attachments: unknown): Pre
     }
     throw error;
   }
-  return { images, notes, attachmentIds, count: notes.length };
+  return { images, notes, attachmentIds, artifactIds, count: notes.length };
 }

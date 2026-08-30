@@ -163,6 +163,11 @@ import {
 } from "./audio-experiment/types.js";
 import { createFileAudioExperimentRuntime } from "./audio-experiment/tools.js";
 import {
+  createArtifactToolRuntime,
+  PRESENT_ARTIFACT_TOOL_NAME,
+  type ArtifactToolRuntime,
+} from "./artifacts/tool.js";
+import {
   DELETED_EVENT_TOMBSTONE,
   INVALIDATED_DERIVED_EVENT_TOMBSTONE,
   trustedEditedMutationMarker,
@@ -240,6 +245,7 @@ export interface PiSessionHandle {
   protectedAutomationFactory?: CreatePiSessionRuntimeOptions["protectedAutomationFactory"];
   fileAudioExperimentRuntime?: FileAudioExperimentRuntime;
   fileAudioExperimentFactory?: CreatePiSessionRuntimeOptions["fileAudioExperimentFactory"];
+  artifactToolRuntime?: ArtifactToolRuntime;
   /** Accepted browser turns retained independently until exact settlement. */
   interactiveTurns: Map<string, BrowserTurnProvenance>;
   /** Current-turn mutation authority; non-browser continuations revoke only this token. */
@@ -2545,6 +2551,7 @@ export async function createPiSession(
   let pendingProtectedBrowserTools: readonly ToolDefinition[] = Object.freeze([]);
   let pendingProtectedAutomationRuntime: ProtectedAutomationToolRuntime | undefined;
   let pendingFileAudioExperimentRuntime: FileAudioExperimentRuntime | undefined;
+  let pendingArtifactToolRuntime: ArtifactToolRuntime | undefined;
   let pendingAgentSession: AgentSession | undefined;
   const assertPendingBrowserCatalogCurrent = () => {
     if (!pendingProtectedBrowserRuntime) return;
@@ -2680,6 +2687,34 @@ export async function createPiSession(
     let protectedAutomationRuntimeForFence: ProtectedAutomationToolRuntime | undefined;
     let fileAudioExperimentRuntimePublished = false;
     let fileAudioExperimentRuntimeForFence: FileAudioExperimentRuntime | undefined;
+    let artifactToolRuntimePublished = false;
+    let artifactToolRuntimeForFence: ArtifactToolRuntime | undefined;
+
+    if (runtimeIdentity.row.scheduled_job_id === null && runtimeIdentity.row.scheduled_run_id === null) {
+      pendingArtifactToolRuntime = createArtifactToolRuntime({
+        binding: {
+          sourceSessionId: id,
+          projectId: runtimeIdentity.project.id,
+          projectCwd: cwd,
+          agentProfileId: runtimeIdentity.agentProfile.id,
+          runtimeGeneration,
+          processBootNonce: PROCESS_BOOT_NONCE,
+        },
+        isCurrent: () => {
+          if (!artifactToolRuntimePublished) {
+            try { assertCreationCurrent(); } catch { return false; }
+            return pendingArtifactToolRuntime === artifactToolRuntimeForFence;
+          }
+          const active = sessions.get(id);
+          return Boolean(active && !active.capabilityAuthorityDenied
+            && active.runtimeGeneration === runtimeGeneration
+            && active.cwd === cwd
+            && active.agentProfileId === runtimeIdentity.agentProfile.id
+            && active.artifactToolRuntime === artifactToolRuntimeForFence);
+        },
+      });
+      artifactToolRuntimeForFence = pendingArtifactToolRuntime;
+    }
 
     const getRestrictedMcpLiveContext = (): RestrictedMcpLiveContext | null => {
       const currentRow = getSessionById(id);
@@ -3038,6 +3073,7 @@ export async function createPiSession(
       ...pendingProtectedBrowserTools.map((tool) => tool.name),
       ...(pendingProtectedAutomationRuntime ? [PROTECTED_AUTOMATION_TOOL_NAME] : []),
       ...(pendingFileAudioExperimentRuntime ? [FILE_AUDIO_EXPERIMENT_TOOL_NAME] : []),
+      ...(pendingArtifactToolRuntime ? [PRESENT_ARTIFACT_TOOL_NAME] : []),
     ];
     // `undefined` is an intentional SDK policy: preserve Pi's normal built-ins,
     // configured defaults, and reviewed extension tools. Converting it to an
@@ -3085,6 +3121,7 @@ export async function createPiSession(
         ...pendingProtectedBrowserTools,
         ...(pendingProtectedAutomationRuntime ? [pendingProtectedAutomationRuntime.tool] : []),
         ...(pendingFileAudioExperimentRuntime ? [pendingFileAudioExperimentRuntime.tool] : []),
+        ...(pendingArtifactToolRuntime ? [pendingArtifactToolRuntime.tool] : []),
         ...(hostBashTool ? [hostBashTool] : []),
         ...(bashMode === "sandboxed" || bashMode === "sandboxed-wren"
           ? [createPolicySandboxedBashToolDefinition(cwd, id, bashMode)]
@@ -3156,6 +3193,7 @@ export async function createPiSession(
       protectedBrowserRuntime: pendingProtectedBrowserRuntime,
       protectedAutomationRuntime: pendingProtectedAutomationRuntime,
       fileAudioExperimentRuntime: pendingFileAudioExperimentRuntime,
+      artifactToolRuntime: pendingArtifactToolRuntime,
     });
     assertCreationCurrent();
     if (hostBashTool && hostCreationDecision.allowed) {
@@ -3244,6 +3282,7 @@ export async function createPiSession(
         fileAudioExperimentRuntime: pendingFileAudioExperimentRuntime,
         fileAudioExperimentFactory: selectedFileAudioExperimentFactory,
       } : {}),
+      ...(pendingArtifactToolRuntime ? { artifactToolRuntime: pendingArtifactToolRuntime } : {}),
       interactiveTurns: new Map(),
       queuedBrowserMessages: new Map(),
     };
@@ -3302,11 +3341,13 @@ export async function createPiSession(
     standardResourcesRuntimePublished = true;
     protectedAutomationRuntimePublished = true;
     fileAudioExperimentRuntimePublished = true;
+    artifactToolRuntimePublished = true;
     pendingAgentSession = undefined;
     pendingRestrictedMcpRuntime = undefined;
     pendingProtectedBrowserRuntime = undefined;
     pendingProtectedAutomationRuntime = undefined;
     pendingFileAudioExperimentRuntime = undefined;
+    pendingArtifactToolRuntime = undefined;
     // The live handle is now the committed authority owner. Observer/timer
     // failures must not reject creation while leaving that published handle
     // live behind a reported startup failure.
@@ -3342,6 +3383,8 @@ export async function createPiSession(
     pendingProtectedAutomationRuntime = undefined;
     await pendingFileAudioExperimentRuntime?.close().catch(() => undefined);
     pendingFileAudioExperimentRuntime = undefined;
+    await pendingArtifactToolRuntime?.close().catch(() => undefined);
+    pendingArtifactToolRuntime = undefined;
     throw error;
   }).finally(() => {
     recordLatencyMetric("lazy_session_create_ms", performance.now() - creationStartedAt);
@@ -4053,11 +4096,13 @@ function beginPiSessionAuthorityCleanup(
     const protectedBrowser = handle.protectedBrowserRuntime;
     const protectedAutomation = handle.protectedAutomationRuntime;
     const fileAudioExperiment = handle.fileAudioExperimentRuntime;
+    const artifactTool = handle.artifactToolRuntime;
     const hostBashTeardown = handle.hostBashTeardown;
     handle.restrictedMcpRuntime = undefined;
     handle.protectedBrowserRuntime = undefined;
     handle.protectedAutomationRuntime = undefined;
     handle.fileAudioExperimentRuntime = undefined;
+    handle.artifactToolRuntime = undefined;
     handle.hostBashTeardown = undefined;
     const invokeClose = (runtime: { close(): Promise<void> } | undefined): Promise<void> => {
       try { return runtime ? Promise.resolve(runtime.close()) : Promise.resolve(); }
@@ -4078,6 +4123,7 @@ function beginPiSessionAuthorityCleanup(
         invokeClose(restricted),
         invokeClose(protectedAutomation),
         invokeClose(fileAudioExperiment),
+        invokeClose(artifactTool),
       ]).then(() => undefined),
     };
     capabilityAuthorityCleanup.set(handle, state);
