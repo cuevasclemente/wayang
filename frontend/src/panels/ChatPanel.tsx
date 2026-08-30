@@ -45,6 +45,7 @@ import {
 } from "../components/transcript/TranscriptMutations";
 import { transcriptMutationMarker } from "../components/transcript/transcriptMutationHelpers";
 import { formatContextWindow } from "../utils/context-window";
+import { shouldCompressImageForAttachment } from "./imageAttachmentCompression";
 import {
   classifyTranscriptPageErrorCode,
   createTranscriptWindowState,
@@ -863,22 +864,33 @@ function compressedFileName(name: string): string {
   return `${baseName}-compressed.jpg`;
 }
 
-async function compressImageForAttachment(file: File): Promise<{ dataUrl: string; fileName: string; mimeType: string; size: number }> {
-  if (file.size <= MAX_IMAGE_BYTES) {
-    return {
-      dataUrl: await readBlobAsDataUrl(file),
-      fileName: file.name || "pasted-image",
-      mimeType: file.type || "image/png",
-      size: file.size,
-    };
-  }
+async function originalImageAttachment(file: File): Promise<{ dataUrl: string; fileName: string; mimeType: string; size: number }> {
+  return {
+    dataUrl: await readBlobAsDataUrl(file),
+    fileName: file.name || "pasted-image",
+    mimeType: file.type || "image/png",
+    size: file.size,
+  };
+}
 
+async function compressImageForAttachment(file: File): Promise<{ dataUrl: string; fileName: string; mimeType: string; size: number }> {
   if (!COMPRESSIBLE_IMAGE_MIME_TYPES.has(file.type)) {
+    if (file.size <= MAX_IMAGE_BYTES) return originalImageAttachment(file);
     throw new Error(`${file.name || "Image"}: ${formatAttachmentBytes(file.size)} exceeds ${formatAttachmentBytes(MAX_IMAGE_BYTES)}.`);
   }
 
   const bitmap = await createImageBitmap(file);
   try {
+    if (!shouldCompressImageForAttachment({
+      size: file.size,
+      width: bitmap.width,
+      height: bitmap.height,
+      maxBytes: MAX_IMAGE_BYTES,
+      maxDimension: IMAGE_COMPRESSION_MAX_DIMENSION,
+    })) {
+      return originalImageAttachment(file);
+    }
+
     let width = bitmap.width;
     let height = bitmap.height;
     const initialScale = Math.min(1, IMAGE_COMPRESSION_MAX_DIMENSION / Math.max(width, height));
