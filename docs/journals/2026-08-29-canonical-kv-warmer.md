@@ -71,4 +71,20 @@ The first aggregate attempt inherited production feature flags and produced one 
 - Wayang, Ruminant, and Narwhal remained active with zero automatic restarts. Installed drop-in hashes matched reviewed artifacts, and Ruminant's rollback preflight re-hashed all eight deployed paths without mutation.
 - Final Ruminant status was `warm` with equal desired/warm content-free bundle hashes, no active foreground or background lease, and zero warmup failures.
 
-The owner-selected production policy remains event-driven dirty restoration and memory-only Wayang template storage. No effective prompt template was persisted or logged. Eighteen named canary/diagnostic sessions may be recoverably archived, and disabled temporary diagnostics may be moved to a timestamped holding directory after explicit cleanup approval; permanent transcript deletion is unnecessary.
+The owner-selected production policy remains event-driven dirty restoration and memory-only Wayang template storage. No effective prompt template was persisted or logged. After explicit approval, all 18 exact-title-prefix canary/diagnostic sessions were recoverably archived: each row was verified archived and stopped, the active catalog reported zero matches, and no transcript was permanently deleted. Three disabled project diagnostics and 23 temporary canary artifacts were hash-verified in timestamped holding; project originals were moved to system trash and `/tmp` originals were removed only after a separate explicit plain-chat authorization.
+
+## Follow-up: extension teardown lifecycle
+
+Archiving exposed a generic Wayang lifecycle defect rather than a warmer defect: nine stopped canary sessions continued refreshing session-coordinator leases past the 90-second stale window. Wayang directly used low-level `AgentSession.dispose()`, which invalidates the extension runner but does not emit Pi's `session_shutdown`; the higher-level Pi runtime normally emits and awaits that event first. The session-coordinator therefore never ran `core.leave()`, retaining heartbeat timers in the shared backend process.
+
+The approved fix adds one handle-owned exactly-once disposal promise. It emits and awaits `session_shutdown` with reason `quit` before unsubscribing and invoking low-level disposal. Concurrent teardown callers share the same promise. A failing shutdown handler cannot prevent disposal and authority cleanup. Focused tests cover ordering, concurrent exactly-once behavior, and failure cleanup.
+
+Validation passed:
+
+- backend TypeScript production build;
+- focused lifecycle tests: 2 passed;
+- full `pi-bridge.test.ts`: 72 passed;
+- full backend suite under documented test-default selectors: 1128 passed, 0 failed, 8 skipped;
+- `git diff --check`.
+
+The first aggregate invocation inherited production memory-first/search/catalog selectors and intentionally forced two paused selectors, producing four then three known selector-dependent fixture failures. Re-running with browser-host, warmer, file-audio, and memory-first features disabled while search/catalog used their documented enabled defaults passed completely. Production restart and live lease-expiry verification remain required before declaring this follow-up active.

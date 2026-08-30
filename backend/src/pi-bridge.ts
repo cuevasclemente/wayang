@@ -257,6 +257,8 @@ export interface PiSessionHandle {
   /** Lifecycle failure not represented by a final assistant message. */
   pendingSessionError?: string;
   liveStreamingMessageUnsubscribe?: () => void;
+  /** Shared exactly-once extension shutdown + low-level AgentSession disposal. */
+  agentSessionDisposal?: Promise<void>;
   /** Process-local activation epoch captured before runtime construction. */
   capabilityActivationGeneration: bigint;
   /** Accepted top-level work not yet protected solely by SDK queue/ledger state. */
@@ -4327,6 +4329,25 @@ export async function closePiSessionAuthorities(
   await beginPiSessionAuthorityCleanup(handle, browserTeardown);
 }
 
+export async function disposePiAgentSession(handle: PiSessionHandle): Promise<void> {
+  if (!handle.agentSessionDisposal) {
+    handle.agentSessionDisposal = (async () => {
+      try {
+        const runner = handle.session.extensionRunner;
+        if (runner.hasHandlers("session_shutdown")) {
+          await runner.emit({ type: "session_shutdown", reason: "quit" });
+        }
+      } catch {
+        // A faulty extension shutdown handler must not retain tools, timers, or
+        // other process-local authorities by preventing low-level disposal.
+      }
+      try { handle.liveStreamingMessageUnsubscribe?.(); } catch { /* best effort */ }
+      try { handle.session.dispose(); } catch { /* best effort */ }
+    })();
+  }
+  await handle.agentSessionDisposal;
+}
+
 export async function destroyPiSession(
   id: string,
   browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
@@ -4372,12 +4393,7 @@ export async function destroyPiSession(
   } catch {
     // ignore
   }
-  try {
-    handle.liveStreamingMessageUnsubscribe?.();
-    handle.session.dispose();
-  } catch {
-    // ignore
-  }
+  await disposePiAgentSession(handle);
   handle.events.removeAllListeners();
   if (handle.sessionFile) invalidateSessionFileSnapshot(handle.sessionFile);
   // Concurrent best-effort refresh retirement and lazy creation may both wait

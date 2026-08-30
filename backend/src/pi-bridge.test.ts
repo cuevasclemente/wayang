@@ -22,6 +22,7 @@ import {
   createModelContext,
   createPiSession,
   destroyPiSession,
+  disposePiAgentSession,
   drainManualCompactionMessageQueue,
   deferBrowserMessageDuringManualCompaction,
   fileAudioExperimentRuntimeIsEligible,
@@ -657,6 +658,69 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   });
   return { promise, resolve };
 }
+
+test("Pi teardown emits and awaits session_shutdown exactly once before low-level disposal", async () => {
+  const entered = deferred();
+  const release = deferred();
+  const events: string[] = [];
+  const handle = {
+    session: {
+      extensionRunner: {
+        hasHandlers(type: string) {
+          events.push(`has:${type}`);
+          return type === "session_shutdown";
+        },
+        async emit(event: { type: string; reason: string }) {
+          events.push(`emit:${event.type}:${event.reason}:start`);
+          entered.resolve();
+          await release.promise;
+          events.push(`emit:${event.type}:${event.reason}:end`);
+        },
+      },
+      dispose() { events.push("dispose"); },
+    },
+    liveStreamingMessageUnsubscribe() { events.push("unsubscribe"); },
+  } as unknown as PiSessionHandle;
+
+  const first = disposePiAgentSession(handle);
+  await entered.promise;
+  const second = disposePiAgentSession(handle);
+  assert.deepEqual(events, ["has:session_shutdown", "emit:session_shutdown:quit:start"]);
+
+  release.resolve();
+  await Promise.all([first, second]);
+  assert.deepEqual(events, [
+    "has:session_shutdown",
+    "emit:session_shutdown:quit:start",
+    "emit:session_shutdown:quit:end",
+    "unsubscribe",
+    "dispose",
+  ]);
+
+  await disposePiAgentSession(handle);
+  assert.equal(events.filter((event) => event === "dispose").length, 1);
+  assert.equal(events.filter((event) => event.startsWith("emit:")).length, 2);
+});
+
+test("Pi teardown still invalidates the low-level session when session_shutdown fails", async () => {
+  const events: string[] = [];
+  const handle = {
+    session: {
+      extensionRunner: {
+        hasHandlers() { return true; },
+        async emit() {
+          events.push("shutdown-failed");
+          throw new Error("synthetic shutdown failure");
+        },
+      },
+      dispose() { events.push("dispose"); },
+    },
+    liveStreamingMessageUnsubscribe() { events.push("unsubscribe"); },
+  } as unknown as PiSessionHandle;
+
+  await assert.doesNotReject(disposePiAgentSession(handle));
+  assert.deepEqual(events, ["shutdown-failed", "unsubscribe", "dispose"]);
+});
 
 function currentTurnFixture(name: string) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), name));
