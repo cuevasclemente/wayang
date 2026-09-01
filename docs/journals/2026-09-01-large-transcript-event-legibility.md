@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-01
 
-**Status:** implemented and validated on task branch; not merged or deployed
+**Status:** integrated on canonical `main` and production-built; service restart not approved, so the fix is not active
 
 **Branch:** `fix/large-event-session-legibility-20260901`
 
@@ -57,9 +57,11 @@ Passed on the isolated task branch:
 
 All fixtures were synthetic. No credential, secret-bearing file, protected transcript, or raw target transcript body was read.
 
-## Rollout and verification
+## Integration and activation state
 
-The branch still requires review/integration into canonical `main`, production build, and a controlled Wayang service restart. After deployment:
+Validated commit `29b7b02` was fast-forwarded onto unchanged canonical `main`, and production backend/frontend builds passed. The requested privileged `wayang.service` restart was not approved, so the existing process remains on its pre-fix in-memory code. No workaround or repeated privilege request was attempted.
+
+After an approved controlled restart:
 
 1. reopen the affected session and verify it renders the original event role and readable text plus an explicit omission note;
 2. invoke `session_read` on the same Standard session and verify it returns `wayang_session_read_projection_v1` instead of an error;
