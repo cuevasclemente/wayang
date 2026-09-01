@@ -54,21 +54,28 @@ export function BrowserToolbar({
     if (url) onNavigate(url);
   };
 
+  const controlLabel = readOnlyInspection ? "Agent read-only" : cooperative ? "Shared control" : "Agent paused";
+  const controlTitle = readOnlyInspection
+    ? "Only redacted text and DOM inspection are allowed; screenshots and mutations remain blocked."
+    : cooperative
+      ? "You and the agent may both act in this browser. Pause the agent before sensitive or irreversible work."
+      : "Viewer input remains active while agent browser inspection and actions are paused.";
+
   return (
-    <div className="shrink-0 border-b border-neutral-800 bg-neutral-950/95 p-2.5 sm:p-3">
-      <div className="mb-2 flex min-w-0 flex-wrap items-center gap-1.5">
-        <ToolbarButton disabled={busy || running} onClick={onStart}>Start</ToolbarButton>
-        <ToolbarButton disabled={busy || !running} onClick={onStop}>Stop</ToolbarButton>
-        {restartSupported && <ToolbarButton disabled={busy} onClick={onRestart}>Restart</ToolbarButton>}
-        {cooperative ? (
+    <div className="shrink-0 border-b border-neutral-800 bg-neutral-950/95 p-2">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto">
+        {!running && <ToolbarButton disabled={busy} onClick={onStart}>Start</ToolbarButton>}
+
+        {running && (cooperative ? (
           <ToolbarButton
             disabled={busy || !running}
             onClick={() => onControlMode("user", "User paused agent control in the Browser workbench")}
             title={protectedRuntime
-              ? "Begin protected human control and capture the current document baseline before login, MFA, CAPTCHA, payment, or direct paste."
+              ? "Begin protected human control before login, MFA, CAPTCHA, payment, or direct paste."
               : readOnlyInspection
-                ? "Pause the agent's read-only redacted inspection while keeping your viewer input active."
-                : "Pause agent browser inspection and actions while keeping your viewer input active."}
+                ? "Pause the agent's read-only redacted inspection while keeping viewer input active."
+                : "Pause agent browser inspection and actions while keeping viewer input active."}
           >
             {protectedRuntime ? "Human control" : "Pause agent"}
           </ToolbarButton>
@@ -81,72 +88,83 @@ export function BrowserToolbar({
               ? "Resume only after reaching a fresh safe top-level document."
               : state?.credentialInspection === "blocked"
                 ? "Credential-fill protection blocks generic Resume. Use Credentials to allow read-only redacted inspection."
-                : "Return to cooperative control so you and the agent can both use this browser."}
+                : "Return to cooperative browser control."}
           >
             Resume agent
           </ToolbarButton>
-        )}
+        ))}
+
         {credentialsSupported && (
           <ToolbarButton
             disabled={busy || !running}
             active={credentialsOpen}
-            title="Open the private credential picker. Opening it pauses the agent; credential-fill permission is read-only and explicit."
+            title="Open the private credential picker. Opening it pauses the agent."
             onClick={onCredentials}
           >
             Credentials
           </ToolbarButton>
         )}
-        {pasteSupported && <ToolbarButton
-          disabled={busy || !running}
-          title={protectedRuntime
-            ? "Enter human control and paste through the authenticated owner-only route; text never becomes an agent tool parameter."
-            : "Paste directly into the focused page without retaining clipboard text in React state."}
-          onClick={onPasteClipboard}
-        >
-          Paste…
-        </ToolbarButton>}
-        {resetSupported && <ToolbarButton disabled={busy} danger onClick={onResetProfile}>Reset profile</ToolbarButton>}
-      </div>
 
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-[11px] text-neutral-500">
-          <span>Viewer</span>
-          <div className="inline-flex rounded-md border border-neutral-800 bg-neutral-900 p-0.5" role="radiogroup" aria-label="Browser viewer">
-            {!protectedRuntime && state?.vncReady === true && (
-              <ViewerButton
-                checked={viewerTransport === "vnc"}
-                disabled={busy || !running}
-                onClick={() => onViewerTransport("vnc")}
-                title={namedRuntime
-                  ? "Profile-wide Full browser can display and control every visible tab in this shared named profile."
-                  : "Full browser includes browser chrome and extensions."}
-              >
-                {namedRuntime ? "Profile-wide Full browser" : "Full browser"}
-              </ViewerButton>
-            )}
+        <div className="inline-flex shrink-0 rounded-md border border-neutral-800 bg-neutral-900 p-0.5" role="radiogroup" aria-label="Browser viewer">
+          {!protectedRuntime && state?.vncReady === true && (
             <ViewerButton
-              checked={viewerTransport === "cdp-screencast"}
-              disabled={busy || !running || state?.cdpReady === false}
-              onClick={() => onViewerTransport("cdp-screencast")}
-              title="Fast page is the CDP screencast viewer used by protected browser runtimes."
+              checked={viewerTransport === "vnc"}
+              disabled={busy || !running}
+              onClick={() => onViewerTransport("vnc")}
+              title={namedRuntime
+                ? "Profile-wide Full browser can display and control every visible tab in this shared named profile."
+                : "Full browser includes browser chrome and extensions."}
             >
-              Fast page
+              Full browser
             </ViewerButton>
-            {protectedRuntime && <span className="px-2 py-1 text-[11px] text-neutral-600">VNC unavailable</span>}
-          </div>
+          )}
+          <ViewerButton
+            checked={viewerTransport === "cdp-screencast"}
+            disabled={busy || !running || state?.cdpReady === false}
+            onClick={() => onViewerTransport("cdp-screencast")}
+            title="Fast page is the low-latency CDP screencast viewer."
+          >
+            Fast page
+          </ViewerButton>
         </div>
-        <span className={`rounded-full border px-2 py-1 text-[11px] font-medium ${
-          readOnlyInspection
-            ? "border-sky-800/70 bg-sky-950/40 text-sky-100"
-            : cooperative
-              ? "border-emerald-900/70 bg-emerald-950/40 text-emerald-200"
-              : "border-amber-800/70 bg-amber-950/40 text-amber-100"
-        }`}>
-          {readOnlyInspection ? "Agent read-only" : cooperative ? "Shared control" : "Agent paused"}
+
+        <span
+          role="status"
+          title={controlTitle}
+          className={`rounded-full border px-2 py-1 text-[11px] font-medium ${
+            readOnlyInspection
+              ? "border-sky-800/70 bg-sky-950/40 text-sky-100"
+              : cooperative
+                ? "border-emerald-900/70 bg-emerald-950/40 text-emerald-200"
+                : "border-amber-800/70 bg-amber-950/40 text-amber-100"
+          }`}
+        >
+          {controlLabel}
         </span>
+        </div>
+
+        {(running || pasteSupported || restartSupported || resetSupported) && (
+          <details className="relative shrink-0">
+            <summary className="cursor-pointer list-none rounded border border-neutral-700 bg-neutral-900 px-2.5 py-1.5 text-xs font-medium text-neutral-300 hover:bg-neutral-800">
+              More
+            </summary>
+            <div className="absolute right-0 top-full z-30 mt-1 flex min-w-40 flex-col gap-1 rounded border border-neutral-700 bg-neutral-950 p-1.5 shadow-xl">
+              {running && <ToolbarButton disabled={busy} onClick={onStop}>Stop browser</ToolbarButton>}
+              {pasteSupported && <ToolbarButton
+                disabled={busy || !running}
+                title={protectedRuntime
+                  ? "Enter human control and paste through the authenticated owner-only route."
+                  : "Paste directly into the focused page without retaining clipboard text in React state."}
+                onClick={onPasteClipboard}
+              >Paste…</ToolbarButton>}
+              {restartSupported && <ToolbarButton disabled={busy} onClick={onRestart}>Restart</ToolbarButton>}
+              {resetSupported && <ToolbarButton disabled={busy} danger onClick={onResetProfile}>Reset profile</ToolbarButton>}
+            </div>
+          </details>
+        )}
       </div>
 
-      <form className="flex min-w-0 gap-2" onSubmit={handleNavigate}>
+      <form className="mt-1.5 flex min-w-0 gap-1.5" onSubmit={handleNavigate}>
         <input
           name="url"
           type="text"
@@ -154,7 +172,7 @@ export function BrowserToolbar({
           autoComplete="off"
           placeholder="URL or website"
           aria-label="Browser URL"
-          className="min-w-0 flex-1 rounded border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-sky-500 focus:outline-none"
+          className="min-w-0 flex-1 rounded border border-neutral-800 bg-neutral-900 px-3 py-1.5 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-sky-500 focus:outline-none"
           disabled={busy || !running}
         />
         <ToolbarButton disabled={busy || !running} submit>Go</ToolbarButton>

@@ -171,9 +171,6 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
     setVncTakeoverGeneration(0);
     setVncTakeoverConsumed(0);
     setViewerTransport(transport);
-    setNotice(transport === "vnc"
-      ? "Full browser selected: browser chrome and extensions are visible."
-      : "CDP screencast selected: page-only low-latency view is active.");
   };
 
   const ensureProtectedHumanControl = async (): Promise<boolean> => {
@@ -324,12 +321,12 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
   }
 
   return (
-    <div className="relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-neutral-950 text-neutral-100">
+    <div data-testid="browser-workbench" className="relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-neutral-950 text-neutral-100">
       {browserMode === "standard" && sessionId && profileChoices.length > 0 && (
-        <div className="shrink-0 border-b border-blue-900/50 bg-blue-950/25 px-3 py-3 text-xs text-blue-100">
-          <label className="flex flex-col gap-2 sm:flex-row sm:items-center">
-            <span className="font-medium">{state?.profile.persistence === "named" ? "Session Browser Profile" : "This session needs a named Browser Profile."}</span>
-            <select className="rounded border border-blue-800 bg-neutral-950 px-2 py-1.5 text-neutral-100" value={sessionProfileState?.active_profile_id ?? ""} disabled={busy} onChange={(event) => {
+        <div data-testid="browser-profile-selector" className="shrink-0 border-b border-blue-900/40 bg-blue-950/20 px-2 py-1.5 text-xs text-blue-100">
+          <label className="flex min-w-0 items-center gap-2">
+            <span className="shrink-0 font-medium">Profile</span>
+            <select className="min-w-0 max-w-56 rounded border border-blue-800 bg-neutral-950 px-2 py-1 text-neutral-100" value={sessionProfileState?.active_profile_id ?? ""} disabled={busy} onChange={(event) => {
               const profileId = event.target.value;
               if (!profileId) return;
               void runAction(async () => {
@@ -341,30 +338,25 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
               <option value="">Choose profile…</option>
               {profileChoices.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
             </select>
-            <span className="text-blue-200/70">This switches only this session; authenticated profile state is shared across approved Standard-browser pairs.</span>
+            <span
+              className="truncate rounded-full border border-blue-900/60 px-2 py-0.5 text-[11px] text-blue-200/80"
+              title="This switches only this session. Authenticated profile state is shared across approved Standard-browser pairs."
+            >
+              Shared login state
+            </span>
           </label>
         </div>
       )}
 
-      {browserAgent && (
-        <div
-          data-testid="browser-agent-diagnostic"
-          className={`shrink-0 border-b px-3 py-2 text-xs ${browserAgent.available
-            ? "border-emerald-900/50 bg-emerald-950/25 text-emerald-100"
-            : "border-amber-900/50 bg-amber-950/25 text-amber-100"}`}
-        >
-          <div className="font-medium">
-            Agent browser tools: {browserAgent.available ? "available" : "unavailable"}
-            <span className="ml-2 font-normal text-neutral-400">
-              {browserAgent.tool_state} · {browserAgent.executable.state} · {browserAgent.executable.platform}/{browserAgent.executable.transport}
-            </span>
-          </div>
-          {!browserAgent.available && browserAgent.remediation && (
-            <div className="mt-1" data-testid="browser-agent-remediation">
+      {browserAgent && !browserAgent.available && (
+        <details data-testid="browser-agent-diagnostic" className="shrink-0 border-b border-amber-900/50 bg-amber-950/25 text-xs text-amber-100">
+          <summary className="cursor-pointer px-3 py-1.5 font-medium">Agent browser tools: unavailable</summary>
+          {browserAgent.remediation && (
+            <div className="border-t border-amber-900/40 px-3 py-2" data-testid="browser-agent-remediation">
               {browserAgent.reason_code ? `${browserAgent.reason_code}: ` : ""}{browserAgent.remediation}
             </div>
           )}
-        </div>
+        </details>
       )}
 
       <BrowserToolbar
@@ -388,11 +380,13 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
       />
 
       {namedRuntime && viewerTransport === "vnc" && (
-        <div role="note" className="shrink-0 border-b border-amber-800/60 bg-amber-950/30 px-3 py-2 text-xs leading-5 text-amber-100">
-          <strong>Profile-wide Full browser:</strong> this view can display and control every visible tab in the shared named profile, including tabs owned by other session workspaces. Pixels, clipboard data, cookies, and login state are not session-isolated. Agent tools remain bound to their exact owned targets.
-          {state?.fullBrowser?.controllerActive && <button type="button" className="ml-2 rounded border border-amber-600 px-2 py-1 text-[11px] font-semibold" onClick={() => {
+        <div role="note" className="flex shrink-0 items-center gap-2 border-b border-amber-800/60 bg-amber-950/30 px-3 py-1.5 text-xs text-amber-100">
+          <span className="min-w-0 truncate" title="This view can display and control every visible tab in the shared named profile. Pixels, clipboard data, cookies, and login state are not session-isolated.">
+            <strong>Profile-wide view:</strong> all profile tabs and shared login state are visible here.
+          </span>
+          {state?.fullBrowser?.controllerActive && <button type="button" className="ml-auto shrink-0 rounded border border-amber-600 px-2 py-1 text-[11px] font-semibold" onClick={() => {
             if (window.confirm("Take over profile-wide Full browser control? The previous controller will be disconnected.")) setVncTakeoverGeneration((value) => value + 1);
-          }}>Take over controller</button>}
+          }}>Take over</button>}
         </div>
       )}
 
@@ -406,42 +400,37 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
         </div>
       )}
 
-      {(state?.profile.persistence === "protected" || state?.profile.persistence === "named") && (
-        <div data-testid="protected-downloads" className="shrink-0 border-b border-neutral-900 bg-neutral-950 px-3 py-1.5 text-xs text-neutral-500">
-          Completed bounded downloads from exactly owned tabs publish to <code className="text-neutral-300">.wayang/browser-downloads/</code>.
-          {state?.download && (
-            <span className="ml-2" data-testid="protected-download-status">
-              Latest: <span className="text-neutral-300">{state.download.status}</span>
-              {state.download.bytes !== undefined && <> · {formatBytes(state.download.bytes)}</>}
-            </span>
-          )}
+      {(credentialInspection || !cooperative) && (
+        <div data-testid="browser-control-notice" className={`shrink-0 border-b px-3 py-1.5 text-xs ${
+          credentialInspection === "text-allowed"
+            ? "border-sky-900/60 bg-sky-950/35 text-sky-100"
+            : "border-amber-800/60 bg-amber-950/35 text-amber-100"
+        }`}>
+          {credentialInspection === "blocked"
+            ? "Credential fill protection: the agent remains paused. Reopen Credentials to allow read-only redacted text and DOM inspection after reviewing the page."
+            : credentialInspection === "text-allowed"
+              ? "Agent read-only inspection: redacted text and DOM only; screenshots and browser mutations remain blocked until a new top-level document."
+              : protectedRuntime
+                ? "Protected human control: viewer input remains active. Resume only after reaching a fresh safe top-level document."
+                : <>Agent paused: your viewer input remains active; agent browser inspection and actions are blocked.{state?.needsUserReason ? <> {state.needsUserReason}</> : null}</>}
         </div>
       )}
 
-      <div className={`shrink-0 border-b px-3 py-2 text-xs ${
-        credentialInspection === "text-allowed"
-          ? "border-sky-900/60 bg-sky-950/35 text-sky-100"
-          : cooperative
-            ? "border-emerald-900/50 bg-emerald-950/25 text-emerald-100"
-            : "border-amber-800/60 bg-amber-950/35 text-amber-100"
-      }`}>
-        {credentialInspection === "blocked"
-          ? "Credential fill protection: the agent remains paused. Reopen Credentials to allow read-only redacted text and DOM inspection after reviewing the page."
-          : credentialInspection === "text-allowed"
-            ? "Agent read-only inspection: redacted text and DOM only. Agent screenshots and all agent navigation, click, type, and mutations remain blocked until the backend confirms a new top-level document."
-            : protectedRuntime && cooperative
-              ? "Protected agent control is active. Choose Human control before login, MFA, CAPTCHA, payment, or other secret-bearing steps."
-              : protectedRuntime
-                ? "Protected human control: use the viewer or owner-only Paste. Resume is allowed only after the browser reaches a fresh, safe top-level document."
-                : cooperative
-                  ? "Shared control: you and the agent may act in this browser at the same time. Pause the agent before sensitive or irreversible steps."
-                  : "Agent paused: your viewer input remains active, but agent browser inspection and actions are blocked until Resume agent."}
-      </div>
-
-      <details className="shrink-0 border-b border-neutral-900 bg-neutral-950 text-xs text-neutral-400">
+      <details data-testid="browser-details" className="shrink-0 border-b border-neutral-900 bg-neutral-950 text-xs text-neutral-400">
         <summary className="cursor-pointer px-3 py-1.5 text-neutral-500 hover:text-neutral-300">
           {protectedRuntime ? "Safety, privacy, and browser details" : "Privacy and browser details"}
         </summary>
+        {browserAgent?.available && (
+          <div data-testid="browser-agent-diagnostic" className="border-t border-emerald-900/40 bg-emerald-950/15 px-3 py-2 text-emerald-100">
+            <span className="font-medium">Agent browser tools: available</span>
+            <span className="ml-2 text-neutral-400">{browserAgent.tool_state} · {browserAgent.executable.state} · {browserAgent.executable.platform}/{browserAgent.executable.transport}</span>
+          </div>
+        )}
+        {namedRuntime && viewerTransport === "vnc" && (
+          <div className="border-t border-amber-900/50 bg-amber-950/20 px-3 py-2 text-amber-100">
+            Profile-wide Full browser can display and control every visible tab in the shared named profile, including tabs owned by other session workspaces. Pixels, clipboard data, cookies, and login state are not session-isolated. Agent tools remain bound to their exact owned targets.
+          </div>
+        )}
         <div className="border-t border-neutral-900 px-3 py-2" role={protectedRuntime ? "note" : undefined}>
           {protectedRuntime
             ? "Protected browser capability: the agent can inspect authenticated pages, click, type non-secret text, download, and cause remote effects. Existing cookies may permit purchases, deletions, exports, account changes, logout, or passkey flows; human-only login and payment do not make later agent actions read-only."
@@ -451,6 +440,17 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
         {protectedRuntime && !cooperative && (
           <div data-testid="protected-human-handoff" className="border-t border-amber-900/50 bg-amber-950/20 px-3 py-2 text-amber-100">
             Enter passwords, MFA codes, CAPTCHA answers, passkeys, payment details, and other secrets only in the human-controlled viewer. {credentialsSupported ? "Guarded saved-login fill sends values only from the backend broker to this exact CDP document." : "Guarded saved-login support is unavailable."} Owner-only Direct Paste uses an authenticated route and is never exposed as an agent operation. Navigate to a fresh safe page before resuming the agent.
+          </div>
+        )}
+        {(state?.profile.persistence === "protected" || state?.profile.persistence === "named") && (
+          <div data-testid="protected-downloads" className="border-t border-neutral-900 px-3 py-2 text-neutral-500">
+            Completed bounded downloads from exactly owned tabs publish to <code className="text-neutral-300">.wayang/browser-downloads/</code>.
+            {state?.download && (
+              <span className="ml-2" data-testid="protected-download-status">
+                Latest: <span className="text-neutral-300">{state.download.status}</span>
+                {state.download.bytes !== undefined && <> · {formatBytes(state.download.bytes)}</>}
+              </span>
+            )}
           </div>
         )}
         <div className="grid grid-cols-2 gap-x-3 gap-y-2 border-t border-neutral-900 px-3 py-2 sm:grid-cols-4">
@@ -525,24 +525,7 @@ export function BrowserPanel({ sessionId, sessionCwd, browserMode, browserAgent 
       {error && <div className="shrink-0 border-b border-red-900/50 bg-red-950/40 px-3 py-2 text-sm text-red-200">{error}</div>}
       {state?.lastError && <div className="shrink-0 border-b border-red-900/50 bg-red-950/30 px-3 py-2 text-xs text-red-200">{state.lastError}</div>}
 
-      {state?.needsUser && !cooperative && (
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-sky-900/60 bg-sky-950/40 px-3 py-2 text-sm text-sky-100">
-          <span>{credentialInspection === "blocked"
-            ? "Credentials were filled. Generic Resume is blocked; reopen Credentials to review the page and explicitly allow read-only redacted text and DOM inspection."
-            : protectedRuntime
-              ? "Human control is active. Finish the sensitive step and navigate to a fresh safe document before resuming the agent."
-              : state.needsUserReason || "Agent is waiting while you handle this browser step."}</span>
-          <button
-            type="button"
-            className="rounded border border-sky-500 bg-sky-500/20 px-3 py-1 text-xs font-semibold text-sky-100 hover:bg-sky-500/30"
-            onClick={() => handleControlMode("agent")}
-          >
-            Resume agent
-          </button>
-        </div>
-      )}
-
-      <div className="min-h-0 flex-1">
+      <div data-testid="browser-viewport" className="min-h-0 flex-1">
         {running ? (
           namedRuntime && cooperative && viewerTransport !== "vnc" ? (
             <div className="flex h-full items-center justify-center p-6 text-center text-sm text-neutral-500">

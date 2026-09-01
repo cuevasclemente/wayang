@@ -291,12 +291,13 @@ test("backend-issued protected runtime selects the generic protected-browser UX 
   await expect(page.getByText("Protected capability", { exact: true })).toBeVisible();
   await expect(page.getByText("Start the backend-issued protected browser runtime.", { exact: true })).toBeVisible();
 
-  await expect(page.getByRole("button", { name: "Restart", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Credentials", exact: true })).toBeVisible();
+  await page.getByText("More", { exact: true }).click();
   await expect(page.getByRole("button", { name: "Paste…", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Restart", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Reset profile", exact: true })).toBeVisible();
   await expect(page.getByRole("radio", { name: "Fast page", exact: true })).toHaveAttribute("aria-checked", "true");
-  await expect(page.getByText("VNC unavailable", { exact: true })).toBeVisible();
+  await expect(page.getByRole("radio", { name: "Full browser", exact: true })).toHaveCount(0);
   await expect(page.getByLabel("Browser URL")).toBeVisible();
 
   await page.getByRole("button", { name: "Start", exact: true }).click();
@@ -350,9 +351,10 @@ test("ordinary sessions retain generic browser behavior", async ({ page }) => {
   await expect(page.getByTestId("browser-agent-remediation")).toContainText("approval_required");
   await expect(page.getByTestId("browser-agent-remediation")).toContainText("Approve the compatible Browser capability");
   await expect(page.getByText("Start Chromium to use the backend-selected browser runtime.", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Restart", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Credentials", exact: true })).toBeVisible();
+  await page.getByText("More", { exact: true }).click();
   await expect(page.getByRole("button", { name: "Paste…", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Restart", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Reset profile", exact: true })).toBeVisible();
   await expect(page.getByLabel("Browser URL")).toBeVisible();
   expect(api.browserRequests.some((entry) => entry.path === "/api/browser/status" && entry.sessionId === ordinarySessionId)).toBe(true);

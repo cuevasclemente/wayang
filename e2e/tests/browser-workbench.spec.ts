@@ -36,6 +36,10 @@ function publicBrowserState(sessionId: string, projectCwd: string, state: Browse
     profile: state.profilePersistence === "named"
       ? { persistence: "named", name: "Legacy shared" }
       : { persistence: "shared" },
+    ...(state.profilePersistence === "named" ? {
+      tabs: [{ tab: "synthetic-tab", title: "Synthetic sign in", url: "https://login.example.test/sign-in" }],
+      activeTab: "synthetic-tab",
+    } : {}),
     updatedAt: Date.now(),
     credentialInspection: state.credentialInspection,
   };
@@ -268,23 +272,33 @@ test("browser viewer switching and cooperative-control copy stay usable in a nar
   await openSessionInUi(page, session);
   await page.getByRole("button", { name: "Browser", exact: true }).click();
 
-  await expect(page.getByText(/Shared control: you and the agent may act/)).toBeVisible();
+  await expect(page.getByTestId("browser-workbench").getByText("Shared control", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("browser-control-notice")).toHaveCount(0);
   const full = page.getByRole("radio", { name: "Full browser" });
   const fast = page.getByRole("radio", { name: "Fast page" });
   await expect(fast).toHaveAttribute("aria-checked", "true");
   await full.click();
   await expect(full).toHaveAttribute("aria-checked", "true");
-  await expect(page.getByText(/Full browser selected/)).toBeVisible();
 
   await page.getByRole("button", { name: "Pause agent" }).click();
   await expect(page.getByText(/Agent paused: your viewer input remains active/)).toBeVisible();
   await page.getByRole("button", { name: "Resume agent" }).first().click();
-  await expect(page.getByText(/Shared control: you and the agent may act/)).toBeVisible();
+  await expect(page.getByTestId("browser-workbench").getByText("Shared control", { exact: true })).toBeVisible();
+  await fast.click();
+  await expect(fast).toHaveAttribute("aria-checked", "true");
 
   await page.setViewportSize({ width: 800, height: 700 });
   await expect(page.getByRole("radio", { name: "Full browser" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Credentials" })).toBeVisible();
   await expect(page.getByLabel("Browser URL")).toBeVisible();
+  await expect(page.getByTestId("browser-details")).not.toHaveAttribute("open", "");
+  const [workbenchBox, viewportBox] = await Promise.all([
+    page.getByTestId("browser-workbench").boundingBox(),
+    page.getByTestId("browser-viewport").boundingBox(),
+  ]);
+  expect(workbenchBox).not.toBeNull();
+  expect(viewportBox).not.toBeNull();
+  expect(viewportBox!.height / workbenchBox!.height).toBeGreaterThan(0.7);
 });
 
 test("Fast page ACKs binary presentation and coalesces pointer and wheel bursts", async ({ page, request }) => {
@@ -433,7 +447,8 @@ test("credential fill stays paused until protected redacted inspection is explic
   // Only a subsequent backend public state clears the UI restriction.
   mock.state.credentialInspection = undefined;
   mock.sendViewerMessage({ type: "status" });
-  await expect(page.getByText(/Shared control: you and the agent may act/)).toBeVisible();
+  await expect(page.getByTestId("browser-workbench").getByText("Shared control", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("browser-control-notice")).toHaveCount(0);
 });
 
 test("credential drawer preserves matches 409 handling after an unlocked status", async ({ page, request }) => {
@@ -482,6 +497,7 @@ test("named Standard Fast page sends human paste only through its authenticated 
 });
 
 test("named Standard Full browser paste is paused, focus-bound, exactly once, and RFB-only", async ({ page, request }) => {
+  await page.setViewportSize({ width: 1600, height: 900 });
   const session = await createE2eSession(request, "e2e named full browser paste");
   await installSyntheticVncSocket(page);
   const mock = await openMockBrowser(page, session.id, session.cwd, "unlocked", undefined, false);
@@ -491,11 +507,21 @@ test("named Standard Full browser paste is paused, focus-bound, exactly once, an
   await page.getByRole("button", { name: "Browser", exact: true }).click();
 
   await expect(page.getByText("Full browser connected")).toBeVisible();
+  await expect(page.getByTestId("browser-details")).not.toHaveAttribute("open", "");
+  await expect(page.getByTestId("protected-downloads")).toBeHidden();
+  const [workbenchBox, viewportBox] = await Promise.all([
+    page.getByTestId("browser-workbench").boundingBox(),
+    page.getByTestId("browser-viewport").boundingBox(),
+  ]);
+  expect(workbenchBox).not.toBeNull();
+  expect(viewportBox).not.toBeNull();
+  expect(viewportBox!.height / workbenchBox!.height).toBeGreaterThan(0.65);
   const pasteButton = page.getByRole("button", { name: "Paste text" });
   await pasteButton.click();
   await expect(page.getByText("Pause the agent before using human-only Full browser paste.")).toBeVisible();
 
   await page.getByRole("button", { name: "Pause agent" }).click();
+  await expect(page.getByRole("button", { name: "Resume agent" })).toHaveCount(1);
   await pasteButton.click();
   await expect(page.getByText("Click the destination field in Full browser before pasting.")).toBeVisible();
 
@@ -571,6 +597,7 @@ test("direct paste forwards an uncontrolled DOM value without retaining it in br
   await openSessionInUi(page, session);
   await page.getByRole("button", { name: "Browser", exact: true }).click();
 
+  await page.getByText("More", { exact: true }).click();
   await page.getByRole("button", { name: "Paste…" }).click();
   const target = page.getByLabel("Direct paste target");
   await target.evaluate((element) => {
