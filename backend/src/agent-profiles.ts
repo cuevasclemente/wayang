@@ -31,6 +31,55 @@ export interface AgentProfileUpdateInput {
   default_model?: string | null;
 }
 
+export interface AgentProfileReferenceSummary {
+  workspace_default: boolean;
+  project_defaults: number;
+  project_allowlists: number;
+  session_attributions: number;
+  running_sessions: number;
+  pending_switches: number;
+  scheduled_jobs: number;
+  protected_automation_jobs: number;
+  protected_automation_runs: number;
+  messaging_endpoints: number;
+}
+
+export interface AgentProfileDisableConflictBody {
+  error: string;
+  code: "agent_profile_disable_blocked";
+  blockers: {
+    workspace_default: boolean;
+    project_defaults: number;
+    pending_switches: number;
+  };
+}
+
+export class AgentProfileDisableConflict extends WorkspaceStoreError {
+  readonly body: AgentProfileDisableConflictBody;
+
+  constructor(summary: AgentProfileReferenceSummary) {
+    const categories = [
+      ...(summary.workspace_default ? ["workspace_default"] : []),
+      ...(summary.project_defaults > 0 ? [`project_defaults:${summary.project_defaults}`] : []),
+      ...(summary.pending_switches > 0 ? [`pending_switches:${summary.pending_switches}`] : []),
+    ];
+    const message = summary.pending_switches > 0
+      ? `Agent profile cannot be disabled while an agent switch references it (${categories.join(", ")})`
+      : `Workspace and project defaults must be changed before disabling this profile (${categories.join(", ")})`;
+    super(message, 409);
+    this.name = "AgentProfileDisableConflict";
+    this.body = {
+      error: this.message,
+      code: "agent_profile_disable_blocked",
+      blockers: {
+        workspace_default: summary.workspace_default,
+        project_defaults: summary.project_defaults,
+        pending_switches: summary.pending_switches,
+      },
+    };
+  }
+}
+
 function cloneProfile(profile: AgentProfileRow): AgentProfileRow {
   return {
     ...profile,
@@ -98,6 +147,35 @@ function isReferencedByPendingSwitch(id: string): boolean {
     || session.pending_agent_switch?.to_agent_profile_id === id);
 }
 
+export function getAgentProfileReferenceSummary(
+  id: string,
+  runningSessionIds: ReadonlySet<string> = new Set(),
+): AgentProfileReferenceSummary {
+  const store = getStore();
+  const attributedSessions = store.sessions.filter((session) => session.agent_profile_id === id);
+  return {
+    workspace_default: store.workspaceSettings.default_agent_profile_id === id,
+    project_defaults: store.projects.filter((project) => project.default_agent_profile_id === id).length,
+    project_allowlists: store.projects.filter((project) => project.access_policy.allowed_agent_profile_ids?.includes(id)).length,
+    session_attributions: attributedSessions.length,
+    running_sessions: attributedSessions.filter((session) => runningSessionIds.has(session.id)).length,
+    pending_switches: store.sessions.filter((session) =>
+      session.pending_agent_switch?.from_agent_profile_id === id
+      || session.pending_agent_switch?.to_agent_profile_id === id).length,
+    scheduled_jobs: store.scheduledJobs.filter((job) => job.agent_profile_id === id).length,
+    protected_automation_jobs: store.protectedAutomationJobs.filter((job) => job.agent_profile_id === id).length,
+    protected_automation_runs: store.protectedAutomationRuns.filter((run) => run.agent_profile_id === id).length,
+    messaging_endpoints: store.messagingEndpoints.filter((endpoint) => endpoint.agent_profile_id === id).length,
+  };
+}
+
+function rejectDisableBlockers(id: string): void {
+  const summary = getAgentProfileReferenceSummary(id);
+  if (summary.workspace_default || summary.project_defaults > 0 || summary.pending_switches > 0) {
+    throw new AgentProfileDisableConflict(summary);
+  }
+}
+
 function rejectPendingSwitchReference(id: string): void {
   if (isReferencedByPendingSwitch(id)) {
     throw new WorkspaceStoreError("Agent profile cannot be updated or deleted while an agent switch references it", 409);
@@ -122,12 +200,6 @@ function hasProtectedAutomationReferences(id: string): boolean {
 
 function hasMessagingReferences(id: string): boolean {
   return getStore().messagingEndpoints.some((endpoint) => endpoint.agent_profile_id === id);
-}
-
-function isDefaultInUse(id: string): boolean {
-  const store = getStore();
-  return store.workspaceSettings.default_agent_profile_id === id
-    || store.projects.some((project) => project.default_agent_profile_id === id);
 }
 
 function replaceReferences(store: StoreData, fromId: string, toId: string): void {
@@ -232,7 +304,8 @@ export function updateAgentProfile(id: string, input: AgentProfileUpdateInput, r
   rejectCapabilityFields(input);
   const profile = getStore().agentProfiles.find((candidate) => candidate.id === id);
   if (!profile) throw new WorkspaceStoreError("Agent profile not found", 404);
-  rejectPendingSwitchReference(id);
+  if (input.enabled === false && profile.enabled) rejectDisableBlockers(id);
+  else rejectPendingSwitchReference(id);
   const next = cloneProfile(profile);
 
   if (input.name !== undefined) {
@@ -260,9 +333,6 @@ export function updateAgentProfile(id: string, input: AgentProfileUpdateInput, r
   }
   if (input.enabled !== undefined) {
     if (typeof input.enabled !== "boolean") throw new WorkspaceStoreError("enabled must be a boolean");
-    if (!input.enabled && profile.enabled && isDefaultInUse(id)) {
-      throw new WorkspaceStoreError("Workspace and project defaults must be changed before disabling this profile", 409);
-    }
     next.enabled = input.enabled;
   }
 

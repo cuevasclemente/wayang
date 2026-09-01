@@ -5,9 +5,11 @@ import {
   fetchAgentProfiles,
   fetchModels,
   fetchProjects,
+  fetchWorkspaceSettings,
   type AgentProfileSummary,
   type ModelOption,
   type WorkspaceProject,
+  type WorkspaceSettings,
 } from "../../api/client";
 import { AgentProfilesSettings } from "./AgentProfilesSettings";
 import { ProjectSettingsForm } from "./ProjectSettingsForm";
@@ -31,6 +33,7 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
   const [tab, setTab] = useState<SettingsTab>(initialTab);
   const [projects, setProjects] = useState<WorkspaceProject[]>([]);
   const [profiles, setProfiles] = useState<AgentProfileSummary[]>([]);
+  const [workspaceSettings, setWorkspaceSettings] = useState<WorkspaceSettings | null>(null);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -48,16 +51,23 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
     return value;
   }, []);
 
+  const refreshWorkspaceSettings = useCallback(async () => {
+    const value = await fetchWorkspaceSettings();
+    setWorkspaceSettings(value);
+    return value;
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError("");
     // Project/Profile RBAC is independent of model discovery; models remain
     // ordinary runtime defaults rather than authority inputs.
-    void Promise.all([fetchProjects(), fetchAgentProfiles()]).then(([projectRows, profileRows]) => {
+    void Promise.all([fetchProjects(), fetchAgentProfiles(), fetchWorkspaceSettings()]).then(([projectRows, profileRows, workspace]) => {
       if (cancelled) return;
       setProjects(projectRows);
       setProfiles(profileRows);
+      setWorkspaceSettings(workspace);
       const preferred = initialProjectCwd
         ? projectRows.find((project) => project.cwd === initialProjectCwd)
         : null;
@@ -97,7 +107,7 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
   };
 
   const handleProfilesChanged = async () => {
-    await Promise.all([refreshProfiles(), refreshProjects()]);
+    await Promise.all([refreshProfiles(), refreshProjects(), refreshWorkspaceSettings()]);
     onChanged?.();
   };
 
@@ -153,7 +163,14 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
           </div>
         ) : tab === "agents" ? (
           <main className="flex min-h-0 flex-1 p-4 sm:p-5">
-            <AgentProfilesSettings profiles={profiles} models={models} onProfilesChanged={handleProfilesChanged} />
+            {workspaceSettings ? (
+              <AgentProfilesSettings
+                profiles={profiles}
+                workspaceSettings={workspaceSettings}
+                models={models}
+                onProfilesChanged={handleProfilesChanged}
+              />
+            ) : <p className="text-sm text-neutral-500">Workspace defaults are unavailable.</p>}
           </main>
         ) : tab === "browser" ? (
           <main className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">

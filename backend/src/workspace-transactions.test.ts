@@ -9,6 +9,7 @@ import {
   getAgentProfile,
   getWorkspaceDefaultAgentProfileId,
   listAgentProfiles,
+  setWorkspaceDefaultAgentProfile,
   updateAgentProfile,
 } from "./agent-profiles.js";
 import { close, init } from "./db.js";
@@ -97,6 +98,24 @@ test("failed project and profile flushes do not leak into a later commit", () =>
   );
   assert.equal(listAgentProfiles().some((candidate) => candidate.name === "Failed profile create"), false);
   assert.equal(listProjects().some((candidate) => candidate.cwd === failedProjectCwd), false);
+}));
+
+test("failed workspace-default persistence never leaks into a later commit", () => withStore((dir) => {
+  const originalDefaultId = getWorkspaceDefaultAgentProfileId();
+  const target = createAgentProfile({ name: "Transactional workspace default" });
+
+  withFailedFlush(dir, () => setWorkspaceDefaultAgentProfile(target.id));
+  assert.equal(getWorkspaceDefaultAgentProfileId(), originalDefaultId);
+
+  createAgentProfile({ name: "Commit after failed workspace default" });
+  close();
+  init();
+  assert.equal(getWorkspaceDefaultAgentProfileId(), originalDefaultId);
+
+  assert.equal(setWorkspaceDefaultAgentProfile(target.id), target.id);
+  close();
+  init();
+  assert.equal(getWorkspaceDefaultAgentProfileId(), target.id);
 }));
 
 test("failed first-session flush commits neither the session nor its implicit project", () => withStore((dir) => {

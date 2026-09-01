@@ -1802,6 +1802,24 @@ export interface AgentProfile extends AgentProfileSummary {
   instructions: string | null;
 }
 
+export interface WorkspaceSettings {
+  default_agent_profile_id: string;
+  default_agent_profile: AgentProfileSummary;
+}
+
+export interface AgentProfileReferenceSummary {
+  workspace_default: boolean;
+  project_defaults: number;
+  project_allowlists: number;
+  session_attributions: number;
+  running_sessions: number;
+  pending_switches: number;
+  scheduled_jobs: number;
+  protected_automation_jobs: number;
+  protected_automation_runs: number;
+  messaging_endpoints: number;
+}
+
 export interface ProjectInstructions {
   path: string;
   exists: boolean;
@@ -1846,6 +1864,14 @@ export interface AgentProfileUpdate {
   replacement_agent_profile_id?: string;
 }
 
+export function fetchWorkspaceSettings(): Promise<WorkspaceSettings> {
+  return apiGet<WorkspaceSettings>("/api/workspace-settings");
+}
+
+export function updateWorkspaceSettings(defaultAgentProfileId: string): Promise<WorkspaceSettings> {
+  return apiPut<WorkspaceSettings>("/api/workspace-settings", { default_agent_profile_id: defaultAgentProfileId });
+}
+
 export function fetchProjects(): Promise<WorkspaceProject[]> {
   return apiGet<WorkspaceProject[]>("/api/projects");
 }
@@ -1883,6 +1909,10 @@ export function createAgentProfile(input: AgentProfileInput): Promise<AgentProfi
 
 export function fetchAgentProfile(id: string): Promise<AgentProfile> {
   return apiGet<AgentProfile>(`/api/agent-profiles/${encodeURIComponent(id)}`);
+}
+
+export function fetchAgentProfileReferences(id: string): Promise<AgentProfileReferenceSummary> {
+  return apiGet<AgentProfileReferenceSummary>(`/api/agent-profiles/${encodeURIComponent(id)}/references`);
 }
 
 export function updateAgentProfile(id: string, input: AgentProfileUpdate): Promise<AgentProfile> {

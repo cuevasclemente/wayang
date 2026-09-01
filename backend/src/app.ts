@@ -16,6 +16,7 @@ import { router as transcriptMutationsRouter } from "./routes/transcript-mutatio
 import { installTranscriptMutationPinAttempts } from "./transcript-mutations.js";
 import { router as projectsRouter } from "./routes/projects.js";
 import { router as agentProfilesRouter } from "./routes/agent-profiles.js";
+import { router as workspaceSettingsRouter } from "./routes/workspace-settings.js";
 import { router as fsRouter } from "./routes/fs.js";
 import { router as capabilitiesRouter } from "./routes/capabilities.js";
 import { router as appsRouter } from "./routes/apps.js";
@@ -249,6 +250,7 @@ export function createApp(options: CreateAppOptions = {}) {
   app.use("/api", sessionsRouter);
   app.use("/api", projectsRouter);
   app.use("/api", agentProfilesRouter);
+  app.use("/api", workspaceSettingsRouter);
   app.use("/api", fsRouter);
   app.use("/api", capabilitiesRouter);
   app.use("/api", appsRouter);

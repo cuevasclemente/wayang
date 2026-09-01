@@ -38,6 +38,24 @@ test("canonical workspace hashing is key-order stable and binds every envelope f
   }));
 });
 
+test("workspace-default mutation is exact, trimmed, and rejects unknown fields", () => {
+  assert.deepEqual(canonicalizeWorkspaceMutation({
+    mutation_type: "workspace_default_agent_profile_update",
+    mutation: { default_agent_profile_id: "  stable-profile-id  " },
+  }), {
+    mutation_type: "workspace_default_agent_profile_update",
+    mutation: { default_agent_profile_id: "stable-profile-id" },
+  });
+  assert.throws(() => canonicalizeWorkspaceMutation({
+    mutation_type: "workspace_default_agent_profile_update",
+    mutation: { default_agent_profile_id: "stable-profile-id", replace_references: true },
+  }), /Unknown workspace_default_agent_profile_update mutation field/);
+  assert.throws(() => canonicalizeWorkspaceMutation({
+    mutation_type: "workspace_default_agent_profile_update",
+    mutation: { default_agent_profile_id: "" },
+  }), /default_agent_profile_id is required/);
+});
+
 test("canonicalization sorts set-valued allowlists and rejects unknown nested keys", () => {
   const canonical = canonicalizeWorkspaceMutation({
     mutation_type: "project_create",

@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { close, failNextCommitStoreMutationPersistenceForTests, getStore, init } from "./db.js";
-import { createAgentProfile } from "./agent-profiles.js";
+import { createAgentProfile, setWorkspaceDefaultAgentProfile } from "./agent-profiles.js";
 import {
   createOpenInterview,
   getInterviewForSession,
@@ -134,9 +134,9 @@ test("exact server-issued preview and WebSocket approval succeeds, is redacted, 
     assert.equal(JSON.stringify(committed).includes(privateText), false);
     assert.equal(committed.mutation_type, "agent_profile_create");
     const created = getStore().agentProfiles.find((profile) => profile.name === "Synthetic Restricted" && profile.instructions === privateText)!;
-    const listed = service.read(f.source.id, { action: "list_agent_profiles" });
+    const listed = await service.read(f.source.id, { action: "list_agent_profiles" });
     assert.equal(JSON.stringify(listed).includes(privateText), false);
-    const detailed = service.read(f.source.id, { action: "get_agent_profile", id: created.id }) as any;
+    const detailed = await service.read(f.source.id, { action: "get_agent_profile", id: created.id }) as any;
     assert.equal(detailed.instructions, privateText);
 
     await assert.rejects(() => service.commitAgentMutation({
@@ -502,6 +502,166 @@ test("changed state invalidates an approved update without exposing instruction 
   } finally { f.cleanup(); }
 });
 
+test("approved workspace-default reassignment preserves every existing attribution and permits nondestructive disable", async () => {
+  const f = fixture("wayang-workspace-default-reassignment-");
+  try {
+    const invalidationEvents: string[] = [];
+    const service = new WorkspaceSettingsService({
+      latchDenied() { invalidationEvents.push("latched"); },
+      async cleanupAfterDenial() { invalidationEvents.push("cleaned"); },
+    });
+    const formerDefault = createAgentProfile({
+      name: "Migration Seeded Identity",
+      resource_mode: "standard",
+      instructions: "SYNTHETIC_PRIVATE_FORMER_DEFAULT_INSTRUCTIONS",
+    });
+    const target = createAgentProfile({
+      name: "Target Owner Identity",
+      resource_mode: "standard",
+      instructions: "SYNTHETIC_PRIVATE_TARGET_DEFAULT_INSTRUCTIONS",
+    });
+    setWorkspaceDefaultAgentProfile(formerDefault.id);
+
+    const targetCwd = path.join(f.dir, "workspace-default-target");
+    fs.mkdirSync(targetCwd);
+    const project = createProject({
+      cwd: targetCwd,
+      default_agent_profile_id: target.id,
+      access_policy: { privacy_mode: "standard", allowed_agent_profile_ids: [formerDefault.id, target.id] },
+    });
+    const attributedSession = createSession(targetCwd, { agentProfileId: formerDefault.id });
+    getStore().scheduledJobs.push({
+      id: "stable-attribution-job",
+      cwd: targetCwd,
+      agent_profile_id: formerDefault.id,
+      legacy_capability_ineligible: false,
+    } as any);
+    getStore().workspaceCapabilityAssociations.push({
+      project_id: project.id,
+      agent_profile_id: formerDefault.id,
+      capability_id: "wayang.host-execution.v1",
+      revision: 9,
+      active: true,
+      approved_at: 1,
+      revoked_at: null,
+      updated_at: 1,
+    });
+
+    const before = structuredClone({
+      agentProfiles: getStore().agentProfiles,
+      projects: getStore().projects,
+      sessions: getStore().sessions,
+      scheduledJobs: getStore().scheduledJobs,
+      scheduledRuns: getStore().scheduledRuns,
+      protectedAutomationJobs: getStore().protectedAutomationJobs,
+      protectedAutomationRuns: getStore().protectedAutomationRuns,
+      messagingEndpoints: getStore().messagingEndpoints,
+      workspaceCapabilityAssociations: getStore().workspaceCapabilityAssociations,
+      workspaceCapabilityApprovalEvents: getStore().workspaceCapabilityApprovalEvents,
+    });
+    const proposal = {
+      mutation_type: "workspace_default_agent_profile_update",
+      mutation: { default_agent_profile_id: target.id },
+    };
+    const preview = service.previewAgentMutation(f.source.id, proposal);
+    assert.match(preview.summary, /existing Project defaults, sessions, schedules, and historical attribution remain unchanged/);
+    assert.equal(JSON.stringify(preview).includes("SYNTHETIC_PRIVATE"), false);
+    const submissionId = approve(f.source.id, preview, "workspace-default-update");
+    const committed = await service.commitAgentMutation({
+      sourceSessionId: f.source.id,
+      raw: proposal,
+      requestId: "workspace-default-update",
+      submissionId,
+      expiresAt: preview.expires_at,
+    }) as any;
+    assert.equal(committed.result.default_agent_profile_id, target.id);
+    assert.equal(JSON.stringify(committed).includes("SYNTHETIC_PRIVATE"), false);
+    assert.equal(getStore().workspaceSettings.default_agent_profile_id, target.id);
+    assert.deepEqual({
+      agentProfiles: getStore().agentProfiles,
+      projects: getStore().projects,
+      sessions: getStore().sessions,
+      scheduledJobs: getStore().scheduledJobs,
+      scheduledRuns: getStore().scheduledRuns,
+      protectedAutomationJobs: getStore().protectedAutomationJobs,
+      protectedAutomationRuns: getStore().protectedAutomationRuns,
+      messagingEndpoints: getStore().messagingEndpoints,
+      workspaceCapabilityAssociations: getStore().workspaceCapabilityAssociations,
+      workspaceCapabilityApprovalEvents: getStore().workspaceCapabilityApprovalEvents,
+    }, before);
+
+    const settings = await service.read(f.source.id, { action: "get_workspace_settings" }) as any;
+    assert.equal(settings.default_agent_profile_id, target.id);
+    assert.equal("instructions" in settings.default_agent_profile, false);
+    const references = await service.read(f.source.id, {
+      action: "get_agent_profile_references",
+      id: formerDefault.id,
+    }) as any;
+    assert.deepEqual(references, {
+      workspace_default: false,
+      project_defaults: 0,
+      project_allowlists: 1,
+      session_attributions: 1,
+      running_sessions: 0,
+      pending_switches: 0,
+      scheduled_jobs: 1,
+      protected_automation_jobs: 0,
+      protected_automation_runs: 0,
+      messaging_endpoints: 0,
+    });
+
+    const disable = {
+      mutation_type: "agent_profile_update",
+      mutation: { id: formerDefault.id, updates: { enabled: false } },
+    };
+    const disablePreview = service.previewAgentMutation(f.source.id, disable);
+    const disableSubmission = approve(f.source.id, disablePreview, "disable-former-workspace-default");
+    await service.commitAgentMutation({
+      sourceSessionId: f.source.id,
+      raw: disable,
+      requestId: "disable-former-workspace-default",
+      submissionId: disableSubmission,
+      expiresAt: disablePreview.expires_at,
+    });
+    assert.equal(getStore().agentProfiles.find((profile) => profile.id === formerDefault.id)?.enabled, false);
+    assert.equal(getStore().sessions.find((session) => session.id === attributedSession.id)?.agent_profile_id, formerDefault.id);
+    assert.equal(getStore().projects.find((row) => row.id === project.id)?.default_agent_profile_id, target.id);
+    assert.deepEqual(getStore().projects.find((row) => row.id === project.id)?.access_policy.allowed_agent_profile_ids, [formerDefault.id, target.id]);
+    assert.equal(getStore().scheduledJobs.find((job) => job.id === "stable-attribution-job")?.agent_profile_id, formerDefault.id);
+    assert.deepEqual(invalidationEvents, ["latched", "cleaned"]);
+  } finally { f.cleanup(); }
+});
+
+test("workspace-default approval rejects no-op selection and target-state drift", async () => {
+  const f = fixture("wayang-workspace-default-drift-");
+  try {
+    const service = new WorkspaceSettingsService();
+    assert.throws(() => service.previewAgentMutation(f.source.id, {
+      mutation_type: "workspace_default_agent_profile_update",
+      mutation: { default_agent_profile_id: getStore().workspaceSettings.default_agent_profile_id },
+    }), /no-op/);
+
+    const target = createAgentProfile({ name: "Workspace Default Drift Target" });
+    const proposal = {
+      mutation_type: "workspace_default_agent_profile_update",
+      mutation: { default_agent_profile_id: target.id },
+    };
+    const preview = service.previewAgentMutation(f.source.id, proposal);
+    const submissionId = approve(f.source.id, preview, "workspace-default-drift");
+    const row = getStore().agentProfiles.find((profile) => profile.id === target.id)!;
+    row.name = "Renamed After Approval";
+    row.updated_at += 1;
+    await assert.rejects(() => service.commitAgentMutation({
+      sourceSessionId: f.source.id,
+      raw: proposal,
+      requestId: "workspace-default-drift",
+      submissionId,
+      expiresAt: preview.expires_at,
+    }), /server-issued preview|state changed/);
+    assert.notEqual(getStore().workspaceSettings.default_agent_profile_id, target.id);
+  } finally { f.cleanup(); }
+});
+
 test("approved project and profile update/delete operations use shared repository semantics", async () => {
   const f = fixture("wayang-workspace-crud-");
   try {
@@ -593,18 +753,18 @@ test("synthetic restricted profile, Protected project, and AGENTS.md complete th
     assert.equal(restricted.memory_access, "read");
     assert.deepEqual(target.access_policy, { privacy_mode: "protected", allowed_agent_profile_ids: [restricted.id] });
     assert.equal(fs.readFileSync(path.join(targetCwd, "AGENTS.md"), "utf8"), instructionText);
-    const metadata = service.read(f.source.id, { action: "get_project_instructions_metadata", project_id: target.id }) as any;
+    const metadata = await service.read(f.source.id, { action: "get_project_instructions_metadata", project_id: target.id }) as any;
     assert.equal(metadata.exists, true);
     assert.equal("text" in metadata, false);
 
     const restrictedSource = createSession(targetCwd, { agentProfileId: restricted.id });
-    assert.throws(() => service.read(restrictedSource.id, { action: "list_projects" }), /Restricted profiles/);
+    await assert.rejects(() => service.read(restrictedSource.id, { action: "list_projects" }), /Restricted profiles/);
     const scheduledSource = createSession(f.sourceCwd, {
       agentProfileId: f.managementProfile.id,
       scheduledJobId: "synthetic-job",
       scheduledRunId: "synthetic-run",
     });
-    assert.throws(() => service.read(scheduledSource.id, { action: "list_projects" }), /Scheduled sessions/);
+    await assert.rejects(() => service.read(scheduledSource.id, { action: "list_projects" }), /Scheduled sessions/);
   } finally { f.cleanup(); }
 });
 
