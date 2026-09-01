@@ -2864,6 +2864,7 @@ test("Wayang exposes only the curated Together catalog and hides OpenRouter", as
     assert.equal(isWayangProviderVisible("openrouter"), false);
     assert.equal(isWayangProviderVisible("together"), true);
     assert.equal(isCuratedTogetherModel("zai-org/GLM-5.3-Flash"), true);
+    assert.equal(isCuratedTogetherModel("zai-org/GLM-5.3"), true);
     assert.equal(isCuratedTogetherModel("mistralai/Mistral-7B-Instruct-v0.1"), false);
 
     const curated = curateTogetherModelRecords([

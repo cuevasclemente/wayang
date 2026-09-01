@@ -17,6 +17,7 @@ export interface CuratedTogetherModelSpec {
  */
 export const CURATED_TOGETHER_MODELS: Readonly<Record<string, CuratedTogetherModelSpec>> = Object.freeze({
   "zai-org/GLM-5.3-Flash": { reasoning: true, input: ["text", "image"], maxTokens: 131072, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" } },
+  "zai-org/GLM-5.3": { reasoning: true, input: ["text"], maxTokens: 262144, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" } },
   "zai-org/GLM-5.2": { reasoning: true, input: ["text"], maxTokens: 164000 },
   "Qwen/Qwen3.8-2.4T-A95B": { reasoning: true, input: ["text"], maxTokens: 131072, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" } },
   "Qwen/Qwen3.7-Max": { reasoning: false, input: ["text"], maxTokens: 131072 },
