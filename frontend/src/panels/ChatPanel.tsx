@@ -2695,6 +2695,67 @@ function CommandGuardPinPrompt({
   );
 }
 
+function CommandGuardApprovalPrompt({
+  prompt,
+  command,
+  reason,
+  onApprove,
+  onDeny,
+}: {
+  prompt: string;
+  command?: string;
+  reason?: string;
+  onApprove: () => void;
+  onDeny: () => void;
+}) {
+  return (
+    <div
+      data-testid="command-guard-approval-prompt"
+      role="dialog"
+      aria-label="Command guard approval"
+      className="border border-red-900/60 rounded-lg overflow-hidden bg-neutral-900"
+    >
+      <div className="px-4 py-3 border-b border-neutral-800">
+        <div className="text-[10px] uppercase tracking-wider text-red-400 mb-1 font-semibold">
+          Command guard approval
+        </div>
+        <p className="text-sm text-neutral-200">{prompt}</p>
+        {reason && <p className="mt-2 text-xs text-neutral-400">{reason}</p>}
+        {command && (
+          <div className="mt-3">
+            <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1 font-semibold">
+              Command under review
+            </div>
+            <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded border border-neutral-800 bg-neutral-950 px-3 py-2 text-xs text-red-100">
+              {command}
+            </pre>
+          </div>
+        )}
+        <p className="text-xs text-neutral-500 mt-2">
+          The guard model could not produce a verdict for this command. Approving runs it in this session; denying or
+          ignoring it blocks the command. No PIN or secret is involved.
+        </p>
+      </div>
+      <div className="p-4 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={onApprove}
+          className="px-3 py-2 text-xs font-semibold rounded bg-red-700 hover:bg-red-600 text-white"
+        >
+          Approve command
+        </button>
+        <button
+          type="button"
+          onClick={onDeny}
+          className="px-3 py-2 text-xs rounded text-neutral-400 hover:text-red-300 hover:bg-neutral-800"
+        >
+          Deny
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function DeletedTranscriptEvent() {
   return (
     <div data-testid="chat-message" data-role="deleted" className="rounded-lg border border-neutral-800 bg-neutral-900/30 px-4 py-3 text-xs italic text-neutral-500">
@@ -3103,6 +3164,14 @@ export function ChatPanel({
     externalActionKey?: string;
     externalActionSnapshot?: ExternalActionImmutableSnapshot;
   } | null>(null);
+  const [activeCommandGuardApprovalPrompt, setActiveCommandGuardApprovalPrompt] = useState<{
+    requestId: string;
+    sessionId: string;
+    selectionId: string;
+    prompt: string;
+    command?: string;
+    reason?: string;
+  } | null>(null);
   const [externalActionRetentionNotice, setExternalActionRetentionNotice] = useState("");
   const [todoState, setTodoState] = useState<TodoState>({ todos: [], source: "none" });
   const [isTodoPanelOpen, setIsTodoPanelOpen] = useState(false);
@@ -3296,6 +3365,7 @@ export function ChatPanel({
   const poisonedExternalActionKeysRef = useRef<Set<string>>(new Set());
   const externalActionTerminalTombstonesRef = useRef<Map<string, ExternalActionTerminalTombstoneStatus>>(new Map());
   const activeCommandGuardPinPromptRef = useRef(activeCommandGuardPinPrompt);
+  const activeCommandGuardApprovalPromptRef = useRef(activeCommandGuardApprovalPrompt);
   const externalActionAuthorityRef = useRef<string | null>(null);
   const wsStatusRef = useRef<WsStatus>(wsStatus);
   const isSessionHistoryLoadingRef = useRef(isSessionHistoryLoading);
@@ -3306,6 +3376,7 @@ export function ChatPanel({
   activeSessionRuntimeStreamingRef.current = Boolean(activeSession?.runtime_is_streaming);
   activeSessionRuntimeCompactingRef.current = Boolean(activeSession?.runtime_is_compacting);
   activeCommandGuardPinPromptRef.current = activeCommandGuardPinPrompt;
+  activeCommandGuardApprovalPromptRef.current = activeCommandGuardApprovalPrompt;
   externalActionAuthorityRef.current = externalActionAuthority;
   wsStatusRef.current = wsStatus;
   isSessionHistoryLoadingRef.current = isSessionHistoryLoading;
@@ -3337,6 +3408,19 @@ export function ChatPanel({
       }
       activeCommandGuardPinPromptRef.current = null;
       setActiveCommandGuardPinPrompt(null);
+    }
+    const previousApproval = activeCommandGuardApprovalPromptRef.current;
+    if (
+      previousApproval
+      && (
+        previousApproval.sessionId !== activeSessionId
+        || previousApproval.selectionId !== selectionId
+      )
+    ) {
+      // Selection changed under an open approval request: drop the local prompt.
+      // The backend waiter resolves on its own timeout; the guard fails closed.
+      activeCommandGuardApprovalPromptRef.current = null;
+      setActiveCommandGuardApprovalPrompt(null);
     }
     selectionIdRef.current = selectionId;
     windowTranscriptProtocolSelectionIdRef.current = null;
@@ -5408,6 +5492,44 @@ export function ChatPanel({
           return;
         }
 
+        // Command guard approval requests are session-bound, like identity
+        // PIN requests. When another approval is already pending, deny the new
+        // request immediately (fail closed) instead of stacking prompts.
+        if (msg.type === "command_guard_approval_request") {
+          const requestId = typeof msg.requestId === "string" ? msg.requestId : null;
+          const promptSessionId = typeof msg.sessionId === "string" ? msg.sessionId : null;
+          const promptSelectionId = typeof msg.selection_id === "string" ? msg.selection_id : null;
+          if (
+            !requestId
+            || !promptSessionId
+            || !promptSelectionId
+            || promptSessionId !== activeSessionIdRef.current
+            || promptSelectionId !== selectionIdRef.current
+            || ws !== wsRef.current
+            || transportGeneration !== transportGenerationRef.current
+          ) return;
+          if (activeCommandGuardApprovalPromptRef.current) {
+            ws.send(JSON.stringify({
+              type: "command_guard_approval_response",
+              requestId,
+              sessionId: promptSessionId,
+              selection_id: promptSelectionId,
+              cancelled: true,
+            }));
+            return;
+          }
+          setActiveCommandGuardApprovalPrompt({
+            requestId,
+            sessionId: promptSessionId,
+            selectionId: promptSelectionId,
+            prompt: msg.prompt || "Command guard model unavailable",
+            command: typeof msg.command === "string" ? msg.command : undefined,
+            reason: typeof msg.reason === "string" ? msg.reason : undefined,
+          });
+          window.setTimeout(() => scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth" }), 0);
+          return;
+        }
+
         if (msg.type === "sudo_snapshot") {
           if (
             msg.session_id !== activeSessionIdRef.current
@@ -6633,6 +6755,24 @@ export function ChatPanel({
     setCommandGuardSaving(false);
   }, [activeCommandGuardPinPrompt, sendWs]);
 
+  const handleCommandGuardApprovalDecision = useCallback((approved: boolean) => {
+    if (!activeCommandGuardApprovalPrompt) return;
+    const { requestId, sessionId, selectionId } = activeCommandGuardApprovalPrompt;
+    if (
+      sessionId === activeSessionIdRef.current
+      && selectionId === selectionIdRef.current
+    ) {
+      sendWs({
+        type: "command_guard_approval_response",
+        requestId,
+        sessionId,
+        selection_id: selectionId,
+        approved,
+      });
+    }
+    setActiveCommandGuardApprovalPrompt(null);
+  }, [activeCommandGuardApprovalPrompt, sendWs]);
+
   const handleSetGoal = useCallback(() => {
     const trimmed = goalInput.trim();
     if (!trimmed || !activeSessionId) return;
@@ -7638,6 +7778,18 @@ export function ChatPanel({
             externalAction={Boolean(activeCommandGuardPinPrompt.externalActionKey)}
             onSubmit={handleCommandGuardPinSubmit}
             onCancel={handleCommandGuardPinCancel}
+          />
+        </div>
+      )}
+      {activeCommandGuardApprovalPrompt && (
+        <div className="shrink-0 border-t border-red-900/50 bg-neutral-950 px-3 py-2">
+          <CommandGuardApprovalPrompt
+            key={activeCommandGuardApprovalPrompt.requestId}
+            prompt={activeCommandGuardApprovalPrompt.prompt}
+            command={activeCommandGuardApprovalPrompt.command}
+            reason={activeCommandGuardApprovalPrompt.reason}
+            onApprove={() => handleCommandGuardApprovalDecision(true)}
+            onDeny={() => handleCommandGuardApprovalDecision(false)}
           />
         </div>
       )}

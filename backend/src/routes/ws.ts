@@ -114,7 +114,7 @@ import {
   type InterviewSubmissionContext,
 } from "../interview-provenance.js";
 import { getSudoBridge, type SudoRequest } from "../sudo-bridge.js";
-import { getCommandGuardIdentityBridge, type CommandGuardIdentityRequest } from "../command-guard-bridge.js";
+import { getCommandGuardIdentityBridge, getCommandGuardApprovalBridge, type CommandGuardIdentityRequest, type CommandGuardApprovalRequest } from "../command-guard-bridge.js";
 import {
   getActionApprovalBridge,
   type ActionApprovalBridge,
@@ -742,6 +742,7 @@ function handleConnection(
   let interviewBridgeUnsub: (() => void) | null = null;
   let sudoBridgeUnsub: (() => void) | null = null;
   let commandGuardIdentityBridgeUnsub: (() => void) | null = null;
+  let commandGuardApprovalBridgeUnsub: (() => void) | null = null;
   const actionApprovalClientId = randomUUID();
   let actionApprovalDetach: (() => void) | null = null;
   let actionApprovalRequestUnsub: (() => void) | null = null;
@@ -796,6 +797,8 @@ function handleConnection(
     sudoBridgeUnsub = null;
     commandGuardIdentityBridgeUnsub?.();
     commandGuardIdentityBridgeUnsub = null;
+    commandGuardApprovalBridgeUnsub?.();
+    commandGuardApprovalBridgeUnsub = null;
     transcriptInvalidationUnsub?.();
     transcriptInvalidationUnsub = null;
     actionApprovalDetach?.();
@@ -1552,6 +1555,39 @@ function handleConnection(
         for (const req of commandGuardIdentityBridge.getPendingRequests(currentSessionId)) {
           sendCommandGuardIdentityRequest(req);
         }
+
+        const deliveredCommandGuardApprovalRequestIds = new Set<string>();
+        const sendCommandGuardApprovalRequest = (req: CommandGuardApprovalRequest) => {
+          // Approval challenges are valid only for the exact active browser
+          // selection, mirroring identity PIN request binding.
+          if (
+            !selectionId
+            || !alive
+            || version !== setupVersion
+            || req.sessionId !== currentSessionId
+            || currentSelectionId !== selectionId
+            || deliveredCommandGuardApprovalRequestIds.has(req.requestId)
+          ) return;
+          deliveredCommandGuardApprovalRequestIds.add(req.requestId);
+          sendSafe(ws, {
+            type: "command_guard_approval_request",
+            requestId: req.requestId,
+            sessionId: req.sessionId,
+            selection_id: selectionId,
+            prompt: req.prompt,
+            command: req.command,
+            reason: req.reason,
+          });
+        };
+
+        const commandGuardApprovalBridge = getCommandGuardApprovalBridge();
+        commandGuardApprovalBridgeUnsub = commandGuardApprovalBridge.onRequest((req) => {
+          if (!alive || version !== setupVersion) return;
+          sendCommandGuardApprovalRequest(req);
+        });
+        for (const req of commandGuardApprovalBridge.getPendingRequests(currentSessionId)) {
+          sendCommandGuardApprovalRequest(req);
+        }
         wsProfile(nextSessionId, "bridge_subscriptions_ready", `duration=${elapsedMs(bridgeStart)}`);
       }
 
@@ -1904,6 +1940,11 @@ function handleConnection(
 
     if (msg.type === "command_guard_pin_response") {
       handleCommandGuardPinResponse(currentSessionId, currentSelectionId, msg);
+      return;
+    }
+
+    if (msg.type === "command_guard_approval_response") {
+      handleCommandGuardApprovalResponse(currentSessionId, currentSelectionId, msg);
       return;
     }
 
@@ -2872,6 +2913,37 @@ function handleCommandGuardPinResponse(
   }
 
   bridge.resolveForSession(sessionId, requestId, typeof msg.pin === "string" ? msg.pin : null);
+}
+
+/** Handle command_guard_approval_response; resolves the guard's approval waiter. */
+function handleCommandGuardApprovalResponse(
+  sessionId: string,
+  currentSelectionId: string | null,
+  msg: any,
+): void {
+  if (getRuntimeMutationSessionState(sessionId).mutation_locked) return;
+  const requestId = typeof msg?.requestId === "string" ? msg.requestId : "";
+  const responseSessionId = typeof msg?.sessionId === "string" ? msg.sessionId : "";
+  const responseSelectionId = typeof msg?.selection_id === "string" ? msg.selection_id : "";
+  if (
+    !requestId
+    || !responseSessionId
+    || !responseSelectionId
+    || !currentSelectionId
+    || responseSessionId !== sessionId
+    || responseSelectionId !== currentSelectionId
+  ) return;
+
+  // Validate the complete wire binding before touching the in-memory bridge.
+  // Missing/stale responses cannot consume a live waiter. Cancellation and
+  // timeout both deny (the guard fails closed on null).
+  const bridge = getCommandGuardApprovalBridge();
+  if (msg.cancelled) {
+    bridge.resolveForSession(sessionId, requestId, false);
+    return;
+  }
+
+  bridge.resolveForSession(sessionId, requestId, msg.approved === true ? true : false);
 }
 
 export function canHandleClientMessageBeforeSessionReady(type: unknown): boolean {

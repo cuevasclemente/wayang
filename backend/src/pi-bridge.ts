@@ -80,7 +80,7 @@ import {
 } from "./together-model-catalog.js";
 export { curateTogetherModelRecords, isCuratedTogetherModel } from "./together-model-catalog.js";
 import { getSudoBridge } from "./sudo-bridge.js";
-import { getCommandGuardIdentityBridge } from "./command-guard-bridge.js";
+import { getCommandGuardIdentityBridge, getCommandGuardApprovalBridge } from "./command-guard-bridge.js";
 import {
   scheduleWayangAutoTitleOnAcceptedTurn,
   scheduleWayangAutoTitleOnInteraction,
@@ -4286,6 +4286,7 @@ export function latchPiSessionCapabilityDenial(
     getInterviewBridge().cancelSession(id);
     getSudoBridge().cancelSession(id);
     getCommandGuardIdentityBridge().cancelSession(id);
+    getCommandGuardApprovalBridge().cancelSession(id);
     // Advance first and without awaiting or requiring a published handle. This
     // is the authoritative starting-runtime revocation latch.
     const generation = getPiSessionCapabilityDenialGeneration(id) + 1n;
@@ -4359,6 +4360,7 @@ export async function destroyPiSession(
   getInterviewBridge().cancelSession(id);
   getSudoBridge().cancelSession(id);
   getCommandGuardIdentityBridge().cancelSession(id);
+  getCommandGuardApprovalBridge().cancelSession(id);
   const pendingCreation = sessionCreations.get(id);
   if (pendingCreation) {
     const generation = getPiSessionCapabilityDenialGeneration(id) + 1n;
