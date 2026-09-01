@@ -1,7 +1,7 @@
 # Browser workbench visual declutter
 
 Date: 2026-09-01
-Status: implemented and validated on `feat/browser-workbench-declutter-20260901`; integration and service restart remain separate
+Status: implemented, validated, and integrated on local `main`; frontend assets are live without a service restart
 
 ## Problem
 
@@ -56,3 +56,7 @@ Passed:
 The first unqualified `make check` inherited production feature flags and reproduced the known host-environment baseline (36 backend failures, including named-profile startup composition and memory-first tool-set differences). Re-running with browser-host, canonical warmer, file-audio, and memory-first gates at documented test defaults and search/catalog background services enabled passed completely. No private configuration values were read or printed.
 
 No browser profile contents, cookies, credentials, production session data, service configuration, or live browser pages were inspected or changed.
+
+## Integration
+
+After the concurrent large-transcript-event fix reached canonical `main`, this commit was rebased onto that head, the focused 12-test browser/protected suite passed again, and `main` fast-forwarded to `28c62a1`. The production frontend was rebuilt in place and the running loopback service served the new `index-B3CxBoOd.js` asset immediately; no process restart was needed because backend code did not change. Repository publication remains pending because the command guard denied the unapproved push to `origin/main`.
