@@ -1,13 +1,17 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  AgentProfileDisableConflict,
   createAgentProfile,
   deleteAgentProfile,
   getAgentProfile,
+  getAgentProfileReferenceSummary,
   getWorkspaceDefaultAgentProfileId,
   listAgentProfiles,
+  setWorkspaceDefaultAgentProfile,
   updateAgentProfile,
   type AgentProfileCreateInput,
+  type AgentProfileReferenceSummary,
   type AgentProfileUpdateInput,
 } from "./agent-profiles.js";
 import { getStore } from "./db.js";
@@ -73,6 +77,8 @@ export interface WorkspaceCapabilityInvalidationPort {
 }
 
 export type WorkspaceReadAction =
+  | { action: "get_workspace_settings" }
+  | { action: "get_agent_profile_references"; id: string }
   | { action: "list_projects" }
   | { action: "get_project"; id: string }
   | { action: "list_agent_profiles" }
@@ -99,6 +105,11 @@ interface IssuedWorkspacePreview {
   precondition: PreparedMutation["precondition"];
   issuedAt: number;
   expiresAt: number;
+}
+
+export interface WorkspaceSettingsView {
+  default_agent_profile_id: string;
+  default_agent_profile: Omit<AgentProfileRow, "instructions">;
 }
 
 const MAX_LIST_RESULTS = 200;
@@ -144,6 +155,27 @@ function requireEnabledProfile(id: string): AgentProfileRow {
   const profile = requireProfile(id, "Default agent profile");
   if (!profile.enabled) throw new WorkspaceStoreError("Default agent profile must be enabled", 409);
   return profile;
+}
+
+function workspaceSettingsView(): WorkspaceSettingsView {
+  const id = getWorkspaceDefaultAgentProfileId();
+  const profile = requireEnabledProfile(id);
+  return {
+    default_agent_profile_id: id,
+    default_agent_profile: withoutInstructions(profile),
+  };
+}
+
+async function agentProfileReferenceSummary(id: string): Promise<AgentProfileReferenceSummary> {
+  requireProfile(id);
+  const attributedSessionIds = getStore().sessions
+    .filter((session) => session.agent_profile_id === id)
+    .map((session) => session.id);
+  const { previewRuntimeMutationImpact } = await import("./runtime-impact.js");
+  const runningSessionIds = new Set(previewRuntimeMutationImpact(attributedSessionIds)
+    .filter((state) => state.runtime_status === "active" || state.runtime_status === "starting")
+    .map((state) => state.session_id));
+  return getAgentProfileReferenceSummary(id, runningSessionIds);
 }
 
 function validatePair(provider: string | null, model: string | null): void {
@@ -282,6 +314,23 @@ function noChange(before: unknown, after: unknown): boolean {
 function prepareMutation(raw: unknown): PreparedMutation {
   let canonical = canonicalizeWorkspaceMutation(raw);
   switch (canonical.mutation_type) {
+    case "workspace_default_agent_profile_update": {
+      const currentId = getWorkspaceDefaultAgentProfileId();
+      const target = requireEnabledProfile(canonical.mutation.default_agent_profile_id);
+      if (currentId === target.id) throw new WorkspaceStoreError("Workspace default agent profile update is a no-op", 409);
+      return {
+        canonical,
+        precondition: {
+          kind: "workspace_default_and_target_profile",
+          sha256: workspaceSha256({
+            current_default_agent_profile_id: currentId,
+            target: { id: target.id, name: target.name, enabled: target.enabled },
+          }),
+        },
+        summary: `set workspace default agent profile to ${target.name}; existing Project defaults, sessions, schedules, and historical attribution remain unchanged`,
+        target: { id: target.id, label: target.name },
+      };
+    }
     case "project_create": {
       const mutation = canonical.mutation;
       let stat: fs.Stats;
@@ -376,10 +425,9 @@ function prepareMutation(raw: unknown): PreparedMutation {
       if (mutation.updates.name !== undefined) ensureUniqueProfileName(mutation.updates.name, current.id);
       validatePair(next.default_provider, next.default_model);
       if (!next.enabled && current.enabled) {
-        const store = getStore();
-        if (store.workspaceSettings.default_agent_profile_id === current.id
-          || store.projects.some((project) => project.default_agent_profile_id === current.id)) {
-          throw new WorkspaceStoreError("Workspace and project defaults must be changed before disabling this profile", 409);
+        const summary = getAgentProfileReferenceSummary(current.id);
+        if (summary.workspace_default || summary.project_defaults > 0 || summary.pending_switches > 0) {
+          throw new AgentProfileDisableConflict(summary);
         }
       }
       if (getStore().sessions.some((session) => session.pending_agent_switch?.from_agent_profile_id === current.id || session.pending_agent_switch?.to_agent_profile_id === current.id)) {
@@ -589,6 +637,10 @@ async function settleMutation(
     }
     let result: unknown;
     switch (prepared.canonical.mutation_type) {
+      case "workspace_default_agent_profile_update":
+        setWorkspaceDefaultAgentProfile(prepared.canonical.mutation.default_agent_profile_id);
+        result = workspaceSettingsView();
+        break;
       case "project_create": result = createProject(prepared.canonical.mutation as ProjectCreateInput); break;
       case "project_update": result = updateProject(prepared.canonical.mutation.id, prepared.canonical.mutation.updates as ProjectUpdateInput); break;
       case "project_delete_registration": deleteProjectRegistration(prepared.canonical.mutation.id); result = { deleted: true, registration_only: true }; break;
@@ -700,9 +752,11 @@ export class WorkspaceSettingsService {
     return issued;
   }
 
-  read(sourceSessionId: string, request: WorkspaceReadAction): unknown {
+  async read(sourceSessionId: string, request: WorkspaceReadAction): Promise<unknown> {
     requireStandardInteractiveSource(sourceSessionId);
     switch (request.action) {
+      case "get_workspace_settings": return workspaceSettingsView();
+      case "get_agent_profile_references": return agentProfileReferenceSummary(request.id);
       case "list_projects": {
         const rows = listProjects();
         return { projects: rows.slice(0, MAX_LIST_RESULTS), total: rows.length, truncated: rows.length > MAX_LIST_RESULTS };
@@ -767,6 +821,17 @@ export class WorkspaceSettingsService {
         },
       } : {}),
     };
+  }
+
+  getWorkspaceSettingsForUi(): WorkspaceSettingsView { return workspaceSettingsView(); }
+
+  setWorkspaceDefaultAgentProfileForUi(id: string): WorkspaceSettingsView {
+    setWorkspaceDefaultAgentProfile(id);
+    return workspaceSettingsView();
+  }
+
+  getAgentProfileReferencesForUi(id: string): Promise<AgentProfileReferenceSummary> {
+    return agentProfileReferenceSummary(id);
   }
 
   createProjectForUi(input: ProjectCreateInput): ProjectRow { return createProject(input); }

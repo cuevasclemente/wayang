@@ -8,6 +8,7 @@ import express from "express";
 import { close, init } from "./db.js";
 import { router as projectsRouter } from "./routes/projects.js";
 import { router as agentProfilesRouter } from "./routes/agent-profiles.js";
+import { router as workspaceSettingsRouter } from "./routes/workspace-settings.js";
 
 test("project and agent profile CRUD APIs validate and redact list responses", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-workspace-api-"));
@@ -21,6 +22,7 @@ test("project and agent profile CRUD APIs validate and redact list responses", a
   app.use(express.json());
   app.use("/api", projectsRouter);
   app.use("/api", agentProfilesRouter);
+  app.use("/api", workspaceSettingsRouter);
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>((resolve, reject) => {
     server.once("listening", resolve);
@@ -34,6 +36,14 @@ test("project and agent profile CRUD APIs validate and redact list responses", a
     else process.env.WAYANG_DATA_DIR = previous;
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  const initialWorkspaceResponse = await fetch(`${base}/workspace-settings`);
+  assert.equal(initialWorkspaceResponse.status, 200);
+  const initialWorkspace = await initialWorkspaceResponse.json() as {
+    default_agent_profile_id: string;
+    default_agent_profile: Record<string, unknown>;
+  };
+  assert.equal(Object.hasOwn(initialWorkspace.default_agent_profile, "instructions"), false);
 
   const agentResponse = await fetch(`${base}/agent-profiles`, {
     method: "POST",
@@ -56,6 +66,53 @@ test("project and agent profile CRUD APIs validate and redact list responses", a
   assert.equal(list.some((profile) => Object.hasOwn(profile, "instructions")), false);
   const detail = await (await fetch(`${base}/agent-profiles/${finance.id}`)).json() as { instructions: string };
   assert.equal(detail.instructions, "detail-only private instructions");
+
+  const workspaceUnknown = await fetch(`${base}/workspace-settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ default_agent_profile_id: finance.id, forged: true }),
+  });
+  assert.equal(workspaceUnknown.status, 400);
+
+  const workspaceUpdate = await fetch(`${base}/workspace-settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ default_agent_profile_id: finance.id }),
+  });
+  assert.equal(workspaceUpdate.status, 200);
+  const updatedWorkspace = await workspaceUpdate.json() as {
+    default_agent_profile_id: string;
+    default_agent_profile: Record<string, unknown>;
+  };
+  assert.equal(updatedWorkspace.default_agent_profile_id, finance.id);
+  assert.equal(Object.hasOwn(updatedWorkspace.default_agent_profile, "instructions"), false);
+
+  const initialReferences = await (await fetch(`${base}/agent-profiles/${initialWorkspace.default_agent_profile_id}/references`)).json() as Record<string, unknown>;
+  assert.deepEqual(initialReferences, {
+    workspace_default: false,
+    project_defaults: 0,
+    project_allowlists: 0,
+    session_attributions: 0,
+    running_sessions: 0,
+    pending_switches: 0,
+    scheduled_jobs: 0,
+    protected_automation_jobs: 0,
+    protected_automation_runs: 0,
+    messaging_endpoints: 0,
+  });
+
+  const disableFormerDefault = await fetch(`${base}/agent-profiles/${initialWorkspace.default_agent_profile_id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: false }),
+  });
+  assert.equal(disableFormerDefault.status, 200);
+  const disabledTarget = await fetch(`${base}/workspace-settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ default_agent_profile_id: initialWorkspace.default_agent_profile_id }),
+  });
+  assert.equal(disabledTarget.status, 409);
 
   const invalidPair = await fetch(`${base}/agent-profiles/${finance.id}`, {
     method: "PUT",
@@ -108,6 +165,26 @@ test("project and agent profile CRUD APIs validate and redact list responses", a
     body: JSON.stringify({ text: "overwrite", expected_sha256: "0".repeat(64) }),
   });
   assert.equal(stale.status, 412);
+
+  const financeReferencesResponse = await fetch(`${base}/agent-profiles/${finance.id}/references`);
+  assert.equal(financeReferencesResponse.status, 200);
+  const financeReferences = await financeReferencesResponse.json() as Record<string, unknown>;
+  assert.equal(financeReferences.workspace_default, true);
+  assert.equal(financeReferences.project_defaults, 1);
+  assert.equal(financeReferences.project_allowlists, 1);
+  assert.equal(financeReferences.session_attributions, 0);
+
+  const disableBlocked = await fetch(`${base}/agent-profiles/${finance.id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: false }),
+  });
+  assert.equal(disableBlocked.status, 409);
+  assert.deepEqual(await disableBlocked.json(), {
+    error: "Workspace and project defaults must be changed before disabling this profile (workspace_default, project_defaults:1)",
+    code: "agent_profile_disable_blocked",
+    blockers: { workspace_default: true, project_defaults: 1, pending_switches: 0 },
+  });
 
   const deleteInUse = await fetch(`${base}/agent-profiles/${finance.id}`, { method: "DELETE" });
   assert.equal(deleteInUse.status, 409);

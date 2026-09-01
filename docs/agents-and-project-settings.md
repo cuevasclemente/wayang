@@ -4,7 +4,11 @@ Wayang has durable, editable Projects and reusable Agent Profiles. An agent prof
 
 ## Defaults
 
-Fresh installations seed one restricted **Default** profile with a generated stable ID, project-only preferences, and no memory. Newly discovered projects use that profile. Names do not grant authority: the current Project privacy mode, profile enabled state, and Project allowlist do. Every enabled profile allowed by a Standard Project receives global resources, browser control, and host execution; every enabled profile allowlisted by a Protected Project receives its isolated browser and deterministic automation.
+Fresh installations seed one restricted **Default** profile with a generated stable ID, project-only preferences, and no memory. Newly discovered projects use the workspace-default profile. Upgraded stores may retain a migration-seeded workspace default until the owner changes it in **Settings → Agents → Workspace default**, through authenticated `GET`/`PUT /api/workspace-settings`, or through the approved agent mutation. This fallback affects only future/default Project registration: changing it never switches current sessions, changes existing Project defaults/allowlists, or rewrites historical stable-ID attribution. The target must be enabled.
+
+The Agents settings view also reports bounded redacted reference counts, separating persisted session attribution from active runtime use. Disable conflicts identify only actual blockers such as the workspace default, Project defaults, or a pending switch. An owner may therefore move active/configuration references, disable the old profile, and retain inert historical attribution without deleting or replacing the stable profile ID.
+
+Names do not grant authority: the current Project privacy mode, profile enabled state, and Project allowlist do. Every enabled profile allowed by a Standard Project receives global resources, browser control, and host execution; every enabled profile allowlisted by a Protected Project receives its isolated browser and deterministic automation.
 
 Project paths are canonical and immutable. Project name, description, color, defaults, allowed agents, privacy mode, and `AGENTS.md` are editable.
 
@@ -50,8 +54,8 @@ An eligible Protected restricted profile may also receive Wayang's backend-owned
 
 Standard interactive Wayang runtimes receive two backend-owned, source-session-bound tools:
 
-- `wayang_workspace_read` provides bounded project/profile reads and project-instruction metadata or content. Detail content enters the session transcript, so metadata reads are preferred.
-- `wayang_workspace_change` previews one canonical CRUD or `AGENTS.md` mutation, then commits it only after the exact one-question approval is submitted in the originating Wayang chat with the predefined **APPROVE** option.
+- `wayang_workspace_read` provides bounded workspace-default, project/profile, redacted profile-reference, and project-instruction metadata or content reads. Detail content enters the session transcript, so metadata reads are preferred.
+- `wayang_workspace_change` previews one canonical workspace-default, CRUD, or `AGENTS.md` mutation, then commits it only after the exact one-question approval is submitted in the originating Wayang chat with the predefined **APPROVE** option. `workspace_default_agent_profile_update` changes only the future/default Project fallback and explicitly preserves existing Project/session/schedule attribution.
 
 Restricted profiles and scheduled/background sessions receive neither tool. Approval is bound to the source session, server-owned WebSocket provenance, complete current-state hash, exact operation digest, and a ten-minute expiry. The backend also retains the exact issued preview in process memory; the approval record must be created and submitted at or after that issuance, and fabricated, pre-preview, altered-expiry, or pre-restart questionnaires fail closed. Issuance is consumed only at the successful durable mutation/file-replacement boundary, so a transient runtime conflict can be retried while the preview remains valid. Approval prompts/results expose hashes and byte counts rather than profile instruction or `AGENTS.md` text. Authenticated Settings REST operations retain their existing UI authority and do not require this agent approval flow.
 
