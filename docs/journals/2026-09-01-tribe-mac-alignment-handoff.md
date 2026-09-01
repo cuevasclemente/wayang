@@ -20,7 +20,7 @@ Governing rule: The-Sceptre's installed runtime is authoritative for extension c
 
 - Refreshed plan: `docs/plans/2026-08-28-tribe-mac-wayang-mypi-alignment.md`, now led by the final issue-#45 completion override.
 - Wayang transfer: merged/published `origin/main` `06795ebbf48a15e6d6fd60700d7c0cbe37fe9f80` (PR #46). It includes the guard approval bridge, large-event projection, and supported workspace-default control. The old `wayang-main-cd98b00.bundle` is stale and prohibited.
-- mypi transfer: merged/published `origin/main` `440c35ee4795487c2887bc8ef69bb0f865742555` over HTTPS, including guard hardening; the Tribe parity policy SHA remains `207a3c88…d86e`.
+- mypi transfer: merged/published `origin/main` `ea88d5e9596dcbc347c864db7f3697a283664556` (code `3f70d1d`) over HTTPS, including guard hardening and the exact-Wayang-owned-manager scope fix for standalone Pi CLI; the Tribe parity policy SHA remains `207a3c88…d86e`.
 - This branch: `ops/tribe-mac-alignment-20260901`, ready to republish through the established report channel for Loom.
 
 ## Identity and privacy boundaries (unchanged)
@@ -41,9 +41,10 @@ Clemente resumes the Loom-owned Tribe-Mac session with only the final delta:
 
 1. preserve the current rollback/runtime/store opaquely;
 2. stage, build, doctor, and activate exact Wayang `06795eb` on loopback;
-3. set the workspace default to Loom stable ID through the new supported control;
-4. verify active/configuration Wren reference counts are zero, while allowing inert persisted session attribution/history;
-5. disable Wren without deletion or replacement;
-6. run the final Loom and command-guard smoke and return non-secret evidence.
+3. advance mypi from `440c35e` only if needed to exact `ea88d5e`/code `3f70d1d`, using a separate backup-first parity delta that does not touch Loom identity/auth/context;
+4. set the workspace default to Loom stable ID through the new supported control;
+5. verify active/configuration Wren reference counts are zero, while allowing inert persisted session attribution/history;
+6. disable Wren without deletion or replacement;
+7. run the final Loom, standalone-Pi DNS, and command-guard smoke and return non-secret evidence.
 
-Do not repeat already verified Pi/mypi work if Tribe-Mac is already on the exact released heads.
+Do not repeat already verified Pi or broader mypi migration work; apply only missing exact-release deltas.
