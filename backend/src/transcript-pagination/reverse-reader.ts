@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import type { FileFingerprint } from "../session-metadata.js";
+import { readSampledTranscriptEntry } from "./oversized-projection.js";
 
 export const TRANSCRIPT_PAGE_MAX_ROWS = 200;
 export const TRANSCRIPT_PAGE_MAX_BYTES = 512 * 1024;
@@ -198,15 +199,13 @@ function oversizedEnvelopePlaceholder(
     eventType: type,
     id,
     parentId,
-    entry: {
-      type: "custom_message",
+    entry: readSampledTranscriptEntry(fd, {
+      eventType: type,
       id,
       parentId,
-      customType: "wayang-transcript-event-placeholder-v1",
-      content: "This transcript event is too large to include in a bounded window.",
-      display: true,
-      details: { reason: "payload_limit", encoded_bytes: bounds.end - bounds.start },
-    },
+      encodedBytes: bounds.end - bounds.start,
+      sourceOffset: bounds.start,
+    }),
   };
 }
 

@@ -6,6 +6,10 @@ import Database, { type Database as DatabaseType } from "better-sqlite3";
 import { getConfig } from "../config.js";
 import type { FileFingerprint } from "../session-metadata.js";
 import {
+  readSampledTranscriptEntry,
+  TRANSCRIPT_OVERSIZED_SAMPLE_BYTES,
+} from "./oversized-projection.js";
+import {
   isStructurallyVisibleTranscriptEntry,
   readTranscriptFileRevision,
   sameTranscriptIdentity,
@@ -658,13 +662,14 @@ export class StructuralTranscriptIndex {
       event_id: string;
       parent_id: string | null;
       display_class: string;
+      event_type: string;
       visible_ordinal: number | null;
     };
     const selectSources = (selectedRows: readonly IndexedSourceRow[]): SourceRow[] => {
       const firstOrdinal = selectedRows[0].activeOrdinal;
       const lastOrdinal = selectedRows.at(-1)!.activeOrdinal;
       return this.db.prepare(
-        `SELECT a.source_offset,a.source_length,a.visible_ordinal,t.event_id,t.parent_id,t.display_class
+        `SELECT a.source_offset,a.source_length,a.visible_ordinal,t.event_id,t.parent_id,t.display_class,t.event_type
          FROM active_branch_entries AS a
          JOIN transcript_entries AS t ON t.session_id=a.session_id AND t.transcript_epoch=a.transcript_epoch AND t.event_id=a.event_id
          WHERE a.session_id=? AND a.transcript_epoch=?
@@ -680,7 +685,9 @@ export class StructuralTranscriptIndex {
     };
     let sources = selectSources(retained);
     const aggregateCost = (values: readonly SourceRow[]) => values.reduce((total, row) => (
-      total + (row.source_length > maxSourceBytes && row.visible_ordinal !== null ? 0 : row.source_length)
+      total + (row.source_length > maxSourceBytes && row.visible_ordinal !== null
+        ? Math.min(row.source_length, TRANSCRIPT_OVERSIZED_SAMPLE_BYTES * 2)
+        : row.source_length)
     ), 0);
     while (retained.length > 1 && aggregateCost(sources) > maxSourceBytes) {
       if (options.preference === "latest") retained.shift();
@@ -710,15 +717,16 @@ export class StructuralTranscriptIndex {
       }
       for (const row of sources) {
         if (row.source_length > maxSourceBytes && row.visible_ordinal !== null) {
-          entries.push({
-            type: "custom_message",
+          entries.push(readSampledTranscriptEntry(fd, {
+            eventType: row.event_type,
             id: row.event_id,
             parentId: row.parent_id,
-            customType: "wayang-transcript-event-placeholder-v1",
-            content: "This transcript event is too large to include in a bounded window.",
-            display: true,
-            details: { reason: "payload_limit", encoded_bytes: row.source_length },
-          });
+            encodedBytes: row.source_length,
+            sourceOffset: row.source_offset,
+          }, (count) => {
+            sourceBytesRead += count;
+            this.options.observeIndexedSourceBytesForTests?.(revision.sessionId, count);
+          }));
           continue;
         }
         if (sourceBytesRead + row.source_length > maxSourceBytes) continue;

@@ -11,7 +11,7 @@ Wayang’s web chat loads long transcripts as bounded windows instead of transfe
 - Compaction summaries remain ordinary transcript landmarks. Compaction chapter navigation is not part of this release.
 - Live output remains at the transcript tail. When viewing an older/search window, Wayang reports newer activity without moving the current viewport.
 
-The initial window is limited to 200 persisted events and 512 KiB of serialized transcript content. Individual oversized events render as bounded placeholders.
+The initial window is limited to 200 persisted events and 512 KiB of serialized transcript content. Individual oversized events render as bounded semantic projections: Wayang preserves the event role/type, stable identity, readable text preview, timestamps, and small tool/custom metadata while replacing embedded binary media and oversized nested fields with explicit omission notes. The projection is visibly marked and reports the original encoded size; it is not the complete canonical event.
 
 ## Protocol compatibility
 
@@ -41,7 +41,7 @@ These are defensive implementation limits, not environment variables:
 
 - 200 persisted events per window;
 - 512 KiB total serialized window content;
-- 384 KiB aggregate indexed source-read budget;
+- 384 KiB aggregate indexed source-read budget, including at most 64 KiB each from an oversized row's prefix and suffix;
 - two concurrent structural-index workers and two concurrent TODO workers;
 - 25,000 topology entries for exact indexed around/forward navigation.
 

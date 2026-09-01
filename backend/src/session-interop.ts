@@ -10,6 +10,7 @@ import { getProjectByCwd } from "./projects.js";
 import { getSessionById, type SessionRow } from "./sessions.js";
 import { authorizeExactStandardTranscript } from "./standard-transcript-authorization.js";
 import { fingerprintsEqual } from "./session-metadata.js";
+import { projectSampledSessionReadLine, TRANSCRIPT_OVERSIZED_SAMPLE_BYTES } from "./transcript-pagination/oversized-projection.js";
 
 export const SESSION_LIST_TOOL_NAME = "session_list";
 export const SESSION_READ_TOOL_NAME = "session_read";
@@ -160,11 +161,62 @@ export function readStandardSessionLines(targetSessionId: string, options: {
   let currentLine = 1;
   let selectedBytes = 0;
   let selectedLine = Buffer.alloc(0);
+  let selectedLinePrefix = Buffer.alloc(0);
+  let selectedLineSuffix = Buffer.alloc(0);
+  let selectedLineBytes = 0;
   let position = 0;
   let scannedBytes = 0;
   let reachedEof = false;
   let byteLimited = false;
   let scanLimited = false;
+
+  const appendSelectedSegment = (segment: Buffer): void => {
+    if (segment.length === 0) return;
+    selectedLineBytes += segment.length;
+    if (selectedLine.length <= MAX_READ_BYTES) {
+      const nextLength = selectedLine.length + segment.length;
+      selectedLine = nextLength <= MAX_READ_BYTES
+        ? Buffer.concat([selectedLine, segment])
+        : Buffer.alloc(0);
+    }
+    if (selectedLinePrefix.length < TRANSCRIPT_OVERSIZED_SAMPLE_BYTES) {
+      const needed = TRANSCRIPT_OVERSIZED_SAMPLE_BYTES - selectedLinePrefix.length;
+      selectedLinePrefix = Buffer.concat([selectedLinePrefix, segment.subarray(0, needed)]);
+    }
+    selectedLineSuffix = segment.length >= TRANSCRIPT_OVERSIZED_SAMPLE_BYTES
+      ? Buffer.from(segment.subarray(segment.length - TRANSCRIPT_OVERSIZED_SAMPLE_BYTES))
+      : Buffer.concat([selectedLineSuffix, segment]).subarray(
+          Math.max(0, selectedLineSuffix.length + segment.length - TRANSCRIPT_OVERSIZED_SAMPLE_BYTES),
+        );
+  };
+  const resetSelectedLine = (): void => {
+    selectedLine = Buffer.alloc(0);
+    selectedLinePrefix = Buffer.alloc(0);
+    selectedLineSuffix = Buffer.alloc(0);
+    selectedLineBytes = 0;
+  };
+  const publishSelectedLine = (complete: boolean): boolean => {
+    if (selectedLineBytes === 0 && !complete) return true;
+    let output: string;
+    if (selectedLineBytes <= MAX_READ_BYTES && complete) {
+      output = selectedLine.toString("utf8");
+    } else if (selectedLineBytes > MAX_READ_BYTES) {
+      output = projectSampledSessionReadLine(selectedLinePrefix, selectedLineSuffix, {
+        lineNumber: currentLine,
+        ...(complete
+          ? { encodedBytes: selectedLineBytes }
+          : { encodedBytesAtLeast: selectedLineBytes }),
+      });
+    } else {
+      return true;
+    }
+    const outputBytes = Buffer.byteLength(output) + 1;
+    if (selectedBytes + outputBytes > MAX_READ_BYTES) return false;
+    lines.push(output);
+    selectedBytes += outputBytes;
+    return true;
+  };
+
   try {
     const opened = fs.fstatSync(descriptor);
     if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== authorized.stat.dev || opened.ino !== authorized.stat.ino) {
@@ -176,10 +228,7 @@ export function readStandardSessionLines(targetSessionId: string, options: {
       const count = fs.readSync(descriptor, chunk, 0, Math.min(chunk.length, remainingScanBytes), position);
       if (count === 0) {
         reachedEof = true;
-        if (currentLine >= offset && selectedLine.length > 0) {
-          if (selectedBytes + selectedLine.length > MAX_READ_BYTES) byteLimited = true;
-          else lines.push(selectedLine.toString("utf8"));
-        }
+        if (currentLine >= offset && selectedLineBytes > 0 && !publishSelectedLine(true)) byteLimited = true;
         break;
       }
       position += count;
@@ -188,34 +237,25 @@ export function readStandardSessionLines(targetSessionId: string, options: {
       for (let index = 0; index < count && lines.length < limit; index++) {
         if (chunk[index] !== 0x0a) continue;
         if (currentLine >= offset) {
-          const segment = chunk.subarray(start, index);
-          if (selectedBytes + selectedLine.length + segment.length + 1 > MAX_READ_BYTES) {
+          appendSelectedSegment(chunk.subarray(start, index));
+          if (!publishSelectedLine(true)) {
             byteLimited = true;
             start = count;
             break;
           }
-          selectedLine = Buffer.concat([selectedLine, segment]);
-          lines.push(selectedLine.toString("utf8"));
-          selectedBytes += selectedLine.length + 1;
-          selectedLine = Buffer.alloc(0);
+          resetSelectedLine();
         }
         currentLine++;
         start = index + 1;
       }
       if (byteLimited) break;
       if (start < count && currentLine >= offset && lines.length < limit) {
-        const segment = chunk.subarray(start, count);
-        if (selectedLine.length + segment.length > MAX_READ_BYTES) {
-          throw new Error("A transcript line exceeds the session_read byte bound");
-        }
-        selectedLine = Buffer.concat([selectedLine, segment]);
+        appendSelectedSegment(chunk.subarray(start, count));
       }
-    }
-    if (byteLimited && lines.length === 0) {
-      throw new Error("A transcript line exceeds the session_read byte bound");
     }
     if (!reachedEof && !byteLimited && lines.length < limit && scannedBytes >= MAX_READ_SCAN_BYTES) {
       scanLimited = true;
+      if (currentLine >= offset && selectedLineBytes > MAX_READ_BYTES) publishSelectedLine(false);
     }
     const after = fs.fstatSync(descriptor);
     const reauthorized = authorizeExactStandardTranscript(expectedPath, { expectedSessionId: target.id });
@@ -293,7 +333,7 @@ export function createSessionInteropToolDefinitions(sourceSessionId: string): To
     defineTool({
       name: SESSION_READ_TOOL_NAME,
       label: "Read Standard session",
-      description: "Read a bounded JSONL segment from one non-Protected Wayang session. Output is limited to 48 KiB/200 lines and total processing, including skipped prefix, is limited to 256 KiB. Protected, quarantined, and unknown sessions are denied.",
+      description: "Read a bounded JSONL segment from one non-Protected Wayang session. Output is limited to 48 KiB/200 lines and total processing, including skipped prefix, is limited to 256 KiB. An oversized selected line is returned as an explicit wayang_session_read_projection_v1 semantic preview rather than complete canonical content. Protected, quarantined, and unknown sessions are denied.",
       promptSnippet: "Read bounded transcript lines from a non-Protected Wayang session",
       promptGuidelines: ["Treat readable Standard transcripts as entrusted context: do not unnecessarily reproduce credentials or sensitive personal data."],
       parameters: Type.Object({

@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
 import { createE2eSession, ensureE2eProject, openSessionInUi } from "./helpers/sessions";
 import { createSyntheticCorpus, type SyntheticSessionFixture } from "./helpers/syntheticSessions";
@@ -451,6 +452,41 @@ test("latest opens bounded and older pages preserve the visible anchor", async (
   await scrollToTopAndCapture(page);
   await expect(anchors).toHaveCount(450);
   await expect(page.getByTestId("transcript-gap-before")).toHaveCount(0);
+});
+
+test("large image-bearing events keep the user prompt legible", async ({ page, request }) => {
+  const fixture = createSyntheticCorpus({
+    sessionCount: 1,
+    messagesPerSession: 0,
+    projectCount: 1,
+    prefix: `pagination-large-event-${Date.now()}`,
+  })[0]!;
+  const nameId = `${fixture.id}-name`;
+  const messageId = `${fixture.id}-large-user`;
+  fs.appendFileSync(fixture.filePath, JSON.stringify({
+    type: "message",
+    id: messageId,
+    parentId: nameId,
+    timestamp: "2026-01-01T00:00:01.000Z",
+    message: {
+      role: "user",
+      content: [
+        { type: "text", text: "Keep this browser-workbench request visible." },
+        { type: "image", mimeType: "image/jpeg", data: "a".repeat(600_000) },
+      ],
+      timestamp: 1,
+    },
+  }) + "\n");
+  await importFixture(request, fixture);
+  await openFixture(page, fixture);
+
+  const row = page.locator(`[data-message-id="${messageId}"]`);
+  await expect(row).toBeVisible();
+  await expect(row.getByText("You", { exact: true })).toBeVisible();
+  await expect(row).toContainText("Keep this browser-workbench request visible.");
+  await expect(row).toContainText("Attached image/jpeg omitted from bounded history");
+  await expect(page.getByText("This transcript event is too large to include in a bounded window.", { exact: true })).toHaveCount(0);
+  await expect(page.getByTestId("transcript-window-error")).toHaveCount(0);
 });
 
 test("search opens around the exact match and can jump latest and back", async ({ page, request }) => {

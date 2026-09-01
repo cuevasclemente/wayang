@@ -56,7 +56,10 @@ test("modern latest and before windows remain bounded and request-correlated", a
     assert.ok(latest.payload_bytes <= TRANSCRIPT_PAGE_MAX_BYTES);
     assert.ok(Buffer.byteLength(JSON.stringify(latest)) <= TRANSCRIPT_PAGE_MAX_BYTES);
     assert.equal(latest.messages.at(-1)?.id, "m-204");
-    assert.equal((latest.messages.at(-1)?.message as any)?.customType, "wayang-transcript-event-placeholder-v1");
+    assert.equal(latest.messages.at(-1)?.type, "user");
+    assert.equal((latest.messages.at(-1)?.message as any)?.role, "user");
+    assert.equal((latest.messages.at(-1)?.message as any)?.transcriptProjection?.kind, "oversized_event");
+    assert.match(JSON.stringify((latest.messages.at(-1)?.message as any)?.content), /Large event projected for legibility/u);
     assert.ok(latest.before_cursor);
 
     const before = await service.page({
@@ -73,6 +76,57 @@ test("modern latest and before windows remain bounded and request-correlated", a
       sessionId: "s", selectionId: "selection-a", sessionFile: file,
       requestId: "stale", direction: "before", cursor: latest.before_cursor!,
     }));
+  } finally {
+    await service.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("image-bearing user events retain prompt text while embedded bytes stay out of cold and indexed windows", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-window-image-projection-"));
+  const file = path.join(dir, "session.jsonl");
+  const imageData = "a".repeat(600_000);
+  const rows = [
+    { type: "session", version: 3, id: "image-session", cwd: "/synthetic" },
+    {
+      type: "message",
+      id: "large-user",
+      parentId: null,
+      timestamp: new Date(0).toISOString(),
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "Please make the browser workbench less cluttered." },
+          { type: "image", mimeType: "image/jpeg", data: imageData },
+        ],
+        timestamp: 0,
+      },
+    },
+  ];
+  fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+  const service = new TranscriptPaginationService(new StructuralTranscriptIndex(path.join(dir, "index.db")));
+  try {
+    const latest = await service.open({
+      sessionId: "image-session", selectionId: "selection-image-latest", sessionFile: file, intent: "latest",
+    });
+    const latestUser = latest.messages[0];
+    assert.equal(latestUser?.type, "user");
+    assert.match(JSON.stringify(latestUser), /Please make the browser workbench less cluttered\./u);
+    assert.match(JSON.stringify(latestUser), /Attached image\/jpeg omitted/u);
+    assert.equal(JSON.stringify(latestUser).includes(imageData.slice(0, 10_000)), false);
+    assert.ok(latest.payload_bytes <= TRANSCRIPT_PAGE_MAX_BYTES);
+
+    const around = await service.open({
+      sessionId: "image-session", selectionId: "selection-image-around", sessionFile: file,
+      intent: "around", anchorId: "large-user",
+    });
+    const aroundUser = around.messages[0];
+    assert.equal(around.anchor?.status, "found");
+    assert.equal(aroundUser?.type, "user");
+    assert.match(JSON.stringify(aroundUser), /Please make the browser workbench less cluttered\./u);
+    assert.match(JSON.stringify(aroundUser), /Large user event projected for legibility/u);
+    assert.equal(JSON.stringify(aroundUser).includes(imageData.slice(0, 10_000)), false);
+    assert.ok(around.payload_bytes <= TRANSCRIPT_PAGE_MAX_BYTES);
   } finally {
     await service.close();
     fs.rmSync(dir, { recursive: true, force: true });

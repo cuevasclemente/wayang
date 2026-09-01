@@ -9,6 +9,7 @@ import { getSessionAttachmentRoot } from "./protected-artifacts.js";
 import { createProject, updateProject } from "./projects.js";
 import { SessionCatalog } from "./session-catalog.js";
 import {
+  MAX_READ_BYTES,
   MAX_READ_SCAN_BYTES,
   classifyReadableStandardArtifact,
   classifySessionPrivacy,
@@ -126,6 +127,69 @@ test("bounded transcript reads fail closed for Protected, quarantined, and priva
       access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [profile.id] },
     });
     assert.throws(() => readStandardSessionLines(standard.id), /not available/);
+  } finally { f.cleanup(); }
+});
+
+test("oversized selected lines return an explicit semantic projection instead of failing the session read", () => {
+  const f = fixture();
+  try {
+    const standardRoot = path.join(f.root, "oversized-line-standard");
+    fs.mkdirSync(standardRoot);
+    const profile = createAgentProfile({ name: "Oversized line reader" });
+    createProject({ cwd: standardRoot, default_agent_profile_id: profile.id });
+    const session = createSession(standardRoot, { agentProfileId: profile.id });
+    const filePath = path.join(process.env.PI_CODING_AGENT_SESSION_DIR!, `${session.id}.jsonl`);
+    const header = JSON.stringify({ type: "session", version: 3, id: session.id, timestamp: "2026-01-01T00:00:00.000Z", cwd: session.cwd });
+    const largeUser = JSON.stringify({
+      type: "message",
+      id: "large-user-event",
+      parentId: null,
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "Keep this request legible." },
+          { type: "image", mimeType: "image/jpeg", data: "a".repeat(MAX_READ_BYTES * 2) },
+        ],
+      },
+    });
+    fs.writeFileSync(filePath, `${header}\n${largeUser}\n`, { mode: 0o600 });
+    updatePiSessionFile(session.id, filePath);
+
+    const page = readStandardSessionLines(session.id, { offset: 2, limit: 1 });
+    assert.equal(page.lines.length, 1);
+    const projection = JSON.parse(page.lines[0]!);
+    assert.equal(projection.type, "wayang_session_read_projection_v1");
+    assert.equal(projection.canonical_line_number, 2);
+    assert.equal(projection.canonical_encoded_bytes, Buffer.byteLength(largeUser));
+    assert.equal(projection.event_type, "message");
+    assert.equal(projection.event_id, "large-user-event");
+    assert.equal(projection.role, "user");
+    assert.match(projection.preview, /Keep this request legible\./u);
+    assert.equal(projection.omitted, true);
+    assert.equal(page.next_offset, 3);
+
+    const beyondScan = JSON.stringify({
+      type: "message",
+      id: "scan-limited-user-event",
+      parentId: null,
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "Keep even a scan-limited request legible." },
+          { type: "image", mimeType: "image/jpeg", data: "b".repeat(MAX_READ_SCAN_BYTES * 2) },
+        ],
+      },
+    });
+    fs.writeFileSync(filePath, `${header}\n${beyondScan}\n`, { mode: 0o600 });
+    const limited = readStandardSessionLines(session.id, { offset: 2, limit: 1 });
+    assert.equal(limited.lines.length, 1);
+    const limitedProjection = JSON.parse(limited.lines[0]!);
+    assert.equal(limitedProjection.type, "wayang_session_read_projection_v1");
+    assert.equal(limitedProjection.event_id, "scan-limited-user-event");
+    assert.ok(limitedProjection.canonical_encoded_bytes_at_least > MAX_READ_BYTES);
+    assert.equal(limited.scan_limited, true);
+    assert.equal(limited.scanned_bytes, MAX_READ_SCAN_BYTES);
+    assert.equal(limited.next_offset, null);
   } finally { f.cleanup(); }
 });
 

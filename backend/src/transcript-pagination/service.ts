@@ -19,6 +19,7 @@ import {
   type ReversePageContinuation,
   type TranscriptFileRevision,
 } from "./reverse-reader.js";
+import { projectOversizedSerializedMessage } from "./oversized-projection.js";
 import {
   StructuralTranscriptIndex,
   closeStructuralTranscriptIndex,
@@ -99,18 +100,7 @@ export interface PageTranscriptWindowInput {
 }
 
 function rowPlaceholder(row: SerializedMessage, encodedBytes: number): SerializedMessage {
-  return {
-    type: "custom",
-    ...(typeof row.id === "string" ? { id: row.id } : {}),
-    ...(row.parentId === null || typeof row.parentId === "string" ? { parentId: row.parentId } : {}),
-    message: {
-      role: "custom",
-      customType: "wayang-transcript-event-placeholder-v1",
-      content: "This transcript event is too large to include in a bounded window.",
-      display: true,
-      details: { reason: "payload_limit", encoded_bytes: encodedBytes },
-    },
-  };
+  return projectOversizedSerializedMessage(row, encodedBytes);
 }
 
 function boundedSerialization(

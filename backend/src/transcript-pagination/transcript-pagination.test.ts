@@ -93,7 +93,10 @@ test("reverse reader returns a stable placeholder for a newest row beyond the sc
     assert.equal(latest.branchTipId, "huge-tip");
     assert.equal(latest.entries.length, 1);
     assert.equal(latest.entries[0].id, "huge-tip");
-    assert.equal(latest.entries[0].customType, "wayang-transcript-event-placeholder-v1");
+    assert.equal(latest.entries[0].type, "message");
+    assert.equal(latest.entries[0].message.role, "user");
+    assert.equal(latest.entries[0].message.transcriptProjection.kind, "oversized_event");
+    assert.match(String(latest.entries[0].message.content), /Large user event projected for legibility/u);
     assert.ok(latest.continuation);
     const before = readReverseTranscriptPage(file, { continuation: latest.continuation! });
     assert.deepEqual(before.entries.map((entry) => entry.id), ["root"]);
@@ -120,7 +123,9 @@ test("reverse reader pages an oversized interior ancestor by stable envelope", (
     assert.ok(latest.continuation);
     const interior = readReverseTranscriptPage(file, { continuation: latest.continuation! });
     assert.equal(interior.entries[0]?.id, "huge-interior");
-    assert.equal(interior.entries[0]?.customType, "wayang-transcript-event-placeholder-v1");
+    assert.equal(interior.entries[0]?.type, "message");
+    assert.equal(interior.entries[0]?.message.role, "user");
+    assert.equal(interior.entries[0]?.message.transcriptProjection.kind, "oversized_event");
     assert.ok(interior.continuation);
     const earliest = readReverseTranscriptPage(file, { continuation: interior.continuation! });
     assert.deepEqual(earliest.entries.map((entry) => entry.id), ["root"]);
