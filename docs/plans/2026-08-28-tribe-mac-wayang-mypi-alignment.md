@@ -22,7 +22,7 @@ Success means:
 - Wayang source: clean commit `cd98b001963bbb63a98e3a8ab5c001f4035f52d9` (latest local `main`; pushed to `origin/main` for exact git-verified transfer).
 - Wayang Pi dependency: `file:earendil-works-pi-coding-agent-0.84.1-wayang.4f7d03ce.tgz`.
 - Pi artifact SHA-256: `c82956f058b7dc09a2206c8c9f9331f2971042a4fa9597a5ee017f58d5303da9` (unchanged from the 2026-08-28 target).
-- mypi release: clean `main` head `f68e4b7` — the 2026-09-01 consolidation integrated the previously dirty recovery snapshot, the reviewed `recovery/reviewed-integration` line, session-coordination enable + empty-widget fix, the neutral-parity installer, and a dedicated Tribe-Mac allowlist (`deploy/tribe-mac-alignment-allowlist.json`, role `tribe`). Journal: mypi `docs/journals/2026-09-01-mypi-consolidation.md`.
+- mypi release: clean `main` head `10d9f93` — the 2026-09-01 consolidation integrated the previously dirty recovery snapshot, the reviewed `recovery/reviewed-integration` line, session-coordination enable + empty-widget fix, the neutral-parity installer, a dedicated Tribe-Mac allowlist (`deploy/tribe-mac-alignment-allowlist.json`, role `tribe`, 147 entries, policy SHA `207a3c880720f39261ed9e12d97c2eccc1f87fd45ee89550876170dc1d71c86e`), and a merge of the remote PR #2 line (guarded SSH control-socket support; the deployed runtime-authoritative monitor variant wins). Pushed: `origin/main` = `a3433eb` (journal addendum atop the release). Journal: mypi `docs/journals/2026-09-01-mypi-consolidation.md`.
 - Current The-Sceptre `make doctor` passes platform/tool/config checks but reports the installed `better-sqlite3` native binding unavailable under Node 26.4.0 ABI 147. This is local dependency drift, not a target acceptance result; the Tribe-Mac runtime must run a fresh deterministic install for its active Node ABI and pass `make doctor` before activation.
 - Last documented Tribe-Mac Wayang deployment: clean detached runtime at `b4368462c5011f034893d3e03bc46160e0672f14`, launchd label `com.wayang.server.b436846`; the older runtime remains a rollback artifact. Loom's 2026-08-28 preflight reported active checkout `7e104578…`; provenance must be resolved locally before M3 (gate below).
 - Last documented Tribe-Mac Pi deployment: `0.84.1`; the combined `0.84.1-wayang.4f7d03ce` artifact remains pending.
@@ -47,7 +47,7 @@ The enabled Wren profile is not permission for Wren to inspect or mutate Tribe-M
 
 Node 25 satisfies the declared minimum but is not the repository's preferred Node 26.4.0 or an LTS baseline. Do not perform a blanket Homebrew upgrade. M3 remains gated on a fresh deterministic install for the selected active Node ABI and a passing `make doctor`; any prerequisite or Node change that requires package-manager or privileged mutation returns to Clemente.
 
-M4 is now unblocked by the 2026-09-01 mypi consolidation release (`f68e4b7`); do not infer a mypi release from any non-Git directory.
+M4 is now unblocked by the 2026-09-01 mypi consolidation release (`10d9f93`, published to `origin/main` as `a3433eb`); do not infer a mypi release from any non-Git directory.
 
 ## 2026-09-01 refresh — consolidation decisions Loom must honor
 
@@ -127,9 +127,9 @@ On Tribe-Mac:
 
 ### M4 — mypi shared capabilities (unblocked 2026-09-01)
 
-Source: clean mypi `main` at `f68e4b7` (consolidation release). Transfer: fetch from `git@github.com:cuevasclemente/mypi` or an owner-approved bundle; the release is not yet pushed to its origin, so if SSH host-key approval is unavailable locally, stop for Clemente.
+Source: clean mypi `main` at `10d9f93` (consolidation release + remote PR #2 integration; `origin/main` currently `a3433eb` with the journal addendum). Transfer: fetch from `https://github.com/cuevasclemente/mypi` — the release is published.
 
-1. Stage the release and verify `git rev-parse HEAD` equals `f68e4b7`.
+1. Stage the release and verify `git rev-parse HEAD` is `10d9f93` or a descendant (origin `main` currently carries the `a3433eb` journal addendum).
 2. Run the reviewed parity planner against the dedicated policy (147 explicit entries; 0 unresolved sources; AGENTS.md/APPEND_SYSTEM.md protected):
    `make neutral-parity-plan ROLE=tribe COMPONENT=capabilities NEUTRAL_PARITY_POLICY=deploy/tribe-mac-alignment-allowlist.json`
    then build to a new staging path and `neutral-parity-verify` before any target mutation. The Makefile intentionally has no live apply target; use the manifest and owner-approved copies, and keep `neutral-parity-install-plan` as a dry-run.
@@ -176,7 +176,7 @@ No rollback step may guess the “latest” backup or permanently delete current
 
 - Tribe-Mac may be unreachable or SSH authentication may require a human-local public-key/Remote Login handoff.
 - Wayang transfer now flows through `origin/main` at `cd98b00` (pushed 2026-09-01); any fetch hash mismatch stops the run. The source-side bundle is the documented fallback.
-- mypi origin uses SSH (`git@github.com:cuevasclemente/mypi`); the source host currently fails SSH host-key verification for GitHub, so the release is not yet pushed. Loom may fetch it locally if Tribe-Mac's GitHub SSH is already trusted; otherwise this needs one human-approved host-key action.
+- mypi origin supports HTTPS (`https://github.com/cuevasclemente/mypi`) and the release is published (`origin/main` = `a3433eb`, release content head `10d9f93`). The mypi remote's SSH URL still works from Loom if its GitHub SSH is trusted, but HTTPS is the verified path from The-Sceptre (GitHub host keys were fingerprint-verified and installed on 2026-09-01).
 - The mypi behavioral smoke awaits ESM-runtime adaptation; its questionnaire test is parked (`.pending-esm-smoke`) and is not release-gating.
 - The command-guard PIN-path-guard upgrade (recovery branch `e61f751`) stays held back until reviewed and deployed to The-Sceptre's runtime first.
 - macOS does not support Wayang's Linux Protected deterministic automation runner; no weaker fallback should be enabled.
