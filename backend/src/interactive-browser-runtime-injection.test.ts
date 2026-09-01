@@ -17,8 +17,8 @@ import {
   destroyPiSession,
   getLiveInteractiveBrowserRuntime,
   getLiveProtectedBrowserRuntime,
+  getPiSessionBashMode,
   getPiSessionBrowserAgentDiagnostic,
-  getPiSessionRuntimeState,
 } from "./pi-bridge.js";
 import { createProject } from "./projects.js";
 import { createSession } from "./sessions.js";
@@ -166,7 +166,7 @@ test("Standard interactive sessions derive exact browser tools while scheduled s
     "wayang_workspace_read", "wayang_workspace_change",
     ...INTERACTIVE_BROWSER_TOOL_NAMES,
   ];
-  if (getPiSessionRuntimeState(approved.id).bash_mode !== "unavailable") expectedRestrictedTools.push("bash");
+  if (getPiSessionBashMode(approved.id) !== "unavailable") expectedRestrictedTools.push("bash");
   const memoryFirst = getConfig().memoryFirstCompaction;
   if (memoryFirst.reviewEnabled && isMemoryFirstCohortEligible(memoryFirst, {
     privacyMode: "standard",
