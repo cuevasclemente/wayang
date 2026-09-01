@@ -1,7 +1,7 @@
 # Tribe-Mac Wayang, Pi, and mypi alignment plan
 
 Date: 2026-08-28 (refreshed 2026-09-01)
-Status: Ready for Loom execution; mypi release caveat resolved by the 2026-09-01 consolidation
+Status: Final Loom completion delta ready; issue #45 merged and exact targets published
 Lead: Wren (source audit and handoff)
 Remote operator: Loom or a neutral agent running locally on Tribe-Mac
 
@@ -19,16 +19,30 @@ Success means:
 
 ## Known source baseline (refreshed 2026-09-01)
 
-- Wayang source: clean commit `cd98b001963bbb63a98e3a8ab5c001f4035f52d9` (latest local `main`; pushed to `origin/main` for exact git-verified transfer).
+- Wayang source: merged `origin/main` commit `06795ebbf48a15e6d6fd60700d7c0cbe37fe9f80` (PR #46). It contains the command-guard approval bridge (`b318304`), large-event semantic transcript projection (`29b7b02`), and the issue-#45 workspace-default control (`0a96578`) plus its cross-platform runtime-policy fixture corrections.
 - Wayang Pi dependency: `file:earendil-works-pi-coding-agent-0.84.1-wayang.4f7d03ce.tgz`.
 - Pi artifact SHA-256: `c82956f058b7dc09a2206c8c9f9331f2971042a4fa9597a5ee017f58d5303da9` (unchanged from the 2026-08-28 target).
-- mypi release: clean `main` head `10d9f93` — the 2026-09-01 consolidation integrated the previously dirty recovery snapshot, the reviewed `recovery/reviewed-integration` line, session-coordination enable + empty-widget fix, the neutral-parity installer, a dedicated Tribe-Mac allowlist (`deploy/tribe-mac-alignment-allowlist.json`, role `tribe`, 147 entries, policy SHA `207a3c880720f39261ed9e12d97c2eccc1f87fd45ee89550876170dc1d71c86e`), and a merge of the remote PR #2 line (guarded SSH control-socket support; the deployed runtime-authoritative monitor variant wins). Pushed: `origin/main` = `a3433eb` (journal addendum atop the release). Journal: mypi `docs/journals/2026-09-01-mypi-consolidation.md`.
-- Current The-Sceptre `make doctor` passes platform/tool/config checks but reports the installed `better-sqlite3` native binding unavailable under Node 26.4.0 ABI 147. This is local dependency drift, not a target acceptance result; the Tribe-Mac runtime must run a fresh deterministic install for its active Node ABI and pass `make doctor` before activation.
+- mypi release: merged/published `origin/main` commit `440c35ee4795487c2887bc8ef69bb0f865742555`. It includes the consolidated identity-neutral release and command-guard hardening (`1078847`: 4096-token verdict budget, low reasoning, breaker, owning-human fallback). The dedicated Tribe-Mac allowlist remains `deploy/tribe-mac-alignment-allowlist.json`, role `tribe`, 147 entries, policy SHA `207a3c880720f39261ed9e12d97c2eccc1f87fd45ee89550876170dc1d71c86e`.
+- The-Sceptre deployment gates for this release reported `make doctor` 0 failures/0 warnings, focused guard bridge 7/7, production build green, and post-restart health green. Tribe-Mac must still perform a fresh deterministic install for its own active Node ABI and pass `make doctor` before activation.
 - Last documented Tribe-Mac Wayang deployment: clean detached runtime at `b4368462c5011f034893d3e03bc46160e0672f14`, launchd label `com.wayang.server.b436846`; the older runtime remains a rollback artifact. Loom's 2026-08-28 preflight reported active checkout `7e104578…`; provenance must be resolved locally before M3 (gate below).
 - Last documented Tribe-Mac Pi deployment: `0.84.1`; the combined `0.84.1-wayang.4f7d03ce` artifact remains pending.
 - Last documented Tribe-Mac mypi install: 14 reviewed macOS-compatible extensions, 85 skills, 6 agents, 2 teams, with auth/settings/sessions preserved.
 
 These target facts must be re-inventoried locally on Tribe-Mac before mutation; historical records are not proof of current state.
+
+## Final issue-#45 completion override — 2026-09-01
+
+This section supersedes every older Wayang/mypi target below. Loom has already completed the earlier migration up to the hidden workspace-default blocker; do not repeat successful Pi/mypi installation or identity-neutralization work merely because this full plan retains its history.
+
+1. Preserve the current active Tribe-Mac runtime, launchd configuration, private store, and exact rollback path opaquely.
+2. Fetch and verify Wayang `06795ebbf48a15e6d6fd60700d7c0cbe37fe9f80` from HTTPS `origin/main`. The old `wayang-main-cd98b00.bundle` is stale and must not be used.
+3. Stage a new versioned runtime, run a fresh target-local install/build/doctor, and activate it on loopback through the existing launchd procedure with a bounded health deadline. Do not edit the raw store.
+4. Through authenticated Settings REST/UI or exact-approved `wayang_workspace_change`, set `workspaceSettings.default_agent_profile_id` to Loom stable ID `86bec3d3-6b18-440b-b256-d236d281ae51`.
+5. Read the redacted Wren reference summary. Require zero workspace default, Project defaults, explicit Project allowlists, running sessions, pending switches, scheduled jobs, active Protected automation jobs, and messaging endpoints before disabling Wren. `session_attributions` and historical Protected automation runs may remain nonzero as inert stable-ID history and must not be rewritten.
+6. Disable Wren through ordinary supported profile update; do not delete it or supply a replacement. Verify the profile is disabled, the workspace default is Loom, and active/configuration reference counts remain zero.
+7. Run the final harmless Loom response, questionnaire, TODO, model-selection, and command-guard smoke. Return only non-secret evidence and exact commit/backup/launchd identifiers.
+
+The issue-#45 implementation changes only the workspace-default field. Automated snapshots prove Project defaults/allowlists, session attribution, schedules, automation, messaging, and capability rows are not rewritten. PR #46 is green on Linux Node 22.19, Linux Node 26.4, and macOS Node 26.4. Full Playwright is 119/121; its two failures reproduce on exact prior `main` and do not touch this feature, while the new workspace-default regression passes.
 
 ## Loom preflight amendment — 2026-08-28
 
@@ -47,7 +61,7 @@ The enabled Wren profile is not permission for Wren to inspect or mutate Tribe-M
 
 Node 25 satisfies the declared minimum but is not the repository's preferred Node 26.4.0 or an LTS baseline. Do not perform a blanket Homebrew upgrade. M3 remains gated on a fresh deterministic install for the selected active Node ABI and a passing `make doctor`; any prerequisite or Node change that requires package-manager or privileged mutation returns to Clemente.
 
-M4 is now unblocked by the 2026-09-01 mypi consolidation release (`10d9f93`, published to `origin/main` as `a3433eb`); do not infer a mypi release from any non-Git directory.
+M4 is now represented by published mypi `origin/main` `440c35ee4795487c2887bc8ef69bb0f865742555`; do not infer a release from any non-Git directory. If Loom already installed and verified this exact head, do not reinstall it during the issue-#45 completion delta.
 
 ## 2026-09-01 refresh — consolidation decisions Loom must honor
 
@@ -110,26 +124,26 @@ On Tribe-Mac:
 
 ### M3 — Wayang runtime
 
-1. Fetch exact commits from `origin` (`git fetch origin main` for `cd98b00…` plus this plan branch); verify `git merge-base --is-ancestor` relationships locally. A staged source-side git bundle (`wayang-main-cd98b00.bundle`, SHA-256 `a75915c2508c14966091e660388ec55826ed218067b884aaeb2bf7f5687dd759`) is the documented fallback transfer if origin is unreachable.
-2. Create a new clean detached runtime worktree at exact commit `cd98b001963bbb63a98e3a8ab5c001f4035f52d9`; leave prior runtime worktrees intact.
-2. Run `make doctor` before setup. Resolve only reported prerequisites; no package-manager or privileged mutation by the agent.
-3. Run deterministic `make install`, `make build`, focused checks, and isolated smoke tests with the existing private configuration preserved opaquely.
-4. Use a new secret-free launchd label rather than editing/printing the old label's environment. Reuse the established `.env` linkage only after metadata and target-path validation.
-5. Keep the backend on loopback and preserve existing reviewed remote-access behavior; do not broaden bind/network settings.
-6. Switch labels with a bounded health deadline. Verify:
+1. Fetch exact commit `06795ebbf48a15e6d6fd60700d7c0cbe37fe9f80` from HTTPS `origin/main` and verify it locally. The prior `wayang-main-cd98b00.bundle` does not contain this target and is prohibited.
+2. Create a new clean detached runtime worktree at exact commit `06795ebbf48a15e6d6fd60700d7c0cbe37fe9f80`; leave prior runtime worktrees intact.
+3. Run `make doctor` before setup. Resolve only reported prerequisites; no package-manager or privileged mutation by the agent.
+4. Run deterministic `make install`, `make build`, focused checks, and isolated smoke tests with the existing private configuration preserved opaquely.
+5. Use a new secret-free launchd label rather than editing/printing the old label's environment. Reuse the established `.env` linkage only after metadata and target-path validation.
+6. Keep the backend on loopback and preserve existing reviewed remote-access behavior; do not broaden bind/network settings.
+7. Switch labels with a bounded health deadline. Verify:
    - new process path and exact Git commit;
    - `GET /healthz` succeeds;
    - production asset loads;
    - expected macOS browser CDP fallback works;
    - old runtime process count is zero;
    - launchd restart count remains stable.
-7. Keep the prior label/runtime as the exact rollback target.
+8. Keep the prior label/runtime as the exact rollback target.
 
 ### M4 — mypi shared capabilities (unblocked 2026-09-01)
 
-Source: clean mypi `main` at `10d9f93` (consolidation release + remote PR #2 integration; `origin/main` currently `a3433eb` with the journal addendum). Transfer: fetch from `https://github.com/cuevasclemente/mypi` — the release is published.
+Source: clean published mypi `origin/main` at `440c35ee4795487c2887bc8ef69bb0f865742555`. Transfer: fetch from `https://github.com/cuevasclemente/mypi`.
 
-1. Stage the release and verify `git rev-parse HEAD` is `10d9f93` or a descendant (origin `main` currently carries the `a3433eb` journal addendum).
+1. Stage the release and verify `git rev-parse HEAD` is exactly `440c35ee4795487c2887bc8ef69bb0f865742555`. Skip M4 if that exact head and its installed monitor hash were already verified in the earlier Loom run.
 2. Run the reviewed parity planner against the dedicated policy (147 explicit entries; 0 unresolved sources; AGENTS.md/APPEND_SYSTEM.md protected):
    `make neutral-parity-plan ROLE=tribe COMPONENT=capabilities NEUTRAL_PARITY_POLICY=deploy/tribe-mac-alignment-allowlist.json`
    then build to a new staging path and `neutral-parity-verify` before any target mutation. The Makefile intentionally has no live apply target; use the manifest and owner-approved copies, and keep `neutral-parity-install-plan` as a dry-run.
@@ -143,9 +157,10 @@ Source: clean mypi `main` at `10d9f93` (consolidation release + remote PR #2 int
 ### M5 — Loom-owned control plane and behavior check
 
 - Do not inspect or mutate Tribe-Mac Agent Profiles from Wren.
-- Loom verifies that Loom remains the intended local identity/default where desired and that no Wren profile, activation witness, context, or authority exists.
-- Clemente performs any OAuth, MFA, password, PIN, account selection, or identity-profile Settings action locally.
-- Run a harmless Loom session and confirm one normal response, TODO persistence, questionnaire delivery, and expected model selection.
+- Loom uses the new supported workspace-default setter to select Loom, then the redacted reference endpoint to distinguish activation-capable references from inert historical attribution.
+- Disable Wren without deletion only after workspace/Project defaults, explicit allowlists, running sessions, pending switches, schedules, active Protected automation jobs, and messaging endpoints are zero. Do not require historical session attribution to be zero.
+- Clemente performs any OAuth, MFA, password, PIN, or account selection locally. The supported workspace-default/profile operations themselves may be performed by Loom through its already authenticated local control plane.
+- Run a harmless Loom session and confirm one normal response, TODO persistence, questionnaire delivery, expected model selection, and owning-human command-guard fallback readiness.
 
 ### M6 — Record and handoff
 
@@ -155,7 +170,7 @@ Record exact commits, artifact hashes, backup paths, launchd label, checks passe
 
 | Surface | Required evidence |
 |---|---|
-| Identity | Loom remains active; Wren artifacts absent; Loom context bytes preserved unless separately approved |
+| Identity | Loom remains active/default; Wren has no active/configuration references and is disabled; inert historical attribution/profile row may remain; Loom context bytes preserved |
 | Pi | Exact package hash/version; fresh-shell executable resolution; offline models pass |
 | Wayang static | Clean exact commit; `make doctor`; install/build/check/smoke results |
 | Wayang runtime | Loopback health; process path/commit; stable launchd job; prior process stopped |
@@ -175,8 +190,8 @@ No rollback step may guess the “latest” backup or permanently delete current
 ## Risks and deferrals
 
 - Tribe-Mac may be unreachable or SSH authentication may require a human-local public-key/Remote Login handoff.
-- Wayang transfer now flows through `origin/main` at `cd98b00` (pushed 2026-09-01); any fetch hash mismatch stops the run. The source-side bundle is the documented fallback.
-- mypi origin supports HTTPS (`https://github.com/cuevasclemente/mypi`) and the release is published (`origin/main` = `a3433eb`, release content head `10d9f93`). The mypi remote's SSH URL still works from Loom if its GitHub SSH is trusted, but HTTPS is the verified path from The-Sceptre (GitHub host keys were fingerprint-verified and installed on 2026-09-01).
+- Wayang transfer now flows through HTTPS `origin/main` at exact merge `06795ebbf48a15e6d6fd60700d7c0cbe37fe9f80`; any fetch hash mismatch stops the run. No existing source-side bundle contains this target.
+- mypi origin supports HTTPS (`https://github.com/cuevasclemente/mypi`) and the exact release is published at `origin/main` `440c35ee4795487c2887bc8ef69bb0f865742555`. The remote SSH URL may work from Loom if its GitHub SSH is trusted, but HTTPS is the verified transfer path.
 - The mypi behavioral smoke awaits ESM-runtime adaptation; its questionnaire test is parked (`.pending-esm-smoke`) and is not release-gating.
 - The command-guard PIN-path-guard upgrade (recovery branch `e61f751`) stays held back until reviewed and deployed to The-Sceptre's runtime first.
 - macOS does not support Wayang's Linux Protected deterministic automation runner; no weaker fallback should be enabled.
