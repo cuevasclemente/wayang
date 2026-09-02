@@ -67,7 +67,7 @@ For a single-user private LAN without an existing reverse proxy, Wayang includes
 
 ## Pi provider authentication
 
-Wayang uses pi 0.84.1's standard authentication and model runtime. The coding-agent package is pinned to the repository-vendored `0.84.1-wayang.29fcca05` artifact (SHA-256 `fc09c52ec79888b30b10e63a985b3ba1c23a96e6ee37b5cf0f3ab1fdfbfb2007`) so session-name writers and PIN-gated transcript event mutations share the reviewed physical-file transaction, lock, atomic multi-entry CAS, stale-runtime mutation epoch, optional fixed compaction threshold, and optional complete-turn retention.
+Wayang uses pi 0.84.1's standard authentication and model runtime. The coding-agent package is pinned to the repository-vendored `0.84.1-wayang.4f7d03ce` artifact (SHA-256 `c82956f058b7dc09a2206c8c9f9331f2971042a4fa9597a5ee017f58d5303da9`) so session-name writers and PIN-gated transcript event mutations share the reviewed physical-file transaction, lock, atomic multi-entry CAS, stale-runtime mutation epoch, optional fixed compaction threshold, optional complete-turn retention, and incremental resume-session loading.
 
 ### OAuth or pi-managed API key
 
