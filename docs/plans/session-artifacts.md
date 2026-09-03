@@ -1,8 +1,8 @@
 # Session Artifacts Pane: Preview, Presentation, and Download Plan
 
 **Date:** 2026-08-26
-**Status:** Implemented and validated on `feat/session-artifacts-20260830`; terminal architecture/security review GO; awaiting integration/deployment review
-**Scope:** Canonical design and implementation contract. Clemente authorized full implementation on 2026-08-30; deployment/restart remains separate.
+**Status:** Implemented, reconciled with `origin/main` `8c11dfb`, and revalidated on `feat/session-artifacts-integration-20260903`; terminal architecture/security review GO; approved for source integration
+**Scope:** Canonical design and implementation contract. Clemente authorized full implementation on 2026-08-30 and source integration on 2026-09-03; production deployment/restart remains separate.
 
 ## 1. Product goal
 
@@ -872,4 +872,4 @@ Update:
 
 A read-only terminal architecture/security review reached **GO** after the plan froze exact tool-object authority, archived/live session gates, registry/deletion failure semantics, descriptor streaming, response policy, renderer containment, shared protocol correlation, upload completion, and post-commit event behavior. No tests were run during planning.
 
-This plan originally did not authorize implementation. Clemente explicitly authorized the full feature on 2026-08-30. Implementation and validation were completed in the isolated worktree documented by `docs/journals/2026-08-30-session-artifacts-implementation.md`; merge, production deployment, and service restart remain separately controlled.
+This plan originally did not authorize implementation. Clemente explicitly authorized the full feature on 2026-08-30 and asked to finish and merge it on 2026-09-03. Implementation was completed in the isolated worktree documented by `docs/journals/2026-08-30-session-artifacts-implementation.md`; current-main reconciliation and validation are documented by `docs/journals/2026-09-03-session-artifacts-integration.md`. Production deployment and service restart remain separately controlled.
