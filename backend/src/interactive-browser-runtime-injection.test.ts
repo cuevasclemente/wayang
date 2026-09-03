@@ -161,7 +161,7 @@ test("Standard interactive sessions derive exact browser tools while scheduled s
     [...INTERACTIVE_BROWSER_TOOL_NAMES],
   );
   const expectedRestrictedTools = [
-    "read", "edit", "write", "memory_review_complete",
+    "read", "edit", "write",
     "wayang_runtime_context", "session_list", "session_read", "session_attachments", "present_artifact",
     "wayang_workspace_read", "wayang_workspace_change",
     ...INTERACTIVE_BROWSER_TOOL_NAMES,
