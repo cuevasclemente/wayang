@@ -1,6 +1,6 @@
 # Wayang
 
-Wayang is a browser-based, chat-first workbench for the [pi coding-agent harness](https://github.com/earendil-works/pi-mono). It brings agent sessions, projects, files, models, scheduled work, project-local apps, and an optional managed browser into one interface.
+Wayang is a browser-based, chat-first workbench for the [pi coding-agent harness](https://github.com/earendil-works/pi-mono). It brings agent sessions, projects, session artifacts, models, scheduled work, project-local apps, and an optional managed browser into one interface.
 
 **Status:** v0.1 is early-stage software for one trusted user. Linux and macOS source checkouts are supported.
 
@@ -23,7 +23,8 @@ Read [SECURITY.md](SECURITY.md) before changing the bind address or exposing Way
 - pi SDK chat with persistent project/session navigation and model selection
 - editable Projects with reusable, deployment-defined Agent Profiles
 - project defaults, agent allowlists, memory modes, in-session agent switching, and Protected privacy policy
-- project file browsing and editing surfaces, including guarded root `AGENTS.md` editing
+- session-scoped Artifacts with deliberate agent presentation, completed-upload discovery, safe previews, and bounded original-byte downloads
+- guarded Project/Profile settings and root `AGENTS.md` editing without a global host filesystem browser
 - scheduled agent jobs, session history search, and PIN-gated canonical transcript event editing/deletion
 - project-local apps rendered in an Apps pane
 - optional Chromium browser workbench with capability-gated backend-owned interactive agent tools
@@ -105,7 +106,7 @@ Browser
   ▼
 Express/WS backend (backend/)
   ├── pi SDK agent sessions and provider auth
-  ├── project/session/file/job/app APIs
+  ├── project/session/artifact/job/app APIs
   ├── optional browser and TTS bridges
   └── production static assets
              ▲

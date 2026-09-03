@@ -344,6 +344,50 @@ export interface WorkspaceProject {
 }
 
 // ---------------------------------------------------------------------------
+// Session artifacts
+// ---------------------------------------------------------------------------
+
+export type ArtifactSource = "presented" | "upload";
+export type ArtifactRenderer = "markdown" | "text" | "image" | "pdf" | "html" | "unsupported";
+export type ArtifactUnavailableReason = "missing" | "policy_changed" | "unsafe_file";
+
+export interface SessionArtifact {
+  id: string;
+  name: string;
+  display_path: string;
+  title: string | null;
+  description: string | null;
+  source: ArtifactSource;
+  renderer: ArtifactRenderer;
+  language: string | null;
+  size: number | null;
+  modified_at: number | null;
+  last_seen_at: number;
+  available: boolean;
+  unavailable_reason: ArtifactUnavailableReason | null;
+  preview_available: boolean;
+  preview_unavailable_reason: string | null;
+  download_available: boolean;
+  download_unavailable_reason: string | null;
+}
+
+/** `GET /api/sessions/:sessionId/artifacts`. */
+export interface SessionArtifactsResponse {
+  session_id: string;
+  revision: number;
+  artifacts: SessionArtifact[];
+}
+
+/** Text-bearing response from `GET .../:artifactId/preview`. */
+export interface ArtifactTextPreviewResponse {
+  artifact_id: string;
+  renderer: "markdown" | "text" | "html";
+  language: string | null;
+  text: string;
+  sha256: string;
+}
+
+// ---------------------------------------------------------------------------
 // Error envelope
 // ---------------------------------------------------------------------------
 

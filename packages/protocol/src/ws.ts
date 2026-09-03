@@ -562,6 +562,15 @@ export interface TodoStateMessage {
   source: "todo-state" | "tool-result" | "todo-preseed" | "none";
 }
 
+export interface ArtifactCatalogChangedMessage {
+  type: "artifact_catalog_changed";
+  session_id: string;
+  selection_id?: string;
+  revision: number;
+  reason: "presented" | "uploaded" | "removed";
+  focus_artifact_id: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Interactive surfaces (approvals, interviews, sudo, command-guard PIN)
 // ---------------------------------------------------------------------------
@@ -832,6 +841,7 @@ export type ChatServerMessage =
   | QueuedMessageAckMessage
   | QueuedMessageCancelAckMessage
   | TodoStateMessage
+  | ArtifactCatalogChangedMessage
   | ExternalActionRequestMessage
   | ExternalActionResponseAckMessage
   | ExternalActionTerminalMessage

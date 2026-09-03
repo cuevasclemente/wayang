@@ -144,6 +144,7 @@ import {
 } from "../standard-transcript-authorization.js";
 import type { AuthService } from "../auth/service.js";
 import { prepareAttachments } from "../attachments.js";
+import { onArtifactCatalogChanged } from "../artifacts/events.js";
 import { logSessionRuntimeStartFailure } from "../session-runtime-logging.js";
 import {
   onTranscriptInvalidation,
@@ -750,6 +751,7 @@ function handleConnection(
   let filePollTimer: NodeJS.Timeout | null = null;
   let runtimeEventUnsub: (() => void) | null = null;
   let transcriptInvalidationUnsub: (() => void) | null = null;
+  let artifactCatalogUnsub: (() => void) | null = null;
   const pendingMessages: any[] = [];
 
   const sendCorrelatedClientFailure = (targetSessionId: string, msg: any, error: string): boolean => {
@@ -801,6 +803,8 @@ function handleConnection(
     commandGuardApprovalBridgeUnsub = null;
     transcriptInvalidationUnsub?.();
     transcriptInvalidationUnsub = null;
+    artifactCatalogUnsub?.();
+    artifactCatalogUnsub = null;
     actionApprovalDetach?.();
     actionApprovalDetach = null;
     actionApprovalRequestUnsub?.();
@@ -1350,6 +1354,18 @@ function handleConnection(
             sendSafe(ws, { type: "session_error", session_id: nextSessionId, error: safeSessionError(nextSessionId, error) });
           });
         }),
+      });
+      artifactCatalogUnsub = onArtifactCatalogChanged((event) => {
+        if (!alive || version !== setupVersion || event.session_id !== nextSessionId
+          || currentSessionId !== nextSessionId || currentSelectionId !== selectionId) return;
+        sendSafe(ws, {
+          type: "artifact_catalog_changed",
+          session_id: nextSessionId,
+          ...(selectionId ? { selection_id: selectionId } : {}),
+          revision: event.revision,
+          reason: event.reason,
+          focus_artifact_id: event.focus_artifact_id,
+        });
       });
 
       // External actions bind only to an exact, non-empty selection

@@ -162,7 +162,7 @@ test("Standard interactive sessions derive exact browser tools while scheduled s
   );
   const expectedRestrictedTools = [
     "read", "edit", "write",
-    "wayang_runtime_context", "session_list", "session_read", "session_attachments",
+    "wayang_runtime_context", "session_list", "session_read", "session_attachments", "present_artifact",
     "wayang_workspace_read", "wayang_workspace_change",
     ...INTERACTIVE_BROWSER_TOOL_NAMES,
   ];
@@ -198,5 +198,6 @@ test("Standard interactive sessions derive exact browser tools while scheduled s
   assert.equal(captured.length, 1, "scheduled runtime never invokes the browser factory");
   assert.equal(getPiSessionBrowserAgentDiagnostic(scheduled.id).reason_code, "interactive_session_required");
   assert.ok(INTERACTIVE_BROWSER_TOOL_NAMES.every((name) => !scheduledHandle.session.getActiveToolNames().includes(name)));
+  assert.equal(scheduledHandle.session.getActiveToolNames().includes("present_artifact"), false);
 
 });
