@@ -154,6 +154,16 @@ async function installSyntheticApi(
     if (path === "/api/agent-profiles") return options.failSettingsLoads
       ? route.fulfill({ status: 503, json: { error: "Synthetic profile load failure" } })
       : route.fulfill({ json: [] });
+    if (path === "/api/workspace-settings") return options.failSettingsLoads
+      ? route.fulfill({ status: 503, json: { error: "Synthetic workspace settings load failure" } })
+      : route.fulfill({ json: {
+        default_agent_profile_id: "default-profile",
+        default_agent_profile: {
+          id: "default-profile", name: "Default", description: null, enabled: true,
+          resource_mode: "project_only", memory_access: "none", default_provider: null,
+          default_model: null, allowed_tools: [], allowed_extensions: [], created_at: 1, updated_at: 1,
+        },
+      } });
     if (path === "/api/sessions" && request.method() === "GET") return route.fulfill({ json: [syntheticSession(humanAttention, options.scheduledRun)] });
     if (path === `/api/sessions/${sessionId}` && request.method() === "GET") return route.fulfill({ json: syntheticSession(humanAttention, options.scheduledRun) });
     if (path === `/api/sessions/${sessionId}` && request.method() === "DELETE") return archiveConflict

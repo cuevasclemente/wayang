@@ -16,6 +16,7 @@ import {
 } from "../session-runtime-mutation-lock.js";
 import { validateSessionDeletionPinAttempt } from "../transcript-mutations.js";
 import { invalidateTranscriptPaginationSession } from "../transcript-pagination/service.js";
+import { removeSessionArtifacts } from "../artifacts/registry.js";
 import { classifySessionPrivacy } from "../session-interop.js";
 import {
   cancelManualTitleGeneration,
@@ -361,6 +362,13 @@ router.post("/sessions/:id/delete", async (req: Request, res: Response) => {
       cancelManualTitleGeneration(session.id);
       await stopPiSession(req.params.id, { kind: "close_session", reason: "session_delete" });
       await removeSearchSession(req.params.id);
+      try {
+        removeSessionArtifacts(req.params.id);
+      } catch {
+        await recoverSearchAfterFailedSessionDelete(req.params.id);
+        res.status(500).json({ error: "Session deletion failed; canonical transcript was retained.", code: "session_delete_failed" });
+        return;
+      }
       let deleted: ReturnType<typeof deleteSession>;
       try {
         invalidateTranscriptPaginationSession(req.params.id);

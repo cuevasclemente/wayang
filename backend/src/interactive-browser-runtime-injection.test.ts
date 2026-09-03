@@ -9,16 +9,18 @@ import { createAgentProfile } from "./agent-profiles.js";
 import { CapabilityBoundProtectedBrowser } from "./browser/protected-browser.js";
 import { createProtectedBrowserToolRuntime, INTERACTIVE_BROWSER_TOOL_NAMES } from "./browser/protected-tools.js";
 import type { ProtectedBrowserBinding } from "./browser/types.js";
+import { getConfig } from "./config.js";
 import { close, init } from "./db.js";
+import { isMemoryFirstCohortEligible, MEMORY_REVIEW_COMPLETE_TOOL_NAME } from "./memory-first-compaction.js";
 import {
   createPiSession,
   destroyPiSession,
   getLiveInteractiveBrowserRuntime,
   getLiveProtectedBrowserRuntime,
+  getPiSessionBashMode,
   getPiSessionBrowserAgentDiagnostic,
 } from "./pi-bridge.js";
 import { createProject } from "./projects.js";
-import { getBashSandboxAvailability } from "./sandbox-bash.js";
 import { createSession } from "./sessions.js";
 
 function runtimeFactory(dataDir: string, captured: ProtectedBrowserBinding[]) {
@@ -160,11 +162,16 @@ test("Standard interactive sessions derive exact browser tools while scheduled s
   );
   const expectedRestrictedTools = [
     "read", "edit", "write",
-    "wayang_runtime_context", "session_list", "session_read", "session_attachments",
+    "wayang_runtime_context", "session_list", "session_read", "session_attachments", "present_artifact",
     "wayang_workspace_read", "wayang_workspace_change",
     ...INTERACTIVE_BROWSER_TOOL_NAMES,
   ];
-  if (getBashSandboxAvailability().available) expectedRestrictedTools.push("bash");
+  if (getPiSessionBashMode(approved.id) !== "unavailable") expectedRestrictedTools.push("bash");
+  const memoryFirst = getConfig().memoryFirstCompaction;
+  if (memoryFirst.reviewEnabled && isMemoryFirstCohortEligible(memoryFirst, {
+    privacyMode: "standard",
+    executionMode: "interactive",
+  })) expectedRestrictedTools.push(MEMORY_REVIEW_COMPLETE_TOOL_NAME);
   assert.deepEqual(
     new Set(approvedHandle.session.getActiveToolNames()),
     new Set(expectedRestrictedTools),
@@ -191,5 +198,6 @@ test("Standard interactive sessions derive exact browser tools while scheduled s
   assert.equal(captured.length, 1, "scheduled runtime never invokes the browser factory");
   assert.equal(getPiSessionBrowserAgentDiagnostic(scheduled.id).reason_code, "interactive_session_required");
   assert.ok(INTERACTIVE_BROWSER_TOOL_NAMES.every((name) => !scheduledHandle.session.getActiveToolNames().includes(name)));
+  assert.equal(scheduledHandle.session.getActiveToolNames().includes("present_artifact"), false);
 
 });

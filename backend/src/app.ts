@@ -13,9 +13,11 @@ import { init } from "./db.js";
 import { isLoopbackHost } from "./loopback.js";
 import { router as sessionsRouter } from "./routes/sessions.js";
 import { router as transcriptMutationsRouter } from "./routes/transcript-mutations.js";
+import { router as artifactsRouter } from "./routes/artifacts.js";
 import { installTranscriptMutationPinAttempts } from "./transcript-mutations.js";
 import { router as projectsRouter } from "./routes/projects.js";
 import { router as agentProfilesRouter } from "./routes/agent-profiles.js";
+import { router as workspaceSettingsRouter } from "./routes/workspace-settings.js";
 import { router as fsRouter } from "./routes/fs.js";
 import { router as capabilitiesRouter } from "./routes/capabilities.js";
 import { router as appsRouter } from "./routes/apps.js";
@@ -58,7 +60,7 @@ import { CredentialBroker } from "./browser/credentials.js";
 import { schedulerManager } from "./scheduler/manager.js";
 import { startWatcher, stopWatcher } from "./search/index.js";
 import { drainSubmittedInterviews } from "./interview-delivery.js";
-import { startSessionCatalog, stopSessionCatalog } from "./sessions.js";
+import { getSessionById, startSessionCatalog, stopSessionCatalog } from "./sessions.js";
 import { getLatencyMetricsSnapshot, recordLatencyMetric, startLatencyMetrics, stopLatencyMetrics } from "./latency-metrics.js";
 import {
   createProductionWorkspaceCapabilityBootstrap,
@@ -92,6 +94,9 @@ import {
 } from "./canonical-kv-warmup.js";
 import { closeTranscriptPagination } from "./transcript-pagination/service.js";
 import { closeDerivedTodoProjectionService } from "./transcript-pagination/derived-todo.js";
+import { artifactRegistryIsInitialized, closeArtifactRegistry, initArtifactRegistry, pruneOrphanArtifactSessions } from "./artifacts/registry.js";
+import { registerUploadedArtifacts } from "./artifacts/service.js";
+import { installAttachmentArtifactObserver } from "./attachments.js";
 
 const serverCredentialBrokers = new WeakMap<http.Server, CredentialBroker>();
 const serverProtectedAutomationWsClosers = new WeakMap<http.Server, () => void>();
@@ -99,6 +104,7 @@ const serverProductionBootstraps = new WeakMap<http.Server, readonly {
   close(): Promise<void>;
 }[]>();
 const serverProductionCleanup = new WeakMap<http.Server, Promise<void>>();
+const serverArtifactObserverClosers = new WeakMap<http.Server, () => void>();
 
 function bindProductionBootstraps(
   server: http.Server,
@@ -170,6 +176,9 @@ export function createApp(options: CreateAppOptions = {}) {
     && Boolean(options.standardBrowser) && Boolean(options.standardBrowserService));
   const auth = options.authService ?? new AuthService(config.auth);
   const credentialBroker = options.credentialBroker ?? new CredentialBroker(config.browser.credentials);
+  const unregisterAttachmentArtifactObserver = artifactRegistryIsInitialized()
+    ? installAttachmentArtifactObserver(registerUploadedArtifacts)
+    : () => undefined;
   const unregisterCredentialStopHook = registerBrowserStopHook(() => credentialBroker.lock());
   installBrowserAgentToken();
   installAppsAgentToken();
@@ -246,9 +255,11 @@ export function createApp(options: CreateAppOptions = {}) {
   // `/sessions/:id` handler treats "search" as a session id.
   app.use("/api", searchRouter);
   app.use("/api", transcriptMutationsRouter);
+  app.use("/api", artifactsRouter);
   app.use("/api", sessionsRouter);
   app.use("/api", projectsRouter);
   app.use("/api", agentProfilesRouter);
+  app.use("/api", workspaceSettingsRouter);
   app.use("/api", fsRouter);
   app.use("/api", capabilitiesRouter);
   app.use("/api", appsRouter);
@@ -300,8 +311,11 @@ export function createApp(options: CreateAppOptions = {}) {
   }
 
   serverCredentialBrokers.set(server, credentialBroker);
+  serverArtifactObserverClosers.set(server, unregisterAttachmentArtifactObserver);
   server.on("close", () => {
     serverProtectedAutomationWsClosers.get(server)?.();
+    serverArtifactObserverClosers.get(server)?.();
+    closeArtifactRegistry();
     unregisterCredentialStopHook();
     void credentialBroker.shutdown().catch(() => undefined);
   });
@@ -327,6 +341,7 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
     Promise.resolve().then(() => stopAllBrowsers()),
     Promise.resolve().then(() => closeTranscriptPagination()),
     Promise.resolve().then(() => closeDerivedTodoProjectionService()),
+    Promise.resolve().then(() => closeArtifactRegistry()),
   ]);
   clearBrowserAgentToken();
   clearAppsAgentToken();
@@ -374,6 +389,8 @@ export function start() {
   // Only a fully composed gate-on process may publish schema 6. Migration is
   // durable-backup-first and aborts before replacement if that backup fails.
   init({ browserProfilesEnabled: config.standardBrowserProfileHosts });
+  initArtifactRegistry(config.dataDir);
+  pruneOrphanArtifactSessions((sessionId) => Boolean(getSessionById(sessionId)));
   console.log(`[db] Store at ${config.dbPath}`);
   const canonicalKvWarmup = new CanonicalKvWarmupCoordinator(config.canonicalKvWarmup);
   if (config.canonicalKvWarmup.enabled) {

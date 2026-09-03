@@ -32,6 +32,7 @@ import {
 import { isInteractiveBrowserToolName } from "./browser/protected-tools.js";
 import { PROTECTED_AUTOMATION_TOOL_NAME, type ProtectedAutomationToolRuntime } from "./protected-automation/tool.js";
 import { FILE_AUDIO_EXPERIMENT_TOOL_NAME, type FileAudioExperimentRuntime } from "./audio-experiment/types.js";
+import { PRESENT_ARTIFACT_TOOL_NAME, type ArtifactToolRuntime } from "./artifacts/tool.js";
 import { classifyReadableStandardArtifact, SESSION_INTEROP_TOOL_NAMES } from "./session-interop.js";
 import {
   isSessionCapabilityEligible,
@@ -233,6 +234,9 @@ export function authorizeAgentToolCall(options: {
   if (toolName === FILE_AUDIO_EXPERIMENT_TOOL_NAME) {
     return { allowed: false, reason: "The file-audio experiment requires its exact source-bound runtime object" };
   }
+  if (toolName === PRESENT_ARTIFACT_TOOL_NAME) {
+    return { allowed: false, reason: "Artifact presentation requires its exact source-bound runtime object" };
+  }
   if (toolName === MEMORY_REVIEW_COMPLETE_TOOL_NAME) {
     return { allowed: true };
   }
@@ -382,6 +386,8 @@ interface LiveToolDecisionOptions {
   trustedProtectedAutomationTool?: unknown;
   fileAudioExperimentRuntime?: FileAudioExperimentRuntime;
   trustedFileAudioExperimentTool?: unknown;
+  artifactToolRuntime?: ArtifactToolRuntime;
+  trustedArtifactTool?: unknown;
 }
 
 function exactTrustedToolObject(candidate: unknown, trusted: unknown): boolean {
@@ -468,6 +474,19 @@ function liveToolDecision(
       return decision.allowed ? { allowed: true } : decision;
     } catch {
       return { allowed: false, reason: "Protected automation preflight is unavailable" };
+    }
+  }
+  if (normalizedToolName === PRESENT_ARTIFACT_TOOL_NAME) {
+    if (scheduled || !options.artifactToolRuntime
+      || !exactTrustedToolObject(options.candidateTool, options.trustedArtifactTool)) {
+      closeRuntimeOnToolObjectDrift(options.artifactToolRuntime);
+      return { allowed: false, reason: "The artifact presentation tool object is not authorized for this runtime" };
+    }
+    try {
+      const decision = options.artifactToolRuntime.preflight();
+      return decision.allowed ? { allowed: true } : decision;
+    } catch {
+      return { allowed: false, reason: "Artifact presentation preflight is unavailable" };
     }
   }
   if (normalizedToolName === FILE_AUDIO_EXPERIMENT_TOOL_NAME) {
@@ -579,6 +598,8 @@ function wrapToolExecute(
   trustedProtectedAutomationTool: unknown,
   fileAudioExperimentRuntime: FileAudioExperimentRuntime | undefined,
   trustedFileAudioExperimentTool: unknown,
+  artifactToolRuntime: ArtifactToolRuntime | undefined,
+  trustedArtifactTool: unknown,
 ): void {
   if (!tool || (typeof tool !== "object" && typeof tool !== "function") || typeof tool.name !== "string"
     || typeof tool.execute !== "function") return;
@@ -598,6 +619,7 @@ function wrapToolExecute(
   const previousExecute = tool.execute.bind(tool);
   const protectedAutomationReleaseFence = normalizedPolicyToolName === PROTECTED_AUTOMATION_TOOL_NAME;
   const fileAudioExperimentReleaseFence = normalizedPolicyToolName === FILE_AUDIO_EXPERIMENT_TOOL_NAME;
+  const artifactReleaseFence = normalizedPolicyToolName === PRESENT_ARTIFACT_TOOL_NAME;
   let standardRuntimeRevoked = false;
   const decideWrappedCall = (params: unknown): ToolAuthorizationDecision => {
     if (standardResourcesWitness && standardRuntimeRevoked) {
@@ -615,6 +637,8 @@ function wrapToolExecute(
       trustedProtectedAutomationTool,
       fileAudioExperimentRuntime,
       trustedFileAudioExperimentTool,
+      artifactToolRuntime,
+      trustedArtifactTool,
     });
     if (standardResourcesWitness && !decision.allowed && /^Standard resource (?:runtime|authority)/u.test(decision.reason ?? "")) {
       standardRuntimeRevoked = true;
@@ -625,7 +649,7 @@ function wrapToolExecute(
     const decision = decideWrappedCall(params);
     if (!decision.allowed) throw new Error(`Wayang policy blocked ${policyToolName}: ${decision.reason ?? "denied"}`);
     const guardedRest = [...rest];
-    if ((standardResourcesWitness || pathReadReleaseFence || interactiveBrowserReleaseFence || protectedAutomationReleaseFence || fileAudioExperimentReleaseFence) && typeof guardedRest[1] === "function") {
+    if ((standardResourcesWitness || pathReadReleaseFence || interactiveBrowserReleaseFence || protectedAutomationReleaseFence || fileAudioExperimentReleaseFence || artifactReleaseFence) && typeof guardedRest[1] === "function") {
       const previousUpdate = guardedRest[1] as (...args: unknown[]) => unknown;
       guardedRest[1] = (...args: unknown[]) => {
         const release = decideWrappedCall(params);
@@ -634,7 +658,7 @@ function wrapToolExecute(
       };
     }
     const result = await previousExecute(toolCallId, params, ...guardedRest);
-    if (standardResourcesWitness || pathReadReleaseFence || interactiveBrowserReleaseFence || protectedAutomationReleaseFence || fileAudioExperimentReleaseFence) {
+    if (standardResourcesWitness || pathReadReleaseFence || interactiveBrowserReleaseFence || protectedAutomationReleaseFence || fileAudioExperimentReleaseFence || artifactReleaseFence) {
       const release = decideWrappedCall(params);
       if (!release.allowed) throw new Error(`Wayang policy suppressed ${policyToolName} result: ${release.reason ?? "denied"}`);
     }
@@ -656,15 +680,17 @@ function wrapCurrentTools(
   trustedProtectedAutomationTool: unknown,
   fileAudioExperimentRuntime: FileAudioExperimentRuntime | undefined,
   trustedFileAudioExperimentTool: unknown,
+  artifactToolRuntime: ArtifactToolRuntime | undefined,
+  trustedArtifactTool: unknown,
 ): void {
   const anySession = session as any;
   if (anySession._toolRegistry instanceof Map) {
     for (const tool of anySession._toolRegistry.values()) {
-      wrapToolExecute(tool, sessionId, restrictedMcpRuntime, trustedRestrictedMcpTool, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, trustedProtectedBrowserTool, protectedAutomationRuntime, trustedProtectedAutomationTool, fileAudioExperimentRuntime, trustedFileAudioExperimentTool);
+      wrapToolExecute(tool, sessionId, restrictedMcpRuntime, trustedRestrictedMcpTool, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, trustedProtectedBrowserTool, protectedAutomationRuntime, trustedProtectedAutomationTool, fileAudioExperimentRuntime, trustedFileAudioExperimentTool, artifactToolRuntime, trustedArtifactTool);
     }
   }
   for (const tool of anySession.agent?.state?.tools ?? []) {
-    wrapToolExecute(tool, sessionId, restrictedMcpRuntime, trustedRestrictedMcpTool, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, trustedProtectedBrowserTool, protectedAutomationRuntime, trustedProtectedAutomationTool, fileAudioExperimentRuntime, trustedFileAudioExperimentTool);
+    wrapToolExecute(tool, sessionId, restrictedMcpRuntime, trustedRestrictedMcpTool, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, trustedProtectedBrowserTool, protectedAutomationRuntime, trustedProtectedAutomationTool, fileAudioExperimentRuntime, trustedFileAudioExperimentTool, artifactToolRuntime, trustedArtifactTool);
   }
 }
 
@@ -679,9 +705,10 @@ export function installAgentToolPolicyGuard(
     protectedBrowserRuntime?: InteractiveBrowserToolRuntime;
     protectedAutomationRuntime?: ProtectedAutomationToolRuntime;
     fileAudioExperimentRuntime?: FileAudioExperimentRuntime;
+    artifactToolRuntime?: ArtifactToolRuntime;
   } = {},
 ): void {
-  const { restrictedMcpRuntime, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, protectedAutomationRuntime, fileAudioExperimentRuntime } = options;
+  const { restrictedMcpRuntime, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, protectedAutomationRuntime, fileAudioExperimentRuntime, artifactToolRuntime } = options;
   if (protectedBrowserRuntime) assertInteractiveBrowserToolCatalog(protectedBrowserRuntime);
   const anySession = session as any;
   const restrictedMcpDefinitionEntry = restrictedMcpRuntime && anySession._toolDefinitions instanceof Map
@@ -718,6 +745,12 @@ export function installAgentToolPolicyGuard(
     : undefined;
   const trustedFileAudioExperimentTool = fileAudioExperimentDefinitionEntry?.definition === fileAudioExperimentRuntime?.tool
     ? resolveRegisteredTool(session, FILE_AUDIO_EXPERIMENT_TOOL_NAME)
+    : undefined;
+  const artifactDefinitionEntry = artifactToolRuntime && anySession._toolDefinitions instanceof Map
+    ? anySession._toolDefinitions.get(PRESENT_ARTIFACT_TOOL_NAME)
+    : undefined;
+  const trustedArtifactTool = artifactDefinitionEntry?.definition === artifactToolRuntime?.tool
+    ? resolveRegisteredTool(session, PRESENT_ARTIFACT_TOOL_NAME)
     : undefined;
   let standardAuthorityRevoked = false;
   const standardCurrent = (): boolean => {
@@ -769,15 +802,17 @@ export function installAgentToolPolicyGuard(
       trustedProtectedAutomationTool,
       fileAudioExperimentRuntime,
       trustedFileAudioExperimentTool,
+      artifactToolRuntime,
+      trustedArtifactTool,
     }).allowed);
   };
-  wrapCurrentTools(session, sessionId, restrictedMcpRuntime, trustedRestrictedMcpTool, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, trustedProtectedBrowserTool, protectedAutomationRuntime, trustedProtectedAutomationTool, fileAudioExperimentRuntime, trustedFileAudioExperimentTool);
+  wrapCurrentTools(session, sessionId, restrictedMcpRuntime, trustedRestrictedMcpTool, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, trustedProtectedBrowserTool, protectedAutomationRuntime, trustedProtectedAutomationTool, fileAudioExperimentRuntime, trustedFileAudioExperimentTool, artifactToolRuntime, trustedArtifactTool);
   if (typeof anySession.setActiveToolsByName === "function" && !policyWrappedSessions.has(anySession)) {
     const previous = anySession.setActiveToolsByName.bind(anySession);
     anySession.setActiveToolsByName = (names: string[]) => {
-      wrapCurrentTools(session, sessionId, restrictedMcpRuntime, trustedRestrictedMcpTool, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, trustedProtectedBrowserTool, protectedAutomationRuntime, trustedProtectedAutomationTool, fileAudioExperimentRuntime, trustedFileAudioExperimentTool);
+      wrapCurrentTools(session, sessionId, restrictedMcpRuntime, trustedRestrictedMcpTool, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, trustedProtectedBrowserTool, protectedAutomationRuntime, trustedProtectedAutomationTool, fileAudioExperimentRuntime, trustedFileAudioExperimentTool, artifactToolRuntime, trustedArtifactTool);
       const result = previous(filterActiveNames(names));
-      wrapCurrentTools(session, sessionId, restrictedMcpRuntime, trustedRestrictedMcpTool, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, trustedProtectedBrowserTool, protectedAutomationRuntime, trustedProtectedAutomationTool, fileAudioExperimentRuntime, trustedFileAudioExperimentTool);
+      wrapCurrentTools(session, sessionId, restrictedMcpRuntime, trustedRestrictedMcpTool, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, trustedProtectedBrowserTool, protectedAutomationRuntime, trustedProtectedAutomationTool, fileAudioExperimentRuntime, trustedFileAudioExperimentTool, artifactToolRuntime, trustedArtifactTool);
       return result;
     };
     policyWrappedSessions.add(anySession);
@@ -796,7 +831,7 @@ export function installAgentToolPolicyGuard(
       return { block: true, reason: "Standard resource authority was revoked; a fresh runtime is required" };
     }
     const candidateTool = resolveRegisteredTool(session, name);
-    wrapToolExecute(candidateTool, sessionId, restrictedMcpRuntime, trustedRestrictedMcpTool, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, trustedProtectedBrowserTool, protectedAutomationRuntime, trustedProtectedAutomationTool, fileAudioExperimentRuntime, trustedFileAudioExperimentTool);
+    wrapToolExecute(candidateTool, sessionId, restrictedMcpRuntime, trustedRestrictedMcpTool, standardResourcesWitness, standardResourcesRuntimeFence, protectedBrowserRuntime, trustedProtectedBrowserTool, protectedAutomationRuntime, trustedProtectedAutomationTool, fileAudioExperimentRuntime, trustedFileAudioExperimentTool, artifactToolRuntime, trustedArtifactTool);
     const decision = liveToolDecision(sessionId, name, event?.args ?? event?.input, {
       candidateTool,
       restrictedMcpRuntime,
@@ -809,6 +844,8 @@ export function installAgentToolPolicyGuard(
       trustedProtectedAutomationTool,
       fileAudioExperimentRuntime,
       trustedFileAudioExperimentTool,
+      artifactToolRuntime,
+      trustedArtifactTool,
     });
     return decision.allowed ? result : { block: true, reason: decision.reason ?? "Wayang policy denied the tool" };
   };

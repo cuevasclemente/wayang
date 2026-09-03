@@ -34,8 +34,9 @@ export interface MatrixGatewayTransactionAdmission {
 }
 
 /**
- * Narrow connector-neutral transaction port Wren must implement using the
- * durable atomic manifest repository, then schedule drains without model wait.
+ * Narrow connector-neutral transaction port the gateway host must implement
+ * using the durable atomic manifest repository, then schedule drains without
+ * model wait. Agent profile names and workspace defaults are irrelevant here.
  */
 export interface MatrixGatewayTransactionPort {
   lookupCompletedTransaction(input: {

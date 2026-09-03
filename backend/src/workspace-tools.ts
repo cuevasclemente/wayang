@@ -21,6 +21,12 @@ const AccessPolicy = Type.Object({
 
 const Mutation = Type.Union([
   Type.Object({
+    mutation_type: Type.Literal("workspace_default_agent_profile_update"),
+    mutation: Type.Object({
+      default_agent_profile_id: Type.String(),
+    }, { additionalProperties: false }),
+  }, { additionalProperties: false }),
+  Type.Object({
     mutation_type: Type.Literal("project_create"),
     mutation: Type.Object({
       cwd: Type.String(),
@@ -96,6 +102,8 @@ const Mutation = Type.Union([
 ]);
 
 const ReadParameters = Type.Union([
+  Type.Object({ action: Type.Literal("get_workspace_settings") }, { additionalProperties: false }),
+  Type.Object({ action: Type.Literal("get_agent_profile_references"), id: Type.String() }, { additionalProperties: false }),
   Type.Object({ action: Type.Literal("list_projects") }, { additionalProperties: false }),
   Type.Object({ action: Type.Literal("get_project"), id: Type.String() }, { additionalProperties: false }),
   Type.Object({ action: Type.Literal("list_agent_profiles") }, { additionalProperties: false }),
@@ -121,7 +129,7 @@ export function createWorkspaceToolDefinitions(options: WorkspaceToolFactoryOpti
   const read = defineTool({
     name: WAYANG_WORKSPACE_READ_TOOL_NAME,
     label: "Wayang Workspace Read",
-    description: "Read bounded Wayang project, agent-profile, and project-root AGENTS.md state for this exact authorized Standard interactive session. Profile instructions and AGENTS.md content enter the session transcript when detail/content actions are used; prefer metadata actions unless content is necessary.",
+    description: "Read bounded Wayang workspace-default, project, agent-profile, redacted profile-reference, and project-root AGENTS.md state for this exact authorized Standard interactive session. Profile instructions and AGENTS.md content enter the session transcript when detail/content actions are used; prefer metadata actions unless content is necessary.",
     promptSnippet: "Read Wayang workspace registration and agent profile settings",
     promptGuidelines: [
       "Prefer list and project-instructions metadata actions; request private instruction text only when the task requires it.",
@@ -129,14 +137,14 @@ export function createWorkspaceToolDefinitions(options: WorkspaceToolFactoryOpti
     ],
     parameters: ReadParameters,
     async execute(_toolCallId, params) {
-      return textResult(service.read(sourceSessionId, params as WorkspaceReadAction));
+      return textResult(await service.read(sourceSessionId, params as WorkspaceReadAction));
     },
   });
 
   const change = defineTool({
     name: WAYANG_WORKSPACE_CHANGE_TOOL_NAME,
     label: "Wayang Workspace Change",
-    description: "Preview or commit one Wayang project, agent-profile, or project-root AGENTS.md mutation. Every commit requires the exact one-question approval returned by preview to be submitted through Wayang questionnaire/interview UI with the predefined APPROVE option. This tool never creates or deletes project directories.",
+    description: "Preview or commit one Wayang workspace-default, project, agent-profile, or project-root AGENTS.md mutation. Every commit requires the exact one-question approval returned by preview to be submitted through Wayang questionnaire/interview UI with the predefined APPROVE option. This tool never creates or deletes project directories.",
     promptSnippet: "Preview and commit exact human-approved Wayang workspace settings changes",
     promptGuidelines: [
       "Always call preview first, then submit exactly its questionnaire schema through questionnaire (preferred) or interview in this same session.",

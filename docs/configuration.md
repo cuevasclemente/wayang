@@ -67,7 +67,7 @@ For a single-user private LAN without an existing reverse proxy, Wayang includes
 
 ## Pi provider authentication
 
-Wayang uses pi 0.84.1's standard authentication and model runtime. The coding-agent package is pinned to the repository-vendored `0.84.1-wayang.29fcca05` artifact (SHA-256 `fc09c52ec79888b30b10e63a985b3ba1c23a96e6ee37b5cf0f3ab1fdfbfb2007`) so session-name writers and PIN-gated transcript event mutations share the reviewed physical-file transaction, lock, atomic multi-entry CAS, stale-runtime mutation epoch, optional fixed compaction threshold, and optional complete-turn retention.
+Wayang uses pi 0.84.1's standard authentication and model runtime. The coding-agent package is pinned to the repository-vendored `0.84.1-wayang.4f7d03ce` artifact (SHA-256 `c82956f058b7dc09a2206c8c9f9331f2971042a4fa9597a5ee017f58d5303da9`) so session-name writers and PIN-gated transcript event mutations share the reviewed physical-file transaction, lock, atomic multi-entry CAS, stale-runtime mutation epoch, optional fixed compaction threshold, optional complete-turn retention, and incremental resume-session loading.
 
 ### OAuth or pi-managed API key
 
@@ -337,7 +337,7 @@ Named Standard Full browser provides an explicit human-only **Paste text** contr
 
 RFB paste necessarily places the value on the remote profile-wide X/VNC clipboard before issuing Ctrl+V; that remote clipboard may retain it according to x11vnc and application behavior. “Not stored by the Wayang UI” does not mean the remote clipboard is erased. Full browser remains the existing cooperative owner viewer: the explicit button is unavailable in the UI during agent control, but it is not a new authorization boundary against an authenticated owner or same-UID process capable of sending ordinary native RFB input.
 
-Interactive capability-browser downloads use Chromium GUID-named private staging. Each capability browser realm observes at most 32 downloads across runtime replacement, accepts at most 32 MiB per file, and keeps the publication directory at no more than 32 files and 64 MiB. Startup revalidates existing publications before accepting more. After completion and fresh authority validation, Wayang reopens one regular single-link staging file without following symlinks and exclusively publishes it under `<project>/.wayang/browser-downloads/` with a safe collision-resistant name. Unsafe, oversized, partial, racing, or unauthorized downloads are canceled or discarded. Published files are ordinary untrusted project files and may be inspected, moved, or deleted through normal project tools and the Files pane. Downloading bytes does not execute them; Wayang does not automatically open, import, parse, or run downloaded files.
+Interactive capability-browser downloads use Chromium GUID-named private staging. Each capability browser realm observes at most 32 downloads across runtime replacement, accepts at most 32 MiB per file, and keeps the publication directory at no more than 32 files and 64 MiB. Startup revalidates existing publications before accepting more. After completion and fresh authority validation, Wayang reopens one regular single-link staging file without following symlinks and exclusively publishes it under `<project>/.wayang/browser-downloads/` with a safe collision-resistant name. Unsafe, oversized, partial, racing, or unauthorized downloads are canceled or discarded. Published files are ordinary untrusted project files and may be inspected, moved, or deleted through normal project tools. They do not enter the Artifacts pane automatically; an interactive agent must deliberately call `present_artifact` after reviewing the finished file. Downloading bytes does not execute them; Wayang does not automatically open, import, parse, or run downloaded files.
 
 ### Guarded Bitwarden fills
 
@@ -388,6 +388,7 @@ Automatic discovery and metadata refresh for externally created or changed Pi se
 | `~/.wayang/protected-automation/runtime/` | Owner-bound bounded run scratch, stdout/stderr diagnostics, and published job-state generations. |
 | `~/.wayang/protected-automation/browser-realms/` | Persistent exact Project/Profile/Job Chromium profiles, download staging, and runtime metadata. Profile storage is private but not byte-quota-bounded. |
 | `~/.wayang/search.db` | Search index derived from pi sessions. |
+| `~/.wayang/artifact-index.db` | Owner-private bounded session artifact references and presentation metadata. Source bytes remain at their authorized original paths and are reauthorized on every list/preview/download. |
 | `~/.wayang/transcript-index.db` | Private, rebuildable content-free topology/source-offset index used for branch-aware transcript windows. Canonical transcript content remains in Pi JSONL. |
 | `~/.wayang/auth-sessions.json` | Hashed built-in-login session records when enabled. |
 | `~/.wayang/workspace-capability-approval/pin-attempt-state.json` | Legacy-named owner-only non-secret attempt/cooldown state shared by remaining operation-specific PIN confirmations; never the PIN. |
@@ -399,9 +400,9 @@ Automatic discovery and metadata refresh for externally created or changed Pi se
 | `~/.pi/agent/auth.json` | pi-managed provider credentials/OAuth state. |
 | `~/.pi/agent/sessions/` | Canonical pi transcript/session JSONL. |
 | `<project>/.pi/browser-workbench/` | Explicit project/session-scoped browser profiles, downloads, and artifacts. |
-| `<project>/.wayang/browser-downloads/` | Successfully published bounded interactive capability-browser downloads. These are ordinary private project files and appear in the Files pane when hidden files are shown. |
+| `<project>/.wayang/browser-downloads/` | Successfully published bounded interactive capability-browser downloads. These are ordinary private project files and appear in Artifacts only after an explicit `present_artifact` call. |
 
-`WAYANG_DATA_DIR` moves Wayang metadata, Protected-automation snapshots/runtime/browser realms, session-scoped attachments, the `tts/` cache, the shared browser workbench, and the ephemeral credential socket together. The `~/.wayang/` paths above follow the default and move under the configured absolute data root. New uploads are never written to the deprecated shared `/tmp/wayang-attachments` root, and agent tools deny that legacy root fail-closed; Wayang does not automatically migrate or inspect old files there. Back up persistent locations only into encrypted/private storage; do not back up a live unlock socket. Stopping Wayang and restoring `.env.backup` is a configuration rollback; never delete user data as a troubleshooting shortcut.
+`WAYANG_DATA_DIR` moves Wayang metadata, the artifact reference registry, Protected-automation snapshots/runtime/browser realms, session-scoped attachments, the `tts/` cache, the shared browser workbench, and the ephemeral credential socket together. The `~/.wayang/` paths above follow the default and move under the configured absolute data root. New uploads are never written to the deprecated shared `/tmp/wayang-attachments` root, and agent tools deny that legacy root fail-closed; Wayang does not automatically migrate or inspect old files there. Back up persistent locations only into encrypted/private storage; do not back up a live unlock socket. Stopping Wayang and restoring `.env.backup` is a configuration rollback; never delete user data as a troubleshooting shortcut.
 
 ## Development frontend
 

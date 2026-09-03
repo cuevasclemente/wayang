@@ -10,6 +10,7 @@ export const WAYANG_WORKSPACE_READ_TOOL_NAME = "wayang_workspace_read";
 export const WAYANG_WORKSPACE_CHANGE_TOOL_NAME = "wayang_workspace_change";
 
 export type WorkspaceMutationType =
+  | "workspace_default_agent_profile_update"
   | "project_create"
   | "project_update"
   | "project_delete_registration"
@@ -68,6 +69,7 @@ export interface CanonicalAgentProfileUpdateMutation {
 }
 
 export type CanonicalWorkspaceMutation =
+  | { mutation_type: "workspace_default_agent_profile_update"; mutation: { default_agent_profile_id: string } }
   | { mutation_type: "project_create"; mutation: CanonicalProjectCreateMutation }
   | { mutation_type: "project_update"; mutation: CanonicalProjectUpdateMutation }
   | { mutation_type: "project_delete_registration"; mutation: { id: string } }
@@ -253,6 +255,11 @@ export function canonicalizeWorkspaceMutation(rawValue: unknown): CanonicalWorks
   only(root, ["mutation_type", "mutation"], "workspace mutation");
   const mutation = object(root.mutation, "mutation");
   switch (root.mutation_type) {
+    case "workspace_default_agent_profile_update":
+      only(mutation, ["default_agent_profile_id"], "workspace_default_agent_profile_update mutation");
+      return { mutation_type: root.mutation_type, mutation: {
+        default_agent_profile_id: requiredId(mutation.default_agent_profile_id, "default_agent_profile_id"),
+      } };
     case "project_create": return { mutation_type: root.mutation_type, mutation: canonicalProjectCreate(mutation) };
     case "project_update": return { mutation_type: root.mutation_type, mutation: canonicalProjectUpdate(mutation) };
     case "project_delete_registration":

@@ -200,7 +200,8 @@ test("public allowlist stays public and every privileged REST router is centrall
 
   const protectedPaths = [
     "/api/me", "/api/latency/metrics", "/api/models", "/api/sessions", "/api/sessions/search",
-    "/api/projects", "/api/agent-profiles", "/api/fs/tree", "/api/capabilities", "/api/apps",
+    "/api/projects", "/api/agent-profiles", "/api/workspace-settings",
+    "/api/agent-profiles/example/references", "/api/fs/tree", "/api/capabilities", "/api/apps",
     "/api/apps/example/proxy/example/", "/api/scheduled-agent-jobs", "/api/scheduled-jobs",
     "/api/tts/audio/example", "/api/browser/status", "/api/unknown",
   ];
@@ -272,6 +273,14 @@ test("state-changing HTTP requests and all WebSocket transports enforce same-ori
   });
   assert.equal(rejectedPost.status, 403);
   assert.deepEqual(await rejectedPost.json(), { error: "Origin not allowed" });
+
+  const rejectedWorkspaceDefault = await fetch(`${baseUrl}/api/workspace-settings`, {
+    method: "PUT",
+    headers: { Cookie: cookie, Origin: "https://evil.example", "Content-Type": "application/json" },
+    body: JSON.stringify({ default_agent_profile_id: "synthetic-profile" }),
+  });
+  assert.equal(rejectedWorkspaceDefault.status, 403);
+  assert.deepEqual(await rejectedWorkspaceDefault.json(), { error: "Origin not allowed" });
 
   for (const wsPath of ["/ws/chat", "/ws/browser", "/ws/browser-vnc"]) {
     await rejectedUpgrade(`${wsUrl}${wsPath}`, 401, { Origin: baseUrl });

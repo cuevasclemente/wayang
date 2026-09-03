@@ -53,6 +53,10 @@ async function installSyntheticApi(page: Page): Promise<{ capabilityRequests: st
       path: `${project.cwd}/AGENTS.md`, exists: false, text: "", sha256: null, git_tracked: false, git_changed: false,
     } });
     if (path === "/api/agent-profiles") return route.fulfill({ json: [profile] });
+    if (path === "/api/workspace-settings") return route.fulfill({ json: {
+      default_agent_profile_id: profileId,
+      default_agent_profile: profile,
+    } });
     if (path === `/api/agent-profiles/${profileId}`) return route.fulfill({ json: { ...profile, instructions: null } });
     if (path === "/api/browser-profiles") return route.fulfill({ json: { profiles: [], consequence: "synthetic" } });
     if (path === `/api/browser-profiles/projects/${projectId}/default`) return route.fulfill({ json: { default: null } });

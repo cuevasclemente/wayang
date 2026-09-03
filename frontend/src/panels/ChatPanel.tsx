@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  artifactDownloadUrl,
   canRetryAuthenticatedTransport,
   chatWsUrl,
   fetchAgentProfiles,
@@ -33,6 +34,7 @@ import {
   type InterviewSubmissionState,
 } from "../components/InterviewForm";
 import { BashModeStatus } from "../components/BashModeStatus";
+import { uploadedArtifactChips, userVisibleMessageText } from "../components/artifacts/artifactMessage";
 import {
   ExternalActionApproval,
   type ExternalActionApprovalRequest,
@@ -66,6 +68,14 @@ interface ChatPanelProps {
   sessionSelectionStartedAt?: number | null;
   onSessionChange?: () => void;
   onSessionUpdate?: (session: Session) => void;
+  onArtifactEvent?: (event: {
+    sessionId: string;
+    artifactId: string | null;
+    revision: number;
+    reason: "presented" | "uploaded" | "removed";
+    requestKey: string;
+    userInitiated?: boolean;
+  }) => void;
   transcriptOpenIntent?: TranscriptOpenIntent;
   /**
    * When set, ChatPanel scrolls the transcript to the message with this pi
@@ -2091,16 +2101,20 @@ function UserMessage({
   canResend = false,
   isResending = false,
   onResend,
+  onOpenArtifact,
 }: {
   msg: ChatMessage;
   canResend?: boolean;
   isResending?: boolean;
   onResend?: (msg: ChatMessage) => void;
+  onOpenArtifact?: (artifactId: string) => void;
 }) {
   const message = msg.message;
   if (!message) return null;
 
-  const text = getUserMessageText(message);
+  const rawText = getUserMessageText(message);
+  const text = userVisibleMessageText(rawText);
+  const uploadedArtifacts = uploadedArtifactChips(rawText);
   const images = getUserMessageImages(message);
   const canShowResend = typeof msg.id === "string" && !isLocalPendingUserMessage(msg) && Boolean(onResend);
 
@@ -2130,6 +2144,21 @@ function UserMessage({
         )}
       </div>
       {text && <div className="text-sm text-neutral-200 whitespace-pre-wrap">{text}</div>}
+      {uploadedArtifacts.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {uploadedArtifacts.map((artifact) => (
+            <button
+              key={artifact.id}
+              type="button"
+              onClick={() => onOpenArtifact?.(artifact.id)}
+              className="max-w-[15rem] truncate rounded border border-blue-800/50 bg-neutral-950/70 px-2 py-1 text-[11px] text-sky-200 hover:bg-blue-950/60"
+              title={`Open ${artifact.name} in Artifacts`}
+            >
+              📄 {artifact.name}
+            </button>
+          ))}
+        </div>
+      )}
       {images.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-2">
           {images.map((image, index) => (
@@ -2150,7 +2179,7 @@ function UserMessage({
           ))}
         </div>
       )}
-      {!text && images.length === 0 && <div className="text-sm text-neutral-400">(empty)</div>}
+      {!text && images.length === 0 && uploadedArtifacts.length === 0 && <div className="text-sm text-neutral-400">(empty)</div>}
     </div>
   );
 }
@@ -2253,10 +2282,28 @@ function QueuedUserMessages({
   );
 }
 
-function ToolResultMessage({ msg }: { msg: ChatMessage }) {
+function ToolResultMessage({
+  msg,
+  sessionId,
+  onOpenArtifact,
+}: {
+  msg: ChatMessage;
+  sessionId?: string | null;
+  onOpenArtifact?: (artifactId: string) => void;
+}) {
   const message = msg.message;
   if (!message) return null;
 
+  const details = message.details && typeof message.details === "object" ? message.details as Record<string, unknown> : null;
+  const presented = details?.kind === "wayang_artifact_presentation"
+    && details.session_id === sessionId
+    && Array.isArray(details.artifacts)
+    ? details.artifacts.filter((item): item is { id: string; name: string; title?: string | null; description?: string | null } => (
+        Boolean(item) && typeof item === "object"
+        && typeof (item as { id?: unknown }).id === "string"
+        && typeof (item as { name?: unknown }).name === "string"
+      ))
+    : [];
   const content = message.content;
   const text =
     typeof content === "string"
@@ -2277,9 +2324,24 @@ function ToolResultMessage({ msg }: { msg: ChatMessage }) {
         </div>
         <MessageTimestamp msg={msg} />
       </div>
-      <pre className="text-xs text-neutral-400 font-mono whitespace-pre-wrap bg-neutral-900 rounded p-2 max-h-40 overflow-y-auto">
-        {text}
-      </pre>
+      {presented.length > 0 ? (
+        <div className="space-y-2 rounded border border-neutral-800 bg-neutral-900 p-2">
+          {presented.map((artifact) => (
+            <div key={artifact.id} className="flex items-center justify-between gap-2 rounded bg-neutral-950 px-2.5 py-2">
+              <div className="min-w-0">
+                <div className="truncate text-xs font-medium text-neutral-200">{artifact.title || artifact.name}</div>
+                {artifact.description && <div className="truncate text-[10px] text-neutral-500">{artifact.description}</div>}
+              </div>
+              <div className="flex shrink-0 gap-1">
+                <button type="button" onClick={() => onOpenArtifact?.(artifact.id)} className="rounded px-2 py-1 text-[10px] text-sky-300 hover:bg-neutral-800">Open</button>
+                {sessionId && <a href={artifactDownloadUrl(sessionId, artifact.id)} className="rounded px-2 py-1 text-[10px] text-neutral-300 hover:bg-neutral-800">Download</a>}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap rounded bg-neutral-900 p-2 font-mono text-xs text-neutral-400">{text}</pre>
+      )}
     </div>
   );
 }
@@ -2786,6 +2848,7 @@ function renderMessage(
     sessionId?: string | null;
     ttsAllowed?: boolean;
     agentName?: string;
+    onOpenArtifact?: (artifactId: string) => void;
   } = {},
 ) {
   if (
@@ -2813,11 +2876,12 @@ function renderMessage(
           canResend={options.canResendUserMessage}
           isResending={typeof msg.id === "string" && msg.id === options.resendingMessageId}
           onResend={options.onResendUserMessage}
+          onOpenArtifact={options.onOpenArtifact}
         />
       );
     case "toolResult":
     case "tool_result":
-      return <ToolResultMessage key={index} msg={msg} />;
+      return <ToolResultMessage key={index} msg={msg} sessionId={options.sessionId} onOpenArtifact={options.onOpenArtifact} />;
     case "error":
       return <ErrorMessage key={index} msg={msg} />;
     case "system":
@@ -2846,6 +2910,7 @@ function TranscriptMessageRowContents({
   sessionId,
   ttsAllowed,
   agentName,
+  onOpenArtifact,
 }: {
   msg: ChatMessage;
   canResendUserMessage: boolean;
@@ -2854,6 +2919,7 @@ function TranscriptMessageRowContents({
   sessionId: string | null;
   ttsAllowed: boolean;
   agentName: string;
+  onOpenArtifact: (artifactId: string) => void;
 }) {
   const eventIds = transcriptEventIds(msg);
   const label = msg.type === "user" ? "user message" : msg.type === "assistant" ? "assistant message" : msg.type;
@@ -2874,6 +2940,7 @@ function TranscriptMessageRowContents({
     sessionId,
     ttsAllowed,
     agentName,
+    onOpenArtifact,
   });
   if (!rendered) return null;
   return (
@@ -2913,6 +2980,7 @@ const MemoizedMessageRow = memo(function MemoizedMessageRow({
   sessionId,
   ttsAllowed,
   agentName,
+  onOpenArtifact,
 }: {
   msg: ChatMessage;
   canResendUserMessage: boolean;
@@ -2921,6 +2989,7 @@ const MemoizedMessageRow = memo(function MemoizedMessageRow({
   sessionId: string | null;
   ttsAllowed: boolean;
   agentName: string;
+  onOpenArtifact: (artifactId: string) => void;
 }) {
   const messageId = typeof msg.id === "string" ? msg.id : null;
   const eventIds = transcriptEventIds(msg);
@@ -2935,6 +3004,7 @@ const MemoizedMessageRow = memo(function MemoizedMessageRow({
         sessionId={sessionId}
         ttsAllowed={ttsAllowed}
         agentName={agentName}
+        onOpenArtifact={onOpenArtifact}
       />
     </div>
   );
@@ -3069,11 +3139,14 @@ export function ChatPanel({
   sessionSelectionStartedAt,
   onSessionChange,
   onSessionUpdate,
+  onArtifactEvent,
   transcriptOpenIntent,
   scrollToMessageId,
   onScrollToMessageHandled,
 }: ChatPanelProps) {
   const activeSessionId = activeSession?.id ?? null;
+  const onArtifactEventRef = useRef(onArtifactEvent);
+  useEffect(() => { onArtifactEventRef.current = onArtifactEvent; }, [onArtifactEvent]);
   const requestedTranscriptOpenIntent = transcriptOpenIntent ?? DEFAULT_TRANSCRIPT_OPEN_INTENT;
   const [transcriptNavigationOverride, setTranscriptNavigationOverride] = useState<{
     baseRequestKey: string;
@@ -3332,6 +3405,18 @@ export function ChatPanel({
   const pendingViewportRestoreRef = useRef<{ eventId: string; offset: number; requestId?: string } | null>(null);
   const chatPanelRootRef = useRef<HTMLElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const openArtifactFromChat = useCallback((artifactId: string) => {
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId) return;
+    onArtifactEventRef.current?.({
+      sessionId,
+      artifactId,
+      revision: 0,
+      reason: "presented",
+      requestKey: `chat-artifact:${artifactId}:${Date.now()}`,
+      userInitiated: true,
+    });
+  }, []);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const wsConnectedRef = useRef(false);
   const connectingSessionIdRef = useRef<string | null>(null);
@@ -4051,6 +4136,27 @@ export function ChatPanel({
         try {
           msg = JSON.parse(ev.data as string);
         } catch {
+          return;
+        }
+
+        if (msg.type === "artifact_catalog_changed") {
+          if (
+            msg.session_id === selectedSessionIdRef.current
+            && msg.session_id === activeSessionIdRef.current
+            && msg.selection_id === selectionIdRef.current
+            && ws === wsRef.current
+            && transportGeneration === transportGenerationRef.current
+            && Number.isInteger(msg.revision)
+            && (msg.reason === "presented" || msg.reason === "uploaded" || msg.reason === "removed")
+          ) {
+            onArtifactEventRef.current?.({
+              sessionId: msg.session_id,
+              artifactId: typeof msg.focus_artifact_id === "string" ? msg.focus_artifact_id : null,
+              revision: msg.revision,
+              reason: msg.reason,
+              requestKey: `${transportGeneration}:${msg.revision}:${msg.focus_artifact_id ?? msg.reason}`,
+            });
+          }
           return;
         }
 
@@ -7600,6 +7706,7 @@ export function ChatPanel({
                   sessionId={activeSessionId}
                   ttsAllowed={ttsAllowed}
                   agentName={currentAgentLabel}
+                  onOpenArtifact={openArtifactFromChat}
                 />
               </div>
             );
@@ -7614,6 +7721,7 @@ export function ChatPanel({
               sessionId={activeSessionId}
               ttsAllowed={ttsAllowed}
               agentName={currentAgentLabel}
+              onOpenArtifact={openArtifactFromChat}
             />
           );
         })}
@@ -7659,6 +7767,7 @@ export function ChatPanel({
               sessionId={activeSessionId}
               ttsAllowed={ttsAllowed}
               agentName={currentAgentLabel}
+              onOpenArtifact={openArtifactFromChat}
             />
           </div>
         ))}

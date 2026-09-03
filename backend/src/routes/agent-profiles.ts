@@ -1,5 +1,11 @@
 import { Router, type Request, type Response } from "express";
-import { getAgentProfile, listAgentProfiles, type AgentProfileCreateInput, type AgentProfileUpdateInput } from "../agent-profiles.js";
+import {
+  AgentProfileDisableConflict,
+  getAgentProfile,
+  listAgentProfiles,
+  type AgentProfileCreateInput,
+  type AgentProfileUpdateInput,
+} from "../agent-profiles.js";
 import { WorkspaceStoreError } from "../workspace-types.js";
 import { runtimeImpactErrorBody } from "../runtime-impact.js";
 import { workspaceSettingsService } from "../workspace-settings-service.js";
@@ -24,6 +30,10 @@ function fail(res: Response, error: unknown): void {
   const impact = runtimeImpactErrorBody(error);
   if (impact) {
     res.status(409).json(impact);
+    return;
+  }
+  if (error instanceof AgentProfileDisableConflict) {
+    res.status(error.statusCode).json(error.body);
     return;
   }
   const status = error instanceof WorkspaceStoreError ? error.statusCode : 500;
@@ -53,6 +63,12 @@ router.get("/agent-profiles/:id", (req, res) => {
     const profile = getAgentProfile(req.params.id);
     if (!profile) throw new WorkspaceStoreError("Agent profile not found", 404);
     res.json(profile);
+  } catch (error) { fail(res, error); }
+});
+
+router.get("/agent-profiles/:id/references", async (req, res) => {
+  try {
+    res.json(await workspaceSettingsService.getAgentProfileReferencesForUi(req.params.id));
   } catch (error) { fail(res, error); }
 });
 

@@ -61,6 +61,16 @@ test("workspace change tool schema accepts explicit null default pairs and stays
     arguments: { mode: "preview", proposal },
   });
 
+  const workspaceDefaultProposal = {
+    mutation_type: "workspace_default_agent_profile_update",
+    mutation: { default_agent_profile_id: "stable-profile-id" },
+  };
+  assert.deepEqual(validate(workspaceDefaultProposal), { mode: "preview", proposal: workspaceDefaultProposal });
+  assert.throws(() => validate({
+    mutation_type: "workspace_default_agent_profile_update",
+    mutation: { default_agent_profile_id: "stable-profile-id", replace_references: true },
+  }), /Validation failed/);
+
   for (const proposal of [
     {
       mutation_type: "project_create",

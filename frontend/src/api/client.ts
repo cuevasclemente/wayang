@@ -313,8 +313,8 @@ async function request<T>(
   return (await parseBody(res)) as T;
 }
 
-function apiGet<T>(path: string): Promise<T> {
-  return request<T>("GET", path);
+function apiGet<T>(path: string, signal?: AbortSignal): Promise<T> {
+  return request<T>("GET", path, undefined, signal);
 }
 
 function apiPost<T>(path: string, body?: unknown): Promise<T> {
@@ -1802,6 +1802,24 @@ export interface AgentProfile extends AgentProfileSummary {
   instructions: string | null;
 }
 
+export interface WorkspaceSettings {
+  default_agent_profile_id: string;
+  default_agent_profile: AgentProfileSummary;
+}
+
+export interface AgentProfileReferenceSummary {
+  workspace_default: boolean;
+  project_defaults: number;
+  project_allowlists: number;
+  session_attributions: number;
+  running_sessions: number;
+  pending_switches: number;
+  scheduled_jobs: number;
+  protected_automation_jobs: number;
+  protected_automation_runs: number;
+  messaging_endpoints: number;
+}
+
 export interface ProjectInstructions {
   path: string;
   exists: boolean;
@@ -1846,6 +1864,14 @@ export interface AgentProfileUpdate {
   replacement_agent_profile_id?: string;
 }
 
+export function fetchWorkspaceSettings(): Promise<WorkspaceSettings> {
+  return apiGet<WorkspaceSettings>("/api/workspace-settings");
+}
+
+export function updateWorkspaceSettings(defaultAgentProfileId: string): Promise<WorkspaceSettings> {
+  return apiPut<WorkspaceSettings>("/api/workspace-settings", { default_agent_profile_id: defaultAgentProfileId });
+}
+
 export function fetchProjects(): Promise<WorkspaceProject[]> {
   return apiGet<WorkspaceProject[]>("/api/projects");
 }
@@ -1883,6 +1909,10 @@ export function createAgentProfile(input: AgentProfileInput): Promise<AgentProfi
 
 export function fetchAgentProfile(id: string): Promise<AgentProfile> {
   return apiGet<AgentProfile>(`/api/agent-profiles/${encodeURIComponent(id)}`);
+}
+
+export function fetchAgentProfileReferences(id: string): Promise<AgentProfileReferenceSummary> {
+  return apiGet<AgentProfileReferenceSummary>(`/api/agent-profiles/${encodeURIComponent(id)}/references`);
 }
 
 export function updateAgentProfile(id: string, input: AgentProfileUpdate): Promise<AgentProfile> {
@@ -1978,17 +2008,8 @@ export function joinSessionsIntoProjects(
 }
 
 // ---------------------------------------------------------------------------
-// Filesystem
+// Project discovery and session artifacts
 // ---------------------------------------------------------------------------
-
-export type FsEntryType = "file" | "dir" | "symlink";
-
-export interface FsEntry {
-  name: string;
-  type: FsEntryType;
-  size: number;
-  mtime: number;
-}
 
 export interface DiscoveredProject {
   cwd: string;
@@ -2000,70 +2021,61 @@ export interface DiscoveredProject {
   lastModified: number;
 }
 
-export interface FsTreeResult {
-  root: string;
-  path: string;
-  entries: FsEntry[];
+export type ArtifactSource = "presented" | "upload";
+export type ArtifactRenderer = "markdown" | "text" | "image" | "pdf" | "html" | "unsupported";
+
+export interface SessionArtifact {
+  id: string;
+  name: string;
+  display_path: string;
+  title: string | null;
+  description: string | null;
+  source: ArtifactSource;
+  renderer: ArtifactRenderer;
+  language: string | null;
+  size: number | null;
+  modified_at: number | null;
+  last_seen_at: number;
+  available: boolean;
+  unavailable_reason: "missing" | "policy_changed" | "unsafe_file" | null;
+  preview_available: boolean;
+  preview_unavailable_reason: string | null;
+  download_available: boolean;
+  download_unavailable_reason: string | null;
 }
 
-export interface FsTextRead {
+export interface SessionArtifactsResponse {
+  session_id: string;
+  revision: number;
+  artifacts: SessionArtifact[];
+}
+
+export interface ArtifactTextPreviewResponse {
+  artifact_id: string;
+  renderer: "markdown" | "text" | "html";
+  language: string | null;
   text: string;
-  size: number;
   sha256: string;
-  name: string;
-}
-
-export interface FsBinaryRead {
-  binary: true;
-  data_b64: string;
-  size: number;
-  name: string;
-}
-
-export interface FsTooLarge {
-  too_large: true;
-  size: number;
-  name: string;
-}
-
-export type FsRead = FsTextRead | FsBinaryRead | FsTooLarge;
-
-export function isFsTextRead(r: FsRead): r is FsTextRead {
-  return "text" in r;
-}
-
-export function isFsBinaryRead(r: FsRead): r is FsBinaryRead {
-  return "binary" in r;
-}
-
-export function isFsTooLarge(r: FsRead): r is FsTooLarge {
-  return "too_large" in r;
 }
 
 export function fetchDiscoveredProjects(): Promise<DiscoveredProject[]> {
   return apiGet<DiscoveredProject[]>("/api/fs/discover-projects");
 }
 
-export function fetchFsTree(path: string, showHidden = false): Promise<FsTreeResult> {
-  const params = new URLSearchParams({ path, show_hidden: showHidden ? "1" : "0" });
-  return apiGet<FsTreeResult>(`/api/fs/tree?${params.toString()}`);
+export function fetchSessionArtifacts(sessionId: string, signal?: AbortSignal): Promise<SessionArtifactsResponse> {
+  return apiGet<SessionArtifactsResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/artifacts`, signal);
 }
 
-export function fetchFsRead(path: string): Promise<FsRead> {
-  const params = new URLSearchParams({ path });
-  return apiGet<FsRead>(`/api/fs/read?${params.toString()}`);
+export function fetchArtifactTextPreview(sessionId: string, artifactId: string, signal?: AbortSignal): Promise<ArtifactTextPreviewResponse> {
+  return apiGet<ArtifactTextPreviewResponse>(artifactPreviewUrl(sessionId, artifactId), signal);
 }
 
-export function writeFsFile(
-  path: string,
-  content: string,
-  expectedSha256?: string,
-): Promise<{ sha256: string; size: number }> {
-  return apiPut<{ sha256: string; size: number }>("/api/fs/write", {
-    path,
-    content,
-    expected_sha256: expectedSha256,
-  });
+export function artifactPreviewUrl(sessionId: string, artifactId: string): string {
+  return `/api/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/preview`;
+}
+
+export function artifactDownloadUrl(sessionId: string, artifactId: string): string {
+  return `/api/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/download`;
 }
 
 // ---------------------------------------------------------------------------

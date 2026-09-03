@@ -26,7 +26,7 @@ import {
 import { SessionsPanel } from "./panels/SessionsPanel";
 import { ChatPanel } from "./panels/ChatPanel";
 import { NewSessionPanel } from "./panels/NewSessionPanel";
-import { RightPanel } from "./panels/RightPanel";
+import { RightPanel, type ArtifactPanelEvent } from "./panels/RightPanel";
 import { ScheduledJobsPanel } from "./panels/ScheduledJobsPanel";
 import { ProtectedAutomationsPanel } from "./panels/ProtectedAutomationsPanel";
 import { isCurrentSessionPath, parseSessionPath, sessionPath } from "./routing/sessionRoute";
@@ -114,6 +114,7 @@ function App({ authEnabled, onLogout }: AppProps) {
   );
   const [sessionChangeTrigger, setSessionChangeTrigger] = useState(0);
   const [humanAttentionCount, setHumanAttentionCount] = useState(0);
+  const [artifactEvent, setArtifactEvent] = useState<ArtifactPanelEvent | null>(null);
   const [showNewSession, setShowNewSession] = useState(false);
   const [activeScheduledJobId, setActiveScheduledJobId] = useState<string | null>(null);
   const [showScheduledJobs, setShowScheduledJobs] = useState(false);
@@ -144,6 +145,7 @@ function App({ authEnabled, onLogout }: AppProps) {
       setShowScheduledJobs(false);
       setShowProtectedAutomations(false);
       setScrollToMessageId(messageId);
+      setArtifactEvent(null);
       setTranscriptOpenIntent(createTranscriptOpenIntent(messageId));
       if (!isCurrentSessionPath(session.id)) {
         window.history.pushState(window.history.state, "", sessionPath(session.id));
@@ -191,6 +193,16 @@ function App({ authEnabled, onLogout }: AppProps) {
   const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [rightCollapsed, setRightCollapsed] = useState(false);
 
+  const handleArtifactEvent = useCallback((event: ArtifactPanelEvent) => {
+    if (event.sessionId !== activeSessionId) return;
+    setArtifactEvent(event);
+    if (isMobile && event.userInitiated) {
+      setMobileTab("tools");
+    } else if (!isMobile && event.reason === "presented" && event.artifactId) {
+      rightPanelRef.current?.expand();
+    }
+  }, [activeSessionId, isMobile, rightPanelRef]);
+
   const handleBrowseSessions = useCallback(() => {
     if (isMobile) {
       setMobileTab("sessions");
@@ -203,6 +215,7 @@ function App({ authEnabled, onLogout }: AppProps) {
     routeRequestGenerationRef.current += 1;
     setActiveSession(null);
     setScrollToMessageId(null);
+    setArtifactEvent(null);
     setTranscriptOpenIntent(createTranscriptOpenIntent());
     setRouteResolution({ kind: "idle" });
     if (window.location.pathname !== "/") {
@@ -401,6 +414,7 @@ function App({ authEnabled, onLogout }: AppProps) {
           sessionSelectionStartedAt={sessionSelectionStartedAtRef.current}
           onSessionChange={handleSessionChange}
           onSessionUpdate={setActiveSession}
+          onArtifactEvent={handleArtifactEvent}
           transcriptOpenIntent={transcriptOpenIntent}
           scrollToMessageId={scrollToMessageId}
           onScrollToMessageHandled={() => setScrollToMessageId(null)}
@@ -458,6 +472,7 @@ function App({ authEnabled, onLogout }: AppProps) {
       sessionCwd={activeSession?.cwd ?? null}
       browserMode={activeSession?.browser_mode ?? "unavailable"}
       browserAgent={activeSession?.browser_agent ?? null}
+      artifactEvent={artifactEvent}
     />
   );
 
@@ -707,7 +722,7 @@ function HeaderBar({
             <button
               onClick={onToggleRight}
               title={
-                rightCollapsed ? "Show files panel" : "Hide files panel"
+                rightCollapsed ? "Show tools panel" : "Hide tools panel"
               }
               className="p-1 rounded text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition-colors"
             >
