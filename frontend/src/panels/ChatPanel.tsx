@@ -137,7 +137,7 @@ interface QueuedUserMessage {
   attachments?: PendingAttachment[];
   attachmentNames?: string[];
   transportGeneration?: number;
-  cancelStatus: "registering" | "ready" | "cancelling" | "unavailable";
+  cancelStatus: "registering" | "ready" | "cancelling" | "unavailable" | "uncertain";
   cancelError?: string;
 }
 
@@ -2047,7 +2047,11 @@ function upsertUserMessage(messages: ChatMessage[], userMessage: ChatMessage): C
   // Content similarity is only safe for replacing this browser's optimistic
   // echo. A later real turn may intentionally repeat an earlier short reply
   // such as "done" and must remain a distinct transcript event.
-  const pendingIndex = messages.findIndex((existing) => isLocalPendingUserMessage(existing) && userMessagesMatch(existing, userMessage));
+  const pendingIndex = messages.findIndex((existing) => isLocalPendingUserMessage(existing) && (
+    isLocalPendingUserMessage(userMessage)
+      ? existing.__localId === userMessage.__localId
+      : userMessagesMatch(existing, userMessage)
+  ));
   if (pendingIndex !== -1) {
     return messages.map((existing, index) => index === pendingIndex ? userMessage : existing);
   }
@@ -2187,9 +2191,11 @@ function UserMessage({
 function QueuedUserMessages({
   messages,
   onCancel,
+  onRestore,
 }: {
   messages: QueuedUserMessage[];
   onCancel: (messageId: string) => void;
+  onRestore: (messageId: string) => void;
 }) {
   if (messages.length === 0) return null;
 
@@ -2197,7 +2203,7 @@ function QueuedUserMessages({
     <div className="border-t border-neutral-800 bg-neutral-950/95 px-3 py-2">
       <div className="mb-1 flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wider text-amber-300">
         <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
-        Queued for the next turn
+        {messages.some((message) => message.cancelStatus === "uncertain") ? "Pending messages — delivery needs review" : "Queued for the next turn"}
       </div>
       <div className="space-y-1">
         {messages.map((message, index) => {
@@ -2223,7 +2229,16 @@ function QueuedUserMessages({
                     {message.content || ((message.attachments?.length || message.attachmentNames?.length) ? "[File attachment]" : "")}
                   </span>
                 </div>
-                <button
+                {message.cancelStatus === "uncertain" ? (
+                  <button
+                    type="button"
+                    onClick={() => onRestore(message.id)}
+                    className="shrink-0 rounded border border-amber-800 px-2 py-1 text-amber-200"
+                    title="Restore editable text and attachments without sending. Check history before resending; the original may already have run."
+                  >
+                    Restore draft
+                  </button>
+                ) : <button
                   type="button"
                   data-testid="chat-cancel-queued-message"
                   disabled={!canCancel}
@@ -2233,7 +2248,7 @@ function QueuedUserMessages({
                   className="shrink-0 rounded border border-red-900/60 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-red-300 hover:bg-red-950/40 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   {cancelLabel}
-                </button>
+                </button>}
               </div>
               {message.attachments && message.attachments.length > 0 && (
                 <div className="mt-2 flex flex-wrap gap-1.5">
@@ -3436,6 +3451,9 @@ export function ChatPanel({
   const lastProgrammaticScrollAtRef = useRef(0);
   const queuedUserMessagesRef = useRef<QueuedUserMessage[]>([]);
   const submittedUserMessagesRef = useRef(new Map<string, SubmittedUserMessage>());
+  // Presentation evidence is not a delivery ACK: content-only history may
+  // suppress an extra bubble, but must never retire exact draft recovery.
+  const renderedSubmissionIdsRef = useRef(new Set<string>());
   const acceptedClientMessageIdsRef = useRef(new Set<string>());
   const draftRevisionBySessionRef = useRef(new Map<string, number>());
   const attachmentDraftsBySessionRef = useRef(new Map<string, PendingAttachment[]>());
@@ -3683,7 +3701,20 @@ export function ChatPanel({
     return isStreamingRef.current || prefix.content.length > 0 || blocks.content.length > 0;
   }, []);
 
+  const rememberRenderedSubmission = useCallback((sessionId: string, clientMessageId: string) => {
+    const rendered = renderedSubmissionIdsRef.current;
+    rendered.add(`${sessionId}\0${clientMessageId}`);
+    while (rendered.size > 512) rendered.delete(rendered.values().next().value!);
+  }, []);
+
   const insertAcceptedUsersAfterActiveStreaming = useCallback((userMessages: ChatMessage[]) => {
+    userMessages = userMessages.filter((message) => {
+      if (!isLocalPendingUserMessage(message) || !activeSessionIdRef.current) return true;
+      const key = `${activeSessionIdRef.current}\0${message.__localId}`;
+      if (renderedSubmissionIdsRef.current.has(key)) return false;
+      rememberRenderedSubmission(activeSessionIdRef.current, message.__localId);
+      return true;
+    });
     if (userMessages.length === 0) return;
     const liveBlocks = streamingPrefixReplacesHistoryTailRef.current
       ? streamingBlocksRef.current
@@ -3708,7 +3739,7 @@ export function ChatPanel({
     // live presentation before inserting the accepted user.
     setStreamingHistoryPrefixSynced({ content: [] });
     setStreamingBlocksSynced({ content: [] });
-  }, [setMessages, setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
+  }, [rememberRenderedSubmission, setMessages, setStreamingBlocksSynced, setStreamingHistoryPrefixSynced]);
 
   const appendRuntimeError = useCallback((message: string, recovery: "context_overflow" | null = null) => {
     const trimmed = message.trim() || "Unknown error";
@@ -3800,11 +3831,28 @@ export function ChatPanel({
     return true;
   }, [markClientMessageAccepted]);
 
-  const queuedMessageMatchesContent = useCallback((message: QueuedUserMessage, content: string) => (
+  const queuedMessageMatchesContent = useCallback((message: Pick<QueuedUserMessage, "content" | "attachments">, content: string) => (
     message.content === content ||
     (message.content.trim() !== "" && content.startsWith(message.content.trim())) ||
     ((message.attachments?.length ?? 0) > 0 && content.includes("<file name="))
   ), []);
+
+  const rememberHistorySubmissionOccurrences = useCallback((occurrences: Iterable<ChatMessage>) => {
+    const sessionId = activeSessionIdRef.current;
+    // No cross-selection content inference. The old display must still belong
+    // to this session so historical repeated replies have already been reserved.
+    if (!sessionId || messagesOwnerSessionIdRef.current !== sessionId) return;
+    for (const occurrence of occurrences) {
+      const content = getUserMessageText(occurrence.message);
+      for (const [clientMessageId, submitted] of submittedUserMessagesRef.current) {
+        if (submitted.sessionId !== sessionId
+          || renderedSubmissionIdsRef.current.has(`${sessionId}\0${clientMessageId}`)) continue;
+        if (!queuedMessageMatchesContent(submitted, content)) continue;
+        rememberRenderedSubmission(sessionId, clientMessageId);
+        break; // One new durable occurrence consumes at most one local send.
+      }
+    }
+  }, [queuedMessageMatchesContent, rememberRenderedSubmission]);
 
   const takeMatchingQueuedMessage = useCallback((content: string) => {
     const matchesQueuedMessage = (message: QueuedUserMessage) => queuedMessageMatchesContent(message, content);
@@ -4340,9 +4388,25 @@ export function ChatPanel({
             && typeof message.__localId === "string"
             && snapshotIds.has(message.__localId)
           )));
+          const unresolvedOnAttach = msg.reason === "attach"
+            ? [...submittedUserMessagesRef.current].flatMap(([id, submitted]) => (
+                submitted.sessionId === msg.session_id
+                && !snapshotIds.has(id)
+                && !terminalOutcomeIds.has(id)
+                && !renderedSubmissionIdsRef.current.has(acceptedClientMessageKey(msg.session_id, id))
+                  ? [{ ...submitted, id, cancelStatus: "uncertain" as const,
+                      cancelError: "Delivery unconfirmed after reconnect. This message may already have been accepted. It has not been automatically resent; check history before restoring and resending." }]
+                  : []
+              ))
+            : [];
+          const unresolvedIds = new Set(unresolvedOnAttach.map((message) => message.id));
+          if (unresolvedIds.size > 0) setMessages((current) => current.filter((message) => !(
+            isLocalPendingUserMessage(message) && unresolvedIds.has(message.__localId)
+          )));
           setQueuedMessagesSynced((current) => {
             const existing = new Map(current.map((message) => [message.id, message]));
             return [
+              ...unresolvedOnAttach,
               ...snapshot.map((message) => {
                 const submitted = submittedUserMessagesRef.current.get(message.id);
                 const correlatedSubmitted = submitted?.sessionId === msg.session_id ? submitted : undefined;
@@ -4357,8 +4421,11 @@ export function ChatPanel({
               ...current.filter((message) => (
                 !snapshotIds.has(message.id)
                 && !terminalOutcomeIds.has(message.id)
-                && message.cancelStatus === "registering"
-                && message.transportGeneration === transportGeneration
+                && !unresolvedIds.has(message.id)
+                && (message.cancelStatus === "uncertain" || (
+                  message.cancelStatus === "registering"
+                  && message.transportGeneration === transportGeneration
+                ))
               )),
             ];
           });
@@ -4651,13 +4718,17 @@ export function ChatPanel({
               ? unmatchedHistoryUserOccurrences(rawWindowMessages, currentSessionMessages)
               : [],
           );
+          rememberHistorySubmissionOccurrences(newWindowUserOccurrences);
           for (const historyMessage of rawWindowMessages) {
             if (historyMessage.type !== "user") continue;
             const id = userMessageId(historyMessage);
             if (id) seenUserMessageIdsRef.current.add(id);
           }
 
-          let remainingQueued = queuedUserMessagesRef.current;
+          let remainingQueued = queuedUserMessagesRef.current.filter((message) => (
+            message.cancelStatus !== "uncertain"
+            || !renderedSubmissionIdsRef.current.has(acceptedClientMessageKey(msg.session_id, message.id))
+          ));
           if (hasActiveAssistantOutput() && remainingQueued.length > 0 && newWindowUserOccurrences.size > 0) {
             remainingQueued = [...remainingQueued];
             for (const historyMessage of newWindowUserOccurrences) {
@@ -4852,6 +4923,7 @@ export function ChatPanel({
           const newHistoryUserOccurrences = new Set(
             unmatchedHistoryUserOccurrences(historyMessages, currentSessionMessages),
           );
+          rememberHistorySubmissionOccurrences(newHistoryUserOccurrences);
           if (
             (hasActiveAssistantOutput() || msg.reason === "compaction_end_reconciliation")
             && queuedUserMessagesRef.current.length > 0
@@ -4876,7 +4948,15 @@ export function ChatPanel({
             }
           } else {
             setMessages((prev) => mergeHistoryWithLocalPending(historyMessages, prev));
-            clearQueuedAndDeferredUserMessages();
+            // An empty history poll is not proof that a disconnected send was
+            // rejected. Keep unresolved recovery visible until an exact outcome
+            // or a newly matched durable occurrence arrives.
+            setQueuedMessagesSynced((current) => current.filter((message) => (
+              message.cancelStatus === "uncertain"
+              && !renderedSubmissionIdsRef.current.has(acceptedClientMessageKey(msg.session_id, message.id))
+            )));
+            deferredUserMessagesRef.current = [];
+            setDeferredUserMessages([]);
           }
           applyTranscriptAction({
             type: "legacy_history",
@@ -6386,6 +6466,15 @@ export function ChatPanel({
     void addAttachmentFiles(attachmentFiles);
   }, [addAttachmentFiles]);
 
+  const handleRestoreUnconfirmedMessage = useCallback((messageId: string) => {
+    const submitted = submittedUserMessagesRef.current.get(messageId);
+    if (!submitted || submitted.sessionId !== activeSessionIdRef.current
+      || !queuedUserMessagesRef.current.some((message) => message.id === messageId && message.cancelStatus === "uncertain")) return;
+    submittedUserMessagesRef.current.delete(messageId);
+    setQueuedMessagesSynced((current) => current.filter((message) => message.id !== messageId));
+    restoreRejectedSubmission(submitted);
+  }, [restoreRejectedSubmission, setQueuedMessagesSynced]);
+
   const handleSend = useCallback(async () => {
     const trimmed = inputText.trim();
     const attachments = pendingAttachments;
@@ -7850,7 +7939,7 @@ export function ChatPanel({
         )}
       </div>
 
-      <QueuedUserMessages messages={queuedUserMessages} onCancel={handleCancelQueuedMessage} />
+      <QueuedUserMessages messages={queuedUserMessages} onCancel={handleCancelQueuedMessage} onRestore={handleRestoreUnconfirmedMessage} />
 
       {/* ---- Interactive prompts: never persisted into chat history ---- */}
       {(visibleExternalActionApprovals.length > 0 || externalActionRetentionNotice) && (
