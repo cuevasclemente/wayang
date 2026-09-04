@@ -7352,13 +7352,15 @@ export function ChatPanel({
               <button
                 type="button"
                 onClick={() => {
-                  if (isAgentRunning || isModelSaving) return;
+                  if (isModelSaving) return;
                   setIsAgentPickerOpen(false);
                   setModelQuery("");
                   setIsModelPickerOpen((open) => !open);
                 }}
-                disabled={isAgentRunning || isModelSaving}
-                title={modelError || "Model used for future turns"}
+                disabled={isModelSaving}
+                title={modelError || (isAgentRunning
+                  ? "Queued: the new model applies to the next turn"
+                  : "Model used for future turns")}
                 className="max-w-64 truncate rounded border border-neutral-800 bg-neutral-900 px-2 py-0.5 text-left text-xs text-neutral-200 outline-none hover:border-neutral-700 focus:border-blue-600 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {selectedModelLabel}

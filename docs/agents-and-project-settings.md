@@ -88,6 +88,12 @@ For a new session:
 
 When switching agents inside a session, the target agent's default takes priority, then the project/Pi fallback. The model can be changed again afterward with the normal session model selector.
 
+## Changing the session model
+
+The model picker and the `/model` command work while the agent is streaming or has queued work. A busy runtime switches models live: the current turn finishes on the old model (pi captures the model once per run), and the next turn — a queued follow-up or the next prompt — uses the new model. The switch is validated first (model exists, auth configured, memory-first context-window requirements), appends a durable `model_change` transcript entry, and never rebuilds the runtime, so tools, approvals, browser leases, and queues stay intact. Pi's model switch also writes pi settings defaults; Wayang restores the prior values so a session choice never becomes the project or deployment default.
+
+Idle sessions keep the stronger behavior: the runtime stops and the next use rebuilds fresh surfaces from the unchanged Project privacy/RBAC decision.
+
 ## Switching agents
 
 The agent pill in the chat header previews a switch before applying it. The confirmation shows:

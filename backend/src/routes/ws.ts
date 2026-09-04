@@ -2146,7 +2146,9 @@ async function handleBuiltinSlashCommand(ws: WebSocket, sessionId: string, conte
       const releaseTopLevelWork = beginPiSessionTopLevelWork(handle);
       try {
         const selected = await setSessionModel(sessionId, provider, model);
-        sendCommandNotice(ws, `Model set to ${selected.provider}/${selected.model}`);
+        sendCommandNotice(ws, selected.applied_live
+          ? `Model set to ${selected.provider}/${selected.model} (takes effect next turn)`
+          : `Model set to ${selected.provider}/${selected.model}`);
         sendSafe(ws, { type: "command_guard_state", ...getCommandGuardState(sessionId) });
         return true;
       } finally {

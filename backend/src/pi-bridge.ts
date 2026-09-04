@@ -2070,11 +2070,7 @@ async function stopRuntimeForModelChange(
   );
   if (row.provider === targetProvider && row.model === targetModel && liveModelMatches
     && !(forceLiveStop && (sessions.has(id) || sessionCreations.has(id)))) return false;
-  if (handle && (
-    handle.session.isStreaming
-    || (handle.session.pendingMessageCount ?? 0) > 0
-    || manualCompactionQueueForHandle(handle)
-  )) {
+  if (handle && liveRuntimeBusy(handle)) {
     throw new WorkspaceStoreError("Live model changes require an idle session; stop the session and retry", 409);
   }
   const browserTeardown: PiSessionBrowserTeardown = { kind: "detach", reason: "model_or_agent_switch" };
@@ -2083,15 +2079,64 @@ async function stopRuntimeForModelChange(
   return true;
 }
 
-function assertModelSwitchIdle(id: string): void {
-  const handle = sessions.get(id);
-  if (handle && (
+/** A live runtime is busy while generation, queued message delivery, or an
+ * owned manual-compaction flow is active. Busy runtimes switch models live:
+ * pi captures the model once per run, so the in-flight turn finishes on the
+ * old model and the next run (a queued follow-up or the next prompt) uses
+ * the new one. */
+function liveRuntimeBusy(handle: PiSessionHandle): boolean {
+  return Boolean(
     handle.session.isStreaming
     || (handle.session.pendingMessageCount ?? 0) > 0
-    || manualCompactionQueueForHandle(handle)
-  )) {
-    throw new WorkspaceStoreError("Live model changes require an idle session; stop the session and retry", 409);
+    || manualCompactionQueueForHandle(handle),
+  );
+}
+
+type PiSettingsDefaultRestorer = (provider: string | undefined, modelId: string | undefined) => void;
+
+/** The SDK types these members private while the runtime keeps them public.
+ * Wayang snapshots and restores the exact prior global values so a
+ * session-scoped live model switch never rewrites deployment/project-owned
+ * pi settings defaults (pi's public setModel persists them unconditionally). */
+interface PiSettingsDefaultInternals {
+  readonly globalSettings: { defaultProvider?: string; defaultModel?: string };
+  setDefaultModelAndProvider: PiSettingsDefaultRestorer;
+}
+
+/** Apply a model change to a healthy live runtime without destroying any of
+ * its surfaces. Provider/model authority never confers or narrows runtime
+ * authority, so tools, hooks, leases, and queues stay intact; only the next
+ * run's model changes. */
+async function applyLiveModelSwitch(
+  handle: PiSessionHandle,
+  row: SessionRow,
+  project: ProjectRow | undefined,
+  model: Model<Api>,
+): Promise<void> {
+  const settingsManager = handle.session.settingsManager;
+  const settingsInternals = settingsManager as unknown as PiSettingsDefaultInternals;
+  const previousProvider = settingsInternals.globalSettings.defaultProvider;
+  const previousModelId = settingsInternals.globalSettings.defaultModel;
+  try {
+    // The in-flight run captured its model already, so pi applies this change
+    // to the next run and appends a durable model_change transcript entry.
+    await handle.session.setModel(model);
+  } finally {
+    settingsInternals.setDefaultModelAndProvider(previousProvider, previousModelId);
+    // Restore writes join pi's async settings queue; flush so no later reader
+    // (for example default-model resolution from a fresh SettingsManager) can
+    // observe the transient session choice pi persisted above.
+    await settingsManager.flush();
   }
+  // Every settings save() re-merges from the settings files and drops applied
+  // overrides, so re-derive memory-first compaction thresholds for the new
+  // context window after the restore. Pi reads compaction settings per
+  // compaction, so the next auto/manual compaction uses the fresh values.
+  const config = project
+    ? memoryFirstCompactionForSession(row, project)
+    : DISABLED_MEMORY_FIRST_COMPACTION_CONFIG;
+  applyMemoryFirstCompactionOverrides(settingsManager, config, model.contextWindow);
+  handle.model = model.id;
 }
 
 async function withModelMutationLock<T>(id: string, operation: () => Promise<T>): Promise<T> {
@@ -2109,11 +2154,10 @@ export async function setSessionModel(
   id: string,
   provider: string,
   modelId: string,
-): Promise<{ provider: string; model: string; name: string }> {
+): Promise<{ provider: string; model: string; name: string; applied_live: boolean }> {
   return withModelMutationLock(id, async () => {
     const row = getSessionById(id);
     if (!row) throw new WorkspaceStoreError("Session not found", 404);
-    assertModelSwitchIdle(id);
     const registry = await getSessionModelSelectionRegistry(id);
     let model = resolveModelFromRegistry(registry, provider, modelId);
     if (!model) {
@@ -2128,22 +2172,37 @@ export async function setSessionModel(
       { provider: String(model.provider), id: model.id, contextWindow: model.contextWindow },
     );
 
+    const handle = sessions.get(id);
+    const liveModelMatches = !handle
+      ? false
+      : !handle.capabilityAuthorityDenied
+        && String(handle.session.model?.provider) === provider
+        && handle.session.model?.id === modelId;
+    if (row.provider === provider && row.model === modelId && liveModelMatches) {
+      return { provider: String(model.provider), model: model.id, name: model.name, applied_live: false };
+    }
+    if (handle && !handle.capabilityAuthorityDenied && liveRuntimeBusy(handle)) {
+      // Busy runtimes switch live: the current turn keeps the old model and
+      // the change is queued for the next turn without destroying surfaces.
+      await applyLiveModelSwitch(handle, row, project, model);
+      updateSessionModel(id, model.id, String(model.provider));
+      return { provider: String(model.provider), model: model.id, name: model.name, applied_live: true };
+    }
     await stopRuntimeForModelChange(id, row, provider, modelId);
     // Persistence happens only after the old loader, hooks, tools, host process,
     // browser lease, and queues have been fully destroyed. Next use constructs
     // fresh surfaces from the unchanged Project privacy/RBAC decision.
     updateSessionModel(id, model.id, String(model.provider));
-    return { provider: String(model.provider), model: model.id, name: model.name };
+    return { provider: String(model.provider), model: model.id, name: model.name, applied_live: false };
   });
 }
 
 export async function setSessionDefaultModel(
   id: string,
-): Promise<{ provider: string; model: string; name: string }> {
+): Promise<{ provider: string; model: string; name: string; applied_live: boolean }> {
   return withModelMutationLock(id, async () => {
     const row = getSessionById(id);
     if (!row) throw new WorkspaceStoreError("Session not found", 404);
-    assertModelSwitchIdle(id);
     const registry = await getSessionModelSelectionRegistry(id);
     await refreshDynamicModels(registry);
     const settingsManager = SettingsManager.create(row.cwd, getAgentDirPath());
@@ -2157,9 +2216,30 @@ export async function setSessionDefaultModel(
       project ? memoryFirstCompactionForSession(row, project) : DISABLED_MEMORY_FIRST_COMPACTION_CONFIG,
       { provider: String(defaultModel.provider), id: defaultModel.id, contextWindow: defaultModel.contextWindow },
     );
+
+    const handle = sessions.get(id);
+    if (handle && !handle.capabilityAuthorityDenied && liveRuntimeBusy(handle)) {
+      // Busy runtimes switch live. A runtime already on the default model only
+      // reconciles the stored row; null/null means "follow the default".
+      const liveOnDefault = String(handle.session.model?.provider) === String(defaultModel.provider)
+        && handle.session.model?.id === defaultModel.id;
+      if (!liveOnDefault) await applyLiveModelSwitch(handle, row, project, defaultModel);
+      updateSessionModel(id, null, null);
+      return {
+        provider: String(defaultModel.provider),
+        model: defaultModel.id,
+        name: defaultModel.name,
+        applied_live: !liveOnDefault,
+      };
+    }
     await stopRuntimeForModelChange(id, row, null, null, true);
     updateSessionModel(id, null, null);
-    return { provider: String(defaultModel.provider), model: defaultModel.id, name: defaultModel.name };
+    return {
+      provider: String(defaultModel.provider),
+      model: defaultModel.id,
+      name: defaultModel.name,
+      applied_live: false,
+    };
   });
 }
 

@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import { Type } from "@earendil-works/pi-ai";
-import { SessionManager, defineTool } from "@earendil-works/pi-coding-agent";
+import { SessionManager, SettingsManager, defineTool } from "@earendil-works/pi-coding-agent";
 import {
   abortInteractiveTurn,
   appendStreamingMessageToHistory,
@@ -1766,16 +1766,48 @@ test("fluid model changes preserve pair authority while destroying every old run
       detachAgentLease() { closes.push("host-browser-tools"); return cleanupRelease.promise; },
     } as any;
 
+    const settingsDefaultsUnchanged = (label: string): void => {
+      const settings = SettingsManager.create(cwd, process.env.PI_CODING_AGENT_DIR!);
+      assert.equal(settings.getDefaultProvider(), undefined, `${label}: live switch must not rewrite pi settings defaults`);
+      assert.equal(settings.getDefaultModel(), undefined, `${label}: live switch must not rewrite pi settings defaults`);
+    };
+
     try {
+      // A queued follow-up counts as busy: the switch applies to the live
+      // runtime and lands on the next turn instead of rejecting.
       Object.defineProperty(anySession, "pendingMessageCount", { configurable: true, value: 1 });
-      await assert.rejects(setSessionModel(row.id, target.provider, target.model), /idle session/);
-      assert.equal(handle.capabilityAuthorityDenied, undefined, "queued conflict leaves old runtime intact");
-      assert.deepEqual([getSessionById(row.id)!.provider, getSessionById(row.id)!.model], [source.provider, source.model]);
+      const queuedSwitch = await setSessionModel(row.id, target.provider, target.model);
+      assert.equal(queuedSwitch.applied_live, true, "queued conflict switches the live runtime instead of rejecting");
+      assert.equal(handle.capabilityAuthorityDenied, undefined, "live switch leaves old runtime authority intact");
+      assert.deepEqual([getSessionById(row.id)!.provider, getSessionById(row.id)!.model], [target.provider, target.model]);
+      assert.equal(anySession.agent.state.model.id, target.model);
+      assert.equal(handle.model, target.model);
+      assert.equal(disposes, 0, "live switch does not dispose the runtime");
+      assert.deepEqual(closes, [], "live switch does not detach loader or browser surfaces");
+      assert.equal(hostRevocations, 0, "live switch does not revoke host children");
+      assert.ok(anySession.agent.state.tools.includes(oldTool), "live switch keeps every tool active");
+      assert.ok(
+        anySession.sessionManager.getBranch().some((entry: any) => entry?.type === "model_change"),
+        "live switch appends a durable model_change transcript entry",
+      );
+      settingsDefaultsUnchanged("queued switch");
       delete anySession.pendingMessageCount;
 
       Object.defineProperty(anySession, "isStreaming", { configurable: true, value: true });
-      await assert.rejects(setSessionModel(row.id, target.provider, target.model), /idle session/);
-      assert.equal(handle.capabilityAuthorityDenied, undefined, "streaming conflict leaves old runtime intact");
+      await assert.rejects(
+        setSessionModel(row.id, "synthetic-unknown-provider", "synthetic-unknown-model"),
+        /Unknown model/,
+        "invalid targets still reject while streaming",
+      );
+      assert.equal(anySession.agent.state.model.id, target.model, "rejected switch leaves the live model unchanged");
+      assert.deepEqual([getSessionById(row.id)!.provider, getSessionById(row.id)!.model], [target.provider, target.model]);
+      const streamingSwitch = await setSessionModel(row.id, source.provider, source.model);
+      assert.equal(streamingSwitch.applied_live, true, "streaming conflict switches the live runtime instead of rejecting");
+      assert.equal(handle.capabilityAuthorityDenied, undefined, "live switch leaves old runtime authority intact");
+      assert.deepEqual([getSessionById(row.id)!.provider, getSessionById(row.id)!.model], [source.provider, source.model]);
+      assert.equal(anySession.agent.state.model.id, source.model);
+      assert.equal(disposes, 0, "streaming live switch still does not dispose the runtime");
+      settingsDefaultsUnchanged("streaming switch");
       delete anySession.isStreaming;
 
       const changing = setSessionModel(row.id, target.provider, target.model);
