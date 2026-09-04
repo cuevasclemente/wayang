@@ -67,7 +67,7 @@ For a single-user private LAN without an existing reverse proxy, Wayang includes
 
 ## Pi provider authentication
 
-Wayang uses pi 0.84.1's standard authentication and model runtime. The coding-agent package is pinned to the repository-vendored `0.84.1-wayang.4f7d03ce` artifact (SHA-256 `c82956f058b7dc09a2206c8c9f9331f2971042a4fa9597a5ee017f58d5303da9`) so session-name writers and PIN-gated transcript event mutations share the reviewed physical-file transaction, lock, atomic multi-entry CAS, stale-runtime mutation epoch, optional fixed compaction threshold, optional complete-turn retention, and incremental resume-session loading.
+Wayang uses pi 0.84.1's standard authentication and model runtime. The coding-agent package is pinned to the repository-vendored `0.84.1-wayang.4f7d03ce` artifact (SHA-256 `c82956f058b7dc09a2206c8c9f9331f2971042a4fa9597a5ee017f58d5303da9`) so session-name writers and PIN-gated transcript event mutations share the reviewed physical-file transaction, lock, atomic multi-entry CAS, stale-runtime mutation epoch, optional fixed compaction threshold, optional complete-turn retention, and incremental resume-session loading. The model runtime is pinned separately to the repository-vendored Pi AI `0.84.1-wayang.61da6928` artifact (SHA-256 `61da692876d01830ebdcc1dc16858b2c7d93b0eab8fce6305e0fc76eba41d3dd`) so the built-in catalog retains reviewed GPT-6 Astra metadata before the next upstream pi release.
 
 ### OAuth or pi-managed API key
 
@@ -99,6 +99,8 @@ Inside the pinned local pi CLI, run `/login`, choose the provider, complete the 
 The bundled pi release also supports additional providers, including Azure OpenAI (`AZURE_OPENAI_API_KEY` plus endpoint/resource settings), Cloudflare, Vercel AI Gateway, ZAI, OpenCode, Hugging Face, Kimi, MiniMax, Xiaomi MiMo, Amazon Bedrock/AWS credentials, and Google Vertex application-default credentials. Configure specialized providers through pi `/login`, pi's provider documentation, and model settings rather than extending the wizard with unreviewed cloud fields. Do not use CLI `--api-key` arguments.
 
 ### Wayang model catalog policy
+
+The built-in direct OpenAI catalog includes GPT-6 Astra (`gpt-6-astra`) through the Responses API with text/image input, low through max reasoning, a 272K short-pricing-tier default context, and a 128K output limit. Pi also derives an Azure OpenAI slot from that metadata. OpenAI's Codex catalog does not list Astra yet, so the Codex OAuth entry is an explicitly forward-compatible placeholder mirroring the verified Responses metadata; it becomes usable only when OpenAI's authenticated backend actually serves the model, and no paid request is made merely to prove listing. The model appears as available only when the corresponding provider authentication is configured and upstream grants account access.
 
 Wayang projects a curated current Together serverless chat catalog from Together's authenticated `/v1/models` endpoint. Live metadata refreshes display names, context windows, and token prices, while a reviewed local allowlist supplies conservative reasoning, modality, and output-limit capabilities. Legacy priced Together endpoints remain usable by other clients but do not clutter Wayang's picker. If the live fetch fails, the pinned pi catalog remains available only for models in the same curated allowlist.
 

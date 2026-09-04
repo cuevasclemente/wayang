@@ -27,7 +27,7 @@
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.65",
     "@earendil-works/pi-agent-core": "0.84.1",
-    "@earendil-works/pi-ai": "0.84.1",
+    "@earendil-works/pi-ai": "file:earendil-works-pi-ai-0.84.1-wayang.61da6928.tgz",
     "@earendil-works/pi-coding-agent": "file:earendil-works-pi-coding-agent-0.84.1-wayang.4f7d03ce.tgz",
     "@modelcontextprotocol/sdk": "1.29.0",
     "better-sqlite3": "^12.10.0",
