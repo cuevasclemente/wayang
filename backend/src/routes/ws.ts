@@ -275,12 +275,17 @@ export async function requireWebSocketRuntimeAttachment(
 
 /** @internal Exported for focused wire-contract tests. */
 export function serializeSessionRuntimeState(sessionId: string, selectionId: string | null): SessionRuntimeStateMessage {
+  const liveHandle = getPiSession(sessionId);
   return {
     type: "session_runtime_state" as const,
     session_id: sessionId,
     ...(selectionId ? { selection_id: selectionId } : {}),
     bash_mode: getPiSessionBashMode(sessionId),
     mutation_locked: getRuntimeMutationSessionState(sessionId).mutation_locked,
+    ...(liveHandle ? {
+      streaming: Boolean(liveHandle.session.isStreaming),
+      compacting: Boolean(liveHandle.session.isCompacting),
+    } : {}),
   };
 }
 
@@ -1891,6 +1896,16 @@ function handleConnection(
       return;
     }
 
+    if (msg.type === "runtime_state_request") {
+      if (
+        typeof msg.session_id !== "string"
+        || msg.session_id !== currentSessionId
+        || (typeof msg.selection_id === "string" && msg.selection_id !== currentSelectionId)
+      ) return;
+      sendSafe(ws, serializeSessionRuntimeState(currentSessionId, currentSelectionId));
+      return;
+    }
+
     if (msg.type === "interactive_state_sync_request") {
       if (
         typeof msg.session_id !== "string"
@@ -2964,6 +2979,7 @@ function handleCommandGuardApprovalResponse(
 
 export function canHandleClientMessageBeforeSessionReady(type: unknown): boolean {
   return type === "interactive_state_sync_request"
+    || type === "runtime_state_request"
     || type === "interview_response"
     || type === "interview_cancel"
     || type === "sudo_response";

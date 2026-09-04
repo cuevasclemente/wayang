@@ -4170,6 +4170,16 @@ export function ChatPanel({
           ) {
             setBashMode(isBashMode(msg.bash_mode) ? msg.bash_mode : "unavailable");
             setRuntimeMutationLocked(msg.mutation_locked === true);
+            // Authoritative runtime reconciliation: a lost lifecycle event must
+            // not pin the session in a phantom "running" state. The backend
+            // omits these fields when no live runtime is attached.
+            if (typeof msg.streaming === "boolean") {
+              isStreamingRef.current = msg.streaming;
+              setIsStreaming(msg.streaming);
+            }
+            if (typeof msg.compacting === "boolean") {
+              setIsCompacting(msg.compacting);
+            }
           }
           return;
         }
@@ -7182,6 +7192,32 @@ export function ChatPanel({
   const displayedStreamingBlocks = combineStreamingBlocks(streamingHistoryPrefix, streamingBlocks);
   const hasStreamingContent = displayedStreamingBlocks.content.length > 0;
   const isAgentRunning = isStreaming || hasStreamingContent || isCompacting;
+
+  // Staleness watchdog for the compaction lifecycle. A lost compaction_end or
+  // agent_settled event otherwise pins the session in a phantom "compacting"
+  // state: Interrupt stays armed, Resend is disabled, and new messages are
+  // silently queued instead of sent. While the UI believes a compaction is
+  // running with no other live output, periodically request an authoritative
+  // runtime snapshot; the session_runtime_state reply reconciles the flags.
+  useEffect(() => {
+    if (!isCompacting || isStreaming || hasStreamingContent) return;
+    if (wsStatus !== "connected" || !activeSessionId) return;
+    const requestRuntimeState = () => {
+      const sessionId = activeSessionIdRef.current;
+      if (!sessionId) return;
+      sendWs({
+        type: "runtime_state_request",
+        session_id: sessionId,
+        ...(selectionIdRef.current ? { selection_id: selectionIdRef.current } : {}),
+      });
+    };
+    const initialProbe = window.setTimeout(requestRuntimeState, 45_000);
+    const interval = window.setInterval(requestRuntimeState, 90_000);
+    return () => {
+      window.clearTimeout(initialProbe);
+      window.clearInterval(interval);
+    };
+  }, [isCompacting, isStreaming, hasStreamingContent, wsStatus, activeSessionId, sendWs]);
   const isTranscriptLoading = !transcriptOwnedBySelection || isSessionHistoryLoading || wsStatus === "connecting";
   const transcriptMutationOtherwiseUnavailableReason = !paneVisible
     ? "Transcript mutation controls close when the Chat pane is not visible"
