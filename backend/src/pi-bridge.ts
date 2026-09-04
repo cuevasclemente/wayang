@@ -5506,6 +5506,17 @@ export async function abortInteractiveTurn(
   if (options.clearQueue) dropManualCompactionMessageQueue(handle);
   if (handle.session.isCompacting) handle.session.abortCompaction();
   await handle.session.abort();
+  // An interrupted turn can end without a terminal pi lifecycle event (for
+  // example when the abort lands during auto or manual compaction). Clients
+  // gate their "running" UI state on agent_settled/compaction_end, so emit a
+  // synthetic settle after the abort whenever the top-level run is no longer
+  // streaming. This is idempotent for already-idle sessions and guarantees a
+  // deterministic exit from the running state for every live subscriber.
+  if (!handle.session.isStreaming) {
+    try {
+      handle.events?.emit?.("message", { type: "agent_settled" } satisfies SerializedMessage);
+    } catch { /* a failing observer cannot break abort completion */ }
+  }
   schedulePiSessionCapabilityRefreshRetirement(handle);
   return clearedQueue;
 }

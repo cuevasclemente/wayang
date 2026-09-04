@@ -202,6 +202,7 @@ export type ChatClientMessage =
   | ExternalActionResponse
   | CommandGuardPinResponse
   | InteractiveStateSyncRequestMessage
+  | RuntimeStateRequestMessage
   | InterviewResponseMessage
   | InterviewCancelMessage
   | SudoResponseMessage;
@@ -324,6 +325,17 @@ export interface SessionRuntimeStateMessage {
   selection_id?: string;
   bash_mode: BashMode;
   mutation_locked: boolean;
+  /** Authoritative live-run flag; absent when no live runtime is attached. */
+  streaming?: boolean;
+  /** Authoritative compaction flag; absent when no live runtime is attached. */
+  compacting?: boolean;
+}
+
+/** Request an authoritative runtime snapshot (streaming/compacting flags). */
+export interface RuntimeStateRequestMessage {
+  type: "runtime_state_request";
+  session_id: string;
+  selection_id?: string;
 }
 
 export interface TranscriptInvalidatedMessage {

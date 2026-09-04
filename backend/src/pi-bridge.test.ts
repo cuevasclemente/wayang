@@ -1011,6 +1011,59 @@ test("interrupt queue clearing drops manual-compaction work before aborting", as
   assert.equal(aborts, 1);
 });
 
+test("interrupt emits a synthetic agent_settled when the session is idle after abort", async () => {
+  const events = new EventEmitter();
+  const received: Array<{ type?: string }> = [];
+  events.on("message", (message: { type?: string }) => received.push(message));
+  const handle = {
+    id: "synthetic-abort-settle-idle",
+    session: {
+      isCompacting: true,
+      isStreaming: false,
+      clearQueue: () => ({ steering: [], followUp: [] }),
+      abortCompaction: () => {},
+      abort: async () => {},
+    },
+    runtimeGeneration: "abort-settle-idle",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    events,
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+
+  await abortInteractiveTurn(handle, { clearQueue: true });
+
+  assert.deepEqual(received, [{ type: "agent_settled" }],
+    "a lost terminal lifecycle event must not pin clients in the running state");
+});
+
+test("interrupt does not emit a synthetic agent_settled while the session keeps streaming", async () => {
+  const events = new EventEmitter();
+  const received: Array<{ type?: string }> = [];
+  events.on("message", (message: { type?: string }) => received.push(message));
+  const handle = {
+    id: "synthetic-abort-settle-streaming",
+    session: {
+      isCompacting: false,
+      isStreaming: true,
+      clearQueue: () => ({ steering: [], followUp: [] }),
+      abort: async () => {},
+    },
+    runtimeGeneration: "abort-settle-streaming",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    events,
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+
+  await abortInteractiveTurn(handle);
+
+  assert.deepEqual(received, [],
+    "an active run owns its own terminal lifecycle events");
+});
+
 test("settled lifecycle persists terminal assistant and compaction failures", () => {
   const f = currentTurnFixture("wayang-settled-error-");
   try {
