@@ -1011,6 +1011,131 @@ test("interrupt queue clearing drops manual-compaction work before aborting", as
   assert.equal(aborts, 1);
 });
 
+test("interrupt reconciles nonempty browser queues and provenance before capability refresh retirement", async (t) => {
+  for (const clearQueue of [true, false, undefined]) {
+    await t.test(`clearQueue=${String(clearQueue)}`, async () => {
+      const f = currentTurnFixture("wayang-abort-browser-queue-");
+      const row = createSession(f.cwd, { agentProfileId: f.profile.id });
+      const manager = SessionManager.create(f.cwd, f.sessionDir);
+      const abortRelease = deferred();
+      let clearCalls = 0;
+      const fakeSession: any = {
+        model: { provider: "synthetic-provider", id: "synthetic-model" },
+        sessionManager: manager,
+        isStreaming: true,
+        isCompacting: false,
+        _steeringMessages: [] as string[],
+        _emitQueueUpdate() {},
+        agent: { steeringQueue: { messages: [] as any[] } },
+        get pendingMessageCount() { return this._steeringMessages.length; },
+        steer(content: string) {
+          this._steeringMessages.push(content);
+          this.agent.steeringQueue.messages.push({ role: "user", content });
+          return Promise.resolve();
+        },
+        clearQueue() {
+          clearCalls++;
+          assert.equal(handle.interactiveMutationTurnToken, undefined);
+          const steering = this._steeringMessages.splice(0);
+          this.agent.steeringQueue.messages.length = 0;
+          return { steering, followUp: [] };
+        },
+        async abort() {
+          assert.equal(handle.interactiveMutationTurnToken, undefined,
+            "mutation authority is revoked before invoking SDK abort");
+          await abortRelease.promise;
+          this.isStreaming = false;
+        },
+      };
+      const handle = {
+        id: row.id,
+        session: fakeSession,
+        cwd: f.cwd,
+        agentProfileId: f.profile.id,
+        runtimeGeneration: "abort-browser-queue",
+        interactiveTurns: new Map(),
+        queuedBrowserMessages: new Map(),
+        events: new EventEmitter(),
+        subscriberCount: 0,
+        lastActivityAt: Date.now(),
+      } as unknown as PiSessionHandle;
+      try {
+        await sendBrowserMessageTurn(handle, "claimed before abort", undefined, "claimed");
+        fakeSession._steeringMessages.shift();
+        const claimedMessage = fakeSession.agent.steeringQueue.messages.shift();
+        manager.appendMessage({ ...claimedMessage, timestamp: Date.now() });
+        markQueuedBrowserMessageStarted(handle, claimedMessage);
+        await sendBrowserMessageTurn(handle, "pending after abort", undefined, "pending");
+        const tokens = [...handle.interactiveTurns.keys()];
+        assert.equal(tokens.length, 2);
+        assert.ok(handle.interactiveMutationTurnToken);
+        handle.capabilityRefreshPending = true;
+        assert.equal(piSessionHandleCanRetireCapabilityRefresh(handle), false);
+
+        const aborting = abortInteractiveTurn(handle, { clearQueue });
+        assert.equal(resolveInteractiveTurn(handle), null);
+        assert.equal(clearCalls, clearQueue ? 1 : 0);
+        assert.equal(handle.queuedBrowserMessages.size, clearQueue ? 0 : 2);
+        assert.deepEqual([...handle.interactiveTurns.keys()], clearQueue ? [] : tokens);
+        assert.equal(piSessionHandleCanRetireCapabilityRefresh(handle), false,
+          "an in-flight abort is not idle retirement");
+        abortRelease.resolve();
+        assert.deepEqual(await aborting, { steering: clearQueue ? ["pending after abort"] : [], followUp: [] });
+
+        if (!clearQueue) {
+          assert.deepEqual(projectQueuedBrowserMessages(handle).map((message) => message.client_message_id), ["pending"]);
+          markClaimedQueuedBrowserTurnsReady(handle);
+          assert.equal(settleInteractiveTurns(handle).length, 1,
+            "already-claimed provenance survives interrupt for exact settlement");
+          assert.equal(handle.interactiveTurns.size, 1);
+          assert.equal(handle.queuedBrowserMessages.size, 1);
+          assert.equal(piSessionHandleCanRetireCapabilityRefresh(handle), false,
+            "retained work still fences runtime retirement");
+          fakeSession._steeringMessages.shift();
+          const pendingMessage = fakeSession.agent.steeringQueue.messages.shift();
+          manager.appendMessage({ ...pendingMessage, timestamp: Date.now() });
+          assert.equal(markQueuedBrowserMessageStarted(handle, pendingMessage), "pending");
+          markClaimedQueuedBrowserTurnsReady(handle);
+          assert.equal(settleInteractiveTurns(handle).length, 1);
+          assert.equal(manager.getEntries().filter((entry: any) => entry.customType === "wayang-interactive-turn-source.v1").length, 2);
+        }
+        assert.equal(handle.interactiveTurns.size, 0);
+        assert.equal(handle.queuedBrowserMessages.size, 0);
+        assert.deepEqual(projectQueuedBrowserMessages(handle), []);
+        assert.equal(piSessionHandleCanRetireCapabilityRefresh(handle), true);
+        let retireCalls = 0;
+        assert.equal(await retirePiSessionCapabilityRefreshIfIdle(handle, {
+          lookup: new Map([[handle.id, handle]]),
+          retire: async () => { retireCalls++; },
+        }), true);
+        assert.equal(retireCalls, 1);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      } finally {
+        abortRelease.resolve();
+        f.cleanup();
+      }
+    });
+  }
+});
+
+test("failed interrupt queue clearing revokes mutation authority without orphaning retained records", async () => {
+  const turn = { token: "synthetic-turn" };
+  const record = { turnToken: turn.token };
+  const handle = {
+    session: {
+      clearQueue() { throw new Error("synthetic queue clear failure"); },
+      abort() { assert.fail("failed clearing must not report abort completion"); },
+    },
+    interactiveTurns: new Map([[turn.token, turn]]),
+    interactiveMutationTurnToken: turn.token,
+    queuedBrowserMessages: new Map([["synthetic-message", record]]),
+  } as unknown as PiSessionHandle;
+  await assert.rejects(abortInteractiveTurn(handle, { clearQueue: true }), /synthetic queue clear failure/);
+  assert.equal(handle.interactiveMutationTurnToken, undefined);
+  assert.equal(handle.interactiveTurns.get(turn.token), turn);
+  assert.equal(handle.queuedBrowserMessages.get("synthetic-message"), record);
+});
+
 test("interrupt emits a synthetic agent_settled when the session is idle after abort", async () => {
   const events = new EventEmitter();
   const received: Array<{ type?: string }> = [];

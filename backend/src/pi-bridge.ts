@@ -5499,11 +5499,19 @@ export async function abortInteractiveTurn(
   handle: PiSessionHandle,
   options: { clearQueue?: boolean } = {},
 ): Promise<{ steering: string[]; followUp: string[] }> {
-  retireInteractiveTurn(handle);
+  // Interrupt revokes mutation authority immediately, but accepted source
+  // evidence must survive when Pi retains queued work for later settlement.
+  revokeInteractiveMutationAuthority(handle);
   const clearedQueue = options.clearQueue
     ? handle.session.clearQueue()
     : { steering: [], followUp: [] };
-  if (options.clearQueue) dropManualCompactionMessageQueue(handle);
+  if (options.clearQueue) {
+    // Only retire after successful SDK clearing. Both maps must move together:
+    // settlement cannot remove a browser record whose ledger token was erased.
+    retireInteractiveTurn(handle);
+    handle.queuedBrowserMessages?.clear();
+    dropManualCompactionMessageQueue(handle);
+  }
   if (handle.session.isCompacting) handle.session.abortCompaction();
   await handle.session.abort();
   // An interrupted turn can end without a terminal pi lifecycle event (for
