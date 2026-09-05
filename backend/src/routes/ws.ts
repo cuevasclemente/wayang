@@ -213,6 +213,18 @@ export function resolveOwningTranscriptNegotiation(
   return quarantined ? { protocol: null, intent: "latest" } : requested;
 }
 
+/** @internal Admit only JSON object envelopes before any dispatch/queue access. */
+export function parseClientMessageEnvelope(raw: string): (Record<string, unknown> & { type: string }) | null {
+  let value: unknown;
+  try { value = JSON.parse(raw); }
+  catch { return null; }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const message = value as Record<string, unknown>;
+  if (typeof message.type !== "string" || !message.type.trim()) return null;
+  // Per-command payload validation and unknown-type handling remain in dispatch.
+  return message as Record<string, unknown> & { type: string };
+}
+
 const wsHandshakeStarts = new WeakMap<object, number>();
 
 function nowMs(): number {
@@ -2049,12 +2061,8 @@ function handleConnection(
   ws.on("message", (raw) => {
     if (!alive) return;
 
-    let msg: any;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    const msg = parseClientMessageEnvelope(raw.toString());
+    if (!msg) return;
 
     dispatchClientMessage(msg);
   });

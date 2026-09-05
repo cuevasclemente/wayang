@@ -3,9 +3,32 @@ import assert from "node:assert/strict";
 import type { PiSessionHandle } from "../pi-bridge.js";
 import {
   isStaleWebSocketRuntimeAttachmentError,
+  parseClientMessageEnvelope,
   requireWebSocketRuntimeAttachment,
   resolveWebSocketRuntimeHandle,
 } from "./ws.js";
+
+test("WebSocket envelope admission rejects null, primitives, arrays, and invalid types", () => {
+  for (const raw of [
+    "{", "null", "true", "42", '"message"', "[]", '[{"type":"message"}]',
+    "{}", '{"type":null}', '{"type":42}', '{"type":{}}', '{"type":[]}',
+    '{"type":""}', '{"type":"  \\t"}',
+  ]) {
+    assert.equal(parseClientMessageEnvelope(raw), null, raw);
+  }
+});
+
+test("WebSocket envelope admission preserves valid payloads and unknown string types", () => {
+  for (const message of [
+    { type: "message", content: "synthetic", client_message_id: "local-1", attachments: [] },
+    { type: "interrupt", clear_queue: false },
+    { type: "switch_session", session_id: "synthetic-session", selection_id: "selection-1" },
+    { type: "future_message_type", extra: { nested: true } },
+    { type: "message", content: null }, // Payload validation still belongs to the command handler.
+  ]) {
+    assert.deepEqual(parseClientMessageEnvelope(JSON.stringify(message)), message);
+  }
+});
 
 function handle(denied?: true): PiSessionHandle {
   return (denied ? { capabilityAuthorityDenied: true } : {}) as PiSessionHandle;
