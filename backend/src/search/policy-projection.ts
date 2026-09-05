@@ -235,7 +235,9 @@ export function startDreamPolicyProjection(): void {
     catch (error) { console.error("[policy-projection] refresh failed:", error); }
   };
   const scheduleRefresh = (): void => {
-    if (refreshTimer) clearTimeout(refreshTimer);
+    // Coalesce against the first event, not the last: continuous store writes
+    // must not indefinitely starve consumers waiting for a fresh fingerprint.
+    if (refreshTimer) return;
     refreshTimer = setTimeout(() => {
       refreshTimer = null;
       refresh();
