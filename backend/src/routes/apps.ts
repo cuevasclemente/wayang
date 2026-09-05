@@ -60,22 +60,39 @@ export function shouldForwardAppProxyResponseHeader(name: string): boolean {
   return !APP_PROXY_BLOCKED_RESPONSE_HEADERS.has(name.toLowerCase());
 }
 
-function requestTarget(req: Request): { sessionId?: string; projectCwd?: string } {
-  const sessionId = typeof req.query.session_id === "string"
-    ? req.query.session_id
-    : typeof req.body?.sessionId === "string"
-      ? req.body.sessionId
-      : undefined;
-  const projectCwd = typeof req.query.project_cwd === "string"
-    ? req.query.project_cwd
-    : typeof req.body?.projectCwd === "string"
-      ? req.body.projectCwd
-      : undefined;
-  return { sessionId, projectCwd };
+interface AppRequestTarget {
+  sessionId?: string;
+  projectCwd?: string;
 }
 
-function authorizeRequestedTarget(req: Request): string {
-  const { sessionId, projectCwd } = requestTarget(req);
+function requestTarget(req: Request): AppRequestTarget {
+  // All accepted spellings participate: never authorize one selector and then
+  // let a different alias, body value, or default choose the execution target.
+  function selector(aliases: string[], normalize: (value: string) => string): string | undefined {
+    const values: string[] = [];
+    for (const input of [req.query, req.body]) {
+      for (const alias of aliases) {
+        if (!input || !Object.hasOwn(input, alias)) continue;
+        const value: unknown = input[alias];
+        if (typeof value !== "string" || !value.trim()) {
+          throw new AppRegistryError(`${alias} must be a nonempty string`, 400);
+        }
+        values.push(normalize(value));
+      }
+    }
+    if (values.some((value) => value !== values[0])) {
+      throw new AppRegistryError(`Conflicting ${aliases.join("/")} selectors`, 400);
+    }
+    return values[0];
+  }
+  return {
+    sessionId: selector(["session_id", "sessionId"], (value) => value),
+    projectCwd: selector(["project_cwd", "projectCwd"], canonicalizeProjectCwd),
+  };
+}
+
+function authorizeRequestedTarget(req: Request, target: AppRequestTarget): AppRequestTarget {
+  const { sessionId, projectCwd } = target;
   const session = sessionId ? getSessionById(sessionId) : undefined;
   if (sessionId && !session) throw new AppRegistryError("Session not found", 404);
   if (session && projectCwd && canonicalizeProjectCwd(projectCwd) !== canonicalizeProjectCwd(session.cwd)) {
@@ -84,23 +101,23 @@ function authorizeRequestedTarget(req: Request): string {
   if (isAppsAgentRequest(req) && !session && !projectCwd) {
     throw new AppRegistryError("Agent Apps requests require sessionId or projectCwd", 400);
   }
-  const targetCwd = projectCwd || session?.cwd || process.cwd();
+  const targetCwd = canonicalizeProjectCwd(projectCwd || session?.cwd || process.cwd());
   authorizeAppsAgentTarget(req, targetCwd);
-  return targetCwd;
+  return { sessionId, projectCwd: targetCwd };
 }
 
-function appFromRequest(req: Request) {
-  const app = getRegisteredApp(req.params.appId, requestTarget(req));
+function appFromRequest(req: Request, target = requestTarget(req)) {
+  const app = getRegisteredApp(req.params.appId, target);
   authorizeAppsAgentTarget(req, app.projectCwd);
   return app;
 }
 
 router.get("/apps", (req: Request, res: Response) => {
   try {
-    const sessionId = typeof req.query.session_id === "string" ? req.query.session_id : undefined;
-    const projectCwd = typeof req.query.project_cwd === "string" ? req.query.project_cwd : undefined;
+    const target = requestTarget(req);
+    const { sessionId, projectCwd } = target;
     const scan = req.query.scan !== "0";
-    authorizeRequestedTarget(req);
+    authorizeRequestedTarget(req, target);
     if (sessionId) {
       res.json(listAppsForSession(sessionId, scan));
       return;
@@ -117,15 +134,14 @@ router.get("/apps", (req: Request, res: Response) => {
 
 router.post("/apps/register", (req: Request, res: Response) => {
   try {
-    const { sessionId, projectCwd, manifestPath } = req.body ?? {};
-    authorizeRequestedTarget(req);
+    const { manifestPath } = req.body ?? {};
+    const target = authorizeRequestedTarget(req, requestTarget(req));
     if (typeof manifestPath !== "string") {
       res.status(400).json({ error: "manifestPath is required" });
       return;
     }
     const app = registerApp({
-      sessionId: typeof sessionId === "string" ? sessionId : undefined,
-      projectCwd: typeof projectCwd === "string" ? projectCwd : undefined,
+      ...target,
       manifestPath,
     });
     res.status(201).json(app);
@@ -254,13 +270,21 @@ router.get("/apps/:appId/events", (req: Request, res: Response) => {
 
 router.post("/apps/:appId/events", async (req: Request, res: Response) => {
   try {
-    const app = appFromRequest(req);
+    const target = requestTarget(req);
+    const app = appFromRequest(req, target);
+    const sessionId = target.sessionId ?? app.sessionId;
+    const session = sessionId ? getSessionById(sessionId) : undefined;
+    // Preserve the registered-session default, but do not deliver through a
+    // stale registration whose session now belongs to another project.
+    if (session && canonicalizeProjectCwd(session.cwd) !== canonicalizeProjectCwd(app.projectCwd)) {
+      throw new AppRegistryError("Event session cwd does not match app projectCwd", 400);
+    }
     const event = await addAppEvent(app, {
       event: req.body?.event,
       payload: req.body?.payload,
       summary: req.body?.summary,
       sendToAgent: req.body?.sendToAgent === true,
-      sessionId: typeof req.body?.sessionId === "string" ? req.body.sessionId : undefined,
+      sessionId,
     });
     res.status(201).json(event);
   } catch (err) {
