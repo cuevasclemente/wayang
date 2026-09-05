@@ -8,6 +8,7 @@ import {
   failNextHostExecutionPositiveProjectionForTests,
   flush,
   getStore,
+  getStorePublicationGeneration,
   getWorkspaceCapabilityStoreProjectionPath,
   init,
   MAX_HOST_EXECUTION_QUESTIONNAIRE_SUBMISSIONS,
@@ -97,6 +98,28 @@ function syntheticSession(input: {
     error: null,
   };
 }
+
+test("failed lazy projection startup stays uninitialized and retries with the writer lock", () => {
+  const input = pair();
+  close();
+  const generation = getStorePublicationGeneration();
+  const lockPath = path.join(dataDir, "store.json.lock");
+  const projectionPath = getWorkspaceCapabilityStoreProjectionPath(input);
+
+  failNextHostExecutionPositiveProjectionForTests(new Error("synthetic lazy startup failure"));
+  assert.throws(() => getStore(), /synthetic lazy startup failure/);
+  assert.equal(fs.existsSync(lockPath), false, "failed startup releases its writer lock");
+  assert.equal(getStorePublicationGeneration(), generation, "failed startup publishes no store");
+  assert.equal(JSON.parse(fs.readFileSync(projectionPath, "utf8")).available, false);
+
+  failNextHostExecutionPositiveProjectionForTests(new Error("synthetic retry failure"));
+  assert.throws(() => getStore(), /synthetic retry failure/, "retry must not return a half-initialized cached store");
+  const loaded = getStore();
+  assert.ok(loaded.projects.some((project) => project.id === input.project_id));
+  assert.equal(fs.existsSync(lockPath), true, "successful retry reacquires the writer lock");
+  assert.equal(getStorePublicationGeneration(), generation + 1);
+  assert.equal(JSON.parse(fs.readFileSync(projectionPath, "utf8")).available, true);
+});
 
 test("fresh stores contain no capability authority", () => {
   init();
