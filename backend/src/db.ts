@@ -2179,12 +2179,15 @@ export function getStore(): StoreData {
     const storePath = canonicalStorePath();
     const acquiredHere = ensureStoreLock(storePath);
     try {
-      _store = loadStore(storePath);
+      const loaded = loadStore(storePath);
       // Current-schema startup does not rewrite store.json. Deny first, then
       // rebuild from the just-validated store so a crash from an older process
       // cannot leave a stale positive questionnaire projection in service.
-      writeHostExecutionProjectionDenials(_store);
-      writeWorkspaceCapabilityStoreProjections(_store);
+      writeHostExecutionProjectionDenials(loaded);
+      writeWorkspaceCapabilityStoreProjections(loaded);
+      // Publish only after startup succeeds, as in init(). A failed projection
+      // must not leave a cached store after its writer lock has been released.
+      _store = loaded;
       _storePath = storePath;
       bumpStorePublicationGeneration();
     } catch (error) {
