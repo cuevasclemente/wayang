@@ -1611,6 +1611,18 @@ function AssistantMessage({
     setTtsStage("buffering_next_chunk");
   }, [currentChunkIndex, sortedChunks, ttsFinalUrl]);
 
+  // EventSource listeners outlive the render that subscribed. Advance from
+  // current playback state, not the stage captured when Read aloud was clicked.
+  useEffect(() => {
+    if (ttsStage === "idle" || ttsStage === "error") return;
+    // Completion can be batched with the last chunk while we are buffering.
+    if (currentChunkIndex !== null && ttsStage !== "buffering_next_chunk" && ttsStage !== "ready_final") return;
+    const nextChunk = sortedChunks.find((chunk) => currentChunkIndex === null || chunk.index > currentChunkIndex);
+    if (!nextChunk) return;
+    setCurrentChunkIndex(nextChunk.index);
+    setTtsStage("playing");
+  }, [currentChunkIndex, sortedChunks, ttsStage]);
+
   const subscribeToTtsJob = useCallback((eventsUrl: string) => {
     closeTtsEvents();
     const source = new EventSource(eventsUrl, { withCredentials: true });
@@ -1655,17 +1667,6 @@ function AssistantMessage({
       const normalizedChunk = { ...chunk, url: normalizeTtsPlaybackUrl(chunk.url) } as TtsChunkManifest;
       upsertChunk(normalizedChunk);
       setTtsProgress((prev) => ({ completed: Math.max(prev.completed, chunk.index), total: Math.max(prev.total, chunk.index) }));
-      setCurrentChunkIndex((current) => {
-        if (current == null) {
-          setTtsStage("playing");
-          return normalizedChunk.index;
-        }
-        if (ttsStage === "buffering_next_chunk" && normalizedChunk.index > current) {
-          setTtsStage("playing");
-          return normalizedChunk.index;
-        }
-        return current;
-      });
     });
     source.addEventListener("job_completed", (event) => {
       const manifest = parseEvent(event as MessageEvent);
@@ -1686,7 +1687,7 @@ function AssistantMessage({
       setTtsStage("error");
       closeTtsEvents();
     };
-  }, [closeTtsEvents, ttsStage, upsertChunk]);
+  }, [closeTtsEvents, upsertChunk]);
 
   const handleReadAloud = useCallback(async () => {
     if (!ttsAllowed || !sessionId || !messageId || ttsLoading) return;
@@ -3215,6 +3216,11 @@ export function ChatPanel({
   const [modelSelectionError, setModelSelectionError] = useState("");
   const [selectedModelValue, setSelectedModelValue] = useState("");
   const [isModelSaving, setIsModelSaving] = useState(false);
+  const modelRequestGenerationRef = useRef(0);
+  useLayoutEffect(() => {
+    setIsModelSaving(false);
+    return () => { modelRequestGenerationRef.current += 1; };
+  }, [activeSessionId]);
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
   const [modelQuery, setModelQuery] = useState("");
   const [agentProfiles, setAgentProfiles] = useState<AgentProfileSummary[]>([]);
@@ -6290,6 +6296,8 @@ export function ChatPanel({
         return;
       }
 
+      const requestGeneration = ++modelRequestGenerationRef.current;
+      const isCurrentRequest = () => modelRequestGenerationRef.current === requestGeneration;
       setSelectedModelValue(nextValue);
       setIsModelSaving(true);
       setIsModelPickerOpen(false);
@@ -6301,16 +6309,18 @@ export function ChatPanel({
           parsed?.provider ?? null,
           parsed?.model ?? null,
         );
-        onSessionUpdate?.(updated);
         onSessionChange?.();
+        if (!isCurrentRequest()) return;
+        onSessionUpdate?.(updated);
         if (wsConnectedRef.current) sendWs({ type: "command_guard" });
       } catch (err: unknown) {
+        if (!isCurrentRequest()) return;
         const message = err instanceof Error ? err.message : String(err);
         setSelectedModelValue(previousValue);
         setModelError(message);
         setModelSelectionError(message);
       } finally {
-        setIsModelSaving(false);
+        if (isCurrentRequest()) setIsModelSaving(false);
       }
     },
     [activeSessionId, onSessionChange, onSessionUpdate, selectedModelValue, sendWs],

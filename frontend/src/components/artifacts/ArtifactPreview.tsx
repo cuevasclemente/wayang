@@ -20,11 +20,14 @@ export function ArtifactPreview({ sessionId, artifact }: { sessionId: string; ar
   useEffect(() => {
     setTextPreview(null);
     setError("");
+    setLoading(false);
     if (!artifact?.preview_available || !["markdown", "text", "html"].includes(artifact.renderer)) return;
     const controller = new AbortController();
     setLoading(true);
     void fetchArtifactTextPreview(sessionId, artifact.id, controller.signal)
-      .then((preview) => setTextPreview(preview))
+      .then((preview) => {
+        if (!controller.signal.aborted) setTextPreview(preview);
+      })
       .catch((caught) => {
         if (controller.signal.aborted) return;
         setError(caught instanceof ApiError ? caught.message : String(caught));

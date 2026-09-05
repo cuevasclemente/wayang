@@ -179,7 +179,7 @@ async function installRepeatedUserWindowSocket(page: Page, emitPreWindowReplay =
             id: "stale-append-done",
             parentId: "latest-user",
             message: { role: "user", content: "done" },
-          }], "stale-after-request"),
+          }], "stale-after-request", "retired-epoch"),
           emitAppend: () => this.emitWindow("tail_reconcile", [{
             type: "user",
             id: "new-done",
@@ -282,6 +282,7 @@ async function installRepeatedUserWindowSocket(page: Page, emitPreWindowReplay =
         reason: "initial" | "prepend" | "append" | "tail_reconcile",
         messages: Array<Record<string, unknown>>,
         requestId?: string,
+        transcriptEpoch = "repeated-user-epoch",
       ): void {
         const streamingMessage = reason === "initial" ? {
           type: "assistant",
@@ -297,7 +298,7 @@ async function installRepeatedUserWindowSocket(page: Page, emitPreWindowReplay =
           selection_id: this.selectionId,
           reason,
           ...(requestId ? { request_id: requestId } : {}),
-          transcript_epoch: "repeated-user-epoch",
+          transcript_epoch: transcriptEpoch,
           branch_tip_id: reason === "tail_reconcile" ? "new-done" : "latest-user",
           messages,
           ...(streamingMessage ? { streaming_message: streamingMessage } : {}),
@@ -579,6 +580,8 @@ test("repeated queued users ignore ID-less live replay and prepended history unt
   });
   await expect(queued).toHaveCount(1);
   await expect(page.locator('[data-message-id="stale-append-done"]')).toHaveCount(0);
+  await expect(transcript).toHaveAttribute("data-transcript-state", "ready");
+  await expect(page.getByText("Active response remains in progress.", { exact: true })).toBeVisible();
 
   await page.getByTestId("transcript-gap-before").getByRole("button", { name: "Load older" }).click();
   await expect(page.locator('[data-message-id="old-done"]')).toBeVisible();

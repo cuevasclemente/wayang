@@ -236,6 +236,12 @@ export function transcriptWindowReducer<Message>(
     case "window": {
       const incoming = action.window;
       if (state.sessionId !== incoming.session_id) return state;
+      // Retired/unsolicited pages cannot invalidate a newer projection, even
+      // when their epoch differs. Admit the directional request first.
+      if (incoming.reason === "prepend"
+        && (!incoming.request_id || state.inFlightBefore?.requestId !== incoming.request_id)) return state;
+      if (incoming.reason === "append"
+        && (!incoming.request_id || state.inFlightAfter?.requestId !== incoming.request_id)) return state;
 
       const replacesProjection = incoming.reason === "initial"
         || incoming.reason === "reset"
