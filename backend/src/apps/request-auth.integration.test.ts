@@ -9,7 +9,7 @@ import { createPasswordHash } from "../auth/password.js";
 import { AuthService } from "../auth/service.js";
 import type { AuthConfig } from "../config.js";
 import { createAgentProfile } from "../agent-profiles.js";
-import { close, init } from "../db.js";
+import { close, getStore, init } from "../db.js";
 import { createProject } from "../projects.js";
 import { createSession } from "../sessions.js";
 import { stopAllApps } from "./process-manager.js";
@@ -91,6 +91,7 @@ test("Apps agent capability is source-attributed, target-authorized, and launch-
   const previousEnvironment = new Map(environmentNames.map((name) => [name, process.env[name]]));
   process.env.WAYANG_DATA_DIR = path.join(root, "data");
   const manifestPath = writeSyntheticApp(project, envResultPath);
+  writeSyntheticApp(protectedProject, envResultPath);
 
   init();
   const sourceProfile = createAgentProfile({ name: "Apps source", resource_mode: "standard" });
@@ -172,6 +173,165 @@ test("Apps agent capability is source-attributed, target-authorized, and launch-
   const ownList = await fetch(`${baseUrl}/api/apps?${new URLSearchParams({ project_cwd: project, scan: "0" })}`, { headers: agentHeaders });
   assert.equal(ownList.status, 200);
   assert.equal(fs.existsSync(envResultPath), false, "listing must not launch app code");
+
+  await t.test("registration binds authorization and execution to one unambiguous target", async () => {
+    const rejected: Array<{ name: string; query?: string; body: Record<string, unknown> }> = [
+      { name: "query session A/body session B", query: `session_id=${source.id}`, body: { sessionId: protectedSource.id } },
+      { name: "query project A/body project B", query: new URLSearchParams({ project_cwd: project }).toString(), body: { projectCwd: protectedProject } },
+      { name: "query session A/body project B", query: `session_id=${source.id}`, body: { projectCwd: protectedProject } },
+      { name: "query project A/body session B", query: new URLSearchParams({ project_cwd: project }).toString(), body: { sessionId: protectedSource.id } },
+      { name: "conflicting query session aliases", query: `session_id=${source.id}&sessionId=${protectedSource.id}`, body: {} },
+      { name: "conflicting body session aliases", body: { sessionId: source.id, session_id: protectedSource.id } },
+      { name: "conflicting query project aliases", query: new URLSearchParams({ project_cwd: project, projectCwd: protectedProject }).toString(), body: {} },
+      { name: "conflicting body project aliases", body: { projectCwd: project, project_cwd: protectedProject } },
+      { name: "repeated query selector", query: `session_id=${source.id}&session_id=${source.id}`, body: { sessionId: source.id } },
+      { name: "empty query selector", query: "session_id=", body: { sessionId: source.id } },
+      { name: "object query selector", query: `session_id[id]=${source.id}`, body: { sessionId: source.id } },
+      { name: "repeated query project selector", query: new URLSearchParams([["project_cwd", project], ["project_cwd", project]]).toString(), body: { projectCwd: project } },
+      ...[null, 42, false, [], [source.id], { id: source.id }, "", "   "].map((value) => ({
+        name: `invalid body session selector ${JSON.stringify(value)}`,
+        query: `session_id=${source.id}`,
+        body: { sessionId: value },
+      })),
+      ...[null, 42, false, [], [project], { cwd: project }, "", "   "].map((value) => ({
+        name: `invalid body project selector ${JSON.stringify(value)}`,
+        query: new URLSearchParams({ project_cwd: project }).toString(),
+        body: { projectCwd: value },
+      })),
+    ];
+    const before = structuredClone(getStore().apps);
+    for (const { name, query = "", body } of rejected) {
+      const response = await fetch(`${baseUrl}/api/apps/register?${query}`, {
+        method: "POST",
+        headers: { ...agentHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ ...body, manifestPath }),
+      });
+      assert.equal(response.status, 400, name);
+      assert.deepEqual(getStore().apps, before, `${name}: no registration may change`);
+    }
+    const denied = await fetch(`${baseUrl}/api/apps/register?session_id=${protectedSource.id}`, {
+      method: "POST",
+      headers: { ...agentHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: protectedSource.id, manifestPath }),
+    });
+    assert.equal(denied.status, 403, "consistent selectors do not bypass target policy");
+    assert.deepEqual(getStore().apps, before);
+
+    const accepted = [
+      { query: new URLSearchParams({ project_cwd: project }).toString(), body: {} },
+      { query: `session_id=${source.id}`, body: {} },
+      { query: `sessionId=${source.id}`, body: {} },
+      { query: "", body: { session_id: source.id, project_cwd: project } },
+      {
+        query: new URLSearchParams({ session_id: source.id, sessionId: source.id, project_cwd: project, projectCwd: fs.realpathSync(project) }).toString(),
+        body: { sessionId: source.id, session_id: source.id, projectCwd: fs.realpathSync(project), project_cwd: project },
+      },
+    ];
+    for (const { query, body } of accepted) {
+      const response = await fetch(`${baseUrl}/api/apps/register?${query}`, {
+        method: "POST",
+        headers: { ...agentHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ ...body, manifestPath }),
+      });
+      assert.equal(response.status, 201, query);
+      const app = await response.json() as { projectCwd: string; sessionId: string };
+      assert.equal(app.projectCwd, fs.realpathSync(project));
+      assert.equal(app.sessionId, source.id);
+      assert.equal(getStore().apps.some((row) => row.project_cwd === fs.realpathSync(protectedProject)), false);
+    }
+    const missingAgentTarget = await fetch(`${baseUrl}/api/apps/register`, {
+      method: "POST",
+      headers: { ...agentHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify({ manifestPath }),
+    });
+    assert.equal(missingAgentTarget.status, 400, "agent registration must not acquire the owner cwd default");
+
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(project);
+      const ownerDefault = await fetch(`${baseUrl}/api/apps/register`, {
+        method: "POST",
+        headers: { Origin: baseUrl, Cookie: cookie, "Content-Type": "application/json" },
+        body: JSON.stringify({ manifestPath }),
+      });
+      assert.equal(ownerDefault.status, 201);
+      assert.equal((await ownerDefault.json() as { projectCwd: string }).projectCwd, fs.realpathSync(project),
+        "owner registration retains the process cwd default");
+    } finally {
+      process.chdir(originalCwd);
+    }
+
+    const aliasList = await fetch(`${baseUrl}/api/apps?sessionId=${source.id}&scan=0`, { headers: agentHeaders });
+    assert.equal(aliasList.status, 200);
+    assert.equal((await aliasList.json() as unknown[]).length, 1);
+    assert.equal(fs.existsSync(envResultPath), false, "registration never launches either fixture");
+  });
+
+  await t.test("events reject conflicting destinations before persistence or delivery", async () => {
+    const rejected = [
+      { query: `session_id=${source.id}`, body: { sessionId: protectedSource.id } },
+      { query: new URLSearchParams({ project_cwd: project }).toString(), body: { sessionId: protectedSource.id } },
+      { query: `session_id=${source.id}&sessionId=${protectedSource.id}`, body: {} },
+      { query: `session_id=${source.id}`, body: { session_id: protectedSource.id } },
+      { query: `session_id=${source.id}&session_id=${protectedSource.id}`, body: {} },
+      { query: `session_id=${source.id}`, body: { sessionId: [protectedSource.id] } },
+      { query: `session_id=${source.id}`, body: { sessionId: null } },
+      { query: `session_id=${source.id}`, body: { project_cwd: protectedProject } },
+    ];
+    const before = structuredClone(getStore().appEvents);
+    for (const { query, body } of rejected) {
+      const response = await fetch(`${baseUrl}/api/apps/synthetic-app/events?${query}`, {
+        method: "POST",
+        headers: { ...agentHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ ...body, event: "synthetic-denied", sendToAgent: true }),
+      });
+      assert.equal(response.status, 400, query);
+      // addAppEvent persists before sendMessage: no append also proves these
+      // requests never reached its delivery branch (no provider is invoked).
+      assert.deepEqual(getStore().appEvents, before);
+    }
+
+    const otherSession = createSession(project);
+    for (const selectors of [
+      { query: `session_id=${otherSession.id}`, body: {} },
+      { query: `sessionId=${otherSession.id}`, body: { session_id: otherSession.id } },
+      { query: `session_id=${otherSession.id}`, body: { sessionId: otherSession.id, project_cwd: project } },
+    ]) {
+      const response = await fetch(`${baseUrl}/api/apps/synthetic-app/events?${selectors.query}`, {
+        method: "POST",
+        headers: { ...agentHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ ...selectors.body, event: "synthetic-consistent" }),
+      });
+      assert.equal(response.status, 201);
+      assert.equal((await response.json() as { sessionId: string }).sessionId, otherSession.id,
+        "query-only event destination must override the registration's original session");
+    }
+
+    const projectQuery = new URLSearchParams({ project_cwd: project }).toString();
+    const ownerDefault = await fetch(`${baseUrl}/api/apps/synthetic-app/events?${projectQuery}`, {
+      method: "POST",
+      headers: { Origin: baseUrl, Cookie: cookie, "Content-Type": "application/json" },
+      body: JSON.stringify({ event: "synthetic-owner-default" }),
+    });
+    assert.equal(ownerDefault.status, 201);
+    assert.equal((await ownerDefault.json() as { sessionId: string }).sessionId, source.id,
+      "owner project-only events retain the registered-session default");
+
+    const registration = getStore().apps.find((row) => row.session_id === source.id)!;
+    registration.session_id = protectedSource.id;
+    try {
+      const beforeStale = structuredClone(getStore().appEvents);
+      const staleDefault = await fetch(`${baseUrl}/api/apps/synthetic-app/events?${projectQuery}`, {
+        method: "POST",
+        headers: { ...agentHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ event: "synthetic-stale-default", sendToAgent: true }),
+      });
+      assert.equal(staleDefault.status, 400);
+      assert.deepEqual(getStore().appEvents, beforeStale, "stale default cannot deliver to another project");
+    } finally {
+      registration.session_id = source.id;
+    }
+  });
 
   const protectedQuery = `${baseUrl}/api/apps?${new URLSearchParams({ project_cwd: protectedProject, scan: "0" })}`;
   const crossProject = await fetch(protectedQuery, { headers: agentHeaders });
