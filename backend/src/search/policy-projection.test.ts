@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import fsMutable from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { EventEmitter } from "node:events";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createAgentProfile } from "../agent-profiles.js";
@@ -22,6 +25,49 @@ function transcript(file: string, id: string, cwd: string, canary: string): void
     JSON.stringify({ type: "message", message: { role: "user", content: canary } }),
   ].join("\n") + "\n");
 }
+
+test("continuous store events cannot postpone projection refresh indefinitely", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-policy-refresh-"));
+  const previous = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = root;
+  close();
+  const watcher = Object.assign(new EventEmitter(), { close() {} });
+  const watchMock = t.mock.method(fsMutable, "watch", (_dir: unknown, _options: unknown, listener: (...args: unknown[]) => void) => {
+    watcher.on("change", listener);
+    return watcher as unknown as fs.FSWatcher;
+  });
+  syncBuiltinESMExports();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    init();
+    startDreamPolicyProjection();
+    const initial = fs.statSync(getDreamPolicyProjectionPath()).ino;
+    for (let i = 0; i < 3; i++) {
+      flush();
+      watcher.emit("change", "rename", "store.json");
+      t.mock.timers.tick(10);
+    }
+    const refreshed = JSON.parse(fs.readFileSync(getDreamPolicyProjectionPath(), "utf8"));
+    assert.notEqual(fs.statSync(getDreamPolicyProjectionPath()).ino, initial,
+      "refresh must run by the first event's deadline even when later writes continue");
+    assert.equal(refreshed.source_store.ino, fs.statSync(path.join(root, "store.json")).ino);
+    flush();
+    watcher.emit("change", "rename", "store.json");
+    t.mock.timers.tick(25);
+    const later = JSON.parse(fs.readFileSync(getDreamPolicyProjectionPath(), "utf8"));
+    assert.equal(later.source_store.ino, fs.statSync(path.join(root, "store.json")).ino,
+      "events after a publication schedule another refresh");
+  } finally {
+    stopDreamPolicyProjection();
+    t.mock.timers.reset();
+    watchMock.mock.restore();
+    syncBuiltinESMExports();
+    close();
+    if (previous === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("Dream policy projection is atomic, private, complete, and metadata-only", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-policy-projection-"));
