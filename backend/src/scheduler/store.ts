@@ -8,7 +8,7 @@ import type { ScheduledJobCommandGuardMode, ScheduledJobInput, ScheduledJobRow, 
 
 const DEFAULT_TIMEOUT_MS = 600_000;
 const DEFAULT_PROMPT_TIMEOUT_MS = 60_000;
-const MAX_RUNS_PER_JOB = 500;
+const MAX_TERMINAL_RUNS_PER_JOB = 500;
 
 export function listScheduledJobs(): ScheduledJobRow[] {
   const store = getStore();
@@ -242,11 +242,12 @@ function normalizeCommandGuardMode(value: unknown): ScheduledJobCommandGuardMode
 
 function pruneRunsForJob(jobId: string): void {
   const store = getStore();
+  // Running rows are the overlap guard, not disposable history.
   const runs = store.scheduledRuns
-    .filter((run) => run.job_id === jobId)
+    .filter((run) => run.job_id === jobId && run.status !== "running")
     .sort((a, b) => b.started_at - a.started_at);
-  const keep = new Set(runs.slice(0, MAX_RUNS_PER_JOB).map((run) => run.id));
-  store.scheduledRuns = store.scheduledRuns.filter((run) => run.job_id !== jobId || keep.has(run.id));
+  const keep = new Set(runs.slice(0, MAX_TERMINAL_RUNS_PER_JOB).map((run) => run.id));
+  store.scheduledRuns = store.scheduledRuns.filter((run) => run.job_id !== jobId || run.status === "running" || keep.has(run.id));
 }
 
 function cloneJob(job: ScheduledJobRow): ScheduledJobRow {

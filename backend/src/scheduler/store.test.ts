@@ -140,6 +140,70 @@ test("scheduled job attribution updates persist the matching capability marker t
   }
 });
 
+test("run retention preserves the overlap guard and bounds terminal history", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-scheduler-retention-"));
+  const previousDataDir = process.env.WAYANG_DATA_DIR;
+  process.env.WAYANG_DATA_DIR = dir;
+  try {
+    init();
+    ensureProjectForCwd(dir);
+    const job = createScheduledJob({
+      name: "Retention regression",
+      cron_expr: "* * * * *",
+      prompt: "synthetic prompt",
+      cwd: dir,
+      enabled: false,
+    });
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now++);
+    const active = createScheduledRun({ jobId: job.id, trigger: "manual", scheduledFor: null });
+    const skip = () => createScheduledRun({
+      jobId: job.id,
+      trigger: "manual",
+      scheduledFor: null,
+      status: "skipped",
+      errorMessage: "previous run is still running",
+    });
+    const firstSkipped = skip();
+    for (let i = 1; i < 500; i++) skip();
+
+    // Exactly 500 newer skips used to evict the still-running overlap guard.
+    let runs = listScheduledRuns(job.id, 1000);
+    assert.equal(runs.find((run) => run.id === active.id)?.status, "running");
+    assert.equal(hasRunningRun(job.id), true);
+    assert.equal(runs.filter((run) => run.status !== "running").length, 500);
+    assert.equal(runs.length, 501);
+
+    const newestSkipped = skip();
+    runs = listScheduledRuns(job.id, 1000);
+    assert.equal(runs.find((run) => run.id === active.id)?.status, "running");
+    assert.equal(hasRunningRun(job.id), true);
+    assert.equal(runs.filter((run) => run.status !== "running").length, 500);
+    assert.equal(runs.some((run) => run.id === firstSkipped.id), false);
+    assert.equal(runs[0].id, newestSkipped.id);
+
+    // Completion releases the guard; the next creation prunes terminal history
+    // by start time as before, even when an old run has only just finished.
+    assert.equal(updateScheduledRun(active.id, {
+      status: "completed",
+      finished_at: Date.now(),
+    })?.status, "completed");
+    assert.equal(hasRunningRun(job.id), false);
+    const nextActive = createScheduledRun({ jobId: job.id, trigger: "manual", scheduledFor: null });
+    runs = listScheduledRuns(job.id, 1000);
+    assert.equal(runs.some((run) => run.id === active.id), false);
+    assert.equal(runs.find((run) => run.id === nextActive.id)?.status, "running");
+    assert.equal(hasRunningRun(job.id), true);
+    assert.equal(runs.filter((run) => run.status !== "running").length, 500);
+    assert.equal(runs.length, 501);
+  } finally {
+    close();
+    if (previousDataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previousDataDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("scheduled job store supports CRUD metadata and run recovery", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-scheduler-test-"));
   const previousDataDir = process.env.WAYANG_DATA_DIR;
