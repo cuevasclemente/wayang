@@ -123,6 +123,12 @@ jobs:
         working-directory: e2e
         run: npx playwright install chromium
 
+      - name: Install ripgrep
+        # Backend tests exercise pi's grep tool, which requires ripgrep and
+        # falls back to a runtime download that is unavailable in CI.
+        # GitHub macOS runners do not ship ripgrep; Linux images do.
+        run: brew install ripgrep
+
       - name: Run backend tests
         working-directory: backend
         env:
