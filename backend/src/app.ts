@@ -2,6 +2,7 @@ import express from "express";
 import * as http from "node:http";
 import * as path from "node:path";
 import * as fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   assertStandardBrowserProfileHostsStartupReady,
   getConfig,
@@ -286,7 +287,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
   // Serve frontend in production
   const frontendDist = path.resolve(
-    path.dirname(new URL(import.meta.url).pathname),
+    path.dirname(fileURLToPath(import.meta.url)),
     "../../frontend/dist",
   );
 
