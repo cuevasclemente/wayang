@@ -124,7 +124,7 @@ interface SyntheticApi {
   switchBodies: Record<string, unknown>[];
 }
 
-async function installSyntheticApi(page: Page): Promise<SyntheticApi> {
+async function installSyntheticApi(page: Page, additionalSessions: ReturnType<typeof session>[] = []): Promise<SyntheticApi> {
   const profiles = [
     profile(currentProfileId, "Cobalt Finch", "model-small", "none"),
     profile(targetProfileId, "Lattice Observer", "model-large", "read"),
@@ -143,8 +143,10 @@ async function installSyntheticApi(page: Page): Promise<SyntheticApi> {
     if (path === "/api/models") return route.fulfill({ json: { models, defaultModel: models[0] } });
     if (path === "/api/key-mode") return route.fulfill({ json: { mode: "default" } });
     if (path === "/api/projects/discover" || path === "/api/fs/discover-projects") return route.fulfill({ json: [] });
-    if (path === "/api/sessions") return route.fulfill({ json: [currentSession] });
+    if (path === "/api/sessions") return route.fulfill({ json: [currentSession, ...additionalSessions] });
     if (path === `/api/sessions/${sessionId}` && method === "GET") return route.fulfill({ json: currentSession });
+    const additionalSession = additionalSessions.find((row) => path === `/api/sessions/${row.id}`);
+    if (additionalSession && method === "GET") return route.fulfill({ json: additionalSession });
     if (path === `/api/sessions/${sessionId}/slash-commands`) return route.fulfill({ json: { commands: [] } });
     if (path === "/api/sessions/events") return route.fulfill({ status: 204 });
     if (path === "/api/scheduled-agent-jobs") return route.fulfill({ json: { jobs: [] } });
@@ -210,6 +212,118 @@ async function installSyntheticApi(page: Page): Promise<SyntheticApi> {
   });
   return api;
 }
+
+async function flushBrowserCallbacks(page: Page): Promise<void> {
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+}
+
+for (const outcome of ["success", "failure"] as const) {
+  test(`late model ${outcome} from A cannot change B's selection or save state`, async ({ page }) => {
+    const second = session({ id: "session-model-b", title: "Synthetic model session B" });
+    await installSyntheticWebSocket(page);
+    await installSyntheticApi(page, [second]);
+    const requests: Route[] = [];
+    await page.route(/\/api\/sessions\/[^/]+\/model$/, (route) => { requests.push(route); });
+    await page.goto(`/sessions/${sessionId}`);
+    await expect(page.getByText("Synthetic retained transcript marker", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Small", exact: true }).click();
+    await page.getByRole("button", { name: /^Large provider-orchid/ }).click();
+    await expect.poll(() => requests.length).toBe(1);
+
+    await page.getByText(second.title, { exact: true }).click();
+    await expect(page).toHaveURL(new RegExp(`/sessions/${second.id}$`));
+    await page.getByTestId("chat-input").fill("B draft remains selected");
+    const picker = page.getByRole("button", { name: "Small", exact: true });
+    await expect(picker).toBeEnabled();
+    if (outcome === "failure") {
+      // A's catch/finally must not roll back B or unlock B's pending save.
+      await picker.click();
+      await page.getByRole("button", { name: /^Large provider-orchid/ }).click();
+      await expect.poll(() => requests.length).toBe(2);
+    }
+    const response = page.waitForResponse((value) => value.url().endsWith(`/sessions/${sessionId}/model`));
+    await requests[0]!.fulfill(outcome === "success"
+      ? { json: session({ model: "model-large" }) }
+      : { status: 400, json: { error: "Synthetic rejected A model" } });
+    await (await response).finished();
+    await flushBrowserCallbacks(page);
+    await expect(page).toHaveURL(new RegExp(`/sessions/${second.id}$`));
+    await expect(page.getByTestId("chat-input")).toHaveValue("B draft remains selected");
+    await expect(page.getByTestId("chat-model-selection-error")).toHaveCount(0);
+    if (outcome === "success") await expect(picker).toBeEnabled();
+    else {
+      await expect(page.getByRole("button", { name: "Large", exact: true })).toBeDisabled();
+      await requests[1]!.fulfill({ json: { ...second, model: "model-large" } });
+      await expect(page.getByRole("button", { name: "Large", exact: true })).toBeEnabled();
+    }
+  });
+}
+
+test("read aloud resumes when the next chunk arrives after buffering", async ({ page }) => {
+  await installSyntheticWebSocket(page);
+  await installSyntheticApi(page);
+  await page.addInitScript(() => {
+    class SyntheticTtsEvents extends EventTarget {
+      onerror = null;
+      constructor(readonly url: string) {
+        super();
+        if (url === "/api/tts/jobs/synthetic/events") {
+          (window as Window & { __ttsEvents?: SyntheticTtsEvents }).__ttsEvents = this;
+        }
+      }
+      close(): void {}
+    }
+    Object.defineProperty(window, "EventSource", { configurable: true, value: SyntheticTtsEvents });
+    HTMLMediaElement.prototype.play = function () { return Promise.resolve(); };
+    HTMLMediaElement.prototype.pause = function () {};
+  });
+  await page.route("**/api/tts/synthesize", (route) => route.fulfill({ json: {
+    jobId: "synthetic", status: "queued", manifestUrl: "/api/tts/jobs/synthetic",
+    eventsUrl: "/api/tts/jobs/synthetic/events",
+  } }));
+  await page.route("**/api/tts/jobs/synthetic/chunks/*", (route) => route.fulfill({ status: 204 }));
+  await page.goto(`/sessions/${sessionId}`);
+  await page.getByRole("button", { name: /Read aloud/ }).click();
+  await expect.poll(() => page.evaluate(() => Boolean((window as Window & { __ttsEvents?: EventTarget }).__ttsEvents))).toBe(true);
+  const emitChunk = async (index: number) => page.evaluate((chunkIndex) => {
+    (window as Window & { __ttsEvents?: EventTarget }).__ttsEvents!.dispatchEvent(new MessageEvent("chunk_completed", {
+      data: JSON.stringify({ index: chunkIndex, status: "completed", url: `/api/tts/jobs/synthetic/chunks/${chunkIndex}` }),
+    }));
+  }, index);
+  const audio = page.locator("audio");
+  await emitChunk(1);
+  await expect(page.getByText("Playing chunk 1", { exact: true })).toBeVisible();
+  await audio.dispatchEvent("ended");
+  await expect(page.getByText("Buffering next chunk…", { exact: true })).toBeVisible();
+  await emitChunk(2);
+  await expect(page.getByText("Playing chunk 2", { exact: true })).toBeVisible();
+  await expect(audio).toHaveAttribute("src", "/api/tts/jobs/synthetic/chunks/2");
+  // Receiving another chunk while playing must not skip the current chunk.
+  await emitChunk(3);
+  await flushBrowserCallbacks(page);
+  await expect(audio).toHaveAttribute("src", "/api/tts/jobs/synthetic/chunks/2");
+  await audio.dispatchEvent("ended");
+  await expect(page.getByText("Playing chunk 3", { exact: true })).toBeVisible();
+  await audio.dispatchEvent("ended");
+  await expect(page.getByText("Buffering next chunk…", { exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    const source = (window as Window & { __ttsEvents?: EventTarget }).__ttsEvents!;
+    const chunks = [1, 2, 3, 4].map((index) => ({
+      index, status: "completed", url: `/api/tts/jobs/synthetic/chunks/${index}`,
+    }));
+    source.dispatchEvent(new MessageEvent("chunk_completed", { data: JSON.stringify(chunks[3]) }));
+    source.dispatchEvent(new MessageEvent("job_completed", { data: JSON.stringify({
+      status: "completed", chunks, chunks_total: 4, chunks_completed: 4,
+      final_audio_url: "/api/tts/jobs/synthetic/final",
+    }) }));
+  });
+  await expect(page.getByText("Playing chunk 4", { exact: true })).toBeVisible();
+  await audio.dispatchEvent("ended");
+  await expect(page.getByText("Audio ready", { exact: true })).toBeVisible();
+  await expect(audio).toHaveAttribute("src", "/api/tts/jobs/synthetic/chunks/4");
+});
 
 test("arbitrary profile labels switch by stable IDs and preserve the session draft and transcript", async ({ page }) => {
   await installSyntheticWebSocket(page);

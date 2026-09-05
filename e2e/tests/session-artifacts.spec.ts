@@ -4,7 +4,7 @@ import { createE2eSession, openSessionInUi } from "./helpers/sessions";
 const markdownId = "11111111-1111-4111-8111-111111111111";
 const htmlId = "22222222-2222-4222-8222-222222222222";
 
-function artifact(id: string, renderer: "markdown" | "html", name: string) {
+function artifact(id: string, renderer: "markdown" | "html" | "image" | "pdf", name: string) {
   return {
     id,
     name,
@@ -79,6 +79,35 @@ test("Artifacts replaces Files, migrates saved state, and safely previews Markdo
   await expect(frame.locator("script, img, form, input")).toHaveCount(0);
   await expect(frame.locator("p[style], a[href]")).toHaveCount(0);
 });
+
+for (const renderer of ["image", "pdf"] as const) {
+  test(`switching from a pending text preview mounts the ${renderer} renderer`, async ({ page, request }) => {
+    const session = await createE2eSession(request, `e2e pending preview to ${renderer}`);
+    const target = { ...artifact(htmlId, renderer, `target.${renderer}`), title: `Target ${renderer}` };
+    await mockArtifactCatalog(page, session.id, [artifact(markdownId, "markdown", "pending.md"), target]);
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    await page.route(new RegExp(`/api/sessions/${session.id}/artifacts/${markdownId}/preview$`), async (route) => {
+      await pending;
+      await route.abort();
+    });
+    await page.route(new RegExp(`/api/sessions/${session.id}/artifacts/${htmlId}/preview$`), async (route) => {
+      // PDF's own error proves the renderer mounted, without external media.
+      await route.fulfill({ status: 404, body: "Synthetic unavailable preview" });
+    });
+    try {
+      await openSessionInUi(page, session);
+      await page.getByRole("button", { name: "Artifacts", exact: true }).click();
+      await expect(page.getByText("Loading preview…", { exact: true })).toBeVisible();
+      await page.getByRole("option", { name: new RegExp(`Target ${renderer}`) }).click();
+      await expect(page.getByText("Loading preview…", { exact: true })).toHaveCount(0);
+      if (renderer === "image") await expect(page.getByRole("img", { name: target.title })).toBeVisible();
+      else await expect(page.getByText("PDF preview is unavailable", { exact: true })).toBeVisible();
+    } finally {
+      release();
+    }
+  });
+}
 
 test("mobile Tools opens the session Artifacts surface", async ({ page, request }) => {
   await page.setViewportSize({ width: 390, height: 844 });

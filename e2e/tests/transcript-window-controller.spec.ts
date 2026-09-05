@@ -2,7 +2,10 @@ import { expect, test } from "@playwright/test";
 import {
   MAX_TRANSCRIPT_WINDOW_CONTENT_BYTES,
   classifyTranscriptPageErrorCode,
+  createTranscriptWindowState,
+  transcriptWindowReducer,
   transcriptWindowValidationError,
+  type TranscriptWindowEnvelope,
 } from "../../frontend/src/transcript/windowController";
 
 function entry(id: string, text = id) {
@@ -27,6 +30,34 @@ function window(overrides: Record<string, unknown> = {}) {
     payload_bytes: Buffer.byteLength(JSON.stringify({ messages })),
     ...overrides,
   };
+}
+
+for (const direction of ["before", "after"] as const) {
+  test(`only an admitted ${direction} page may invalidate a changed epoch`, () => {
+    type Entry = ReturnType<typeof entry>;
+    let state = transcriptWindowReducer(createTranscriptWindowState<Entry>(), {
+      type: "selection", sessionId: "session-a", selectionId: "selection-a",
+      intent: { kind: "latest", requestKey: "open" },
+    });
+    state = transcriptWindowReducer(state, {
+      type: "window", window: window() as TranscriptWindowEnvelope<Entry>,
+    });
+    const stalePage = window({
+      reason: direction === "before" ? "prepend" : "append",
+      request_id: "retired-request", transcript_epoch: "old-epoch",
+    }) as TranscriptWindowEnvelope<Entry>;
+    // Includes late responses after an authoritative reset cleared all flights.
+    expect(transcriptWindowReducer(state, { type: "window", window: stalePage })).toBe(state);
+    state = transcriptWindowReducer(state, {
+      type: "page_requested", direction, flight: { requestId: "current-request", cursor: "cursor" },
+    });
+    expect(transcriptWindowReducer(state, { type: "window", window: stalePage })).toBe(state);
+    const invalidated = transcriptWindowReducer(state, {
+      type: "window", window: { ...stalePage, request_id: "current-request" },
+    });
+    expect(invalidated.invalidated).toBe(true);
+    expect(invalidated.messages).toEqual([]);
+  });
 }
 
 test("window validator accepts bounded persisted rows and a separate ID-less streaming overlay", () => {
