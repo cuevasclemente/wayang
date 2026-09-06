@@ -46,6 +46,20 @@ export interface IndexedSourceRow {
   sourceLength: number;
 }
 
+export interface SearchSourceRow {
+  eventId: string;
+  role: "user" | "assistant";
+  activeOrdinal: number;
+  sourceOffset: number;
+  sourceLength: number;
+}
+
+export interface SearchSourcePage {
+  rows: SearchSourceRow[];
+  nextOrdinal: number;
+  done: boolean;
+}
+
 export interface IndexedReadResult {
   entries: any[];
   rows: IndexedSourceRow[];
@@ -85,6 +99,7 @@ interface WorkerResult {
   endedNewline: boolean;
   tailDigest: string;
   bodyBytesRead: number;
+  searchSafe: boolean;
 }
 
 const WORKER_SOURCE = String.raw`
@@ -129,7 +144,9 @@ try {
     throw new Error("Transcript changed before structural worker body admission");
   }
 
+  if (workerData.searchLimits && before.size > 128 * 1024 * 1024) throw new Error("Search structural file unsupported");
   const entries = [];
+  let searchSafe = true;
   let topologyLimitExceeded = false;
   let branchTipId = null;
   let ordinal = 0;
@@ -142,6 +159,7 @@ try {
 
   function appendLinePart(part) {
     if (!part.length) return;
+    if (workerData.searchLimits && lineBytes + part.length > 8 * 1024 * 1024) throw new Error("Search structural record unsupported");
     const copy = Buffer.from(part);
     lineParts.push(copy);
     lineBytes += copy.length;
@@ -160,7 +178,15 @@ try {
     if (raw.length > 0) {
       try {
         const value = JSON.parse(raw.toString("utf8"));
+        if (!value || typeof value.type !== "string"
+          || (value.type === "message" && typeof value.id !== "string")) searchSafe = false;
         if (value && typeof value.id === "string") {
+          const oversizedEnvelope = [value.id,value.parentId,value.type,displayClass(value)]
+            .some(field => typeof field === "string" && Buffer.byteLength(field)>512);
+          if (oversizedEnvelope) {
+            searchSafe = false;
+            if (workerData.searchLimits) throw new Error("Search structural envelope unsupported");
+          }
           const eventType = typeof value.type === "string" ? value.type : "unknown";
           if (entries.length >= MAX_TOPOLOGY_ENTRIES) {
             topologyLimitExceeded = true;
@@ -176,7 +202,7 @@ try {
           });
           if (eventType !== "session_info" && eventType !== "session") branchTipId = value.id;
         }
-      } catch { /* Pi tolerates malformed physical lines */ }
+      } catch { searchSafe = false; /* UI tolerates malformed physical lines; search must report incomplete. */ }
     }
     ordinal++;
     lineParts = [];
@@ -263,6 +289,7 @@ try {
     endedNewline,
     tailDigest: sha(tail),
     bodyBytesRead,
+    searchSafe,
   });
 } catch (error) {
   parentPort.postMessage({ workerError: error && error.message ? error.message : String(error), bodyBytesRead });
@@ -331,6 +358,7 @@ interface StructuralWorkerTask {
   filePath: string;
   expectedFingerprint: FileFingerprint;
   expectedRevision: TranscriptFileRevision;
+  searchLimits: boolean;
   promise: Promise<WorkerResult>;
   resolve: (result: WorkerResult) => void;
   reject: (error: Error) => void;
@@ -367,6 +395,8 @@ export interface StructuralTranscriptIndexOptions {
 export class StructuralTranscriptIndex {
   private readonly db: DatabaseType;
   private readonly builds = new Map<string, Promise<StructuralIndexRevision>>();
+  private readonly fullBuildProofs = new Map<string, string>();
+  private readonly searchUnsafeBuilds = new Set<string>();
   private readonly latestBuildKeys = new Map<string, string>();
   private readonly workerQueue: StructuralWorkerTask[] = [];
   private readonly activeWorkerTasks = new Map<string, StructuralWorkerTask>();
@@ -396,6 +426,7 @@ export class StructuralTranscriptIndex {
     filePath: string,
     expectedFingerprint?: FileFingerprint,
     authorizationGuard?: () => boolean,
+    options: { allowAppend?: boolean } = {},
   ): Promise<StructuralIndexRevision> {
     if (authorizationGuard && !authorizationGuard()) throw new Error("Transcript structural indexing is no longer authorized");
     const canonicalPath = path.resolve(filePath);
@@ -414,7 +445,7 @@ export class StructuralTranscriptIndex {
     if (stored?.error === "building") {
       this.db.prepare("DELETE FROM transcript_revisions WHERE session_id=?").run(sessionId);
     }
-    if (stored && stored.filePath === canonicalPath && current.size > stored.indexedSize
+    if (options.allowAppend !== false && stored && stored.filePath === canonicalPath && current.size > stored.indexedSize
       && current.size - stored.indexedSize <= TRANSCRIPT_APPEND_REFRESH_MAX_BYTES
       && sameTranscriptIdentity(stored, current) && this.canAppend(stored, current, canonicalPath)) {
       try {
@@ -430,7 +461,7 @@ export class StructuralTranscriptIndex {
     }
     const workerFingerprint = expectedFingerprint ?? fingerprintFromRevision(current);
     const build = this.fullBuild(
-      sessionId, canonicalPath, key, workerFingerprint, current, authorizationGuard,
+      sessionId, canonicalPath, key, workerFingerprint, current, authorizationGuard, options.allowAppend === false,
     );
     this.builds.set(key, build);
     try { return await build; }
@@ -585,6 +616,70 @@ export class StructuralTranscriptIndex {
       "SELECT event_id FROM active_branch_entries WHERE session_id=? AND transcript_epoch=?",
     ).all(sessionId, revision.transcriptEpoch) as Array<{ event_id: string }>).map((row) => row.event_id));
     return { revision, eventIds };
+  }
+
+  /** Search uses exact active offsets, never the sampled UI entry projection.
+   * No append shortcut: a tail witness alone cannot prove the old prefix.
+   */
+  async searchRevision(sessionId: string, filePath: string, expectedFingerprint: FileFingerprint,
+    authorizationGuard: () => boolean): Promise<StructuralIndexRevision> {
+    if (!authorizationGuard()) throw new Error("Search structural authorization changed");
+    const expectedKey = structuralBuildKey(sessionId, path.resolve(filePath), readTranscriptFileRevision(filePath, expectedFingerprint));
+    // A previously cached UI append refresh carries no full-prefix proof. A
+    // cold/restarted search must establish it, not inherit that optimization.
+    if (this.readRevision(sessionId) && this.fullBuildProofs.get(sessionId) !== expectedKey) this.purge(sessionId);
+    const revision = await this.ensure(sessionId, filePath, expectedFingerprint, authorizationGuard, { allowAppend: false });
+    this.assertSearchRevision(revision, authorizationGuard);
+    return revision;
+  }
+
+  assertSearchRevision(revision: StructuralIndexRevision, authorizationGuard: () => boolean,
+    options: { exactFileAlreadyAuthorized?: boolean } = {}): void {
+    if (!authorizationGuard()) throw new Error("Search structural authorization changed");
+    const stored = this.readRevision(revision.sessionId);
+    if (this.searchUnsafeBuilds.has(revision.sessionId)) throw new Error("Search structure unsupported: malformed or unanchored records");
+    if (!revision.complete || !stored?.complete || stored.transcriptEpoch !== revision.transcriptEpoch
+      || !revisionsExactlyEqual(stored, revision)
+      // Only the search owner may reuse its just-completed synchronous exact
+      // fingerprint/header authorization; default callers re-open the file.
+      || (!options.exactFileAlreadyAuthorized
+        && !revisionsExactlyEqual(revision, readTranscriptFileRevision(revision.filePath, fingerprintFromRevision(revision))))) {
+      throw new Error("Search structural revision is stale or unsupported");
+    }
+  }
+
+  searchSourcePage(revision: StructuralIndexRevision, afterOrdinal: number,
+    authorizationGuard: () => boolean, limit = 64,
+    options: { exactFileAlreadyAuthorized?: boolean } = {}): SearchSourcePage {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 64 || !Number.isSafeInteger(afterOrdinal) || afterOrdinal < -1) throw new Error("Invalid search offset page limit");
+    this.assertSearchRevision(revision, authorizationGuard, options);
+    // Bound topology candidates before filtering roles: a tool-only branch may
+    // contain 25,000 rows, but no main-thread search iterator slice scans them all.
+    const candidates = this.db.prepare(`WITH candidates AS MATERIALIZED (
+      SELECT * FROM active_branch_entries WHERE session_id=? AND transcript_epoch=? AND active_ordinal>?
+      ORDER BY active_ordinal LIMIT ?)
+      SELECT CASE WHEN length(CAST(a.event_id AS BLOB))<=512 THEN a.event_id ELSE NULL END AS eventId,
+      t.display_class AS role,t.event_type AS eventType,a.active_ordinal AS activeOrdinal,
+      a.source_offset AS sourceOffset,a.source_length AS sourceLength
+      FROM candidates a JOIN transcript_entries t
+        ON t.session_id=a.session_id AND t.transcript_epoch=a.transcript_epoch AND t.event_id=a.event_id
+      ORDER BY a.active_ordinal`).all(revision.sessionId, revision.transcriptEpoch, afterOrdinal, limit) as Array<SearchSourceRow & {eventType:string}>;
+    let sourceBytes = 0;
+    let nextOrdinal = afterOrdinal;
+    const rows: SearchSourceRow[] = [];
+    for (const row of candidates) {
+      if (row.eventType === "message" && (row.role === "user" || row.role === "assistant")) {
+        if (!row.eventId) throw new Error("Search event ID unsupported");
+        // Over-limit records are offset-only negatives, not admitted reads.
+        const cost = row.sourceLength <= 1024*1024 ? row.sourceLength : 0;
+        if (rows.length && sourceBytes + cost > 1024*1024) return {rows,nextOrdinal,done:false};
+        rows.push({eventId:row.eventId,role:row.role,activeOrdinal:row.activeOrdinal,
+          sourceOffset:row.sourceOffset,sourceLength:row.sourceLength});
+        sourceBytes += cost;
+      }
+      nextOrdinal = row.activeOrdinal;
+    }
+    return {rows,nextOrdinal,done:candidates.length < limit};
   }
 
   async activeEventIds(sessionId: string, filePath: string, expectedFingerprint?: FileFingerprint): Promise<Set<string>> {
@@ -765,6 +860,11 @@ export class StructuralTranscriptIndex {
   purge(sessionId: string): void {
     this.invalidationGenerations.set(sessionId, (this.invalidationGenerations.get(sessionId) ?? 0) + 1);
     this.latestBuildKeys.delete(sessionId);
+    this.fullBuildProofs.delete(sessionId);
+    this.searchUnsafeBuilds.delete(sessionId);
+    // Search fences must stop structural body work too, not merely reject its
+    // eventual publication after a full worker timeout.
+    this.cancelSupersededWorkerTasks(sessionId, "invalidated");
     this.db.transaction(() => {
       this.db.prepare("DELETE FROM transcript_revisions WHERE session_id = ?").run(sessionId);
     })();
@@ -824,6 +924,7 @@ export class StructuralTranscriptIndex {
     key: string,
     expectedFingerprint: FileFingerprint,
     expectedRevision: TranscriptFileRevision,
+    searchLimits = false,
   ): Promise<WorkerResult> {
     let resolveTask!: (result: WorkerResult) => void;
     let rejectTask!: (error: Error) => void;
@@ -832,7 +933,7 @@ export class StructuralTranscriptIndex {
       rejectTask = reject;
     });
     const task: StructuralWorkerTask = {
-      key, sessionId, filePath, expectedFingerprint, expectedRevision, promise,
+      key, sessionId, filePath, expectedFingerprint, expectedRevision, searchLimits, promise,
       resolve: resolveTask,
       reject: rejectTask,
       cancelled: false,
@@ -873,6 +974,7 @@ export class StructuralTranscriptIndex {
             filePath: task.filePath,
             expectedFingerprint: task.expectedFingerprint,
             expectedRevision: task.expectedRevision,
+            searchLimits: task.searchLimits,
             delayMs: Math.max(0, this.options.workerDelayMsForTests ?? 0),
           },
           resourceLimits: { maxOldGenerationSizeMb: 64, maxYoungGenerationSizeMb: 16, stackSizeMb: 2 },
@@ -959,10 +1061,11 @@ export class StructuralTranscriptIndex {
     expectedFingerprint: FileFingerprint,
     expectedRevision: TranscriptFileRevision,
     authorizationGuard?: () => boolean,
+    searchLimits = false,
   ): Promise<StructuralIndexRevision> {
     const generation = this.invalidationGenerations.get(sessionId) ?? 0;
     const result = await this.scheduleWorkerBuild(
-      sessionId, filePath, buildKey, expectedFingerprint, expectedRevision,
+      sessionId, filePath, buildKey, expectedFingerprint, expectedRevision, searchLimits,
     );
     await this.options.beforePublishForTests?.(sessionId, filePath);
     if ((this.invalidationGenerations.get(sessionId) ?? 0) !== generation
@@ -984,6 +1087,9 @@ export class StructuralTranscriptIndex {
       this.db.prepare("DELETE FROM transcript_revisions WHERE session_id=? AND transcript_epoch=?").run(sessionId, epoch);
       throw error;
     }
+    this.fullBuildProofs.set(sessionId, buildKey);
+    if (result.searchSafe) this.searchUnsafeBuilds.delete(sessionId);
+    else this.searchUnsafeBuilds.add(sessionId);
     return this.readRevision(sessionId)!;
   }
 

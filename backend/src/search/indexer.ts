@@ -1,544 +1,337 @@
-/**
- * search/indexer.ts — Index pi JSONL sessions into search.db.
- *
- * Operations:
- *   - indexSession(sessionId, { force? }): stat the jsonl, diff against
- *     session_index_state, reindex if changed. Wrapped in a single transaction.
- *   - reindexAll(): iterate all sessions (including archived) and index any
- *     that changed.
- *   - removeSession(sessionId): delete chunks + state for a session. Used only
- *     on physical delete; archived sessions are retained.
- *
- * Failure handling: per-session errors are recorded in
- * session_index_state.error and surfaced by /api/sessions/search/health. They
- * do not abort the batch.
- */
-
+/** Bounded search queue -> exact structural offsets -> worker -> staged generation -> synchronous CAS flip. */
 import { getStore, type SessionRow } from "../db.js";
 import { getPolicyGeneration } from "../policy.js";
-import { fingerprintsEqual } from "../session-metadata.js";
 import { authorizeExactStandardTranscript } from "../standard-transcript-authorization.js";
 import { listSessions } from "../sessions.js";
+import { eventRecoveryMarkerForSession } from "../transcript-recovery-journal.js";
 import { getSearchDb, SCHEMA_VERSION } from "./db.js";
 import { isSessionIndexable } from "./policy-filter.js";
-import { chunkJsonlFile, type MetaForChunker } from "./chunker.js";
-import {
-  DreamPolicyProjectionUnavailableError,
-  ensureDreamPolicyProjection,
-} from "./policy-projection.js";
+import { DreamPolicyProjectionUnavailableError, ensureDreamPolicyProjection } from "./policy-projection.js";
 import { invalidateTranscriptPaginationSession } from "../transcript-pagination/service.js";
-import { getStructuralTranscriptIndex } from "../transcript-pagination/structural-index.js";
+import { getStructuralTranscriptIndex, type StructuralIndexRevision } from "../transcript-pagination/structural-index.js";
+import { SearchQueue, SearchQueueUnavailableError, type SearchPriority } from "./queue.js";
+import { extractSearchDocuments } from "./extraction.js";
+import { beginGeneration, cleanupSearchChunks, getIndexCoverageSnapshot as coverageSnapshot,
+  getSearchPublicationMetrics, invalidatePublication, metadataRevision, publishGeneration, publishMetadata,
+  recordSearchOutcome, recordSearchQueued, stageDocuments, yieldSearchTurn, type SearchOutcome } from "./publication.js";
 
 export interface IndexResult {
-  sessionId: string;
-  chunkCount: number;
-  skipped: boolean;
-  policySkipped?: boolean;
-  mutationFenced?: boolean;
-  retryable?: boolean;
-  error?: string;
+  sessionId: string; chunkCount: number; skipped: boolean;
+  policySkipped?: boolean; mutationFenced?: boolean; retryable?: boolean; error?: string;
+  outcome?: SearchOutcome;
 }
-
-export interface IndexBatchSummary {
-  total: number;
-  indexed: number;
-  skipped: number;
-  errors: number;
-  durationMs: number;
-}
-
+export interface IndexBatchSummary { total: number; indexed: number; skipped: number; errors: number; durationMs: number }
 export interface IndexerOptions {
   includeThinking?: boolean;
   force?: boolean;
-  /** Exact durable marker authorizing startup/mutation recovery reindex only. */
   recoveryMarkerId?: string;
-  /** @internal Pauses after transcript chunking for deterministic CAS tests. */
+  priority?: SearchPriority;
+  delayMs?: number;
   afterChunkingForTests?: () => void | Promise<void>;
+  afterStageForTests?: () => void | Promise<void>;
 }
-
-let _includeThinking = false;
+const queue = new SearchQueue<IndexResult>();
 const transcriptMutationFences = new Set<string>();
+const invalidations = new Map<string, number>();
+let includeThinking = false;
+let phase = "idle";
+let projectionPaused = false;
+let ownerStopped = false;
+const EXTRACTION_VERSION = "message-document-v1:text-only:128KiB";
+export function setIncludeThinking(v: boolean): void { includeThinking = v; }
+export function getIncludeThinking(): boolean { return includeThinking; }
+export function startSearchQueue(): void { ownerStopped = false; projectionPaused = false; queue.start(); }
+export async function stopSearchQueue(): Promise<void> { ownerStopped = true; await queue.stop(); }
+export function resumeSearchQueueAfterProjection(): void {
+  if (projectionPaused && !ownerStopped) { projectionPaused = false; queue.start(); }
+}
+export function getSearchQueueStatus() { return { ...queue.status(), phase, projectionPaused, publication: getSearchPublicationMetrics() }; }
+export function getIndexCoverageSnapshot(allowedIds: ReadonlySet<string>) { return coverageSnapshot(getSearchDb(), allowedIds); }
 
-export function setIncludeThinking(v: boolean): void {
-  _includeThinking = v;
+class Invalidated extends Error {}
+class MetadataChanged extends Error {}
+
+function recoveryMarkerMatches(sessionId: string, markerId: string): boolean {
+  const marker = eventRecoveryMarkerForSession(sessionId);
+  const row = getStore().sessions.find((candidate) => candidate.id === sessionId);
+  return marker?.id === markerId && Boolean(row?.pi_session_file) && marker.pi_session_file === row!.pi_session_file;
 }
 
-export function getIncludeThinking(): boolean {
-  return _includeThinking;
-}
-
-async function loadSessionRow(sessionId: string): Promise<SessionRow | null> {
-  const store = getStore();
-  const row = store.sessions.find((r) => r.id === sessionId);
-  return row ? { ...row } : null;
-}
-
-interface IndexMetadataProjection {
-  catalogMutationVersion: number;
-  piSessionFile: string | null;
-  title: string;
-  goal: string | null;
-  cwd: string;
-  model: string | null;
-  provider: string | null;
-  createdAt: number;
-  lastActive: number;
-  archived: number;
-  error: string | null;
-}
-
-function indexMetadataProjection(row: SessionRow): IndexMetadataProjection {
-  return {
-    catalogMutationVersion: row.catalog_mutation_version ?? 0,
-    piSessionFile: row.pi_session_file,
-    title: row.title,
-    goal: row.goal,
-    cwd: row.cwd,
-    model: row.model,
-    provider: row.provider,
-    createdAt: row.created_at,
-    lastActive: row.last_active,
-    archived: row.archived,
-    error: row.error,
-  };
-}
-
-function sameIndexMetadata(left: IndexMetadataProjection, right: IndexMetadataProjection): boolean {
-  return left.catalogMutationVersion === right.catalogMutationVersion
-    && left.piSessionFile === right.piSessionFile
-    && left.title === right.title
-    && left.goal === right.goal
-    && left.cwd === right.cwd
-    && left.model === right.model
-    && left.provider === right.provider
-    && left.createdAt === right.createdAt
-    && left.lastActive === right.lastActive
-    && left.archived === right.archived
-    && left.error === right.error;
-}
-
-function makeMeta(row: SessionRow): MetaForChunker {
-  return {
-    title: row.title || "(untitled)",
-    goal: row.goal,
-    cwd: row.cwd,
-    model: row.model,
-  };
-}
-
-const RETRY_FRESH_ROW = Symbol("retry-fresh-index-row");
-const MAX_INDEX_METADATA_CAS_ATTEMPTS = 3;
-
-export async function indexSession(
-  sessionId: string,
-  options: IndexerOptions = {},
-): Promise<IndexResult> {
-  for (let attempt = 0; attempt < MAX_INDEX_METADATA_CAS_ATTEMPTS; attempt++) {
-    const result = await indexSessionAttempt(sessionId, options);
-    if (result !== RETRY_FRESH_ROW) return result;
+export async function indexSession(sessionId: string, options: IndexerOptions = {}): Promise<IndexResult> {
+  if (options.recoveryMarkerId && !recoveryMarkerMatches(sessionId,options.recoveryMarkerId)) {
+    return {sessionId,chunkCount:0,skipped:true,retryable:true,error:"Search recovery marker changed"};
   }
-  purgeSessionIndex(sessionId);
-  return {
-    sessionId,
-    chunkCount: 0,
-    skipped: true,
-    retryable: true,
-    error: "Session metadata changed repeatedly during indexing; retry later.",
-  };
-}
-
-async function indexSessionAttempt(
-  sessionId: string,
-  options: IndexerOptions,
-): Promise<IndexResult | typeof RETRY_FRESH_ROW> {
   if (transcriptMutationFences.has(sessionId)) {
-    purgeSessionIndex(sessionId);
-    return { sessionId, chunkCount: 0, skipped: true, mutationFenced: true };
+    return {sessionId,chunkCount:0,skipped:true,mutationFenced:true,
+      ...(options.recoveryMarkerId ? {error:"Search recovery is mutation-fenced"} : {})};
   }
-  const row = await loadSessionRow(sessionId);
-  if (!row) {
-    return { sessionId, chunkCount: 0, skipped: true, error: "session not found" };
-  }
-  const expectedMetadata = indexMetadataProjection(row);
-
-  // Ensure the current complete path decision is durably published before
-  // this background path can touch transcript metadata. Unchanged store/policy
-  // state reuses the exact in-process publication; unknown paths remain denied.
-  ensureDreamPolicyProjection();
-
-  // Authorization precedes search DB lookup, transcript stat/read, and the
-  // unchanged shortcut. Denial removes stale indexed content.
-  const initialDenial = policyDenial(row, options.recoveryMarkerId);
-  if (initialDenial) return purgePolicyDeniedSession(sessionId, initialDenial);
+  const requestedInvalidation = invalidations.get(sessionId) ?? 0;
+  // Exact marker is part of the coalescing key: ordinary work can never inherit
+  // mutation recovery authority or resolve a recovery waiter by enqueue alone.
+  const key = JSON.stringify([sessionId, options.recoveryMarkerId ?? null, Boolean(options.force)]);
+  const priority = options.recoveryMarkerId ? "mutation" : options.priority ?? "manual";
   const db = getSearchDb();
-  const filePath = row.pi_session_file;
-  const initialAuthorization = filePath
-    ? authorizeExactStandardTranscript(filePath, { expectedSessionId: sessionId })
-    : null;
-  if (filePath && !initialAuthorization) {
-    return purgePolicyDeniedSession(sessionId, "Exact durable Standard transcript authorization failed");
-  }
-  const authorizedFingerprint = initialAuthorization?.fingerprint ?? null;
-  const authorizationGeneration = getPolicyGeneration();
-  const fileMtime = authorizedFingerprint?.mtimeMs ?? null;
-  const fileSize = authorizedFingerprint?.size ?? null;
-  const exactAuthorizationCurrent = (): boolean => Boolean(filePath && authorizedFingerprint
-    && getPolicyGeneration() === authorizationGeneration
-    && !policyDenial(row, options.recoveryMarkerId)
-    && authorizeExactStandardTranscript(filePath, {
-      expectedSessionId: sessionId,
-      expectedFingerprint: authorizedFingerprint,
-    }));
-
-  // Recheck after exact stat/header authorization and before the unchanged shortcut so a policy change
-  // cannot preserve stale searchable content merely because bytes are stable.
-  if (transcriptMutationFences.has(sessionId)) {
-    purgeSessionIndex(sessionId);
-    return { sessionId, chunkCount: 0, skipped: true, mutationFenced: true };
-  }
-  const postStatDenial = policyDenial(row, options.recoveryMarkerId);
-  if (postStatDenial) return purgePolicyDeniedSession(sessionId, postStatDenial);
-  if (filePath && (!authorizedFingerprint
-    || getPolicyGeneration() !== authorizationGeneration
-    || !authorizeExactStandardTranscript(filePath, {
-      expectedSessionId: sessionId,
-      expectedFingerprint: authorizedFingerprint,
-    }))) {
-    return purgePolicyDeniedSession(sessionId, "Exact Standard transcript authorization changed after stat");
-  }
-
-  // Skip if unchanged.
-  const existing = db
-    .prepare(
-      "SELECT pi_session_file, file_mtime_ms, file_size, schema_version, indexed_at_ms FROM session_index_state WHERE session_id = ?",
-    )
-    .get(sessionId) as
-    | {
-        pi_session_file: string | null;
-        file_mtime_ms: number | null;
-        file_size: number | null;
-        schema_version: number;
-        indexed_at_ms: number;
-      }
-    | undefined;
-
-  const indexedMetadata = db.prepare(
-    `SELECT cwd, title, goal, model, provider, created_at, last_active, archived, has_error
-       FROM chunks WHERE session_id = ? ORDER BY chunk_index LIMIT 1`,
-  ).get(sessionId) as {
-    cwd: string; title: string; goal: string | null; model: string | null; provider: string | null;
-    created_at: number; last_active: number; archived: number; has_error: number;
-  } | undefined;
-  const indexedMetadataMatches = Boolean(indexedMetadata
-    && indexedMetadata.cwd === row.cwd
-    && indexedMetadata.title === row.title
-    && indexedMetadata.goal === row.goal
-    && indexedMetadata.model === row.model
-    && indexedMetadata.provider === row.provider
-    && indexedMetadata.created_at === row.created_at
-    && indexedMetadata.last_active === row.last_active
-    && indexedMetadata.archived === (row.archived ? 1 : 0)
-    && indexedMetadata.has_error === (row.error ? 1 : 0));
-
-  if (
-    !options.force &&
-    existing &&
-    indexedMetadataMatches &&
-    existing.schema_version === SCHEMA_VERSION &&
-    existing.pi_session_file === (filePath ?? null) &&
-    existing.file_mtime_ms === (fileMtime ?? null) &&
-    existing.file_size === (fileSize ?? null)
-  ) {
-    return { sessionId, chunkCount: 0, skipped: true };
-  }
-
-  let chunks: Awaited<ReturnType<typeof chunkJsonlFile>>["chunks"] = [];
-  let chunkerError: string | undefined;
-  let structuralEpoch: string | null = null;
-
-  const meta = makeMeta(row);
-  if (filePath && fileMtime != null) {
-    const preReadDenial = policyDenial(row, options.recoveryMarkerId);
-    if (preReadDenial) return purgePolicyDeniedSession(sessionId, preReadDenial);
-    try {
-      const result = await chunkJsonlFile(filePath, meta, {
-        includeThinking: _includeThinking || options.includeThinking,
-        expectedFingerprint: authorizedFingerprint ?? undefined,
-      });
-      chunks = result.chunks;
-    } catch (err: any) {
-      chunkerError = err?.message || String(err);
-      // Even on chunker failure, fall back to a meta-only chunk so the
-      // session is still searchable by title/goal/cwd.
-      chunks = [
-        {
-          chunkIndex: 0,
-          role: "meta",
-          text: [meta.title, meta.goal || "", `cwd: ${meta.cwd}`, meta.model ? `model: ${meta.model}` : ""]
-            .filter(Boolean)
-            .join("\n\n"),
-          messageId: null,
-          sourceOffset: null,
-        },
-      ];
-    }
-  } else {
-    // No pi file yet — emit just the meta chunk.
-    chunks = [
-      {
-        chunkIndex: 0,
-        role: "meta",
-        text: [meta.title, meta.goal || "", `cwd: ${meta.cwd}`, meta.model ? `model: ${meta.model}` : ""]
-          .filter(Boolean)
-          .join("\n\n"),
-        messageId: null,
-        sourceOffset: null,
-      },
-    ];
-  }
-
-  if (filePath && fileMtime != null && !chunkerError) {
-    try {
-      const active = await getStructuralTranscriptIndex().activeProjection(
-        sessionId, filePath, authorizedFingerprint ?? undefined, exactAuthorizationCurrent,
-      );
-      structuralEpoch = active.revision.transcriptEpoch;
-      chunks = chunks.filter((chunk) => chunk.role === "meta" || Boolean(chunk.messageId && active.eventIds.has(chunk.messageId)));
-    } catch (error) {
-      purgeSessionIndex(sessionId);
-      invalidateTranscriptPaginationSession(sessionId);
-      return {
-        sessionId,
-        chunkCount: 0,
-        skipped: true,
-        retryable: true,
-        error: `Active-branch transcript structure is unavailable: ${error instanceof Error ? error.message : String(error)}`,
-      };
-    }
-  }
-
-  await options.afterChunkingForTests?.();
-
-  // chunkJsonlFile, structural indexing, and test seams yield. Reauthorize and
-  // compare the complete index projection before preparing a commit.
-  if (transcriptMutationFences.has(sessionId)) {
-    purgeSessionIndex(sessionId);
-    return { sessionId, chunkCount: 0, skipped: true, mutationFenced: true };
-  }
-  const preCommitDenial = policyDenial(row, options.recoveryMarkerId);
-  if (preCommitDenial) return purgePolicyDeniedSession(sessionId, preCommitDenial);
-  if (filePath && (!authorizedFingerprint
-    || getPolicyGeneration() !== authorizationGeneration
-    || !authorizeExactStandardTranscript(filePath, {
-      expectedSessionId: sessionId,
-      expectedFingerprint: authorizedFingerprint,
-    }))) {
-    return purgePolicyDeniedSession(sessionId, "Exact Standard transcript authorization changed during indexing");
-  }
-  const afterChunkingRow = await loadSessionRow(sessionId);
-  if (!afterChunkingRow || !sameIndexMetadata(expectedMetadata, indexMetadataProjection(afterChunkingRow))) {
-    return RETRY_FRESH_ROW;
-  }
-
-  const insertStmt = db.prepare(
-    `INSERT INTO chunks (
-      session_id, cwd, title, goal, model, provider,
-      created_at, last_active, archived, has_error,
-      chunk_index, role, text, message_id, source_offset, transcript_epoch, active_branch
-    ) VALUES (
-      @session_id, @cwd, @title, @goal, @model, @provider,
-      @created_at, @last_active, @archived, @has_error,
-      @chunk_index, @role, @text, @message_id, @source_offset, @transcript_epoch, @active_branch
-    )`,
-  );
-
-  const deleteStmt = db.prepare("DELETE FROM chunks WHERE session_id = ?");
-  const stateStmt = db.prepare(
-    `INSERT INTO session_index_state (
-       session_id, pi_session_file, file_mtime_ms, file_size,
-       indexed_at_ms, chunk_count, vector_count, schema_version, error
-     ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
-     ON CONFLICT(session_id) DO UPDATE SET
-       pi_session_file = excluded.pi_session_file,
-       file_mtime_ms   = excluded.file_mtime_ms,
-       file_size       = excluded.file_size,
-       indexed_at_ms   = excluded.indexed_at_ms,
-       chunk_count     = excluded.chunk_count,
-       schema_version  = excluded.schema_version,
-       error           = excluded.error`,
-  );
-
-  // Last synchronous CAS immediately before the SQLite transaction. No await
-  // is permitted between this durable-row read and trx().
-  const preTransactionRow = getStore().sessions.find((candidate) => candidate.id === sessionId);
-  if (!preTransactionRow || !sameIndexMetadata(expectedMetadata, indexMetadataProjection(preTransactionRow))) {
-    return RETRY_FRESH_ROW;
-  }
-  const finalGenerationBefore = getPolicyGeneration();
-  const finalAuthorization = filePath && authorizedFingerprint
-    ? authorizeExactStandardTranscript(filePath, {
-        expectedSessionId: sessionId,
-        expectedFingerprint: authorizedFingerprint,
-      })
-    : null;
-  const finalGenerationAfter = getPolicyGeneration();
-  if (filePath && (!finalAuthorization || finalGenerationBefore !== authorizationGeneration
-    || finalGenerationAfter !== finalGenerationBefore
-    || !fingerprintsEqual(finalAuthorization.fingerprint, authorizedFingerprint))) {
-    return purgePolicyDeniedSession(sessionId, "Exact Standard transcript authorization changed before publication");
-  }
-
-  const trx = db.transaction(() => {
-    deleteStmt.run(sessionId);
-    for (const c of chunks) {
-      insertStmt.run({
-        session_id: sessionId,
-        cwd: row.cwd,
-        title: row.title || "(untitled)",
-        goal: row.goal,
-        model: row.model,
-        provider: row.provider,
-        created_at: row.created_at,
-        last_active: row.last_active,
-        archived: row.archived ? 1 : 0,
-        has_error: row.error ? 1 : 0,
-        chunk_index: c.chunkIndex,
-        role: c.role,
-        text: c.text,
-        message_id: c.messageId ?? null,
-        source_offset: c.sourceOffset ?? null,
-        transcript_epoch: structuralEpoch,
-        active_branch: c.messageId && structuralEpoch ? 1 : 0,
-      });
-    }
-    stateStmt.run(
-      sessionId,
-      filePath ?? null,
-      fileMtime ?? null,
-      fileSize ?? null,
-      Date.now(),
-      chunks.length,
-      SCHEMA_VERSION,
-      chunkerError ?? null,
-    );
-  });
-  trx();
-
-  return { sessionId, chunkCount: chunks.length, skipped: false, error: chunkerError };
-}
-
-export async function removeSession(sessionId: string): Promise<void> {
-  purgeSessionIndex(sessionId);
-  invalidateTranscriptPaginationSession(sessionId);
-}
-
-/** Prevent watcher/manual indexing from republishing stale text during rewrite. */
-export function beginTranscriptMutationSearchFence(sessionId: string): void {
-  if (transcriptMutationFences.has(sessionId)) {
-    throw new Error("A transcript mutation search fence is already active");
-  }
-  transcriptMutationFences.add(sessionId);
+  recordSearchQueued(db,sessionId);
   try {
-    purgeSessionIndex(sessionId);
-    invalidateTranscriptPaginationSession(sessionId);
+    const result = await queue.enqueue(key,priority, async (signal) => {
+      try {
+        if (signal.aborted || (invalidations.get(sessionId) ?? 0) !== requestedInvalidation) {
+          return {sessionId,chunkCount:0,skipped:true,retryable:true,error:"Search request invalidated"};
+        }
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try { return await indexSessionAttempt(sessionId,options,signal); }
+          catch (error) { if (!(error instanceof MetadataChanged)) throw error; }
+        }
+        purgeSessionIndex(sessionId);
+        recordSearchOutcome(db,sessionId,null,"failed","metadata_churn");
+        return { sessionId,chunkCount:0,skipped:true,retryable:true,
+          error:"Session metadata changed repeatedly during indexing; retry later." };
+      } catch (error) {
+        if (error instanceof DreamPolicyProjectionUnavailableError) {
+          // A global prerequisite outage is one failure, not one body admission
+          // attempt per queued session. Only a successful watcher heartbeat resumes.
+          projectionPaused = true;
+          void queue.stop();
+        }
+        throw error;
+      } finally {
+        if (queue.hasPending((pendingKey) => JSON.parse(pendingKey)[0] === sessionId)) recordSearchQueued(db,sessionId);
+        phase = "idle";
+      }
+    }, options.delayMs ?? 0);
+    // Existing mutation/startup callers interpret !error as reconciliation. Do
+    // not let partial, denied, fenced, cancelled, stale-marker or skipped work
+    // clear their durable recovery barrier, including shortcut results.
+    if (options.recoveryMarkerId && (result.error || result.outcome !== "current" || result.skipped
+      || !recoveryMarkerMatches(sessionId,options.recoveryMarkerId))) {
+      return {...result,error:result.error ?? "Search recovery did not reconcile the complete transcript"};
+    }
+    return result;
   } catch (error) {
-    transcriptMutationFences.delete(sessionId);
+    if (error instanceof SearchQueueUnavailableError) {
+      // Durable dirty state survives admission pressure and is revisited by the
+      // next bounded sweep. Do not overwrite another running request's state.
+      return { sessionId,chunkCount:0,skipped:true,retryable:true,error:"Search queue unavailable" };
+    }
     throw error;
   }
 }
 
-export function endTranscriptMutationSearchFence(sessionId: string): void {
-  transcriptMutationFences.delete(sessionId);
+async function indexSessionAttempt(sessionId: string, options: IndexerOptions, signal: AbortSignal): Promise<IndexResult> {
+  if (transcriptMutationFences.has(sessionId)) {
+    purgeSessionIndex(sessionId);
+    return {sessionId,chunkCount:0,skipped:true,mutationFenced:true};
+  }
+  const durable = getStore().sessions.find((r) => r.id === sessionId);
+  if (!durable) { purgeSessionIndex(sessionId); return {sessionId,chunkCount:0,skipped:true,error:"session not found"}; }
+  const row = {...durable};
+  ensureDreamPolicyProjection();
+  if (policyDenial(row,options.recoveryMarkerId)) return purgePolicyDeniedSession(sessionId);
+  const filePath = row.pi_session_file;
+  const authorization = filePath ? authorizeExactStandardTranscript(filePath,{expectedSessionId:sessionId}) : null;
+  if (filePath && !authorization) return purgePolicyDeniedSession(sessionId);
+  const fingerprint = authorization?.fingerprint;
+  const policyGeneration = getPolicyGeneration();
+  const invalidation = invalidations.get(sessionId) ?? 0;
+  const expectedMetadata = JSON.stringify([metadataRevision(row),row.catalog_mutation_version ?? 0,row.pi_session_file]);
+  const db = getSearchDb();
+  const revisionKey = JSON.stringify([filePath,fingerprint ?? null,EXTRACTION_VERSION]);
+  const authCurrent = (): boolean => !signal.aborted && !transcriptMutationFences.has(sessionId)
+    && (invalidations.get(sessionId) ?? 0) === invalidation
+    && getPolicyGeneration() === policyGeneration && !policyDenial(row,options.recoveryMarkerId)
+    && (!options.recoveryMarkerId || recoveryMarkerMatches(sessionId,options.recoveryMarkerId))
+    && (!filePath || Boolean(fingerprint && authorizeExactStandardTranscript(filePath,{
+      expectedSessionId:sessionId,expectedFingerprint:fingerprint})))
+    && getPolicyGeneration() === policyGeneration;
+  let structural: StructuralIndexRevision | undefined;
+  let generation: string | undefined;
+  const guard = (): void => {
+    if (!authCurrent()) throw new Invalidated("search_invalidated");
+    const current = getStore().sessions.find((r) => r.id === sessionId);
+    if (!current || JSON.stringify([metadataRevision(current),current.catalog_mutation_version ?? 0,current.pi_session_file]) !== expectedMetadata) throw new MetadataChanged();
+    if (structural) getStructuralTranscriptIndex().assertSearchRevision(structural,() => true,{exactFileAlreadyAuthorized:true});
+  };
+  const state = db.prepare("SELECT * FROM search_work_state WHERE session_id=?").get(sessionId) as {
+    outcome:string;successful_revision:string|null;attempted_revision:string|null;retry_at:number;error_code:string|null;chunk_bytes:number } | undefined;
+  try {
+    guard();
+    // Independent metadata CAS. Body revision is exact inode/ctime/mtime/size,
+    // not mtime+size, and failed/partial legacy states never satisfy success.
+    const sameComplete = state?.successful_revision === revisionKey && state.error_code === null;
+    const samePartial = state?.outcome === "partial" && state.attempted_revision === revisionKey;
+    if (state && !options.force && !options.recoveryMarkerId && (sameComplete || samePartial)) {
+      const publication = db.prepare("SELECT valid FROM search_publication WHERE session_id=?").get(sessionId) as {valid:number}|undefined;
+      if (publication?.valid === 1) {
+        db.transaction(() => publishMetadata(db,row))();
+        const outcome: SearchOutcome = state.error_code === "included_record_limit" ? "partial" : filePath ? "current" : "metadata_only";
+        recordSearchOutcome(db,sessionId,revisionKey,outcome,state.error_code,state.chunk_bytes);
+        return {sessionId,chunkCount:0,skipped:true,outcome,
+          ...(outcome === "partial" ? {error:"Some included transcript records exceed search limits"} : {})};
+      }
+    }
+    if (!options.force && !options.recoveryMarkerId && state?.attempted_revision === revisionKey
+      && (state.outcome === "unsupported" || state.retry_at > Date.now())) {
+      // Preserve stable negatives/backoff despite the queued admission marker.
+      db.prepare("UPDATE search_work_state SET queued_at=0,requested_revision=? WHERE session_id=?").run(revisionKey,sessionId);
+      return {sessionId,chunkCount:0,skipped:true,outcome:state.outcome as SearchOutcome,retryable:state.outcome !== "unsupported"};
+    }
+    // Once changed/uncertain input is observed, stale text loses visibility
+    // before any worker or cleanup yield. Legacy results remain until refreshed.
+    invalidatePublication(db,sessionId);
+    recordSearchOutcome(db,sessionId,revisionKey,"running");
+    await cleanupSearchChunks(db,{sessionId,maxBatches:4});
+    guard();
+    phase = "structure";
+    if (filePath && fingerprint) {
+      structural = await getStructuralTranscriptIndex().searchRevision(sessionId,filePath,fingerprint,authCurrent);
+      guard();
+    }
+    generation = beginGeneration(db,sessionId);
+    let documents = 0;
+    let bytes = 0;
+    let unsupported = 0;
+    if (structural) {
+      phase = "extracting";
+      const stats = await extractSearchDocuments({revision:structural,signal,guard,
+        // The dispatcher just reauthorized this exact fingerprint synchronously.
+        sources: (after) => getStructuralTranscriptIndex().searchSourcePage(structural!,after,() => true,64,{exactFileAlreadyAuthorized:true}),
+        stage: async (chunks) => {
+          // Parent extraction dispatcher just performed guard(), without a yield.
+          phase = "staging";
+          stageDocuments(db,sessionId,generation!,structural!.transcriptEpoch,chunks);
+          if (options.afterStageForTests) { await options.afterStageForTests(); guard(); }
+          await yieldSearchTurn();
+          // The dispatcher reauthorizes after this await before acknowledging.
+          phase = "extracting";
+        }});
+      documents = stats.documents; bytes = stats.textBytes; unsupported = stats.unsupportedRecords;
+    }
+    await options.afterChunkingForTests?.();
+    guard();
+    const outcome: SearchOutcome = unsupported ? "partial" : filePath ? "current" : "metadata_only";
+    if (options.recoveryMarkerId && outcome !== "current") {
+      // Partial extraction is useful for ordinary search, never positive
+      // evidence that a mutation has completely reconciled its text.
+      recordSearchOutcome(db,sessionId,revisionKey,outcome,"included_record_limit",bytes);
+      return {sessionId,chunkCount:0,skipped:true,outcome,error:"Search recovery requires complete transcript coverage"};
+    }
+    phase = "staging_metadata";
+    db.transaction(() => publishMetadata(db,row))();
+    guard();
+    phase = "publishing";
+    // No await between fresh policy/fingerprint/metadata/active-revision CAS and
+    // the short publication flip. Text was already staged in bounded slices.
+    publishGeneration(db,row,generation,() => {
+      db.prepare(`INSERT INTO session_index_state(session_id,pi_session_file,file_mtime_ms,file_size,indexed_at_ms,
+        chunk_count,vector_count,schema_version,error) VALUES(?,?,?,?,?,?,0,?,?) ON CONFLICT(session_id) DO UPDATE SET
+        pi_session_file=excluded.pi_session_file,file_mtime_ms=excluded.file_mtime_ms,file_size=excluded.file_size,
+        indexed_at_ms=excluded.indexed_at_ms,chunk_count=excluded.chunk_count,schema_version=excluded.schema_version,error=excluded.error`).run(
+        sessionId,filePath,fingerprint?.mtimeMs ?? null,fingerprint?.size ?? null,Date.now(),documents+1,SCHEMA_VERSION,
+        unsupported ? "included_record_limit" : null);
+      recordSearchOutcome(db,sessionId,revisionKey,outcome,unsupported ? "included_record_limit" : null,bytes);
+    });
+    phase = "cleanup";
+    await cleanupSearchChunks(db,{sessionId,maxBatches:4});
+    guard();
+    return {sessionId,chunkCount:documents+1,skipped:false,outcome,
+      ...(unsupported ? {error:"Some included transcript records exceed search limits"} : {})};
+  } catch (error) {
+    if (error instanceof MetadataChanged) throw error;
+    if (error instanceof DreamPolicyProjectionUnavailableError) throw error;
+    if (error instanceof Invalidated || !authCurrent()) {
+      // A prior fence already denied and purged this job. Do not let a late
+      // predecessor invalidate/cancel a newly queued exact recovery request.
+      if ((invalidations.get(sessionId) ?? 0) !== invalidation) {
+        return {sessionId,chunkCount:0,skipped:true,retryable:true,error:"Search request invalidated"};
+      }
+      return purgePolicyDeniedSession(sessionId);
+    }
+    invalidatePublication(db,sessionId);
+    const code = error instanceof Error ? error.message : "index_failed";
+    const stable = code.includes("topology") || code.includes("unsupported") || code === "malformed_record";
+    const outcome = stable ? "unsupported" : "failed";
+    // Persist content-free typed failure. Never persist worker/native errors,
+    // which may contain transcript bytes or private paths.
+    recordSearchOutcome(db,sessionId,revisionKey,outcome,stable ? "unsupported_structure_or_metadata" : "index_failed");
+    return {sessionId,chunkCount:0,skipped:true,retryable:!stable,outcome,error:stable ? "Search input unsupported" : "Search indexing failed"};
+  } finally {
+    if (generation) db.prepare("UPDATE search_generations SET active=0 WHERE generation=?").run(generation);
+  }
 }
 
-export function purgePolicyDeniedSessions(options: {
-  ensureSearchDb?: () => unknown;
-} = {}): { purged: number; errors: number } {
-  try {
-    (options.ensureSearchDb ?? getSearchDb)();
-  } catch (error) {
-    console.error("[search] policy purge unavailable:", error);
-    return { purged: 0, errors: 1 };
-  }
-  let purged = 0;
-  let errors = 0;
+function cancelSessionWork(sessionId: string): void {
+  queue.cancelWhere((key) => JSON.parse(key)[0] === sessionId);
+}
+export async function removeSession(sessionId: string): Promise<void> {
+  cancelSessionWork(sessionId);
+  purgeSessionIndex(sessionId);
+  invalidateTranscriptPaginationSession(sessionId);
+  await cleanupSearchChunks(getSearchDb(),{sessionId,maxBatches:4});
+}
+export function beginTranscriptMutationSearchFence(sessionId: string): void {
+  if (transcriptMutationFences.has(sessionId)) throw new Error("A transcript mutation search fence is already active");
+  transcriptMutationFences.add(sessionId);
+  cancelSessionWork(sessionId);
+  try { purgeSessionIndex(sessionId); invalidateTranscriptPaginationSession(sessionId); }
+  catch (error) { transcriptMutationFences.delete(sessionId); throw error; }
+}
+export function endTranscriptMutationSearchFence(sessionId: string): void { transcriptMutationFences.delete(sessionId); }
+export function purgePolicyDeniedSessions(options: {ensureSearchDb?: () => unknown} = {}): {purged:number;errors:number} {
+  try { (options.ensureSearchDb ?? getSearchDb)(); }
+  catch { console.error("[search] policy purge unavailable"); return {purged:0,errors:1}; }
+  let purged = 0; let errors = 0;
+  const reclaimBudget = {bytes:128*1024,rows:16};
   for (const row of listSessions(true)) {
     if (!policyDenial(row)) continue;
-    try {
-      purgeSessionIndex(row.id);
-      invalidateTranscriptPaginationSession(row.id);
-      purged++;
-    } catch (error) {
-      errors++;
-      console.error(`[search] policy purge failed for ${row.id}:`, error);
-    }
+    try { cancelSessionWork(row.id); purgeSessionIndex(row.id,reclaimBudget); invalidateTranscriptPaginationSession(row.id); purged++; }
+    catch { errors++; }
   }
-  return { purged, errors };
+  return {purged,errors};
 }
-
 export async function reindexAll(options: IndexerOptions = {}): Promise<IndexBatchSummary> {
   const start = Date.now();
-  const sessions = listSessions(true); // include archived
-  // A missing/unsafe/unwritable projection is one batch-global prerequisite
-  // failure, not a per-session error to retry across the whole corpus.
   ensureDreamPolicyProjection();
-  let indexed = 0;
-  let skipped = 0;
-  let errors = 0;
-  for (const s of sessions) {
+  const sessions = listSessions(true);
+  let indexed = 0; let skipped = 0; let errors = 0;
+  for (const row of sessions) {
+    if (options.priority === "background" && queue.status().stopped) break;
     try {
-      const r = await indexSession(s.id, options);
-      if (r.skipped) skipped++;
-      else indexed++;
-      if (r.error) errors++;
-    } catch (err) {
-      if (err instanceof DreamPolicyProjectionUnavailableError) throw err;
-      errors++;
-      console.error(`[search] indexSession(${s.id}) failed:`, err);
-    }
-    // Awaiting an already-resolved indexSession promise stays in the microtask
-    // queue. Yield explicitly so a large unchanged backfill cannot starve auth,
-    // health, and WebSocket I/O until the whole catalog has been visited.
-    await new Promise<void>((resolve) => setImmediate(resolve));
+      const result = await indexSession(row.id,options);
+      if (result.skipped) skipped++; else indexed++;
+      if (result.error) errors++;
+    } catch (error) { if (error instanceof DreamPolicyProjectionUnavailableError) throw error; errors++; }
+    await yieldSearchTurn();
   }
-  return {
-    total: sessions.length,
-    indexed,
-    skipped,
-    errors,
-    durationMs: Date.now() - start,
-  };
+  return {total:sessions.length,indexed,skipped,errors,durationMs:Date.now()-start};
 }
-
-function policyDenial(row: SessionRow, recoveryMarkerId?: string): string | null {
-  // Re-resolve the durable row on every phase check so a quarantine committed
-  // while the streaming chunker yields cannot publish derived private text.
+function policyDenial(row: SessionRow, recoveryMarkerId?: string): boolean {
   const current = getStore().sessions.find((candidate) => candidate.id === row.id);
-  return current && isSessionIndexable(current, { recoveryMarkerId })
-    ? null
-    : "Session indexing denied by project or legacy private-data policy";
+  return !current || !isSessionIndexable(current,{recoveryMarkerId});
 }
-
-function purgeSessionIndex(sessionId: string): void {
+function purgeSessionIndex(sessionId: string, reclaimBudget = {bytes:128*1024,rows:16}): void {
+  invalidations.set(sessionId,(invalidations.get(sessionId) ?? 0)+1);
   const db = getSearchDb();
   db.transaction(() => {
-    db.prepare("DELETE FROM chunks WHERE session_id = ?").run(sessionId);
-    db.prepare("DELETE FROM session_index_state WHERE session_id = ?").run(sessionId);
+    invalidatePublication(db,sessionId);
+    db.prepare("UPDATE search_generations SET active=0 WHERE session_id=?").run(sessionId);
+    db.prepare("DELETE FROM session_index_state WHERE session_id=?").run(sessionId);
+    db.prepare("DELETE FROM search_session_metadata WHERE session_id=?").run(sessionId);
+    db.prepare("DELETE FROM search_work_state WHERE session_id=?").run(sessionId);
+    // Fast small-session reclamation; large purges remain invisible and are
+    // reclaimed by the bounded maintenance pass, never one giant FTS cascade.
+    if (reclaimBudget.rows > 0 && reclaimBudget.bytes > 0) {
+      const rows = db.prepare("SELECT id,length(CAST(text AS BLOB)) AS bytes FROM chunks WHERE session_id=? LIMIT ?")
+        .all(sessionId,reclaimBudget.rows) as Array<{id:number;bytes:number}>;
+      for (const row of rows) {
+        if (row.bytes > reclaimBudget.bytes) break;
+        db.prepare("DELETE FROM chunks WHERE id=?").run(row.id);
+        reclaimBudget.bytes -= row.bytes; reclaimBudget.rows--;
+      }
+    }
   })();
 }
-
-function purgePolicyDeniedSession(sessionId: string, reason: string): IndexResult {
-  try {
-    purgeSessionIndex(sessionId);
-    invalidateTranscriptPaginationSession(sessionId);
-    return { sessionId, chunkCount: 0, skipped: true, policySkipped: true };
-  } catch (error) {
-    return {
-      sessionId,
-      chunkCount: 0,
-      skipped: true,
-      policySkipped: true,
-      error: `Policy denied indexing and stale-index purge failed: ${error instanceof Error ? error.message : String(error)} (${reason})`,
-    };
-  }
+function purgePolicyDeniedSession(sessionId: string): IndexResult {
+  try { purgeSessionIndex(sessionId); invalidateTranscriptPaginationSession(sessionId);
+    return {sessionId,chunkCount:0,skipped:true,policySkipped:true}; }
+  catch { return {sessionId,chunkCount:0,skipped:true,policySkipped:true,error:"Denied search cleanup failed"}; }
 }
