@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
@@ -9,6 +10,7 @@ import { createAgentProfile, updateAgentProfile } from "../agent-profiles.js";
 import { close as closeStore, getStore } from "../db.js";
 import { createProject, updateProject } from "../projects.js";
 import { getTtsCacheDir } from "../tts-cache.js";
+import { createSession } from "../sessions.js";
 import { router } from "./tts.js";
 
 function postJson(server: http.Server, pathname: string, body: unknown): Promise<{ status: number; body: any }> {
@@ -186,4 +188,136 @@ test("stopped quarantined legacy private sessions deny TTS before history, broke
   assert.equal(allowed.status, 200);
   assert.equal(allowed.body.status, "queued");
   assert.equal(brokerCalls, 1);
+});
+
+test("broker submission uses only the server-owned response group, every table row, and the versioned text hash", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-response-tts-route-"));
+  const projectCwd = path.join(root, "project");
+  const sessionFile = path.join(root, "synthetic-session.jsonl");
+  fs.mkdirSync(projectCwd);
+  const previous = {
+    dataDir: process.env.WAYANG_DATA_DIR,
+    brokerUrl: process.env.WAYANG_TTS_BROKER_URL,
+    baseUrl: process.env.WAYANG_TTS_BASE_URL,
+    fetch: globalThis.fetch,
+  };
+  process.env.WAYANG_DATA_DIR = path.join(root, "data");
+  process.env.WAYANG_TTS_BROKER_URL = "http://tts-broker.invalid";
+  delete process.env.WAYANG_TTS_BASE_URL;
+  const submissions: Array<{ text: string; idempotency_key: string }> = [];
+  globalThis.fetch = async (url, init) => {
+    assert.equal(String(url), "http://tts-broker.invalid/v1/tts/jobs");
+    assert.equal(init?.method, "POST");
+    submissions.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({
+      job_id: "01234567-89ab-cdef-0123-456789abcdef",
+      status: "queued",
+      manifest_url: "/v1/tts/jobs/01234567-89ab-cdef-0123-456789abcdef/manifest",
+      events_url: "/v1/tts/jobs/01234567-89ab-cdef-0123-456789abcdef/events",
+    }), { status: 201, headers: { "Content-Type": "application/json" } });
+  };
+  const app = express();
+  app.use(express.json());
+  app.use("/api", router);
+  const server = http.createServer(app);
+  t.after(async () => {
+    await closeServer(server);
+    closeStore();
+    globalThis.fetch = previous.fetch;
+    if (previous.dataDir === undefined) delete process.env.WAYANG_DATA_DIR;
+    else process.env.WAYANG_DATA_DIR = previous.dataDir;
+    if (previous.brokerUrl === undefined) delete process.env.WAYANG_TTS_BROKER_URL;
+    else process.env.WAYANG_TTS_BROKER_URL = previous.brokerUrl;
+    if (previous.baseUrl === undefined) delete process.env.WAYANG_TTS_BASE_URL;
+    else process.env.WAYANG_TTS_BASE_URL = previous.baseUrl;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const profile = createAgentProfile({ name: "Synthetic speech profile" });
+  createProject({ cwd: projectCwd, default_agent_profile_id: profile.id });
+  const session = createSession(projectCwd, { agentProfileId: profile.id });
+  getStore().sessions.find((row) => row.id === session.id)!.pi_session_file = sessionFile;
+  const table = [
+    "| Name | | Value | A | B | C |", "|---|---|---|---|---|---|",
+    ...Array.from({ length: 9 }, (_, i) => `| Item ${i + 1} | | ${i + 1}.25 | yes | no | last |`),
+  ].join("\n");
+  const text = (value: string) => [{ type: "text", text: value }];
+  const messages = [
+    { id: "previous", role: "assistant", content: text("Previous response excluded.") },
+    { id: "user", role: "user", content: text("User request excluded.") },
+    { id: "commentary", role: "assistant", content: [
+      { type: "thinking", thinking: "Hidden reasoning excluded." },
+      ...text("I will check."),
+      { type: "toolCall", id: "call", name: "synthetic", arguments: { value: "Tool arguments excluded." } },
+    ] },
+    { id: "tool", role: "toolResult", toolCallId: "call", toolName: "synthetic", content: text("Tool result excluded.") },
+    { id: "final", role: "assistant", content: text(`Here is the result.\n\n${table}\n\nDone.`) },
+    { id: "next-user", role: "user", content: text("Next request excluded.") },
+    { id: "code-only", role: "assistant", content: text("~~~ts\nCode-only output excluded.\n~~~") },
+    { id: "last-user", role: "user", content: text("Last request excluded.") },
+    { id: "next", role: "assistant", content: text("Next response excluded.") },
+    { id: "oversized-user", role: "user", content: text("Read every row, not a prefix.") },
+    { id: "oversized", role: "assistant", content: text([
+      "| Name | Value |", "|---|---|",
+      ...Array.from({ length: 30 }, (_, i) => `| Item ${i + 1} | ${"Synthetic value. ".repeat(50)} |`),
+    ].join("\n")) },
+  ];
+  fs.writeFileSync(sessionFile, [
+    { type: "session", version: 3, id: session.id, cwd: projectCwd, timestamp: "2026-01-01T00:00:00.000Z" },
+    ...messages.map(({ id, ...message }, index) => ({
+      type: "message", id, parentId: messages[index - 1]?.id ?? null,
+      timestamp: `2026-01-01T00:00:${String(index + 1).padStart(2, "0")}.000Z`,
+      message: { ...message, timestamp: 1_767_225_601_000 + index * 1000 },
+    })),
+  ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  await listen(server);
+
+  const expected = "I will check.\n\nHere is the result.\n\nTable with 9 rows. "
+    + Array.from({ length: 9 }, (_, i) => `Row ${i + 1}: Name: Item ${i + 1}; Column 2: empty; Value: ${i + 1}.25; A: yes; B: no; C: last.`).join(" ")
+    + "\n\nDone.";
+  for (const messageId of ["final", "commentary", "final"]) {
+    const response = await postJson(server, "/api/tts/synthesize", {
+      sessionId: session.id, messageId,
+      text: "Client-supplied text must not be spoken.",
+      messages: [{ role: "assistant", content: "Forged client group." }],
+    });
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.equal(response.body.eventsUrl, "/api/tts/jobs/01234567-89ab-cdef-0123-456789abcdef/events");
+    const submission = submissions.at(-1)!;
+    assert.equal(submission.text, expected);
+    const hash = createHash("sha256").update(expected, "utf8").digest("hex").slice(0, 16);
+    assert.ok(submission.idempotency_key.startsWith(`wayang:${session.id}:${messageId}:`));
+    assert.ok(submission.idempotency_key.endsWith(`:speech-text-v3:${hash}`));
+  }
+  assert.equal(submissions[0].idempotency_key, submissions[2].idempotency_key);
+  for (const [messageId, status] of [["user", 400], ["code-only", 400], ["missing", 404]] as const) {
+    const response = await postJson(server, "/api/tts/synthesize", { sessionId: session.id, messageId, text: "Untrusted replacement." });
+    assert.equal(response.status, status);
+  }
+  assert.equal(submissions.length, 3, "nonspeakable and unknown targets must not submit broker jobs");
+  assert.equal(fs.existsSync(getTtsCacheDir()), false, "broker mode must not create direct audio cache files");
+
+  await t.test("oversized direct narration fails explicitly before provider or cache work", async () => {
+    const previousMaxChars = process.env.WAYANG_TTS_MAX_CHARS;
+    process.env.WAYANG_TTS_MAX_CHARS = "500";
+    process.env.WAYANG_TTS_BROKER_URL = "";
+    process.env.WAYANG_TTS_BASE_URL = "http://tts-direct.invalid";
+    let providerCalls = 0;
+    globalThis.fetch = async () => {
+      providerCalls++;
+      return new Response("synthetic audio bytes", { status: 200 });
+    };
+    try {
+      const response = await postJson(server, "/api/tts/synthesize", { sessionId: session.id, messageId: "oversized" });
+      assert.equal(response.status, 413);
+      assert.deepEqual(response.body, {
+        error: "This response exceeds the 20-chunk direct TTS limit. Configure WAYANG_TTS_BROKER_URL to read the complete response.",
+      });
+      assert.equal(providerCalls, 0, "a refused response must not synthesize even its first chunk");
+      assert.equal(fs.existsSync(getTtsCacheDir()), false, "a refused response must not create partial audio cache files");
+    } finally {
+      if (previousMaxChars === undefined) delete process.env.WAYANG_TTS_MAX_CHARS;
+      else process.env.WAYANG_TTS_MAX_CHARS = previousMaxChars;
+    }
+  });
 });

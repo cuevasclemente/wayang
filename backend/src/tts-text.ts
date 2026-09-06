@@ -5,6 +5,8 @@
  * content so the TTS engine only reads the assistant's actual prose output.
  */
 
+import { Lexer, type Token, type Tokens } from "marked";
+
 export interface MessageEntry {
   id?: string;
   message?: {
@@ -25,93 +27,107 @@ export interface ContentBlock {
   thinking?: string;
 }
 
-const TTS_TABLE_MAX_ROWS = 6;
-const TTS_TABLE_MAX_COLUMNS = 4;
+// Marked leaves entity references in text tokens. Decode once, at text leaves
+// only: a code span containing `&amp;` visibly contains that literal spelling.
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: "&", AMP: "&", lt: "<", LT: "<", gt: ">", GT: ">",
+  quot: '"', QUOT: '"', apos: "'", nbsp: " ",
+};
 
-function splitMarkdownTableRow(line: string): string[] {
-  let trimmed = line.trim();
-  if (trimmed.startsWith("|")) trimmed = trimmed.slice(1);
-  if (trimmed.endsWith("|")) trimmed = trimmed.slice(0, -1);
-  return trimmed.split("|").map((cell) => cell.trim()).filter((cell) => cell.length > 0);
+function decodeSpeechEntities(text: string): string {
+  return text.replace(/&(#(?:[xX][0-9a-fA-F]{1,6}|[0-9]{1,7})|[a-zA-Z]+);/g, (raw, entity: string) => {
+    if (!entity.startsWith("#")) return NAMED_ENTITIES[entity] ?? raw;
+    const hex = /^#x/i.test(entity);
+    const point = parseInt(entity.slice(hex ? 2 : 1), hex ? 16 : 10);
+    return point === 0 || point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff)
+      ? "�" : String.fromCodePoint(point);
+  });
 }
 
-function isMarkdownTableSeparator(line: string): boolean {
-  const cells = splitMarkdownTableRow(line);
-  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, "")));
+// Literal punctuation remaining after Markdown parsing is meaningful content,
+// not markup. Speak it rather than letting the broker's second Markdown pass
+// erase identifier underscores, comparisons, or code-span label punctuation.
+const SPOKEN_SYMBOLS: Record<string, string> = {
+  "<=": "less than or equal to", ">=": "greater than or equal to",
+  "!=": "not equal to", "≤": "less than or equal to", "≥": "greater than or equal to",
+  "≠": "not equal to", "=>": "leads to", "→": "leads to",
+  "_": "underscore", "<": "less than", ">": "greater than",
+  "*": "asterisk", "`": "backtick", "[": "left bracket", "]": "right bracket",
+  "#": "hash", "|": "pipe", "&": "and", "+": "plus", "=": "equals",
+};
+
+function speechifyCell(cell: Tokens.TableCell | undefined): string {
+  return speechTokens(cell?.tokens ?? []).replace(/\s+/g, " ").trim();
 }
 
-function looksLikeMarkdownTableRow(line: string): boolean {
-  const trimmed = line.trim();
-  if (!trimmed.includes("|")) return false;
-  return splitMarkdownTableRow(trimmed).length >= 2;
-}
+function describeMarkdownTable(table: Tokens.Table): string {
+  const labels = table.header.map((cell, index) => speechifyCell(cell) || `Column ${index + 1}`);
+  if (table.rows.length === 0) return `Table with columns: ${labels.join("; ")}.`;
 
-function speechifyCell(text: string): string {
-  return text
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/(\*\*|__)(.*?)\1/g, "$2")
-    .replace(/(\*|_)(.*?)\1/g, "$2")
-    .replace(/\s*\+\s*/g, " plus ")
-    .replace(/\s*→\s*/g, " leads to ")
-    .replace(/\s*=>\s*/g, " leads to ")
-    .replace(/\s*=\s*/g, " equals ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function describeMarkdownTable(header: string[], rows: string[][]): string {
-  if (rows.length === 0) return "";
-  if (header.length > TTS_TABLE_MAX_COLUMNS || rows.length > TTS_TABLE_MAX_ROWS) {
-    return `Table omitted: ${rows.length} rows and ${header.length} columns.`;
-  }
-
-  const describedRows = rows.map((row, rowIndex) => {
-    const pairs = header.map((heading, index) => {
-      const value = speechifyCell(row[index] ?? "");
-      if (!value) return "";
-      return `${speechifyCell(heading)}: ${value}`;
-    }).filter(Boolean);
+  // GFM pads short rows and ignores excess cells, just like the visible table.
+  // Never filter cells: even an empty value must retain its column association.
+  const rows = table.rows.map((row, rowIndex) => {
+    const pairs = labels.map((label, index) => `${label}: ${speechifyCell(row[index]) || "empty"}`);
     return `Row ${rowIndex + 1}: ${pairs.join("; ")}.`;
   });
+  return [`Table with ${rows.length} ${rows.length === 1 ? "row" : "rows"}.`, ...rows].join(" ");
+}
 
-  return [`Table with ${rows.length} ${rows.length === 1 ? "row" : "rows"}.`, ...describedRows].join(" ");
+/** Walk Markdown structure, not raw source: code cannot become a spoken table. */
+function speechTokens(tokens: Token[]): string {
+  return tokens.map((token): string => {
+    switch (token.type) {
+      case "code":
+      case "def":
+      case "html":
+      case "hr":
+      case "checkbox":
+        return "";
+      case "space":
+        return "\n\n";
+      case "br":
+        return "\n";
+      case "table":
+        return `${describeMarkdownTable(token as Tokens.Table)}\n\n`;
+      case "list":
+        return "\n" + (token as Tokens.List).items.map((item) => speechTokens(item.tokens).trim()).filter(Boolean).join("\n") + "\n\n";
+      case "blockquote":
+      case "heading":
+      case "paragraph":
+        return `${speechTokens(token.tokens ?? [])}\n\n`;
+      case "image":
+        return token.tokens?.length ? speechTokens(token.tokens) : decodeSpeechEntities(token.text ?? "");
+      case "link":
+      case "strong":
+      case "em":
+      case "del":
+        return speechTokens(token.tokens ?? []);
+      case "text":
+        return token.tokens ? speechTokens(token.tokens) : decodeSpeechEntities(token.text);
+      case "escape":
+      case "codespan":
+        // Inline labels are visible prose, not standalone code blocks.
+        return token.text;
+      default:
+        return "";
+    }
+  }).join("");
 }
 
 /**
- * Convert markdown structures that are painful for TTS into compact prose.
- * In particular, small markdown tables become row descriptions; large/wide
- * tables are announced and omitted instead of being read as pipes/dashes.
+ * Convert all visible Markdown prose and every labeled table row to speech.
+ * Use a fresh lexer with explicit GFM options; do not mutate global Marked state.
+ * Fences (including unclosed/nested fences), escapes and links belong to the
+ * parser. No generic Markdown stripping may run over the resulting plain text.
  */
 export function normalizeSpeechText(markdown: string): string {
-  const lines = markdown.replace(/\r\n?/g, "\n").split("\n");
-  const out: string[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    if (
-      i + 1 < lines.length &&
-      looksLikeMarkdownTableRow(lines[i]) &&
-      isMarkdownTableSeparator(lines[i + 1])
-    ) {
-      const header = splitMarkdownTableRow(lines[i]);
-      const rows: string[][] = [];
-      i += 2;
-      while (i < lines.length && looksLikeMarkdownTableRow(lines[i])) {
-        if (!isMarkdownTableSeparator(lines[i])) rows.push(splitMarkdownTableRow(lines[i]));
-        i++;
-      }
-      i--;
-      const description = describeMarkdownTable(header, rows);
-      if (description) out.push(description, "");
-      continue;
-    }
-
-    // Drop stray separator rows from malformed/partial markdown tables.
-    if (isMarkdownTableSeparator(lines[i])) continue;
-    out.push(lines[i]);
-  }
-
-  return out.join("\n");
+  return speechTokens(Lexer.lex(markdown, { gfm: true, pedantic: false }))
+    .replace(/<=|>=|!=|=>|[≤≥≠→_<>*`\[\]#|&+=]/g, (symbol) => ` ${SPOKEN_SYMBOLS[symbol]} `)
+    .replace(/[ \t\u00a0]+/g, " ")
+    .replace(/ +([,.;:!?])/g, "$1")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 /**
@@ -131,7 +147,7 @@ export function extractTtsText(entry: MessageEntry): string {
   const content = message.content;
   if (!content) return "";
 
-  let parts: string[] = [];
+  const parts: string[] = [];
 
   if (typeof content === "string") {
     parts.push(content);
@@ -150,49 +166,9 @@ export function extractTtsText(entry: MessageEntry): string {
     }
   }
 
-  const raw = parts.join("\n\n").trim();
-  if (!raw) return "";
-
-  // Convert tables before generic Markdown stripping removes their structure.
-  const tableSafe = normalizeSpeechText(raw);
-
-  // Strip Markdown code fences (``` … ```)
-  const noFences = tableSafe.replace(/```[\s\S]*?```/g, "");
-
-  // Strip inline code spans (`code`)
-  const noInline = noFences.replace(/`([^`]+)`/g, "$1");
-
-  // Strip image syntax ![alt](url) before generic links.
-  const noImages = noInline.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1");
-
-  // Strip Markdown link syntax [text](url) → text
-  const noLinks = noImages.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
-
-  // Strip bold/italic markers
-  const noEmphasis = noLinks.replace(/(\*\*|__)(.*?)\1/g, "$2").replace(/(\*|_)(.*?)\1/g, "$2");
-
-  // Strip heading markers (# ## etc.)
-  const noHeadings = noEmphasis.replace(/^#{1,6}\s+/gm, "");
-
-  // Strip horizontal rules
-  const noHr = noHeadings.replace(/^[-*_]{3,}\s*$/gm, "");
-
-  // Strip blockquote markers
-  const noBlockquote = noHr.replace(/^>\s?/gm, "");
-
-  // Strip HTML tags
-  const noHtml = noBlockquote.replace(/<[^>]*>/g, "");
-
-  // Strip ordered/unordered list markers (keep text)
-  const noLists = noHtml.replace(/^[\s]*[-*+]\s+/gm, "").replace(/^[\s]*\d+\.\s+/gm, "");
-
-  // Collapse whitespace
-  const clean = noLists
-    .replace(/\n{3,}/g, "\n\n")
-    .replace(/[ \t]+/g, " ")
-    .trim();
-
-  return clean;
+  // The UI renders text blocks independently. Preserve those parser boundaries
+  // so an unfinished fence in one block cannot hide a later visible block.
+  return parts.map(normalizeSpeechText).filter(Boolean).join("\n\n");
 }
 
 /**

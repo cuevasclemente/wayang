@@ -276,8 +276,35 @@ test("read aloud resumes when the next chunk arrives after buffering", async ({ 
       close(): void {}
     }
     Object.defineProperty(window, "EventSource", { configurable: true, value: SyntheticTtsEvents });
-    HTMLMediaElement.prototype.play = function () { return Promise.resolve(); };
-    HTMLMediaElement.prototype.pause = function () {};
+    const playCalls: string[] = [];
+    Object.defineProperty(window, "__ttsPlayCalls", { value: playCalls });
+    const mediaState = new WeakMap<HTMLMediaElement, { paused: boolean; ended: boolean }>();
+    const state = (media: HTMLMediaElement) => {
+      let value = mediaState.get(media);
+      if (!value) {
+        value = { paused: true, ended: false };
+        mediaState.set(media, value);
+        media.addEventListener("ended", () => {
+          value!.paused = true;
+          value!.ended = true;
+        });
+      }
+      return value;
+    };
+    Object.defineProperty(HTMLMediaElement.prototype, "paused", { configurable: true, get() { return state(this).paused; } });
+    Object.defineProperty(HTMLMediaElement.prototype, "ended", { configurable: true, get() { return state(this).ended; } });
+    HTMLMediaElement.prototype.play = function () {
+      playCalls.push(this.getAttribute("src") ?? "");
+      state(this).paused = false;
+      state(this).ended = false;
+      this.dispatchEvent(new Event("play"));
+      return Promise.resolve();
+    };
+    HTMLMediaElement.prototype.pause = function () {
+      if (state(this).paused) return;
+      state(this).paused = true;
+      this.dispatchEvent(new Event("pause"));
+    };
   });
   await page.route("**/api/tts/synthesize", (route) => route.fulfill({ json: {
     jobId: "synthetic", status: "queued", manifestUrl: "/api/tts/jobs/synthetic",
@@ -293,10 +320,24 @@ test("read aloud resumes when the next chunk arrives after buffering", async ({ 
     }));
   }, index);
   const audio = page.locator("audio");
+  const expectPlays = async (indices: number[]) => {
+    await flushBrowserCallbacks(page);
+    expect(await page.evaluate(() => (window as Window & { __ttsPlayCalls: string[] }).__ttsPlayCalls))
+      .toEqual(indices.map((index) => `/api/tts/jobs/synthetic/chunks/${index}`));
+  };
   await emitChunk(1);
   await expect(page.getByText("Playing chunk 1", { exact: true })).toBeVisible();
   await audio.dispatchEvent("ended");
   await expect(page.getByText("Buffering next chunk…", { exact: true })).toBeVisible();
+  // Baseline regression: entering buffering must not call play() on ended chunk 1.
+  await expectPlays([1]);
+  await page.evaluate(() => {
+    const source = (window as Window & { __ttsEvents?: EventTarget }).__ttsEvents!;
+    for (let count = 0; count < 3; count += 1) {
+      source.dispatchEvent(new MessageEvent("chunk_split", { data: JSON.stringify({ chunks_total: 4, chunks_completed: 1 }) }));
+    }
+  });
+  await expectPlays([1]);
   await emitChunk(2);
   await expect(page.getByText("Playing chunk 2", { exact: true })).toBeVisible();
   await expect(audio).toHaveAttribute("src", "/api/tts/jobs/synthetic/chunks/2");
@@ -304,6 +345,7 @@ test("read aloud resumes when the next chunk arrives after buffering", async ({ 
   await emitChunk(3);
   await flushBrowserCallbacks(page);
   await expect(audio).toHaveAttribute("src", "/api/tts/jobs/synthetic/chunks/2");
+  await expectPlays([1, 2]);
   await audio.dispatchEvent("ended");
   await expect(page.getByText("Playing chunk 3", { exact: true })).toBeVisible();
   await audio.dispatchEvent("ended");
@@ -323,6 +365,7 @@ test("read aloud resumes when the next chunk arrives after buffering", async ({ 
   await audio.dispatchEvent("ended");
   await expect(page.getByText("Audio ready", { exact: true })).toBeVisible();
   await expect(audio).toHaveAttribute("src", "/api/tts/jobs/synthetic/chunks/4");
+  await expectPlays([1, 2, 3, 4]);
 });
 
 test("arbitrary profile labels switch by stable IDs and preserve the session draft and transcript", async ({ page }) => {

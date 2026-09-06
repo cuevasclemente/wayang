@@ -13,7 +13,6 @@ import {
   recordSessionOpenLatency,
   switchSessionAgent,
   transcriptSwitchEnvelope,
-  synthesizeTts,
   updateSessionGoal,
   updateSessionModel as updateSessionModelRequest,
   type AgentProfileSummary,
@@ -24,7 +23,6 @@ import {
   type SessionAgentSwitchPreview,
   type SlashArgumentSuggestion,
   type SlashCommandOption,
-  type TtsChunkManifest,
   type WorkspaceProject,
 } from "../api/client";
 import {
@@ -47,6 +45,7 @@ import {
 } from "../components/transcript/TranscriptMutations";
 import { transcriptMutationMarker } from "../components/transcript/transcriptMutationHelpers";
 import { formatContextWindow } from "../utils/context-window";
+import { useTtsPlayback } from "../tts/useTtsPlayback";
 import { shouldCompressImageForAttachment } from "./imageAttachmentCompression";
 import {
   classifyTranscriptPageErrorCode,
@@ -192,7 +191,6 @@ interface TodoState {
 }
 
 type CommandGuardMode = "off" | "audit" | "balanced" | "strict";
-type TtsStage = "idle" | "preparing" | "submitting" | "queued" | "generating" | "playing" | "buffering_next_chunk" | "ready_final" | "ready" | "error";
 
 interface CommandGuardState {
   available: boolean;
@@ -1521,12 +1519,6 @@ function MessageTimestamp({ msg, className = "" }: { msg: ChatMessage; className
   );
 }
 
-function normalizeTtsPlaybackUrl(url: string | null | undefined): string {
-  if (!url) return "";
-  if (url.startsWith("/v1/tts/")) return url.replace(/^\/v1\/tts/, "/api/tts");
-  return url;
-}
-
 function AssistantMessage({
   msg,
   agentName,
@@ -1540,180 +1532,15 @@ function AssistantMessage({
 }) {
   const message = msg.message;
   const messageId = typeof msg.id === "string" ? msg.id : null;
-  const [ttsStage, setTtsStage] = useState<TtsStage>("idle");
-  const [ttsChunks, setTtsChunks] = useState<TtsChunkManifest[]>([]);
-  const [ttsProgress, setTtsProgress] = useState({ completed: 0, total: 0 });
-  const [ttsFinalUrl, setTtsFinalUrl] = useState<string | null>(null);
-  const [currentChunkIndex, setCurrentChunkIndex] = useState<number | null>(null);
-  const [ttsError, setTtsError] = useState("");
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const ttsLoading = ["preparing", "submitting", "queued", "generating"].includes(ttsStage);
-
-  const sortedChunks = useMemo(
-    () => [...ttsChunks].filter((chunk) => chunk.status === "completed" && chunk.url).sort((a, b) => a.index - b.index),
-    [ttsChunks],
-  );
-  const currentChunk = sortedChunks.find((chunk) => chunk.index === currentChunkIndex) ?? null;
-  const currentAudioUrl = normalizeTtsPlaybackUrl(
-    currentChunk?.url ?? (ttsFinalUrl && currentChunkIndex == null ? ttsFinalUrl : null),
-  );
-
-  const upsertChunk = useCallback((chunk: TtsChunkManifest) => {
-    setTtsChunks((prev) => {
-      const next = new Map(prev.map((item) => [item.index, item]));
-      next.set(chunk.index, { ...next.get(chunk.index), ...chunk });
-      return [...next.values()].sort((a, b) => a.index - b.index);
-    });
-  }, []);
-
-  const closeTtsEvents = useCallback(() => {
-    eventSourceRef.current?.close();
-    eventSourceRef.current = null;
-  }, []);
-
-  useEffect(() => closeTtsEvents, [closeTtsEvents]);
-
-  useEffect(() => {
-    if (ttsAllowed) return;
-    closeTtsEvents();
-    audioRef.current?.pause();
-    setTtsStage("idle");
-    setTtsChunks([]);
-    setTtsFinalUrl(null);
-    setCurrentChunkIndex(null);
-    setTtsError("");
-  }, [closeTtsEvents, ttsAllowed]);
-
-  useEffect(() => {
-    if (!currentAudioUrl || !["playing", "buffering_next_chunk", "ready"].includes(ttsStage)) return;
-    audioRef.current?.play().catch(() => {
-      // Browser autoplay policies may require a second user gesture; controls remain visible.
-    });
-  }, [currentAudioUrl, ttsStage]);
-
-  const handleAudioEnded = useCallback(() => {
-    const currentPosition = currentChunkIndex ?? 0;
-    const nextChunk = sortedChunks.find((chunk) => chunk.index > currentPosition);
-    if (nextChunk) {
-      setCurrentChunkIndex(nextChunk.index);
-      setTtsStage("playing");
-      return;
-    }
-    if (ttsFinalUrl) {
-      // We just finished the last streamed chunk. Do not swap the player over
-      // to the concatenated final audio automatically, because that makes the
-      // message appear to repeat from the beginning after successful chunk
-      // playback. Keep the final URL for seeking/replay metadata instead.
-      setTtsStage("ready_final");
-      return;
-    }
-    setTtsStage("buffering_next_chunk");
-  }, [currentChunkIndex, sortedChunks, ttsFinalUrl]);
-
-  // EventSource listeners outlive the render that subscribed. Advance from
-  // current playback state, not the stage captured when Read aloud was clicked.
-  useEffect(() => {
-    if (ttsStage === "idle" || ttsStage === "error") return;
-    // Completion can be batched with the last chunk while we are buffering.
-    if (currentChunkIndex !== null && ttsStage !== "buffering_next_chunk" && ttsStage !== "ready_final") return;
-    const nextChunk = sortedChunks.find((chunk) => currentChunkIndex === null || chunk.index > currentChunkIndex);
-    if (!nextChunk) return;
-    setCurrentChunkIndex(nextChunk.index);
-    setTtsStage("playing");
-  }, [currentChunkIndex, sortedChunks, ttsStage]);
-
-  const subscribeToTtsJob = useCallback((eventsUrl: string) => {
-    closeTtsEvents();
-    const source = new EventSource(eventsUrl, { withCredentials: true });
-    eventSourceRef.current = source;
-
-    const handleManifest = (payload: any) => {
-      if (typeof payload?.chunks_completed === "number" || typeof payload?.chunks_total === "number") {
-        setTtsProgress({ completed: payload.chunks_completed ?? 0, total: payload.chunks_total ?? 0 });
-      }
-      if (Array.isArray(payload?.chunks)) {
-        setTtsChunks(
-          payload.chunks
-            .filter((chunk: any) => typeof chunk?.index === "number")
-            .map((chunk: any) => ({ ...chunk, url: normalizeTtsPlaybackUrl(chunk.url) })),
-        );
-      }
-      if (payload?.final_audio_url) setTtsFinalUrl(normalizeTtsPlaybackUrl(payload.final_audio_url));
-      if (payload?.status === "failed" || payload?.status === "cancelled") {
-        setTtsError(payload?.errors?.length ? JSON.stringify(payload.errors.slice(-1)[0]) : `TTS job ${payload.status}`);
-        setTtsStage("error");
-        closeTtsEvents();
-      }
-    };
-
-    const parseEvent = (event: MessageEvent) => {
-      try {
-        return JSON.parse(event.data);
-      } catch {
-        return null;
-      }
-    };
-
-    source.addEventListener("manifest", (event) => handleManifest(parseEvent(event as MessageEvent)));
-    source.addEventListener("job_started", (event) => {
-      handleManifest(parseEvent(event as MessageEvent));
-      setTtsStage("generating");
-    });
-    source.addEventListener("chunk_split", (event) => handleManifest(parseEvent(event as MessageEvent)));
-    source.addEventListener("chunk_completed", (event) => {
-      const chunk = parseEvent(event as MessageEvent);
-      if (!chunk || typeof chunk.index !== "number") return;
-      const normalizedChunk = { ...chunk, url: normalizeTtsPlaybackUrl(chunk.url) } as TtsChunkManifest;
-      upsertChunk(normalizedChunk);
-      setTtsProgress((prev) => ({ completed: Math.max(prev.completed, chunk.index), total: Math.max(prev.total, chunk.index) }));
-    });
-    source.addEventListener("job_completed", (event) => {
-      const manifest = parseEvent(event as MessageEvent);
-      handleManifest(manifest);
-      if (manifest?.final_audio_url) setTtsFinalUrl(normalizeTtsPlaybackUrl(manifest.final_audio_url));
-      setTtsStage((stage) => (stage === "playing" ? stage : "ready_final"));
-      closeTtsEvents();
-    });
-    source.addEventListener("job_failed", (event) => {
-      const manifest = parseEvent(event as MessageEvent);
-      handleManifest(manifest);
-      setTtsError(manifest?.errors?.length ? JSON.stringify(manifest.errors.slice(-1)[0]) : "TTS job failed");
-      setTtsStage("error");
-      closeTtsEvents();
-    });
-    source.onerror = () => {
-      setTtsError("Lost connection to TTS progress stream");
-      setTtsStage("error");
-      closeTtsEvents();
-    };
-  }, [closeTtsEvents, upsertChunk]);
-
-  const handleReadAloud = useCallback(async () => {
-    if (!ttsAllowed || !sessionId || !messageId || ttsLoading) return;
-    closeTtsEvents();
-    setTtsChunks([]);
-    setTtsProgress({ completed: 0, total: 0 });
-    setTtsFinalUrl(null);
-    setCurrentChunkIndex(null);
-    setTtsError("");
-    setTtsStage("preparing");
-    try {
-      await new Promise((resolve) => window.setTimeout(resolve, 150));
-      setTtsStage("submitting");
-      const result = await synthesizeTts(sessionId, messageId);
-      if ("eventsUrl" in result) {
-        setTtsStage(result.status === "queued" ? "queued" : "generating");
-        subscribeToTtsJob(result.eventsUrl);
-      } else {
-        setTtsFinalUrl(result.url);
-        setTtsStage("ready");
-      }
-    } catch (err) {
-      setTtsError(err instanceof Error ? err.message : "TTS failed");
-      setTtsStage("error");
-    }
-  }, [closeTtsEvents, sessionId, messageId, subscribeToTtsJob, ttsAllowed, ttsLoading]);
+  const tts = useTtsPlayback(sessionId, messageId, ttsAllowed);
+  const ttsStage = tts.stage;
+  const ttsLoading = ["submitting", "queued", "generating"].includes(ttsStage);
+  const ttsProgress = tts.state.progress;
+  const ttsFinalUrl = tts.state.finalUrl;
+  const ttsError = tts.state.error;
+  const currentChunkIndex = tts.state.source?.index;
+  const currentAudioUrl = tts.state.source?.url;
+  const handleReadAloud = tts.readAloud;
   if (!message) return null;
 
   const content = Array.isArray(message.content) ? message.content : [];
@@ -1761,25 +1588,25 @@ function AssistantMessage({
               Read aloud
             </div>
             {ttsLoading && <div className="text-[10px] text-blue-300">Working…</div>}
-            {ttsStage === "playing" && <div className="text-[10px] text-green-300">Playing chunk {currentChunkIndex}</div>}
+            {ttsStage === "playing" && <div className="text-[10px] text-green-300">{currentChunkIndex == null ? "Playing audio" : `Playing chunk ${currentChunkIndex}`}</div>}
             {ttsStage === "buffering_next_chunk" && <div className="text-[10px] text-blue-300">Buffering next chunk…</div>}
-            {(ttsStage === "ready" || ttsStage === "ready_final") && <div className="text-[10px] text-green-300">Audio ready</div>}
+            {ttsStage === "ready_final" && <div className="text-[10px] text-green-300">Audio ready</div>}
+            {ttsStage === "paused" && <div className="text-[10px] text-neutral-400">Paused</div>}
+            {ttsStage === "blocked" && <div className="text-[10px] text-amber-300">Playback needs a click to continue</div>}
             {ttsStage === "error" && <div className="text-[10px] text-amber-300">Needs attention</div>}
           </div>
-          <div className="mb-3 grid gap-1 text-xs text-neutral-400 sm:grid-cols-5">
+          <div className="mb-3 grid gap-1 text-xs text-neutral-400 sm:grid-cols-4">
             {[
-              ["preparing", "Creating request"],
               ["submitting", "Submitting text"],
               ["queued", "Queued"],
               ["generating", "Generating chunks"],
               ["playing", "Playing"],
             ].map(([stage, label]) => {
-              const stageOrder: TtsStage[] = ["preparing", "submitting", "queued", "generating", "playing", "ready_final"];
-              const effectiveStage: TtsStage = ttsStage === "ready" ? "ready_final" : ttsStage === "buffering_next_chunk" ? "playing" : ttsStage === "error" ? "generating" : ttsStage;
-              const currentIndex = stageOrder.indexOf(effectiveStage);
-              const stageIndex = stageOrder.indexOf(stage as TtsStage);
-              const complete = currentIndex > stageIndex || ttsStage === "ready" || ttsStage === "ready_final";
-              const active = ttsStage === stage;
+              const generationOrder = ["submitting", "queued", "generating", "completed"];
+              const complete = stage === "playing"
+                ? ttsStage === "ready_final"
+                : generationOrder.indexOf(tts.state.generation) > generationOrder.indexOf(stage);
+              const active = stage === "playing" ? ttsStage === "playing" : tts.state.generation === stage;
               return (
                 <div
                   key={stage}
@@ -1805,14 +1632,22 @@ function AssistantMessage({
           )}
           {currentAudioUrl && (
             <audio
-              ref={audioRef}
+              key={tts.audioKey}
+              ref={tts.attachAudio}
               controls
               src={currentAudioUrl}
-              onEnded={handleAudioEnded}
+              onEnded={(event) => tts.onEnded(event.currentTarget)}
+              onPause={(event) => tts.onPause(event.currentTarget)}
+              onPlay={(event) => tts.onPlay(event.currentTarget)}
               className="w-full max-w-xl h-9"
               preload="auto"
             />
           )}
+          <div className="mt-2 flex gap-3 text-xs text-neutral-300">
+            {(ttsStage === "playing" || ttsStage === "buffering_next_chunk") && <button type="button" onClick={tts.pause}>Pause read aloud</button>}
+            {(ttsStage === "paused" || ttsStage === "blocked") && <button type="button" onClick={tts.resume}>Resume read aloud</button>}
+            {ttsFinalUrl && <button type="button" onClick={tts.replay}>Replay full audio</button>}
+          </div>
           {ttsError && (
             <div className="text-[11px] text-amber-300">
               {ttsError}

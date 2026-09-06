@@ -371,6 +371,12 @@ TTS is disabled unless a service URL is configured.
 | `WAYANG_TTS_SPEED` | `1.0` | Playback/synthesis speed. |
 | `WAYANG_TTS_MAX_CHARS` | `500` | Per-request character limit. |
 
+Read aloud uses all visible assistant prose in the selected response group, including progress commentary, but not thinking, tool calls/results, or code blocks. Markdown is prepared deterministically for speech; every table row is narrated with its column labels, including empty cells. Inline labels and meaningful symbols remain speakable. No model summary is generated.
+
+With the shared broker, the first completed segment starts immediately. Later segments play once in order, with silent buffering when the next segment is not ready. Progress updates do not resume paused audio or replay ended segments. Browser autoplay restrictions may require **Resume read aloud**. **Replay full audio** explicitly starts the completed recording; job completion never does so automatically.
+
+Legacy direct mode still waits for the whole recording. Requests exceeding its 20-segment bound fail explicitly instead of returning truncated audio; use the shared broker for long responses.
+
 Treat remote TTS as a data disclosure boundary: assistant text is sent to the configured service. Keep local URLs loopback-only unless the service has its own reviewed transport security.
 
 ## Transcript background maintenance
