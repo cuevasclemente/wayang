@@ -3848,7 +3848,18 @@ export function ChatPanel({
     // No cross-selection content inference. The old display must still belong
     // to this session so historical repeated replies have already been reserved.
     if (!sessionId || messagesOwnerSessionIdRef.current !== sessionId) return;
+    // An acceptance ACK may already have removed the submission record. The
+    // optimistic row still carries its exact client ID: reserve that occurrence
+    // before it is replaced by history, so a delayed live echo cannot recreate
+    // it below the assistant (or consume a second intentional identical send).
+    const localPending = messagesRef.current.filter(isLocalPendingUserMessage);
     for (const occurrence of occurrences) {
+      const pendingIndex = localPending.findIndex((pending) => userMessagesMatch(pending, occurrence));
+      if (pendingIndex !== -1) {
+        const [pending] = localPending.splice(pendingIndex, 1);
+        rememberRenderedSubmission(sessionId, pending.__localId);
+        continue;
+      }
       const content = getUserMessageText(occurrence.message);
       for (const [clientMessageId, submitted] of submittedUserMessagesRef.current) {
         if (submitted.sessionId !== sessionId
