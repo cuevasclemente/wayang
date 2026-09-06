@@ -76,7 +76,7 @@ function validateAudioName(name: string): boolean {
   return /^\d{1,6}\.[a-z0-9]+$/i.test(name) || /^audio\.[a-z0-9]+$/i.test(name);
 }
 
-const TTS_TEXT_PIPELINE_VERSION = "speech-text-v2";
+const TTS_TEXT_PIPELINE_VERSION = "speech-text-v3";
 
 function hashTtsText(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex").slice(0, 16);
@@ -197,12 +197,13 @@ router.post("/tts/synthesize", async (req: Request, res: Response) => {
     // because it exposes chunk-ready events and avoids browser waits for full audio.
     const chunks = chunkText(text, config.tts.maxChars);
 
-    // Cap legacy direct synthesis to prevent abuse. Broker jobs own robust long-form chunking.
+    // Keep the direct-mode resource bound, but never report a truncated response
+    // as complete narration. Reject before any provider or cache work.
     if (chunks.length > 20) {
-      console.warn(
-        `[tts] Message ${messageId} has ${chunks.length} chunks — capping legacy direct synthesis at 20`,
-      );
-      chunks.length = 20;
+      res.status(413).json({
+        error: "This response exceeds the 20-chunk direct TTS limit. Configure WAYANG_TTS_BROKER_URL to read the complete response.",
+      });
+      return;
     }
 
     const audioBuffers: Buffer[] = [];
