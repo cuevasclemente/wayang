@@ -693,8 +693,8 @@ test("Pi teardown emits and awaits session_shutdown exactly once before low-leve
     "has:session_shutdown",
     "emit:session_shutdown:quit:start",
     "emit:session_shutdown:quit:end",
-    "unsubscribe",
     "dispose",
+    "unsubscribe",
   ]);
 
   await disposePiAgentSession(handle);
@@ -719,7 +719,7 @@ test("Pi teardown still invalidates the low-level session when session_shutdown 
   } as unknown as PiSessionHandle;
 
   await assert.doesNotReject(disposePiAgentSession(handle));
-  assert.deepEqual(events, ["shutdown-failed", "unsubscribe", "dispose"]);
+  assert.deepEqual(events, ["shutdown-failed", "dispose", "unsubscribe"]);
 });
 
 function currentTurnFixture(name: string) {

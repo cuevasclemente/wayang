@@ -26,7 +26,7 @@ import { performance } from "node:perf_hooks";
 import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
 import { recordLatencyMetric } from "./latency-metrics.js";
 import { getInterviewBridge } from "./interview-bridge.js";
-import { resolveInterviewSubmissionEvidence, verifyInterviewSubmissionEntry, type InterviewRecord } from "./interviews.js";
+import { markDelivered, resolveInterviewSubmissionEvidence, type InterviewRecord } from "./interviews.js";
 import {
   beginAgentSwitch,
   completeAgentSwitch,
@@ -263,7 +263,9 @@ export interface PiSessionHandle {
   /** Lifecycle failure not represented by a final assistant message. */
   pendingSessionError?: string;
   liveStreamingMessageUnsubscribe?: () => void;
-  /** Shared exactly-once extension shutdown + low-level AgentSession disposal. */
+  /** Shared exactly-once extension shutdown, including disposal retries. */
+  agentSessionShutdown?: Promise<void>;
+  /** Shared low-level disposal; failures retain ownership and may be retried. */
   agentSessionDisposal?: Promise<void>;
   /** Process-local activation epoch captured before runtime construction. */
   capabilityActivationGeneration: bigint;
@@ -1271,6 +1273,7 @@ export async function stopPiSessionIfIdle(id: string): Promise<boolean> {
   const handle = sessions.get(id);
   if (!handle) return true;
   if (handle.session.isStreaming || handle.session.pendingMessageCount > 0
+    || interviewAdmissions.get(handle)?.size
     || manualCompactionQueueForHandle(handle)) return false;
   await destroyPiSession(id);
   return true;
@@ -1338,7 +1341,8 @@ export function protectedBrowserIdleRetentionIsRequired(
 export async function stopIdlePiSessions(now = Date.now()): Promise<string[]> {
   const stopped: string[] = [];
   for (const [id, handle] of [...sessions]) {
-    if (handle.session.isStreaming || manualCompactionQueueForHandle(handle)) continue;
+    if (handle.session.isStreaming || interviewAdmissions.get(handle)?.size
+      || manualCompactionQueueForHandle(handle)) continue;
     // Protected human handoff intentionally spans chat turns and may take
     // longer than the ordinary idle timeout. Explicit denial, stop, model or
     // agent change, and shutdown paths still revoke it directly.
@@ -3367,6 +3371,11 @@ export async function createPiSession(
       queuedBrowserMessages: new Map(),
     };
     handle.liveStreamingMessageUnsubscribe = session.subscribe((event: AgentSessionEvent) => {
+      // SDK subscribers see message_end before its synchronous durable append.
+      // One deferred probe per persistence/settlement event, never a poll loop.
+      if (event.type === "message_end" || event.type === "agent_settled") {
+        queueMicrotask(() => reconcileInterviewAdmissionsQuietly(handle));
+      }
       trackOverflowRecovery(handle, event);
       persistSettledSessionError(handle, event);
       if (event.type === "agent_settled") {
@@ -4247,7 +4256,7 @@ function latchPiSessionHandleCapabilityDenial(
   const browserToolNames = handle.protectedBrowserRuntime?.tools?.map((tool) => tool.name) ?? [];
   const session = handle.session as any;
   if (session) {
-    try { session.clearQueue?.(); } catch { /* synchronous denial remains latched */ }
+    try { clearPiSessionQueue(handle); } catch { /* synchronous denial remains latched */ }
     try { session.setActiveToolsByName?.([]); } catch { /* fall through to direct removal */ }
     if (Array.isArray(session.agent?.state?.tools)) session.agent.state.tools = [];
     // A queued/future tool call must not be able to reactivate a cached registry.
@@ -4458,19 +4467,32 @@ export async function closePiSessionAuthorities(
 
 export async function disposePiAgentSession(handle: PiSessionHandle): Promise<void> {
   if (!handle.agentSessionDisposal) {
-    handle.agentSessionDisposal = (async () => {
+    handle.agentSessionShutdown ??= (async () => {
       try {
         const runner = handle.session.extensionRunner;
         if (runner.hasHandlers("session_shutdown")) {
           await runner.emit({ type: "session_shutdown", reason: "quit" });
         }
       } catch {
-        // A faulty extension shutdown handler must not retain tools, timers, or
-        // other process-local authorities by preventing low-level disposal.
+        // Faulty extension shutdown must not prevent low-level disposal.
       }
-      try { handle.liveStreamingMessageUnsubscribe?.(); } catch { /* best effort */ }
-      try { handle.session.dispose(); } catch { /* best effort */ }
     })();
+    handle.agentSessionDisposal = (async () => {
+      await handle.agentSessionShutdown;
+      // Disposal only detaches SDK listeners; it does not terminate an active
+      // run. The canonical idle contract must confirm cleanup first. A throw
+      // retains the admission and subscriber for retry of this exact runtime.
+      if (interviewAdmissions.get(handle)?.size && !handle.session.isIdle) {
+        throw new Error("Interview delivery runtime cleanup is incomplete");
+      }
+      handle.session.dispose();
+      reconcileInterviewAdmissionsQuietly(handle);
+      retireDisposedInterviewAdmissions(handle);
+      try { handle.liveStreamingMessageUnsubscribe?.(); } catch { /* best effort */ }
+    })().catch((error) => {
+      handle.agentSessionDisposal = undefined;
+      throw error;
+    });
   }
   await handle.agentSessionDisposal;
 }
@@ -4583,14 +4605,103 @@ export function interviewSubmissionContent(record: InterviewRecord): string {
   ].join("\n");
 }
 
-function findInterviewSubmissionEntry(handle: PiSessionHandle, record: InterviewRecord): string | undefined {
-  return handle.session.sessionManager.getEntries().find((entry: any) => (
-    entry.type === "custom_message" &&
-    entry.customType === "wayang-interview-submission" &&
-    entry.details?.request_id === record.request_id &&
-    entry.details?.submission_id === record.submission_id &&
-    verifyInterviewSubmissionEntry(record.session_id, entry)
-  ))?.id;
+type InterviewAdmissionOutcome =
+  | { delivery: InterviewSubmissionDelivery }
+  | { error: Error };
+
+interface InterviewAdmission {
+  record: InterviewRecord;
+  /** Pi creates a CustomMessage wrapper but preserves this exact details object. */
+  details: object;
+  release: () => void;
+  outcome?: InterviewAdmissionOutcome;
+  sendError?: Error;
+  observers: Set<(outcome: InterviewAdmissionOutcome) => void>;
+}
+
+// Handle object ownership deliberately survives runtimeGeneration denial changes.
+// No TTL: only verified persistence, exact discard or completed disposal retires it.
+const interviewAdmissions = new WeakMap<PiSessionHandle, Map<string, InterviewAdmission>>();
+
+function interviewAdmissionKey(record: InterviewRecord): string {
+  return JSON.stringify([record.request_id, record.submission_id]);
+}
+
+function findInterviewSubmissionDelivery(handle: PiSessionHandle, record: InterviewRecord): InterviewSubmissionDelivery | undefined {
+  for (const entry of handle.session.sessionManager.getEntries()) {
+    const evidence = resolveInterviewSubmissionEvidence(record.session_id, entry);
+    if (!evidence || evidence.requestId !== record.request_id || evidence.submissionId !== record.submission_id) continue;
+    // The outer recovery caller historically marks custom_message. Preserve a
+    // racing tool-result's authoritative mode before its idempotent mark call.
+    if (evidence.source === "tool_result") markDelivered(record.request_id, "tool_result", entry.id);
+    return { entryId: entry.id, alreadyPresent: true };
+  }
+  return undefined;
+}
+
+function finishInterviewAdmission(handle: PiSessionHandle, admission: InterviewAdmission, outcome: InterviewAdmissionOutcome): void {
+  const ledger = interviewAdmissions.get(handle);
+  const key = interviewAdmissionKey(admission.record);
+  if (ledger?.get(key) !== admission) return;
+  ledger.delete(key);
+  admission.outcome = outcome;
+  admission.release();
+  for (const observer of admission.observers) observer(outcome);
+  admission.observers.clear();
+}
+
+function reconcileInterviewAdmissions(handle: PiSessionHandle): void {
+  const ledger = interviewAdmissions.get(handle);
+  if (!ledger?.size) return;
+  for (const admission of ledger.values()) {
+    const delivery = findInterviewSubmissionDelivery(handle, admission.record);
+    if (delivery) finishInterviewAdmission(handle, admission, {
+      delivery: { ...delivery, alreadyPresent: false },
+    });
+  }
+}
+
+function reconcileInterviewAdmissionsQuietly(handle: PiSessionHandle): void {
+  try { reconcileInterviewAdmissions(handle); }
+  catch { /* Failed evidence reads/commits never free accepted ownership. */ }
+}
+
+function retireDisposedInterviewAdmissions(handle: PiSessionHandle): void {
+  for (const admission of interviewAdmissions.get(handle)?.values() ?? []) {
+    finishInterviewAdmission(handle, admission, { error: new Error("Interview delivery runtime was disposed") });
+  }
+}
+
+function clearPiSessionQueue(handle: PiSessionHandle): { steering: string[]; followUp: string[] } {
+  return handle.session.clearQueue({
+    onDiscardedCustomMessages: (messages) => {
+      // Receipt is synchronous before queue_update can reenter delivery. Never
+      // infer custom discard from user counters, queue emptiness or send failure.
+      for (const admission of interviewAdmissions.get(handle)?.values() ?? []) {
+        if (!messages.some((message) => message.customType === "wayang-interview-submission"
+          && message.details === admission.details)) continue;
+        finishInterviewAdmission(handle, admission, { error: new Error("Interview submission was discarded from the queue") });
+      }
+    },
+  });
+}
+
+function observeInterviewAdmission(admission: InterviewAdmission): Promise<InterviewSubmissionDelivery> {
+  return new Promise((resolve, reject) => {
+    const finish = (outcome: InterviewAdmissionOutcome) => {
+      clearTimeout(timer);
+      admission.observers.delete(finish);
+      if ("delivery" in outcome) resolve(outcome.delivery);
+      else reject(outcome.error);
+    };
+    // Arm before dispatch: idle sendCustomMessage may await the entire run.
+    const timer = setTimeout(() => finish({
+      error: new Error("Interview submission was queued but not persisted before delivery timeout"),
+    }), 30_000);
+    admission.observers.add(finish);
+    if (admission.outcome) finish(admission.outcome);
+    else if (admission.sendError) finish({ error: admission.sendError });
+  });
 }
 
 export async function findInterviewToolResultEntry(sessionId: string, record: InterviewRecord): Promise<string | undefined> {
@@ -4614,8 +4725,8 @@ export async function findInterviewToolResultEntry(sessionId: string, record: In
 
 /**
  * Inject an orphaned durable submission into its exact Wayang/pi session.
- * The caller marks the store record delivered only after this returns an entry
- * ID that is visible in the persisted pi session tree.
+ * The caller marks custom delivery only after this returns a verified persisted
+ * entry ID. A racing tool-result is reconciled with its own mode before return.
  */
 export async function deliverInterviewSubmission(
   sessionId: string,
@@ -4635,46 +4746,59 @@ export async function deliverInterviewSubmission(
   );
   if (handle.sessionFile && !sessionRow.pi_session_file) updatePiSessionFile(sessionId, handle.sessionFile);
 
-  const existing = findInterviewSubmissionEntry(handle, record);
-  if (existing) return { entryId: existing, alreadyPresent: true };
+  reconcileInterviewAdmissions(handle);
+  const existing = findInterviewSubmissionDelivery(handle, record);
+  if (existing) return existing;
   assertRuntimeMutationUnlocked(sessionId);
+  assertCapabilityAuthorityAvailable(handle);
 
-  // The originating old turn already accepted this continuation. It may cross
-  // an activation latch, but never a denial latch, and remains leased until its
-  // exact durable CustomMessageEntry is visible.
-  const releaseTopLevelWork = beginPiSessionTopLevelWork(handle, { acceptedContinuation: true });
+  let ledger = interviewAdmissions.get(handle);
+  if (!ledger) interviewAdmissions.set(handle, ledger = new Map());
+  const key = interviewAdmissionKey(record);
+  const pending = ledger.get(key);
+  if (pending) return observeInterviewAdmission(pending);
+
+  const captured = structuredClone(record);
+  const details = {
+    request_id: captured.request_id,
+    submission_id: captured.submission_id,
+    session_id: captured.session_id,
+    origin_tool_name: captured.origin_tool_name,
+    origin_tool_call_id: captured.origin_tool_call_id ?? null,
+    created_at: captured.created_at,
+    submitted_at: captured.submitted_at,
+    questions: captured.questions,
+    answers: captured.answers ?? [],
+  };
+  const admission: InterviewAdmission = {
+    record: captured, details, observers: new Set(),
+    release: beginPiSessionTopLevelWork(handle, { acceptedContinuation: true }),
+  };
+  // No await between reservation and dispatch; concurrent/reentrant observers
+  // join this exact admission even before Pi has inserted a queue object.
+  ledger.set(key, admission);
+  const observation = observeInterviewAdmission(admission);
+  revokeInteractiveMutationAuthority(handle);
+  const failed = (error: unknown) => {
+    reconcileInterviewAdmissionsQuietly(handle);
+    if (admission.outcome) return;
+    // A failed send alone is ambiguous: it may already have queued/persisted.
+    // Detach observers but keep the lease and event-driven persistence probes.
+    admission.sendError = error instanceof Error ? error : new Error("Interview submission send failed");
+    for (const observer of admission.observers) observer({ error: admission.sendError });
+    admission.observers.clear();
+  };
   try {
-    revokeInteractiveMutationAuthority(handle);
-    const details = {
-      request_id: record.request_id,
-      submission_id: record.submission_id,
-      session_id: record.session_id,
-      origin_tool_name: record.origin_tool_name,
-      origin_tool_call_id: record.origin_tool_call_id ?? null,
-      created_at: record.created_at,
-      submitted_at: record.submitted_at,
-      questions: record.questions,
-      answers: record.answers ?? [],
-    };
-    await handle.session.sendCustomMessage({
+    void handle.session.sendCustomMessage({
       customType: "wayang-interview-submission",
-      content: interviewSubmissionContent(record),
+      content: interviewSubmissionContent(captured),
       display: true,
       details,
-    }, { deliverAs: "steer", triggerTurn: true });
-
-    // When pi is streaming, sendCustomMessage queues steering work. Wait for the
-    // SDK to persist its CustomMessageEntry before acknowledging delivery.
-    const deadline = performance.now() + 30_000;
-    while (performance.now() < deadline) {
-      const entryId = findInterviewSubmissionEntry(handle, record);
-      if (entryId) return { entryId, alreadyPresent: false };
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    throw new Error("Interview submission was queued but not persisted before delivery timeout");
-  } finally {
-    releaseTopLevelWork();
-  }
+    }, { deliverAs: "steer", triggerTurn: true }).then(
+      () => reconcileInterviewAdmissionsQuietly(handle), failed,
+    );
+  } catch (error) { failed(error); }
+  return observation;
 }
 
 function manualCompactionQueueForHandle(handle: PiSessionHandle): ManualCompactionMessageQueue | undefined {
@@ -5503,7 +5627,7 @@ export async function abortInteractiveTurn(
   // evidence must survive when Pi retains queued work for later settlement.
   revokeInteractiveMutationAuthority(handle);
   const clearedQueue = options.clearQueue
-    ? handle.session.clearQueue()
+    ? clearPiSessionQueue(handle)
     : { steering: [], followUp: [] };
   if (options.clearQueue) {
     // Only retire after successful SDK clearing. Both maps must move together:
