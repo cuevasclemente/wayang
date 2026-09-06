@@ -40,6 +40,7 @@ export interface ChunkerStats {
   messagesUsed: number;
   utterancesEmitted: number;
   skippedParseErrors: number;
+  oversizedRecords: number;
 }
 
 export interface ChunkerResult {
@@ -70,6 +71,7 @@ export async function chunkJsonlFile(
     messagesUsed: 0,
     utterancesEmitted: 0,
     skippedParseErrors: 0,
+    oversizedRecords: 0,
   };
 
   const utterances: Utterance[] = [];
@@ -157,24 +159,36 @@ export async function chunkJsonlFile(
     const block = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
     let lineStartOffset = 0;
-    let pendingBytes = Buffer.alloc(0);
+    let lineParts: Buffer[] = [];
+    let lineBytes = 0;
+    let oversized = false;
+    const append = (part: Buffer): void => {
+      lineBytes += part.length;
+      if (lineBytes > 1024 * 1024) { oversized = true; lineParts = []; }
+      else if (!oversized && part.length) lineParts.push(Buffer.from(part));
+    };
+    const consume = (): void => {
+      if (oversized) { stats.linesRead++; stats.oversizedRecords++; }
+      else consumeLine(Buffer.concat(lineParts,lineBytes),lineStartOffset);
+      lineParts = []; lineBytes = 0; oversized = false;
+    };
     while (true) {
       const { bytesRead } = await handle.read(block, 0, block.length, position);
       if (bytesRead === 0) break;
-      const chunk = pendingBytes.length > 0
-        ? Buffer.concat([pendingBytes, block.subarray(0, bytesRead)])
-        : Buffer.from(block.subarray(0, bytesRead));
+      const chunk = block.subarray(0,bytesRead);
       let segmentStart = 0;
       for (let index = 0; index < chunk.length; index++) {
         if (chunk[index] !== 0x0a) continue;
-        consumeLine(chunk.subarray(segmentStart, index), lineStartOffset);
-        lineStartOffset += index - segmentStart + 1;
+        append(chunk.subarray(segmentStart,index));
+        consume();
+        lineStartOffset = position + index + 1;
         segmentStart = index + 1;
       }
-      pendingBytes = Buffer.from(chunk.subarray(segmentStart));
+      append(chunk.subarray(segmentStart));
       position += bytesRead;
+      if (position > 32 * 1024 * 1024) throw new Error("Legacy search chunker input limit exceeded; use bounded extraction");
     }
-    if (pendingBytes.length > 0) consumeLine(pendingBytes, lineStartOffset);
+    if (lineBytes > 0) consume();
     if (!fingerprintMatches(await handle.stat())) throw new Error("Transcript changed during search indexing");
   } finally {
     await handle.close();
@@ -200,16 +214,7 @@ export async function chunkJsonlFile(
 
   // Keep chunks message-bound so best_message_id identifies the exact
   // searchable event rather than the first contributor to a coalesced chunk.
-  const utteranceToText = (u: Utterance): string => {
-    const prefix =
-      u.role === "user" ? "User: " : u.role === "assistant" ? "Assistant: " : "Thinking: ";
-    return prefix + u.text;
-  };
-
-  const overlapTail = (s: string): string => {
-    if (s.length <= OVERLAP_CHARS) return "";
-    return s.slice(s.length - OVERLAP_CHARS);
-  };
+  const utteranceToText = (u: Utterance): string => u.text;
 
   // We emit per role-group: thinking chunks should never mix with user/assistant
   // so they are kept in their own buffer. Simpler: split utterances into two
@@ -235,11 +240,8 @@ export async function chunkJsonlFile(
         continue;
       }
       let offset = 0;
-      let priorTail = "";
       while (offset < text.length) {
-        const available = Math.max(1, MAX_CHUNK_CHARS - (priorTail ? priorTail.length + 2 : 0));
-        const slice = text.slice(offset, offset + available);
-        const projected = priorTail ? `${priorTail}\n\n${slice}` : slice;
+        const projected = text.slice(offset,offset + MAX_CHUNK_CHARS);
         chunks.push({
           chunkIndex: chunkIndex++,
           role: utterance.role,
@@ -247,8 +249,8 @@ export async function chunkJsonlFile(
           messageId: utterance.messageId,
           sourceOffset: utterance.sourceOffset,
         });
-        offset += available;
-        priorTail = overlapTail(slice);
+        if (offset + MAX_CHUNK_CHARS >= text.length) break;
+        offset += MAX_CHUNK_CHARS - OVERLAP_CHARS;
       }
     }
   };
