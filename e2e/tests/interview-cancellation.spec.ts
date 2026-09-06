@@ -114,7 +114,12 @@ async function installSyntheticBackend(page: Page): Promise<void> {
       send(value: string): void { outbound.push(JSON.parse(value)); }
       close(): void { this.readyState = SyntheticWebSocket.CLOSED; }
       deliver(value: unknown): void {
-        this.onmessage?.(Object.assign(new Event("message"), { data: JSON.stringify(value) }));
+        // Match the server's session/selection envelope. Retain this socket's
+        // captured selection so replies from retired transports remain stale.
+        const framed = value && typeof value === "object" && !Array.isArray(value)
+          ? { session_id: ownerSessionId, selection_id: this.selectionId, ...value }
+          : value;
+        this.onmessage?.(Object.assign(new Event("message"), { data: JSON.stringify(framed) }));
       }
       disconnect(): void {
         this.readyState = SyntheticWebSocket.CLOSED;
@@ -196,6 +201,14 @@ test("interview form survives cancel send, mismatched/rejected ack, and disconne
         type: "interview_cancel_ack", requestId: request, sessionId: "synthetic-cancellation-session", status: "cancelled",
       });
   }, { request: requestId });
+  await expect(page.getByTestId("interview-cancellation-status")).toContainText("waiting for acknowledgement");
+  await page.evaluate(({ request }) => {
+    (window as unknown as { __sendSyntheticCancelAck(value: unknown): void }).__sendSyntheticCancelAck({
+      type: "interview_cancel_ack", requestId: request, sessionId: "synthetic-cancellation-session",
+      selection_id: "wrong-selection", status: "cancelled",
+    });
+  }, { request: requestId });
+  await expect(form).toBeVisible();
   await expect(page.getByTestId("interview-cancellation-status")).toContainText("waiting for acknowledgement");
   await page.evaluate(({ request }) => {
     (window as unknown as { __sendSyntheticCancelAck(value: unknown): void }).__sendSyntheticCancelAck({
