@@ -32,4 +32,10 @@ Tests used the repository's synthetic HOME/Pi/data/environment harness, isolated
 
 ## Release boundary
 
-Source-only, ready for review. Not merged, pushed, or deployed; no backend restart or frontend asset publication. The screenshot's exact live cause remains unverified. Owner was asked whether reload removes the duplicate; no answer received during this work. Frontend-only deployment may be possible without restarting active sessions, subject to owner approval and current integration/release checks.
+Owner approved deployment after review. On 2026-09-06 at approximately 01:36 UTC, fast-forwarded clean canonical main from `b6a0225` to source commit `35af5c5` and deployed the frontend on The-Sceptre. Prepublication rebuild reproduced the same hashed asset filenames; all nine delivery regressions passed again. Published new JS/PDF chunks additively after byte comparisons, verified unchanged shared CSS/worker/icon, and atomically swapped index.html. Old hashed assets remain for open tabs and rollback.
+
+HTTP byte comparisons passed for the served index, main JS, PDF chunk, CSS, and PDF worker. Health returned OK; system `wayang.service` remained active with unchanged PID 439605 and start time (2026-09-04 14:04:05 PDT). No backend restart, remote push, Tribe-Mac deployment, or production transcript/configuration mutation.
+
+Served main asset: `assets/index-Dmj8x7r2.js`; SHA256 `1a7af69fe45635e524bef9e412cde5e56fa34bec4d7564ca8b99ec8c74127ee1`. Index SHA256 `3d152db6a51e4158b3748fd59383cfa5248093d6d2e8206742e2cc4117cc705a`. Rollback entry page: `/tmp/wayang-frontend-before-35af5c5/index.html`; restore using a staged same-directory rename into canonical frontend/dist if needed. This is temporary host storage; old assets are retained in frontend/dist/assets.
+
+Browser tabs must reload to load the new bundle. The screenshot's exact live cause remains unverified, and the owner has not yet reported whether reload removes the original duplicate.
