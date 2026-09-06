@@ -64,7 +64,7 @@ Every delegated role reports concise future-value wiki lessons to lead, never wr
 - [x] Run Wayang make check (backend1278/8skip/0fail, frontend9, scripts67), myPi123 plus complete team typing/ceiling smoke, SDK116/2skip pluscore2 and fullcheck/offlinebuild, and60/60 selected E2E.
 - [x] Correct baseline cancellation-test framing against actual server contract, preserving stale/wrong-selection rejection; original separate pagination-order failure is not claimed fixed.
 - [x] Update findings report and project journals; complete wiki closeout.
-- [ ] Owner decision on all-three local-main integration; never infer deployment approval from source integration.
+- [x] Owner approved all-three local-main integration; completed checked fast-forwards of Wayang/myPi and Pi merge363cef07 preserving existing main metadata. Combined Pi full check and focused SDK/core/metadata tests pass; package-tree comparisons and sampled runtime hashes verify preservation. No deployment approval inferred; no canonical install/build/restart/push.
 
 Final source report: `docs/audits/2026-09-06-wayang-mypi-followup.md`. Pi source29082030; Wayang codecheckpoint da8b539 (includes main eaa7da5 via5592a98); myPi codecheckpoint0a75171. The later frontend echo deployment was performed independently, not by this follow-up. Source SDK and core artifacts were paired and actual resolution tested; only audit dependency directories were updated.
 
