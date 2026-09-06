@@ -3,8 +3,8 @@ import { createE2eSession, openSessionInUi } from "./helpers/sessions";
 
 // Exercise deliberately reordered delivery signals without a provider or any
 // production transcript. Session registration uses the isolated E2E backend.
-async function installDeliverySocket(page: Page, windowed: boolean): Promise<void> {
-  await page.addInitScript(({ windowed }) => {
+async function installDeliverySocket(page: Page, windowed: boolean, initiallyRunning = true): Promise<void> {
+  await page.addInitScript(({ windowed, initiallyRunning }) => {
     type Handler<T> = ((event: T) => void) | null;
     let connections = 0;
     let sendCount = 0;
@@ -56,6 +56,26 @@ async function installDeliverySocket(page: Page, windowed: boolean): Promise<voi
               message: { role: "user", content: sent.content } });
             this.persistSent();
           },
+          acknowledge: () => {
+            this.emit({ type: "queued_message_ack", client_message_id: this.sent!.client_message_id, status: "accepted" });
+          },
+          persistWithAssistant: () => {
+            const sent = this.sent!;
+            this.persisted.push(
+              { type: "user", id: `durable-${sent.client_message_id}`, message: { role: "user", content: sent.content } },
+              { type: "assistant", id: `assistant-${sent.client_message_id}`, message: { role: "assistant", content: "Persisted assistant tool step." } },
+            );
+            this.history(this.persisted);
+            this.emit({ type: "text_delta", delta: "Live continuation stays below the tool step." });
+          },
+          settle: () => {
+            this.history(this.persisted, false);
+            this.emit({ type: "agent_settled" });
+          },
+          lateLiveEcho: () => {
+            this.emit({ type: "message_start", client_message_id: this.sent!.client_message_id,
+              message: { role: "user", content: this.sent!.content } });
+          },
           restartWithoutOutcomes: () => {
             this.readyState = DeliverySocket.CLOSED;
             this.onclose?.(new CloseEvent("close"));
@@ -69,15 +89,17 @@ async function installDeliverySocket(page: Page, windowed: boolean): Promise<voi
         if (windowed) this.emit({ type: "transcript_protocol", protocol: "window-v1", intent: "latest" });
         this.history([]);
         this.emit({ type: "queued_message_snapshot", reason: "attach", messages: [], outcomes: [] });
-        this.emit({ type: "agent_start" });
-        this.emit({ type: "text_delta", delta: "Synthetic running turn." });
+        if (initiallyRunning) {
+          this.emit({ type: "agent_start" });
+          this.emit({ type: "text_delta", delta: "Synthetic running turn." });
+        }
       }
-      history(messages: unknown[]): void {
+      history(messages: unknown[], streaming = initiallyRunning || messages.length > 0): void {
         if (!windowed) { this.emit({ type: "history", messages }); return; }
         this.emit({ type: "transcript_window", reason: this.initialWindow ? "initial" : "tail_reconcile", transcript_epoch: "delivery-epoch",
           branch_tip_id: messages.length ? this.persisted.at(-1)?.id ?? null : null,
           messages, before_cursor: null, after_cursor: null, has_older: false, has_newer: false,
-          streaming_at_snapshot: true, compacting_at_snapshot: false,
+          streaming_at_snapshot: streaming, compacting_at_snapshot: false,
           message_count: messages.length, payload_bytes: new TextEncoder().encode(JSON.stringify({ messages })).byteLength });
         this.initialWindow = false;
       }
@@ -93,14 +115,40 @@ async function installDeliverySocket(page: Page, windowed: boolean): Promise<voi
         } else if (message.type === "message") {
           this.sent = message;
           (window as any).deliverySendCount = ++sendCount;
-          this.emit({ type: "queued_message_ack", client_message_id: message.client_message_id,
+          if (initiallyRunning) this.emit({ type: "queued_message_ack", client_message_id: message.client_message_id,
             status: "queued", cancellable: true });
         }
       }
       close(): void { this.readyState = DeliverySocket.CLOSED; }
     }
     (window as any).WebSocket = DeliverySocket;
-  }, { windowed });
+  }, { windowed, initiallyRunning });
+}
+
+for (const acknowledged of [false, true]) {
+  test(`idle optimistic send survives history then late echo (early ACK: ${acknowledged})`, async ({ page, request }) => {
+    await installDeliverySocket(page, true, false);
+    const session = await createE2eSession(request, `e2e idle late echo ${acknowledged}`);
+    await openSessionInUi(page, session);
+    await expect(page.getByTestId("chat-send-button")).toHaveText("Send");
+    const text = "One idle submission, not a second user turn.";
+    // A second deliberate identical submission must remain a separate turn.
+    for (const count of [1, 2]) {
+      await expect(page.getByTestId("chat-send-button")).toHaveText("Send");
+      await page.getByTestId("chat-input").fill(text);
+      await page.getByTestId("chat-send-button").click();
+      await expect(page.locator('[data-testid="chat-message"][data-role="user"]').filter({ hasText: text })).toHaveCount(count);
+      if (acknowledged) await page.evaluate(() => (window as any).deliveryWire.acknowledge());
+      await page.evaluate(() => (window as any).deliveryWire.persistWithAssistant());
+      await expect(page.locator('[data-message-id^="durable-"]').filter({ hasText: text })).toHaveCount(count);
+      await expect(page.getByTestId("chat-streaming")).toContainText("Live continuation stays below the tool step.");
+      await page.evaluate(() => (window as any).deliveryWire.lateLiveEcho());
+      await expect(page.locator('[data-testid="chat-message"][data-role="user"]').filter({ hasText: text })).toHaveCount(count, { timeout: 3_000 });
+      await expect(page.getByTestId("chat-streaming")).toContainText("Live continuation stays below the tool step.");
+      expect(await page.evaluate(() => (window as any).deliverySendCount)).toBe(count);
+      await page.evaluate(() => (window as any).deliveryWire.settle());
+    }
+  });
 }
 
 for (const windowed of [false, true]) {
