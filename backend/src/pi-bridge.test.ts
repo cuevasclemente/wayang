@@ -665,6 +665,9 @@ test("Pi teardown emits and awaits session_shutdown exactly once before low-leve
   const events: string[] = [];
   const handle = {
     session: {
+      pendingPromptCount: 0,
+      async abort() {},
+      async waitForPendingPrompts() {},
       extensionRunner: {
         hasHandlers(type: string) {
           events.push(`has:${type}`);
@@ -706,6 +709,9 @@ test("Pi teardown still invalidates the low-level session when session_shutdown 
   const events: string[] = [];
   const handle = {
     session: {
+      pendingPromptCount: 0,
+      async abort() {},
+      async waitForPendingPrompts() {},
       extensionRunner: {
         hasHandlers() { return true; },
         async emit() {
@@ -1136,31 +1142,47 @@ test("failed interrupt queue clearing revokes mutation authority without orphani
   assert.equal(handle.queuedBrowserMessages.get("synthetic-message"), record);
 });
 
-test("interrupt emits a synthetic agent_settled when the session is idle after abort", async () => {
-  const events = new EventEmitter();
-  const received: Array<{ type?: string }> = [];
-  events.on("message", (message: { type?: string }) => received.push(message));
-  const handle = {
-    id: "synthetic-abort-settle-idle",
-    session: {
-      isCompacting: true,
-      isStreaming: false,
-      clearQueue: () => ({ steering: [], followUp: [] }),
-      abortCompaction: () => {},
-      abort: async () => {},
-    },
-    runtimeGeneration: "abort-settle-idle",
-    interactiveTurns: new Map(),
-    queuedBrowserMessages: new Map(),
-    events,
-    subscriberCount: 0,
-    lastActivityAt: Date.now(),
-  } as unknown as PiSessionHandle;
+test("interrupt emits a synthetic agent_settled when the session is idle after abort", async (t) => {
+  const f = currentTurnFixture("wayang-abort-settle-idle-");
+  const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
+  const { InMemoryCredentialStore } = await import("@earendil-works/pi-ai");
+  const originalCreate = ModelRuntime.create.bind(ModelRuntime);
+  // Only model/auth inputs are synthetic. Runtime registration, prompt-count
+  // inspection, abort and the SDK pending-invocation barrier remain real.
+  t.mock.method(ModelRuntime, "create", async () => {
+    const runtime = await originalCreate({ credentials: new InMemoryCredentialStore(), modelsPath: null,
+      refreshOnCreate: false, allowModelNetwork: false });
+    runtime.registerProvider("synthetic-idle", {
+      api: "synthetic-idle-api", apiKey: "synthetic-only", baseUrl: "https://offline.invalid",
+      models: [{ id: "fixture", name: "fixture", reasoning: false, input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 262144, maxTokens: 1024 }],
+      streamSimple() { assert.fail("idle interruption must not dispatch a provider"); },
+    });
+    await runtime.refresh({ allowNetwork: false });
+    return runtime;
+  });
+  const row = createSession(f.cwd, { agentProfileId: f.profile.id, provider: "synthetic-idle", model: "fixture" });
+  try {
+    const handle = await createPiSession(row.id, f.cwd, row.provider, row.model);
+    assert.equal(getPiSession(row.id), handle, "only the exact registered runtime may publish settlement");
+    assert.equal(handle.session.pendingPromptCount, 0);
+    assert.equal(handle.session.isStreaming, false);
+    // Model the old fixture's lost compaction-end event, clearing compaction
+    // state when interrupted rather than incorrectly leaving it active forever.
+    let compacting = true;
+    t.mock.getter(handle.session, "isCompacting", () => compacting);
+    t.mock.method(handle.session, "abortCompaction", () => { compacting = false; });
+    const received: Array<{ type?: string }> = [];
+    handle.events.on("message", (message: { type?: string }) => received.push(message));
 
-  await abortInteractiveTurn(handle, { clearQueue: true });
+    await abortInteractiveTurn(handle, { clearQueue: true });
 
-  assert.deepEqual(received, [{ type: "agent_settled" }],
-    "a lost terminal lifecycle event must not pin clients in the running state");
+    assert.deepEqual(received, [{ type: "agent_settled" }],
+      "a lost terminal lifecycle event must not pin clients in the running state");
+  } finally {
+    try { await destroyPiSession(row.id); }
+    finally { f.cleanup(); }
+  }
 });
 
 test("interrupt does not emit a synthetic agent_settled while the session keeps streaming", async () => {
@@ -1347,6 +1369,10 @@ test("Pi bridge dispatches every typed browser teardown operation and reason wit
 test("archive/delete lifecycle reaches detached Standard workspaces without a live Pi handle", async () => {
   const calls: string[] = [];
   const uninstall = installInteractiveBrowserSessionLifecyclePort({
+    captureSessionWorkspaceCleanup(sourceSessionId, reason) {
+      return this.closeSessionWorkspaces.bind(this, sourceSessionId, reason);
+    },
+    captureAuthorityCleanup() { return async () => {}; },
     closeSessionWorkspaces(sourceSessionId, reason) {
       calls.push(`${sourceSessionId}:${reason}`);
       return Promise.resolve();
@@ -1370,6 +1396,8 @@ test("archive/delete lifecycle reaches detached Standard workspaces without a li
 test("detached browser authority revocation reaches the process owner synchronously without a Pi handle", async () => {
   const calls: string[] = [];
   const uninstall = installInteractiveBrowserSessionLifecyclePort({
+    captureSessionWorkspaceCleanup() { return async () => {}; },
+    captureAuthorityCleanup(scope, reason) { return this.revokeAuthority.bind(this, { ...scope }, reason); },
     closeSessionWorkspaces() { return Promise.resolve(); },
     revokeAuthority(scope, reason) {
       calls.push(`${scope.capabilityId}:${scope.projectId}:${scope.agentProfileId}:${reason}`);
@@ -1401,6 +1429,8 @@ test("neutral Standard human-control retention consults the process lifecycle ow
   const binding: any = { sourceSessionId: "synthetic-retained-standard" };
   const runtime: any = { kind: "standard", binding, preflight: () => ({ allowed: true }) };
   const uninstall = installInteractiveBrowserSessionLifecyclePort({
+    captureSessionWorkspaceCleanup() { return async () => {}; },
+    captureAuthorityCleanup() { return async () => {}; },
     closeSessionWorkspaces() { return Promise.resolve(); },
     revokeAuthority() { return Promise.resolve(); },
     blocksPiIdleDetach(candidate) { return candidate === binding; },

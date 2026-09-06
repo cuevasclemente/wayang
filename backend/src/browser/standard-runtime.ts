@@ -185,7 +185,30 @@ export function createStandardBrowserSessionRuntime(options: {
 
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
   let teardown: Promise<void> | null = null;
+  let capturedTeardown: (() => Promise<void>) | undefined;
   const latchRevoked = () => { revoked = true; };
+  const closeCapturedWorkspaces = (reason: SessionWorkspaceCloseReason, capturedCleanup?: () => Promise<void>): Promise<void> => {
+    if (teardown) return teardown;
+    // Reserve before capture or callbacks. A failure clears only the attempt,
+    // never the original target snapshot; retries must not capture successors.
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const attempt = new Promise<void>((done, failed) => { resolve = done; reject = failed; });
+    teardown = attempt;
+    const failed = (error: unknown) => {
+      latchRevoked();
+      if (teardown === attempt) teardown = null;
+      reject(error);
+    };
+    try {
+      capturedTeardown ??= capturedCleanup
+        ?? options.service.captureSessionWorkspaceCleanup(options.binding.sourceSessionId, reason);
+      latchRevoked();
+      options.service.runtimeDetached(runtime);
+      Promise.resolve(capturedTeardown()).then(resolve, failed);
+    } catch (error) { failed(error); }
+    return attempt;
+  };
   const runtime: StandardBrowserSessionRuntime = {
     kind: "standard",
     binding: options.binding,
@@ -205,17 +228,11 @@ export function createStandardBrowserSessionRuntime(options: {
       if (workspace) await workspace.host.detachAgentLease(options.binding.sourceSessionId, options.binding.runtimeGeneration);
       options.service.runtimeDetached(runtime);
     },
-    closeSessionWorkspaces(reason: SessionWorkspaceCloseReason) {
-      latchRevoked();
-      teardown ??= options.service.closeSessionWorkspaces(options.binding.sourceSessionId, reason);
-      options.service.runtimeDetached(runtime);
-      return teardown;
+    closeSessionWorkspaces(reason: SessionWorkspaceCloseReason, capturedCleanup?: () => Promise<void>) {
+      return closeCapturedWorkspaces(reason, capturedCleanup);
     },
-    revokeAuthority(_reason: BrowserAuthorityRevokeReason) {
-      latchRevoked();
-      teardown ??= options.service.closeSessionWorkspaces(options.binding.sourceSessionId, "owner_close_all");
-      options.service.runtimeDetached(runtime);
-      return teardown;
+    revokeAuthority(_reason: BrowserAuthorityRevokeReason, capturedCleanup?: () => Promise<void>) {
+      return closeCapturedWorkspaces("owner_close_all", capturedCleanup);
     },
   };
   return runtime;

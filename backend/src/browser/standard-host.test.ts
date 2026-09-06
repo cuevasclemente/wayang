@@ -171,6 +171,81 @@ test("failed target closure retains exact cleanup identity and blocks workspace 
   await f.host.close();
 });
 
+test("reentrant workspace close waits for the original gated viewer drain", async () => {
+  const f = hostFixture();
+  let releaseViewer!: () => void;
+  const viewerGate = new Promise<void>((resolve) => { releaseViewer = resolve; });
+  let viewerEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { viewerEntered = resolve; });
+  let closing: Promise<void> | undefined;
+  let reentered: Promise<void> | undefined;
+  let reentrantSettled = false;
+  try {
+    const exact = binding("session-a");
+    const workspace = f.host.bindWorkspace(exact);
+    await f.host.execute(exact, workspace.generation, { kind: "start" });
+    await f.host.ownerSetControlMode(exact.sourceSessionId, workspace.generation, "user");
+    f.host.registerViewer(exact.sourceSessionId, workspace.generation, async () => {
+      reentered = f.host.closeWorkspace(exact.sourceSessionId, "archive", 456, workspace.generation);
+      void reentered.then(() => { reentrantSettled = true; });
+      viewerEntered();
+      await viewerGate;
+    });
+    closing = f.host.closeWorkspace(exact.sourceSessionId, "archive", 123, workspace.generation);
+    await entered;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(reentrantSettled, false, "reentrant close confirmed cleanup before the original viewer drained");
+    assert.deepEqual(f.host.cleanupPendingSessionIds(), [exact.sourceSessionId]);
+    releaseViewer();
+    await Promise.all([closing, reentered]);
+    assert.equal(reentrantSettled, true);
+    assert.equal(f.host.workspaceCount, 0);
+    assert.equal(f.host.emptySinceTimestamp(), 123, "reentrant close replaced the original closedAt");
+  } finally {
+    releaseViewer();
+    await Promise.allSettled([closing, reentered]);
+    await f.host.close();
+  }
+});
+
+test("captured workspace close fences absent and replaced generations and preserves closedAt", async () => {
+  const f = hostFixture();
+  try {
+    const exact = binding("session-a");
+    const absent = f.host.workspaceCleanupGeneration(exact.sourceSessionId);
+    assert.equal(absent, null);
+    const first = f.host.bindWorkspace(exact);
+    await f.host.execute(exact, first.generation, { kind: "start" });
+    await f.host.closeWorkspace(exact.sourceSessionId, "archive", 123, absent);
+    assert.equal(f.host.hasWorkspace(exact.sourceSessionId, first.generation), true);
+    await f.host.closeWorkspace(exact.sourceSessionId, "archive", 456, first.generation);
+    assert.equal(f.host.emptySinceTimestamp(), 456, "expected-generation support changed the third closedAt argument");
+    const next = f.host.bindWorkspace(binding("session-a", "replacement-runtime"));
+    await f.host.closeWorkspace(exact.sourceSessionId, "archive", 789, first.generation);
+    assert.equal(f.host.hasWorkspace(exact.sourceSessionId, next.generation), true);
+    await f.host.closeWorkspace(exact.sourceSessionId, "archive", 987);
+    assert.equal(f.host.emptySinceTimestamp(), 987, "legacy unqualified close no longer works");
+  } finally { await f.host.close(); }
+});
+
+test("cleanup generation includes failed closed records for exact retry", async () => {
+  const f = hostFixture();
+  try {
+    const exact = binding("session-a");
+    const workspace = f.host.bindWorkspace(exact);
+    await f.host.execute(exact, workspace.generation, { kind: "start" });
+    const target = [...f.backend().targets.keys()][0]!;
+    f.backend().closeFailures.add(target);
+    await assert.rejects(f.host.closeWorkspace(exact.sourceSessionId, "archive"), /cleanup is pending/);
+    const captured = f.host.workspaceCleanupGeneration(exact.sourceSessionId);
+    assert.equal(captured, workspace.generation);
+    f.backend().closeFailures.clear();
+    await f.host.closeWorkspace(exact.sourceSessionId, "cleanup_retry", 123, captured);
+    assert.equal(f.host.workspaceCleanupGeneration(exact.sourceSessionId), null);
+    assert.equal(f.host.emptySinceTimestamp(), 123);
+  } finally { f.backend().closeFailures.clear(); await f.host.close(); }
+});
+
 test("failed host shutdown retains its opener identity and retries termination", async () => {
   const f = hostFixture();
   const exact = binding("session-a");

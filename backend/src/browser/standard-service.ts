@@ -366,29 +366,72 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     return workspace.host.publicState(binding, workspace.workspaceGeneration);
   }
 
-  async closeSessionWorkspaces(sourceSessionId: string, reason: SessionWorkspaceCloseReason): Promise<void> {
-    const runtimes = this.runtimes.get(sourceSessionId);
-    if (runtimes) for (const runtime of [...runtimes]) runtime.latchRevoked();
+  captureSessionWorkspaceCleanup(sourceSessionId: string, reason: SessionWorkspaceCloseReason): () => Promise<void> {
+    // Capture everything before latching runtimes or calling a host: either can
+    // notify synchronous observers which attach replacement state.
+    const runtimes = [...(this.runtimes.get(sourceSessionId) ?? [])].map((runtime) => ({ runtime, done: false }));
     const leases = this.workspaceLeases.get(sourceSessionId);
-    const failures: unknown[] = [];
-    for (const [profileId, host] of this.hosts) {
-      try {
-        await host.closeWorkspace(sourceSessionId, reason);
-        leases?.delete(profileId);
-      } catch (error) { failures.push(error); }
-    }
-    if (leases?.size === 0) this.workspaceLeases.delete(sourceSessionId);
-    if (failures.length > 0) throw new AggregateError(failures, "Standard browser session cleanup is pending");
+    const targets = [...this.hosts].map(([profileId, host]) => ({
+      profileId,
+      host,
+      generation: host.workspaceCleanupGeneration(sourceSessionId),
+      lease: leases?.get(profileId),
+      done: false,
+    }));
+    let inFlight: Promise<void> | null = null;
+    return () => {
+      if (inFlight) return inFlight;
+      // Reserve the joining promise before any observer can reenter this closer.
+      let resolve!: () => void;
+      let reject!: (error: unknown) => void;
+      const attempt = new Promise<void>((done, failed) => { resolve = done; reject = failed; });
+      inFlight = attempt;
+      void (async () => {
+        const failures: unknown[] = [];
+        for (const target of runtimes) {
+          if (target.done) continue;
+          try { target.runtime.latchRevoked(); target.done = true; } catch (error) { failures.push(error); }
+        }
+        for (const target of targets) {
+          if (target.done) continue;
+          try {
+            await target.host.closeWorkspace(sourceSessionId, reason, undefined, target.generation);
+            // Neither the session's map nor its profile entry may be replaced
+            // by this old cleanup, even when the workspace generation is gone.
+            if (leases && this.workspaceLeases.get(sourceSessionId) === leases
+              && leases.get(target.profileId) === target.lease) {
+              leases.delete(target.profileId);
+              if (leases.size === 0) this.workspaceLeases.delete(sourceSessionId);
+            }
+            target.done = true;
+          } catch (error) { failures.push(error); }
+        }
+        if (failures.length > 0) throw new AggregateError(failures, "Standard browser session cleanup is pending");
+      })().then(
+        () => { inFlight = null; resolve(); },
+        (error) => { inFlight = null; reject(error); },
+      );
+      return attempt;
+    };
   }
 
-  async revokeAuthority(scope: Readonly<InteractiveBrowserAuthorityScope>, reason: BrowserAuthorityRevokeReason): Promise<void> {
-    const sessions = this.options.catalog.sourceSessionsForAuthority(scope);
-    const results = await Promise.allSettled(
-      sessions.map((sourceSessionId) => this.closeSessionWorkspaces(sourceSessionId, "owner_close_all")),
-    );
-    const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason);
-    if (failures.length > 0) throw new AggregateError(failures, "Standard browser authority cleanup is pending");
+  closeSessionWorkspaces(sourceSessionId: string, reason: SessionWorkspaceCloseReason): Promise<void> {
+    return this.captureSessionWorkspaceCleanup(sourceSessionId, reason)();
+  }
+
+  captureAuthorityCleanup(scope: Readonly<InteractiveBrowserAuthorityScope>, reason: BrowserAuthorityRevokeReason): () => Promise<void> {
+    const sessions = [...this.options.catalog.sourceSessionsForAuthority(scope)];
+    const cleanups = sessions.map((sourceSessionId) => this.captureSessionWorkspaceCleanup(sourceSessionId, "owner_close_all"));
     void reason;
+    return async () => {
+      const results = await Promise.allSettled(cleanups.map((cleanup) => cleanup()));
+      const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason);
+      if (failures.length > 0) throw new AggregateError(failures, "Standard browser authority cleanup is pending");
+    };
+  }
+
+  revokeAuthority(scope: Readonly<InteractiveBrowserAuthorityScope>, reason: BrowserAuthorityRevokeReason): Promise<void> {
+    return this.captureAuthorityCleanup(scope, reason)();
   }
 
   async invalidateProfile(profileId: string): Promise<void> {

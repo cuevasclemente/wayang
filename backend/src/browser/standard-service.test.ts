@@ -108,7 +108,7 @@ function fixture(configured: Record<string, string | null>, credentialBroker?: a
     backendFactory: ({ callbacks }) => { const backend = new FakeBackend(callbacks); backends.push(backend); return backend; },
     credentialBroker,
   });
-  return { root, service, profiles, states, backends, cleanup: async () => { await service.close(); fs.rmSync(root, { recursive: true, force: true }); } };
+  return { root, service, catalog, profiles, states, backends, cleanup: async () => { await service.close(); fs.rmSync(root, { recursive: true, force: true }); } };
 }
 
 async function execute(runtime: any, name: string, args: Record<string, unknown> = {}) {
@@ -165,6 +165,387 @@ test("session cleanup propagates target-close failure and retries with retained 
     backend.closeFailures.delete(targetId);
     await f.service.sweepIdle();
     assert.equal(backend.targets.has(targetId), false, "bounded cleanup retry did not retire the retained target");
+  } finally { await f.cleanup(); }
+});
+
+for (const arrival of ["while-viewer-close-pending", "during-viewer-close", "during-runtime-revocation"] as const) {
+  test(`session cleanup freezes absent second-host workspace before ${arrival}`, async () => {
+    const f = fixture({
+      "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "session-b": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    });
+    let releaseClose!: () => void;
+    const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+    let closing: Promise<void> | undefined;
+    try {
+      const old = f.service.createRuntime(binding("session-a"));
+      await execute(old, "browser_open");
+      const first = f.service.resolveLiveWorkspace(binding("session-a"))!;
+      const other = f.service.createRuntime(binding("session-b"));
+      await execute(other, "browser_open");
+      const otherWorkspace = f.service.resolveLiveWorkspace(binding("session-b"))!;
+      const otherTarget = [...f.backends[1]!.targets.keys()][0]!;
+      assert.notEqual(first.host, otherWorkspace.host);
+
+      const replacementBinding = { ...binding("session-a"), runtimeGeneration: "replacement-runtime" };
+      const arrived: {
+        runtime?: ReturnType<typeof f.service.createRuntime>;
+        workspace?: ReturnType<typeof f.service.resolveLiveWorkspace>;
+      } = {};
+      const attachReplacement = () => {
+        const state = f.states.get("session-a")!;
+        state.active_profile_id = f.profiles[1]!.id;
+        state.revision += 1;
+        arrived.runtime = f.service.createRuntime(replacementBinding);
+        arrived.workspace = f.service.resolveLiveWorkspace(replacementBinding);
+      };
+      if (arrival === "during-runtime-revocation") {
+        const latch = old.latchRevoked;
+        old.latchRevoked = () => { old.latchRevoked = latch; latch(); attachReplacement(); };
+      }
+      await first.host.ownerSetControlMode("session-a", first.workspaceGeneration, "user");
+      let closeEntered!: () => void;
+      const entered = new Promise<void>((resolve) => { closeEntered = resolve; });
+      first.host.registerViewer("session-a", first.workspaceGeneration, async () => {
+        if (arrival === "during-viewer-close") attachReplacement();
+        closeEntered();
+        await closeGate;
+      });
+      closing = f.service.closeSessionWorkspaces("session-a", "archive");
+      await entered;
+      if (arrival === "while-viewer-close-pending") attachReplacement();
+      const { runtime: replacement, workspace: replacementWorkspace } = arrived;
+      assert.ok(replacement);
+      assert.ok(replacementWorkspace);
+      await execute(replacement, "browser_open");
+      const target = [...f.backends[1]!.targets.keys()].find((id) => id !== otherTarget)!;
+      assert.ok(target);
+      releaseClose();
+      await closing;
+
+      assert.equal(replacementWorkspace!.host.hasWorkspace("session-a", replacementWorkspace!.workspaceGeneration), true,
+        "old cleanup closed a workspace absent from its original second-host targets");
+      assert.equal(f.service.resolveLiveWorkspace(replacementBinding), replacementWorkspace!,
+        "old cleanup deleted the newly attached lease");
+      assert.ok(f.backends[1]!.targets.has(target));
+      assert.ok(f.backends[1]!.targets.has(otherTarget));
+      assert.equal(replacement.preflight().allowed, true);
+      assert.equal(old.preflight().allowed, false);
+    } finally {
+      releaseClose();
+      await closing?.catch(() => undefined);
+      await f.cleanup();
+    }
+  });
+}
+
+test("session cleanup preserves a replacement second-host generation and exact lease", async () => {
+  const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+  let releaseClose!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseClose = resolve; });
+  let closing: Promise<void> | undefined;
+  try {
+    const exact = binding("session-a");
+    const old = f.service.createRuntime(exact);
+    await execute(old, "browser_open");
+    const first = f.service.resolveLiveWorkspace(exact)!;
+    const switched = await f.service.switchProfile(exact, first, f.profiles[1]!.id, 1);
+    const second = switched.workspace;
+    await second.host.execute(exact, second.workspaceGeneration, { kind: "start" });
+    const oldTarget = [...f.backends[1]!.targets.keys()][0]!;
+    await first.host.ownerSetControlMode("session-a", first.workspaceGeneration, "user");
+    let closeEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { closeEntered = resolve; });
+    first.host.registerViewer("session-a", first.workspaceGeneration, async () => { closeEntered(); await gate; });
+    closing = f.service.closeSessionWorkspaces("session-a", "archive");
+    await entered;
+    await second.host.closeWorkspace("session-a", "owner_stop");
+    const replacementBinding = { ...exact, runtimeGeneration: "replacement-runtime" };
+    const replacement = f.service.createRuntime(replacementBinding);
+    const current = f.service.resolveLiveWorkspace(replacementBinding)!;
+    assert.notEqual(current.workspaceGeneration, second.workspaceGeneration);
+    await execute(replacement, "browser_open");
+    const newTarget = [...f.backends[1]!.targets.keys()][0]!;
+    releaseClose();
+    await closing;
+    assert.equal(current.host.hasWorkspace("session-a", current.workspaceGeneration), true,
+      "old cleanup followed the second host into a replacement generation");
+    assert.equal(f.service.resolveLiveWorkspace(replacementBinding), current, "old cleanup deleted the replacement lease entry");
+    assert.equal(f.backends[1]!.targets.has(oldTarget), false);
+    assert.ok(f.backends[1]!.targets.has(newTarget));
+    assert.equal(replacement.preflight().allowed, true);
+  } finally {
+    releaseClose();
+    await closing?.catch(() => undefined);
+    await f.cleanup();
+  }
+});
+
+test("session cleanup attempts both captured hosts after failure and retains only pending cleanup", async () => {
+  const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+  try {
+    const exact = binding("session-a");
+    const runtime = f.service.createRuntime(exact);
+    await execute(runtime, "browser_open");
+    const first = f.service.resolveLiveWorkspace(exact)!;
+    const second = (await f.service.switchProfile(exact, first, f.profiles[1]!.id, 1)).workspace;
+    await second.host.execute(exact, second.workspaceGeneration, { kind: "start" });
+    const target = [...f.backends[0]!.targets.keys()][0]!;
+    f.backends[0]!.closeFailures.add(target);
+    await assert.rejects(f.service.closeSessionWorkspaces("session-a", "archive"), /cleanup is pending/);
+    assert.deepEqual(first.host.cleanupPendingSessionIds(), ["session-a"]);
+    assert.ok(f.backends[0]!.targets.has(target));
+    assert.equal(second.host.workspaceCount, 0, "first-host failure skipped the captured second host");
+    assert.equal(f.backends[1]!.targets.size, 0);
+    assert.equal(f.service.resolveLiveWorkspace(exact), null, "successful target retained its service lease");
+    f.backends[0]!.closeFailures.clear();
+    await f.service.closeSessionWorkspaces("session-a", "archive");
+    assert.equal(first.host.workspaceCount, 0);
+    assert.equal(f.backends[0]!.targets.size, 0);
+  } finally {
+    f.backends[0]?.closeFailures.clear();
+    await f.cleanup();
+  }
+});
+
+test("captured cleanup retries only failed exact targets after a replacement attaches", async () => {
+  const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+  try {
+    const exact = binding("session-a");
+    const old = f.service.createRuntime(exact);
+    await execute(old, "browser_open");
+    const first = f.service.resolveLiveWorkspace(exact)!;
+    const second = (await f.service.switchProfile(exact, first, f.profiles[1]!.id, 1)).workspace;
+    await second.host.execute(exact, second.workspaceGeneration, { kind: "start" });
+    let revocations = 0;
+    const latch = old.latchRevoked;
+    old.latchRevoked = () => { revocations += 1; latch(); };
+    const cleanup = f.service.captureSessionWorkspaceCleanup("session-a", "archive");
+    assert.equal(revocations, 0, "capture emitted a revocation notification");
+    assert.equal(first.host.hasWorkspace("session-a", first.workspaceGeneration), true);
+    const target = [...f.backends[0]!.targets.keys()][0]!;
+    f.backends[0]!.closeFailures.add(target);
+    const attempt = cleanup();
+    assert.equal(cleanup(), attempt, "concurrent captured cleanup did not join");
+    await assert.rejects(attempt, /cleanup is pending/);
+    assert.equal(second.host.workspaceCount, 0);
+    assert.deepEqual(first.host.cleanupPendingSessionIds(), ["session-a"]);
+
+    const replacementBinding = { ...exact, runtimeGeneration: "replacement-runtime" };
+    const replacement = f.service.createRuntime(replacementBinding);
+    await execute(replacement, "browser_open");
+    const current = f.service.resolveLiveWorkspace(replacementBinding)!;
+    const replacementTarget = [...f.backends[1]!.targets.keys()][0]!;
+    f.backends[0]!.closeFailures.clear();
+    await cleanup();
+    await cleanup();
+    assert.equal(revocations, 1, "retry notified an already revoked runtime again");
+    assert.equal(first.host.workspaceCount, 0);
+    assert.equal(f.backends[0]!.targets.size, 0);
+    assert.equal(f.service.resolveLiveWorkspace(replacementBinding), current);
+    assert.ok(f.backends[1]!.targets.has(replacementTarget));
+    assert.equal(replacement.preflight().allowed, true);
+  } finally {
+    f.backends[0]?.closeFailures.clear();
+    await f.cleanup();
+  }
+});
+
+for (const method of ["closeSessionWorkspaces", "revokeAuthority"] as const) {
+  test(`Standard runtime ${method} honors cleanup captured before a replacement attaches`, async () => {
+    const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+    try {
+      const exact = binding("session-a");
+      const old = f.service.createRuntime(exact);
+      await execute(old, "browser_open");
+      const first = f.service.resolveLiveWorkspace(exact)!;
+      const captured = f.service.captureSessionWorkspaceCleanup("session-a", "archive");
+      const state = f.states.get("session-a")!;
+      state.active_profile_id = f.profiles[1]!.id;
+      state.revision += 1;
+      const replacementBinding = { ...exact, runtimeGeneration: "replacement-runtime" };
+      const replacement = f.service.createRuntime(replacementBinding);
+      await execute(replacement, "browser_open");
+      const current = f.service.resolveLiveWorkspace(replacementBinding)!;
+      if (method === "closeSessionWorkspaces") await old.closeSessionWorkspaces("archive", captured);
+      else await old.revokeAuthority("project_or_profile_denied", captured);
+      assert.equal(current.host.hasWorkspace("session-a", current.workspaceGeneration), true,
+        "runtime adapter ignored its supplied snapshot and closed the later workspace");
+      assert.equal(f.service.resolveLiveWorkspace(replacementBinding), current);
+      assert.equal(replacement.preflight().allowed, true);
+      assert.equal(old.preflight().allowed, false);
+      assert.equal(first.host.workspaceCount, 0);
+      assert.equal(f.backends[0]!.targets.size, 0);
+      assert.equal(f.backends[1]!.targets.size, 1);
+    } finally { await f.cleanup(); }
+  });
+
+  test(`Standard runtime ${method} retries its original failed cleanup without recapturing`, async () => {
+    const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+    try {
+      const exact = binding("session-a");
+      const old = f.service.createRuntime(exact);
+      await execute(old, "browser_open");
+      const first = f.service.resolveLiveWorkspace(exact)!;
+      const target = [...f.backends[0]!.targets.keys()][0]!;
+      const closeRuntime = () => method === "closeSessionWorkspaces"
+        ? old.closeSessionWorkspaces("archive")
+        : old.revokeAuthority("project_or_profile_denied");
+      f.backends[0]!.closeFailures.add(target);
+      await assert.rejects(closeRuntime(), /cleanup is pending/);
+      assert.deepEqual(first.host.cleanupPendingSessionIds(), ["session-a"]);
+      const state = f.states.get("session-a")!;
+      state.active_profile_id = f.profiles[1]!.id;
+      state.revision += 1;
+      const replacementBinding = { ...exact, runtimeGeneration: "replacement-runtime" };
+      const replacement = f.service.createRuntime(replacementBinding);
+      await execute(replacement, "browser_open");
+      const current = f.service.resolveLiveWorkspace(replacementBinding)!;
+      f.backends[0]!.closeFailures.clear();
+      await closeRuntime();
+      assert.equal(first.host.workspaceCount, 0);
+      assert.equal(f.backends[0]!.targets.has(target), false);
+      assert.equal(f.service.resolveLiveWorkspace(replacementBinding), current);
+      assert.equal(f.backends[1]!.targets.size, 1);
+      assert.equal(replacement.preflight().allowed, true);
+      await closeRuntime();
+      assert.equal(f.service.resolveLiveWorkspace(replacementBinding), current);
+    } finally {
+      f.backends[0]?.closeFailures.clear();
+      await f.cleanup();
+    }
+  });
+
+  test(`Standard runtime ${method} reserves its in-flight cleanup before synchronous reentry`, async () => {
+    const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+    let releaseViewer!: () => void;
+    const viewerGate = new Promise<void>((resolve) => { releaseViewer = resolve; });
+    let closing: Promise<void> | undefined;
+    let reentered: Promise<void> | undefined;
+    try {
+      const exact = binding("session-a");
+      const runtime = f.service.createRuntime(exact);
+      await execute(runtime, "browser_open");
+      const workspace = f.service.resolveLiveWorkspace(exact)!;
+      await workspace.host.ownerSetControlMode("session-a", workspace.workspaceGeneration, "user");
+      let viewerEntered!: () => void;
+      const entered = new Promise<void>((resolve) => { viewerEntered = resolve; });
+      workspace.host.registerViewer("session-a", workspace.workspaceGeneration, async () => {
+        viewerEntered();
+        await viewerGate;
+      });
+      const captured = f.service.captureSessionWorkspaceCleanup("session-a", "archive");
+      let cleanupInvocations = 0;
+      const supplied = () => { cleanupInvocations += 1; return captured(); };
+      const closeRuntime = () => method === "closeSessionWorkspaces"
+        ? runtime.closeSessionWorkspaces("archive", supplied)
+        : runtime.revokeAuthority("project_or_profile_denied", supplied);
+      const latch = runtime.latchRevoked;
+      runtime.latchRevoked = () => {
+        runtime.latchRevoked = latch;
+        latch();
+        reentered = closeRuntime();
+      };
+      closing = closeRuntime();
+      await entered;
+      assert.ok(reentered, "synthetic revocation observer did not reenter runtime cleanup");
+      assert.equal(reentered, closing, "reentrant runtime cleanup started a second attempt instead of joining");
+      assert.equal(cleanupInvocations, 1, "runtime reentry invoked its captured operation twice");
+      let settled = false;
+      void reentered.then(() => { settled = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(settled, false, "runtime cleanup confirmed before the viewer drained");
+      releaseViewer();
+      await Promise.all([closing, reentered]);
+      assert.equal(workspace.host.workspaceCount, 0);
+      assert.equal(f.backends[0]!.targets.size, 0);
+    } finally {
+      releaseViewer();
+      await Promise.allSettled([closing, reentered]);
+      await f.cleanup();
+    }
+  });
+}
+
+test("captured authority cleanup freezes selector sessions before invocation and retry", async () => {
+  const f = fixture({
+    "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "session-b": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  });
+  try {
+    const a = f.service.createRuntime(binding("session-a"));
+    const b = f.service.createRuntime(binding("session-b"));
+    await execute(a, "browser_open");
+    await execute(b, "browser_open");
+    const bWorkspace = f.service.resolveLiveWorkspace(binding("session-b"))!;
+    const selected = ["session-a"];
+    let selections = 0;
+    f.catalog.sourceSessionsForAuthority = () => { selections += 1; return selected; };
+    const cleanup = f.service.captureAuthorityCleanup({
+      capabilityId: "wayang.standard-browser.v1", projectId: "project", agentProfileId: "agent",
+    }, "project_or_profile_denied");
+    assert.equal(a.preflight().allowed, true, "capture revoked a runtime before invocation");
+    selected.splice(0, 1, "session-b");
+    const target = [...f.backends[0]!.targets.keys()][0]!;
+    f.backends[0]!.closeFailures.add(target);
+    await assert.rejects(cleanup(), /authority cleanup is pending/);
+    assert.equal(a.preflight().allowed, false);
+    assert.equal(b.preflight().allowed, true);
+    f.backends[0]!.closeFailures.clear();
+    await cleanup();
+    assert.equal(selections, 1, "captured cleanup re-resolved mutable authority sessions");
+    assert.equal(f.backends[0]!.targets.size, 0);
+    assert.equal(f.service.resolveLiveWorkspace(binding("session-b")), bWorkspace);
+    assert.equal(f.backends[1]!.targets.size, 1);
+    assert.equal(b.preflight().allowed, true);
+  } finally {
+    f.backends[0]?.closeFailures.clear();
+    await f.cleanup();
+  }
+});
+
+test("authority cleanup captures all selected workspaces before the first runtime notification", async () => {
+  const f = fixture({
+    "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "session-b": null,
+  });
+  try {
+    const a = f.service.createRuntime(binding("session-a"));
+    await execute(a, "browser_open");
+    const replacementBinding = { ...binding("session-b"), runtimeGeneration: "late-runtime" };
+    let replacement: ReturnType<typeof f.service.createRuntime> | undefined;
+    const latch = a.latchRevoked;
+    a.latchRevoked = () => {
+      a.latchRevoked = latch;
+      latch();
+      f.states.get("session-b")!.active_profile_id = f.profiles[1]!.id;
+      replacement = f.service.createRuntime(replacementBinding);
+    };
+    await f.service.revokeAuthority({
+      capabilityId: "wayang.standard-browser.v1", projectId: "project", agentProfileId: "agent",
+    }, "project_or_profile_denied");
+    assert.ok(replacement);
+    assert.equal(replacement.preflight().allowed, true);
+    assert.ok(f.service.resolveLiveWorkspace(replacementBinding));
+    await execute(replacement, "browser_open");
+  } finally { await f.cleanup(); }
+});
+
+test("completed captured cleanup cannot delete a replacement session lease map", async () => {
+  const f = fixture({ "session-a": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+  try {
+    const old = f.service.createRuntime(binding("session-a"));
+    await execute(old, "browser_open");
+    const cleanup = f.service.captureSessionWorkspaceCleanup("session-a", "archive");
+    await cleanup();
+    const exact = { ...binding("session-a"), runtimeGeneration: "replacement-runtime" };
+    const replacement = f.service.createRuntime(exact);
+    const current = f.service.resolveLiveWorkspace(exact)!;
+    await execute(replacement, "browser_open");
+    await cleanup();
+    assert.equal(f.service.resolveLiveWorkspace(exact), current);
+    assert.equal(replacement.preflight().allowed, true);
+    assert.equal(f.backends[0]!.targets.size, 1);
   } finally { await f.cleanup(); }
 });
 

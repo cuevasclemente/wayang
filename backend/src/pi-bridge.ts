@@ -263,9 +263,7 @@ export interface PiSessionHandle {
   /** Lifecycle failure not represented by a final assistant message. */
   pendingSessionError?: string;
   liveStreamingMessageUnsubscribe?: () => void;
-  /** Shared exactly-once extension shutdown, including disposal retries. */
-  agentSessionShutdown?: Promise<void>;
-  /** Shared low-level disposal; failures retain ownership and may be retried. */
+  /** Shared shutdown/drain/disposal attempt; retries preserve confirmed phases. */
   agentSessionDisposal?: Promise<void>;
   /** Process-local activation epoch captured before runtime construction. */
   capabilityActivationGeneration: bigint;
@@ -408,11 +406,184 @@ const SESSION_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const SESSION_IDLE_CHECK_INTERVAL_MS = 30 * 1000;
 const sessions = new Map<string, PiSessionHandle>();
 const queuedBrowserClientMessageIds = new WeakMap<object, string>();
+/** Only the latest interruption may publish a delayed idle notification. */
+const interactiveAbortSettlements = new WeakMap<PiSessionHandle, object>();
 const recentBrowserMessageOutcomes = new Map<string, Map<string, {
   status: "accepted" | "rejected";
   acceptedUserTurn: boolean;
 }>>();
 const sessionCreations = new Map<string, Promise<PiSessionHandle>>();
+
+/** The Error object itself is an opaque, process-local cleanup receipt. */
+export class PiSessionCleanupUnconfirmedError extends Error {
+  readonly code = "pi_session_cleanup_unconfirmed" as const;
+  constructor() { super("Session runtime cleanup is unconfirmed"); }
+}
+
+interface PiSessionCleanupReservation {
+  id: string;
+  teardownSeverity: number;
+  revision: number;
+  receipt: PiSessionCleanupUnconfirmedError;
+  completion: Promise<void>;
+  confirm(): void;
+  confirmed: boolean;
+  attempt?: Promise<void>;
+  cleanup?: (retryFailed: boolean) => Promise<void>;
+  upgrade?: (action: PiSessionBrowserTeardown, captured?: CleanupStep) => void;
+  ownsCurrentGeneration?: () => boolean;
+  onConfirmed?: () => void;
+}
+const unconfirmedSessionCleanups = new Map<string, PiSessionCleanupReservation>();
+const cleanupReceiptOwners = new WeakMap<PiSessionCleanupUnconfirmedError, PiSessionCleanupReservation>();
+
+function createCleanupReservation(
+  id: string,
+  cleanup: (retryFailed: boolean) => Promise<void>,
+  ownsCurrentGeneration: () => boolean,
+  onConfirmed?: () => void,
+  browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
+): PiSessionCleanupReservation {
+  let confirm!: () => void;
+  const reservation: PiSessionCleanupReservation = {
+    id, teardownSeverity: browserTeardownSeverity(browserTeardown), revision: 0,
+    receipt: new PiSessionCleanupUnconfirmedError(), confirmed: false,
+    completion: new Promise<void>((resolve) => { confirm = resolve; }),
+    confirm: () => confirm(), cleanup, ownsCurrentGeneration, onConfirmed,
+  };
+  cleanupReceiptOwners.set(reservation.receipt, reservation);
+  return reservation;
+}
+
+function attemptReservedCleanup(
+  reservation: PiSessionCleanupReservation,
+  action?: PiSessionBrowserTeardown,
+): Promise<void> {
+  if (reservation.confirmed) return Promise.resolve();
+  if (reservation.attempt) {
+    if (action) reservation.upgrade?.(action);
+    return reservation.attempt;
+  }
+  let resolveAttempt!: () => void;
+  let rejectAttempt!: (error: unknown) => void;
+  const attempt = new Promise<void>((resolve, reject) => {
+    resolveAttempt = resolve;
+    rejectAttempt = reject;
+  });
+  // Publish before invoking cleanup: a synchronous closer may reenter this owner.
+  reservation.attempt = attempt;
+  void attempt.then(
+    () => { if (reservation.attempt === attempt) reservation.attempt = undefined; },
+    () => { if (reservation.attempt === attempt) reservation.attempt = undefined; },
+  );
+  void (async () => {
+    try {
+      if (action) reservation.upgrade?.(action);
+      let revision: number;
+      let retryFailed = true;
+      do {
+        revision = reservation.revision;
+        await reservation.cleanup!(retryFailed);
+        // Only newly added, stronger phases are drained on another pass. This
+        // never retries a failed phase without another explicit owner attempt.
+        retryFailed = false;
+      } while (revision !== reservation.revision);
+      reservation.onConfirmed?.();
+      reservation.confirmed = true;
+      if (unconfirmedSessionCleanups.get(reservation.id) === reservation) {
+        unconfirmedSessionCleanups.delete(reservation.id);
+      }
+      // A retained, confirmed receipt needs no resource references or retry closure.
+      reservation.cleanup = undefined;
+      reservation.upgrade = undefined;
+      reservation.ownsCurrentGeneration = undefined;
+      reservation.onConfirmed = undefined;
+      reservation.confirm();
+    } catch {
+      // Never replace another generation's reservation or expose raw closer/SDK errors.
+      if (reservation.ownsCurrentGeneration?.()
+        && (!unconfirmedSessionCleanups.has(reservation.id)
+          || unconfirmedSessionCleanups.get(reservation.id) === reservation)) {
+        unconfirmedSessionCleanups.set(reservation.id, reservation);
+      }
+      throw reservation.receipt;
+    }
+  })().then(resolveAttempt, rejectAttempt);
+  return attempt;
+}
+
+function reservationForReceipt(receipt: unknown): PiSessionCleanupReservation {
+  const reservation = receipt instanceof PiSessionCleanupUnconfirmedError
+    ? cleanupReceiptOwners.get(receipt) : undefined;
+  if (!reservation) throw new WorkspaceStoreError("Cleanup receipt is not recognized", 409);
+  return reservation;
+}
+
+/** One explicit attempt, or join the exact owner's current attempt. No polling. */
+export async function retryPiSessionCleanup(receipt: unknown): Promise<void> {
+  await attemptReservedCleanup(reservationForReceipt(receipt));
+}
+
+/** Observation only. Resolves solely after confirmed cleanup, including a later
+ * explicit destroy; failed attempts do not settle this completion promise. */
+export async function waitForPiSessionCleanup(receipt: unknown): Promise<void> {
+  await reservationForReceipt(receipt).completion;
+}
+
+interface CleanupStep {
+  run: () => void | Promise<void>;
+  /** Original process-owner operation, not this step's cached attempt promise. */
+  rawBrowserCleanup?: () => Promise<void>;
+  status: "new" | "running" | "failed" | "complete";
+  attempt?: Promise<void>;
+}
+function cleanupStep(run: CleanupStep["run"]): CleanupStep { return { run, status: "new" }; }
+function runCleanupStep(step: CleanupStep, retryFailed: boolean): Promise<void> {
+  if (step.status === "complete") return Promise.resolve();
+  if (step.status === "running" || (step.status === "failed" && !retryFailed)) return step.attempt!;
+  let resolveAttempt!: () => void;
+  let rejectAttempt!: (error: unknown) => void;
+  const attempt = new Promise<void>((resolve, reject) => {
+    resolveAttempt = resolve;
+    rejectAttempt = reject;
+  });
+  // Running always means this current promise exists, never undefined or the
+  // previous rejection. Keep the closer's synchronous denial prefix immediate.
+  step.attempt = attempt;
+  step.status = "running";
+  let work: Promise<void>;
+  try { work = Promise.resolve(step.run()); }
+  catch (error) { work = Promise.reject(error); }
+  void work.then(() => {
+    if (step.attempt === attempt) {
+      step.status = "complete";
+      step.run = () => undefined;
+    }
+    resolveAttempt();
+  }, () => {
+    if (step.attempt === attempt) step.status = "failed";
+    rejectAttempt(new Error("Owned runtime cleanup did not complete"));
+  });
+  return attempt;
+}
+async function completeCleanupSteps(steps: readonly CleanupStep[], retryFailed = false): Promise<void> {
+  const results: PromiseSettledResult<void>[] = [];
+  // Only failures already present at this barrier's entry may be retried.
+  // An upgrade may pre-start a newly appended phase while this pass waits;
+  // its failure must propagate, not silently become another attempt.
+  const retryable = new Set(retryFailed ? steps.filter((step) => step.status === "failed") : []);
+  let visited = 0;
+  // Teardown severity can append phases while a closer is running. Visit every
+  // appended step once, without turning this barrier into a retry loop.
+  while (visited < steps.length) {
+    const batch = steps.slice(visited);
+    visited = steps.length;
+    results.push(...await Promise.allSettled(batch.map((step) => runCleanupStep(step, retryable.has(step)))));
+  }
+  if (results.some((result) => result.status === "rejected")) {
+    throw new Error("Owned runtime cleanup did not complete");
+  }
+}
 /** Monotonic process-local denial epoch. A creation may publish only while the
  * exact epoch captured before its first await remains current. */
 const sessionCapabilityDenialGenerations = new Map<string, bigint>();
@@ -426,6 +597,8 @@ const MAX_CAPABILITY_REFRESH_SETTLEMENT_RETRIES = 8;
 interface SessionBrowserTeardownIntent {
   generation: bigint;
   action: PiSessionBrowserTeardown;
+  /** Exact process-owner snapshots, shared with partial-creation cleanup. */
+  browserCleanups?: readonly CleanupStep[];
 }
 const sessionBrowserTeardownIntents = new Map<string, SessionBrowserTeardownIntent>();
 const agentSwitches = new Map<string, Promise<AgentSwitchResult>>();
@@ -1269,10 +1442,10 @@ function assertRuntimeMutationUnlocked(id: string): void {
 }
 
 export async function stopPiSessionIfIdle(id: string): Promise<boolean> {
-  if (sessionCreations.has(id)) return false;
+  if (sessionCreations.has(id) || unconfirmedSessionCleanups.has(id)) return false;
   const handle = sessions.get(id);
   if (!handle) return true;
-  if (handle.session.isStreaming || handle.session.pendingMessageCount > 0
+  if (handle.session.isStreaming || handle.session.pendingPromptCount > 0 || handle.session.pendingMessageCount > 0
     || interviewAdmissions.get(handle)?.size
     || manualCompactionQueueForHandle(handle)) return false;
   await destroyPiSession(id);
@@ -1341,15 +1514,23 @@ export function protectedBrowserIdleRetentionIsRequired(
 export async function stopIdlePiSessions(now = Date.now()): Promise<string[]> {
   const stopped: string[] = [];
   for (const [id, handle] of [...sessions]) {
-    if (handle.session.isStreaming || interviewAdmissions.get(handle)?.size
-      || manualCompactionQueueForHandle(handle)) continue;
+    // Cleanup uncertainty requires explicit recovery, never a timer retry loop.
+    if (unconfirmedSessionCleanups.has(id)) continue;
+    if (handle.session.isStreaming || handle.session.pendingPromptCount > 0
+      || interviewAdmissions.get(handle)?.size || manualCompactionQueueForHandle(handle)) continue;
     // Protected human handoff intentionally spans chat turns and may take
     // longer than the ordinary idle timeout. Explicit denial, stop, model or
     // agent change, and shutdown paths still revoke it directly.
     if (protectedBrowserIdleRetentionIsRequired(handle.protectedBrowserRuntime)) continue;
     if (now - handle.lastActivityAt < SESSION_IDLE_TIMEOUT_MS) continue;
-    await destroyPiSession(id, { kind: "detach", reason: "pi_idle" });
-    stopped.push(id);
+    try {
+      await destroyPiSession(id, { kind: "detach", reason: "pi_idle" }, handle);
+      stopped.push(id);
+    } catch (error) {
+      if (!(error instanceof PiSessionCleanupUnconfirmedError)) throw error;
+      // The retained receipt blocks only its own runtime. Continue independent
+      // sessions without reporting this failed cleanup as stopped.
+    }
   }
   maybeStopIdleCleanupTimer();
   return stopped;
@@ -2096,17 +2277,6 @@ function liveRuntimeBusy(handle: PiSessionHandle): boolean {
   );
 }
 
-type PiSettingsDefaultRestorer = (provider: string | undefined, modelId: string | undefined) => void;
-
-/** The SDK types these members private while the runtime keeps them public.
- * Wayang snapshots and restores the exact prior global values so a
- * session-scoped live model switch never rewrites deployment/project-owned
- * pi settings defaults (pi's public setModel persists them unconditionally). */
-interface PiSettingsDefaultInternals {
-  readonly globalSettings: { defaultProvider?: string; defaultModel?: string };
-  setDefaultModelAndProvider: PiSettingsDefaultRestorer;
-}
-
 /** Apply a model change to a healthy live runtime without destroying any of
  * its surfaces. Provider/model authority never confers or narrows runtime
  * authority, so tools, hooks, leases, and queues stay intact; only the next
@@ -2118,24 +2288,12 @@ async function applyLiveModelSwitch(
   model: Model<Api>,
 ): Promise<void> {
   const settingsManager = handle.session.settingsManager;
-  const settingsInternals = settingsManager as unknown as PiSettingsDefaultInternals;
-  const previousProvider = settingsInternals.globalSettings.defaultProvider;
-  const previousModelId = settingsInternals.globalSettings.defaultModel;
-  try {
-    // The in-flight run captured its model already, so pi applies this change
-    // to the next run and appends a durable model_change transcript entry.
-    await handle.session.setModel(model);
-  } finally {
-    settingsInternals.setDefaultModelAndProvider(previousProvider, previousModelId);
-    // Restore writes join pi's async settings queue; flush so no later reader
-    // (for example default-model resolution from a fresh SettingsManager) can
-    // observe the transient session choice pi persisted above.
-    await settingsManager.flush();
-  }
-  // Every settings save() re-merges from the settings files and drops applied
-  // overrides, so re-derive memory-first compaction thresholds for the new
-  // context window after the restore. Pi reads compaction settings per
-  // compaction, so the next auto/manual compaction uses the fresh values.
+  // Keep SDK auth validation, transcript model_change, thinking clamping and
+  // model_select hooks, but never write provider/model or thinking defaults.
+  // In-flight runs retain their captured model; the next run uses this one.
+  await handle.session.setModel(model, { persist: false });
+  // Re-derive memory-first thresholds for the new context window without
+  // changing Standard resource discovery or file-backed settings reload.
   const config = project
     ? memoryFirstCompactionForSession(row, project)
     : DISABLED_MEMORY_FIRST_COMPACTION_CONFIG;
@@ -2421,6 +2579,10 @@ export type PiSessionCreationPrivilegedEffect =
   | "handle_publication";
 
 export interface CreatePiSessionRuntimeOptions {
+  /** Cancels only construction owned by this call, until atomic publication.
+   * Joining another caller's pending creation cancels only this caller's wait.
+   * Existing live handles are never owned by this signal. */
+  signal?: AbortSignal;
   profileOverride?: AgentProfileRow;
   skipPendingRecovery?: boolean;
   forceInMemorySettings?: boolean;
@@ -2434,6 +2596,8 @@ export interface CreatePiSessionRuntimeOptions {
   /** Deterministic regression seam. Production callers must leave this unset. */
   testHooks?: {
     afterStandardResourcesResolution?: (authorized: boolean) => Promise<void>;
+    beforeExtensionStartup?: (session: AgentSession) => Promise<void>;
+    afterExtensionStartup?: (session: AgentSession) => Promise<void>;
     onPrivilegedEffect?: (effect: PiSessionCreationPrivilegedEffect) => void;
   };
 }
@@ -2486,7 +2650,9 @@ export function installProductionProtectedBrowserFactory(factory: InteractiveBro
 export function installInteractiveBrowserSessionLifecyclePort(
   port: InteractiveBrowserSessionLifecyclePort,
 ): () => void {
-  if (!port || typeof port.closeSessionWorkspaces !== "function"
+  if (!port || typeof port.captureSessionWorkspaceCleanup !== "function"
+    || typeof port.captureAuthorityCleanup !== "function"
+    || typeof port.closeSessionWorkspaces !== "function"
     || typeof port.revokeAuthority !== "function" || typeof port.blocksPiIdleDetach !== "function"
     || typeof port.close !== "function") {
     throw new WorkspaceStoreError("Interactive browser session lifecycle port is invalid", 500);
@@ -2498,6 +2664,15 @@ export function installInteractiveBrowserSessionLifecyclePort(
   return () => {
     if (productionInteractiveBrowserSessionLifecycle === port) productionInteractiveBrowserSessionLifecycle = undefined;
   };
+}
+
+/** Capture is synchronous and once-only. A failed capture cannot safely be
+ * repeated against a later id/pair generation, so retain uncertainty instead. */
+function capturedBrowserCleanupStep(capture: () => (() => Promise<void>) | undefined): CleanupStep {
+  let operation: (() => Promise<void>) | undefined;
+  try { operation = capture(); }
+  catch { operation = async () => { throw new Error("Browser cleanup capture is unconfirmed"); }; }
+  return { ...cleanupStep(operation ?? (() => undefined)), rawBrowserCleanup: operation };
 }
 
 function trackInteractiveBrowserLifecycleCleanup(task: Promise<void>): Promise<void> {
@@ -2550,16 +2725,31 @@ export function assertPiSessionCreationGeneration(id: string, captured: PiSessio
   }
 }
 
+/** External-owner barrier only: never await this from the prompt being drained.
+ * Abort cancels ingress synchronously but waits for active-run idle only. The
+ * separate SDK snapshot waits for actual invocation/hook settlement. */
+async function abortAndDrainPiSessionPrompts(session: AgentSession): Promise<void> {
+  let abortFailure: unknown;
+  try { await session.abort(); }
+  catch (error) { abortFailure = error; }
+  await session.waitForPendingPrompts();
+  // Wayang ingress is denied before destruction. Trusted SDK callers bypassing
+  // that fence must not turn a snapshot barrier into a false cleanup success.
+  if (session.pendingPromptCount !== 0) {
+    throw new WorkspaceStoreError("Session accepted new prompt work during runtime cleanup", 409);
+  }
+  if (abortFailure !== undefined) throw abortFailure;
+}
+
 async function closeUnpublishedAgentSession(session: AgentSession | undefined): Promise<void> {
   if (!session) return;
   const runtime = session as any;
   try { runtime.clearQueue?.(); } catch { /* best effort after denial */ }
   try { runtime.setActiveToolsByName?.([]); } catch { /* best effort after denial */ }
   if (Array.isArray(runtime.agent?.state?.tools)) runtime.agent.state.tools = [];
-  try {
-    if (session.isStreaming) await session.abort();
-  } catch { /* best effort after denial */ }
-  try { session.dispose(); } catch { /* best effort after denial */ }
+  // Called only after the original create/startup promise has drained.
+  await abortAndDrainPiSessionPrompts(session);
+  session.dispose();
 }
 
 export function piSessionHandleRequiresFreshRuntime(
@@ -2594,6 +2784,27 @@ export function composeRuntimeActiveTools(
     : [...new Set([...configured, ...companions])];
 }
 
+/** A joiner owns an observer, not the shared creation or its eventual handle. */
+async function awaitPiSessionCreationAsJoiner(
+  pending: Promise<PiSessionHandle>,
+  signal?: AbortSignal,
+): Promise<PiSessionHandle> {
+  if (!signal) return pending;
+  signal.throwIfAborted();
+  let onAbort!: () => void;
+  const cancelled = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    const handle = await Promise.race([pending, cancelled]);
+    signal.throwIfAborted();
+    return handle;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export async function createPiSession(
   id: string,
   cwd: string,
@@ -2602,11 +2813,21 @@ export async function createPiSession(
   sessionFile?: string | null,
   runtimeOptions: CreatePiSessionRuntimeOptions = {},
 ): Promise<PiSessionHandle> {
+  // Must precede locks, recency updates, teardown, identity recovery and I/O.
+  runtimeOptions.signal?.throwIfAborted();
+  const unconfirmedCleanup = unconfirmedSessionCleanups.get(id);
+  if (unconfirmedCleanup) throw unconfirmedCleanup.receipt;
   assertRuntimeMutationUnlocked(id);
   // Capture both narrowing and widening epochs before this function's first
   // await. Either transition invalidates every later creation checkpoint.
   const creationGeneration = capturePiSessionCreationGeneration(id);
-  const assertCreationCurrent = () => assertPiSessionCreationGeneration(id, creationGeneration);
+  let creationFailed = false;
+  let failedCreationCleanup: PiSessionCleanupReservation | undefined;
+  const assertCreationCurrent = () => {
+    if (creationFailed) throw new WorkspaceStoreError("Session runtime creation has failed", 409);
+    runtimeOptions.signal?.throwIfAborted();
+    assertPiSessionCreationGeneration(id, creationGeneration);
+  };
   const existing = sessions.get(id);
   if (existing?.capabilityRefreshPending) {
     // Preserve current/already-queued work and its exact runtime surfaces.
@@ -2615,7 +2836,7 @@ export async function createPiSession(
       markSessionActivity(id);
       return existing;
     }
-    await destroyPiSession(id);
+    await destroyPiSession(id, undefined, existing);
     assertCreationCurrent();
   } else if (existing && !piSessionHandleRequiresFreshRuntime(existing)) {
     markSessionActivity(id);
@@ -2623,20 +2844,38 @@ export async function createPiSession(
   } else if (existing) {
     // A denied handle or permanently revoked privileged lease can never be
     // resumed. The pair-keyed browser profile remains backend-owned.
-    await destroyPiSession(id);
+    await destroyPiSession(id, undefined, existing);
     assertCreationCurrent();
   }
 
   const pending = sessionCreations.get(id);
-  if (pending) return pending;
+  if (pending) return awaitPiSessionCreationAsJoiner(pending, runtimeOptions.signal);
   const creationStartedAt = performance.now();
   let pendingRestrictedMcpRuntime: RestrictedMcpRuntime | undefined;
   let pendingProtectedBrowserRuntime: CapabilityBoundInteractiveBrowserToolRuntime | undefined;
+  let pendingBrowserCleanupOverride: PiSessionBrowserTeardown | undefined;
   let pendingProtectedBrowserTools: readonly ToolDefinition[] = Object.freeze([]);
   let pendingProtectedAutomationRuntime: ProtectedAutomationToolRuntime | undefined;
   let pendingFileAudioExperimentRuntime: FileAudioExperimentRuntime | undefined;
   let pendingArtifactToolRuntime: ArtifactToolRuntime | undefined;
   let pendingAgentSession: AgentSession | undefined;
+  let pendingAgentAbort: Promise<void> | undefined;
+  let publishedHandle: PiSessionHandle | undefined;
+  const denyOwnedCreation = () => {
+    // Never dispatch id-keyed cancellation for a replacement or a joiner's work.
+    if (publishedHandle || sessionCreations.get(id) !== creation) return;
+    latchPiSessionCapabilityDenial([id]);
+    // Startup may itself have admitted SDK ingress before publishing a handle.
+    // Deny the exact partial session now. Cleanup separately awaits the original
+    // startup and the SDK's explicit pending-invocation snapshot, not just abort.
+    if (pendingAgentSession) {
+      try { pendingAgentSession.clearQueue(); } catch { /* generation denial remains latched */ }
+      try { pendingAgentSession.setActiveToolsByName([]); } catch { /* generation denial remains latched */ }
+      try { pendingAgentAbort ??= pendingAgentSession.abort().catch(() => undefined); }
+      catch { /* creation cleanup retries the public abort boundary after startup drains */ }
+    }
+  };
+  const removeCreationAbortListener = () => runtimeOptions.signal?.removeEventListener("abort", denyOwnedCreation);
   const assertPendingBrowserCatalogCurrent = () => {
     if (!pendingProtectedBrowserRuntime) return;
     assertInteractiveBrowserToolCatalog(pendingProtectedBrowserRuntime);
@@ -2801,6 +3040,10 @@ export async function createPiSession(
     }
 
     const getRestrictedMcpLiveContext = (): RestrictedMcpLiveContext | null => {
+      // Pending MCP authority must observe the same synchronous creation denial.
+      if (!publishedHandle) {
+        try { assertCreationCurrent(); } catch { return null; }
+      } else if (publishedHandle.capabilityAuthorityDenied) return null;
       const currentRow = getSessionById(id);
       if (!currentRow || currentRow.cwd !== cwd || currentRow.pending_agent_switch) return null;
       if (currentRow.agent_profile_id !== runtimeIdentity.agentProfile.id) return null;
@@ -2898,8 +3141,7 @@ export async function createPiSession(
           if (pendingAuthority && exactProtectedBrowserBindingEqual(pendingAuthority.binding, protectedBinding)) {
             pendingInteractiveBrowserAuthority.delete(id);
           }
-          await pendingProtectedBrowserRuntime?.revokeAuthority("project_or_profile_denied").catch(() => undefined);
-          pendingProtectedBrowserRuntime = undefined;
+          pendingBrowserCleanupOverride = { kind: "revoke", reason: "project_or_profile_denied" };
           throw new WorkspaceStoreError("Protected browser factory returned a non-exact runtime lease", 409);
         }
       }
@@ -2947,8 +3189,6 @@ export async function createPiSession(
         assertCreationCurrent();
         if (!pendingProtectedAutomationRuntime
           || !exactProtectedAutomationBindingEqual(pendingProtectedAutomationRuntime.binding, automationBinding)) {
-          await pendingProtectedAutomationRuntime?.close().catch(() => undefined);
-          pendingProtectedAutomationRuntime = undefined;
           throw new WorkspaceStoreError("Protected automation factory returned a non-exact runtime lease", 409);
         }
       }
@@ -3033,8 +3273,6 @@ export async function createPiSession(
         || returned.agentProfileId !== audioBinding.agentProfileId
         || returned.provider !== audioBinding.provider
         || returned.model !== audioBinding.model) {
-        await pendingFileAudioExperimentRuntime?.close().catch(() => undefined);
-        pendingFileAudioExperimentRuntime = undefined;
         throw new WorkspaceStoreError("File-audio experiment factory returned a non-exact runtime lease", 409);
       }
     }
@@ -3231,9 +3469,17 @@ export async function createPiSession(
     assertCreationCurrent();
     runtimeOptions.testHooks?.onPrivilegedEffect?.("extension_lifecycle");
     assertCreationCurrent();
+    if (runtimeOptions.testHooks?.beforeExtensionStartup) {
+      await runtimeOptions.testHooks.beforeExtensionStartup(session);
+      assertCreationCurrent();
+    }
     await session.bindExtensions({
       shutdownHandler: () => {
-        void destroyPiSession(id).catch((error) => {
+        if (!publishedHandle) {
+          denyOwnedCreation();
+          return;
+        }
+        void destroyPiSession(id, undefined, publishedHandle).catch((error) => {
           console.warn(`[pi-bridge] extension shutdown failed for session ${id}:`, error);
         });
       },
@@ -3242,6 +3488,10 @@ export async function createPiSession(
       },
     });
     assertCreationCurrent();
+    if (runtimeOptions.testHooks?.afterExtensionStartup) {
+      await runtimeOptions.testHooks.afterExtensionStartup(session);
+      assertCreationCurrent();
+    }
     recordLatencyMetric("lazy_extension_bind_ms", performance.now() - extensionBindStartedAt);
 
     if (hostBashTool && !resolveHostBashExecutable(session, hostBashTool)) {
@@ -3351,7 +3601,7 @@ export async function createPiSession(
         } : undefined,
         settingsManager,
         failClosed: async () => {
-          await destroyPiSession(id);
+          await destroyPiSession(id, undefined, handle);
         },
       }),
       ...(trustedHostBashTool ? { trustedHostBashTool } : {}),
@@ -3415,6 +3665,10 @@ export async function createPiSession(
     runtimeOptions.testHooks?.onPrivilegedEffect?.("handle_publication");
     assertCreationCurrent();
     sessions.set(id, handle);
+    publishedHandle = handle;
+    // Atomic handoff: from here the caller must cancel/destroy this exact handle,
+    // not retain construction-signal authority through later observer callbacks.
+    removeCreationAbortListener();
     // Publication transfers browser authorization from the exact pending
     // witness to this live handle. No await is permitted across the transfer.
     pendingInteractiveBrowserAuthority.delete(id);
@@ -3453,34 +3707,80 @@ export async function createPiSession(
     catch { console.warn("[pi-bridge] Idle cleanup timer failed after session publication"); }
     return handle;
   })().catch(async (error) => {
-    // A stale creation owns all of its partial objects until this cleanup has
-    // finished. Denial cleanup waits on this promise and therefore cannot race
-    // a second destroy/publication path.
+    // Failure permanently denies creation-time witnesses. Each partial object
+    // remains owned until its own cleanup succeeds, including disposer failures.
+    creationFailed = true;
     pendingInteractiveBrowserAuthority.delete(id);
-    await closeUnpublishedAgentSession(pendingAgentSession);
-    pendingAgentSession = undefined;
-    await pendingRestrictedMcpRuntime?.close().catch(() => undefined);
-    pendingRestrictedMcpRuntime = undefined;
     const teardownIntent = sessionBrowserTeardownIntents.get(id);
-    if (pendingProtectedBrowserRuntime) {
-      const teardown = currentBrowserTeardownIntent(id) ?? DEFAULT_BROWSER_TEARDOWN;
-      await invokeBrowserTeardown(pendingProtectedBrowserRuntime, teardown).catch(() => undefined);
-    }
-    pendingProtectedBrowserRuntime = undefined;
-    if (teardownIntent) clearBrowserTeardownIntent(id, teardownIntent.generation);
-    await pendingProtectedAutomationRuntime?.close().catch(() => undefined);
-    pendingProtectedAutomationRuntime = undefined;
-    await pendingFileAudioExperimentRuntime?.close().catch(() => undefined);
-    pendingFileAudioExperimentRuntime = undefined;
-    await pendingArtifactToolRuntime?.close().catch(() => undefined);
-    pendingArtifactToolRuntime = undefined;
+    let teardownIntentGeneration = teardownIntent?.generation;
+    const teardown = pendingBrowserCleanupOverride ?? currentBrowserTeardownIntent(id) ?? DEFAULT_BROWSER_TEARDOWN;
+    const partialBrowser = pendingProtectedBrowserRuntime;
+    const lifecycle = productionInteractiveBrowserSessionLifecycle;
+    const steps = [
+      ...(teardownIntent?.browserCleanups ?? []),
+      cleanupStep(async () => {
+        await pendingAgentAbort;
+        await closeUnpublishedAgentSession(pendingAgentSession);
+        pendingAgentSession = undefined;
+      }),
+      cleanupStep(async () => { await pendingRestrictedMcpRuntime?.close(); pendingRestrictedMcpRuntime = undefined; }),
+      cleanupStep(async () => {
+        if (pendingProtectedBrowserRuntime) await invokeBrowserTeardown(pendingProtectedBrowserRuntime, teardown,
+          teardownIntent?.browserCleanups?.at(-1)?.rawBrowserCleanup);
+        pendingProtectedBrowserRuntime = undefined;
+      }),
+      cleanupStep(async () => { await pendingProtectedAutomationRuntime?.close(); pendingProtectedAutomationRuntime = undefined; }),
+      cleanupStep(async () => { await pendingFileAudioExperimentRuntime?.close(); pendingFileAudioExperimentRuntime = undefined; }),
+      cleanupStep(async () => { await pendingArtifactToolRuntime?.close(); pendingArtifactToolRuntime = undefined; }),
+    ];
+    failedCreationCleanup = createCleanupReservation(id,
+      (retryFailed) => completeCleanupSteps(steps, retryFailed),
+      () => sessionCreations.get(id) === creation,
+      () => {
+        if (sessionCreations.get(id) === creation) sessionCreations.delete(id);
+        if (teardownIntentGeneration !== undefined) clearBrowserTeardownIntent(id, teardownIntentGeneration);
+      },
+      teardown,
+    );
+    const owner = failedCreationCleanup;
+    owner.upgrade = (action, preCaptured) => {
+      const severity = browserTeardownSeverity(action);
+      const intent = sessionBrowserTeardownIntents.get(id);
+      if (preCaptured && intent?.browserCleanups?.includes(preCaptured)) teardownIntentGeneration = intent.generation;
+      if (severity <= owner.teardownSeverity && (!preCaptured || steps.includes(preCaptured))) return;
+      owner.teardownSeverity = Math.max(owner.teardownSeverity, severity);
+      owner.revision++;
+      const captured = preCaptured ?? capturedBrowserCleanupStep(() => action.kind === "close_session"
+        ? lifecycle?.captureSessionWorkspaceCleanup(id, action.reason)
+        : action.kind === "revoke" && partialBrowser
+          ? lifecycle?.captureAuthorityCleanup({ capabilityId: partialBrowser.binding.capabilityId,
+              projectId: partialBrowser.binding.projectId, agentProfileId: partialBrowser.binding.agentProfileId }, action.reason)
+          : undefined);
+      const browser = cleanupStep(async () => {
+        if (partialBrowser) await invokeBrowserTeardown(partialBrowser, action, captured.rawBrowserCleanup);
+      });
+      for (const step of preCaptured ? intent?.browserCleanups ?? [] : []) {
+        if (!steps.includes(step)) steps.push(step);
+      }
+      if (!steps.includes(captured)) steps.push(captured);
+      steps.push(browser);
+      void runCleanupStep(browser, false).catch(() => undefined);
+      void runCleanupStep(captured, false).catch(() => undefined);
+    };
+    unconfirmedSessionCleanups.set(id, owner);
+    await attemptReservedCleanup(owner);
+    // Only a confirmed cleanup may propagate the original startup error.
     throw error;
   }).finally(() => {
+    removeCreationAbortListener();
+    if ((!failedCreationCleanup || failedCreationCleanup.confirmed) && sessionCreations.get(id) === creation) {
+      sessionCreations.delete(id);
+    }
     recordLatencyMetric("lazy_session_create_ms", performance.now() - creationStartedAt);
-    sessionCreations.delete(id);
   });
 
   sessionCreations.set(id, creation);
+  runtimeOptions.signal?.addEventListener("abort", denyOwnedCreation);
   return creation;
 }
 
@@ -4151,10 +4451,14 @@ const DEFAULT_BROWSER_TEARDOWN: PiSessionBrowserTeardown = Object.freeze({
 interface CapabilityAuthorityCleanupState {
   browserRuntime?: CapabilityBoundInteractiveBrowserToolRuntime;
   browserSeverity: 0 | 1 | 2 | 3;
-  promise: Promise<void>;
+  browserCapturedCleanup?: () => Promise<void>;
+  steps: CleanupStep[];
 }
 
 const capabilityAuthorityCleanup = new WeakMap<object, CapabilityAuthorityCleanupState>();
+const hostBashCleanupRetries = new WeakMap<PiSessionHandle, () => Promise<void>>();
+const agentSessionShutdownCompleted = new WeakSet<PiSessionHandle>();
+const agentSessionDisposed = new WeakSet<PiSessionHandle>();
 
 function browserTeardownSeverity(action: PiSessionBrowserTeardown): 1 | 2 | 3 {
   return action.kind === "detach" ? 1 : action.kind === "close_session" ? 2 : 3;
@@ -4163,11 +4467,16 @@ function browserTeardownSeverity(action: PiSessionBrowserTeardown): 1 | 2 | 3 {
 function invokeBrowserTeardown(
   runtime: CapabilityBoundInteractiveBrowserToolRuntime,
   action: PiSessionBrowserTeardown,
+  capturedCleanup?: () => Promise<void>,
 ): Promise<void> {
   try {
     if (action.kind === "detach") return Promise.resolve(runtime.detachAgentLease(action.reason));
-    if (action.kind === "close_session") return Promise.resolve(runtime.closeSessionWorkspaces(action.reason));
-    return Promise.resolve(runtime.revokeAuthority(action.reason));
+    if (action.kind === "close_session") return Promise.resolve(runtime.kind === "standard"
+      ? runtime.closeSessionWorkspaces(action.reason, capturedCleanup)
+      : runtime.closeSessionWorkspaces(action.reason));
+    return Promise.resolve(runtime.kind === "standard"
+      ? runtime.revokeAuthority(action.reason, capturedCleanup)
+      : runtime.revokeAuthority(action.reason));
   } catch (error) {
     return Promise.reject(error);
   }
@@ -4176,44 +4485,48 @@ function invokeBrowserTeardown(
 function beginPiSessionAuthorityCleanup(
   handle: PiSessionHandle,
   browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
+  retryFailed = false,
+  capturedCleanup?: () => Promise<void>,
 ): Promise<void> {
   let state = capabilityAuthorityCleanup.get(handle);
   if (!state) {
-    // Invoke every revoker before returning. Their synchronous prefixes latch
-    // agent/process/control denial; process, socket, and browser shutdown may finish later.
+    // Move exact ownership into retained steps, not into discarded allSettled
+    // results. Successful resources are never closed again by an explicit retry.
     const restricted = handle.restrictedMcpRuntime;
     const protectedBrowser = handle.protectedBrowserRuntime;
     const protectedAutomation = handle.protectedAutomationRuntime;
     const fileAudioExperiment = handle.fileAudioExperimentRuntime;
     const artifactTool = handle.artifactToolRuntime;
-    const hostBashTeardown = handle.hostBashTeardown;
+    let hostBashTeardown = handle.hostBashTeardown;
+    const retryHostBash = hostBashCleanupRetries.get(handle);
+    hostBashCleanupRetries.delete(handle);
     handle.restrictedMcpRuntime = undefined;
     handle.protectedBrowserRuntime = undefined;
     handle.protectedAutomationRuntime = undefined;
     handle.fileAudioExperimentRuntime = undefined;
     handle.artifactToolRuntime = undefined;
     handle.hostBashTeardown = undefined;
-    const invokeClose = (runtime: { close(): Promise<void> } | undefined): Promise<void> => {
-      try { return runtime ? Promise.resolve(runtime.close()) : Promise.resolve(); }
-      catch (error) { return Promise.reject(error); }
-    };
-    const invokeAgentAbort = (): Promise<void> => {
-      try {
-        const abort = (handle.session as any)?.abort;
-        return typeof abort === "function" ? Promise.resolve(abort.call(handle.session)) : Promise.resolve();
-      } catch (error) { return Promise.reject(error); }
-    };
     state = {
       browserRuntime: protectedBrowser,
       browserSeverity: 0,
-      promise: Promise.allSettled([
-        hostBashTeardown ?? Promise.resolve(),
-        invokeAgentAbort(),
-        invokeClose(restricted),
-        invokeClose(protectedAutomation),
-        invokeClose(fileAudioExperiment),
-        invokeClose(artifactTool),
-      ]).then(() => undefined),
+      steps: [
+        cleanupStep(async () => {
+          if (hostBashTeardown) {
+            const first = hostBashTeardown;
+            // Keep a non-retryable failure as failure rather than invent success.
+            if (retryHostBash) hostBashTeardown = undefined;
+            await first;
+          } else await retryHostBash?.();
+        }),
+        cleanupStep(async () => {
+          const abort = handle.session?.abort;
+          if (typeof abort === "function") await abort.call(handle.session);
+        }),
+        cleanupStep(() => restricted?.close()),
+        cleanupStep(() => protectedAutomation?.close()),
+        cleanupStep(() => fileAudioExperiment?.close()),
+        cleanupStep(() => artifactTool?.close()),
+      ],
     };
     capabilityAuthorityCleanup.set(handle, state);
   }
@@ -4221,15 +4534,19 @@ function beginPiSessionAuthorityCleanup(
   const severity = browserTeardownSeverity(browserTeardown);
   if (state.browserRuntime && severity > state.browserSeverity) {
     state.browserSeverity = severity;
-    const browserCleanup = invokeBrowserTeardown(state.browserRuntime, browserTeardown);
-    state.promise = Promise.allSettled([state.promise, browserCleanup]).then(() => undefined);
+    state.browserCapturedCleanup = capturedCleanup;
+    const runtime = state.browserRuntime;
+    state.steps.push(cleanupStep(() => invokeBrowserTeardown(runtime, browserTeardown, capturedCleanup)));
   }
-  return state.promise;
+  // Invoke all synchronous denial prefixes now, await every result, then fail
+  // if any owned closer is unconfirmed. No retry occurs without explicit intent.
+  return completeCleanupSteps(state.steps, retryFailed);
 }
 
 function latchPiSessionHandleCapabilityDenial(
   handle: PiSessionHandle,
   browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
+  capturedCleanup?: () => Promise<void>,
 ): void {
   if (!handle.capabilityAuthorityDenied) {
     handle.capabilityAuthorityDenied = true;
@@ -4240,6 +4557,9 @@ function latchPiSessionHandleCapabilityDenial(
   const trustedHostBashTool = handle.trustedHostBashTool;
   if (trustedHostBashTool) {
     trustedHostBashTool.revoked = true;
+    if (typeof trustedHostBashTool.revokeActiveExecutions === "function") {
+      hostBashCleanupRetries.set(handle, () => trustedHostBashTool.revokeActiveExecutions());
+    }
     try {
       handle.hostBashTeardown = typeof trustedHostBashTool.revokeActiveExecutions === "function"
         ? Promise.resolve(trustedHostBashTool.revokeActiveExecutions())
@@ -4283,7 +4603,7 @@ function latchPiSessionHandleCapabilityDenial(
   }
 
   // Calling these async closers starts their synchronous denial prefixes now.
-  void beginPiSessionAuthorityCleanup(handle, browserTeardown);
+  void beginPiSessionAuthorityCleanup(handle, browserTeardown, false, capturedCleanup).catch(() => undefined);
   emitRuntimeUnavailableOnce(handle);
 }
 
@@ -4303,6 +4623,7 @@ export function piSessionHandleCanRetireCapabilityRefresh(
     && !handle.session.isStreaming
     && !handle.session.isCompacting
     && handle.session.pendingMessageCount === 0
+    && !(handle.session.pendingPromptCount > 0)
     && handle.interactiveTurns.size === 0
     && handle.queuedBrowserMessages.size === 0;
 }
@@ -4315,6 +4636,7 @@ function refreshSettlementRetryIsEligible(handle: PiSessionHandle): boolean {
     && !handle.session.isStreaming
     && !handle.session.isCompacting
     && handle.session.pendingMessageCount === 0
+    && !(handle.session.pendingPromptCount > 0)
     && [...interactiveTurnLedger(handle).values()].some((turn) => turn.settlementReady);
 }
 
@@ -4327,7 +4649,7 @@ export async function retirePiSessionCapabilityRefreshIfIdle(
   } = {},
 ): Promise<boolean> {
   const lookup = options.lookup ?? sessions;
-  if (lookup.get(handle.id) !== handle) return false;
+  if (lookup.get(handle.id) !== handle || unconfirmedSessionCleanups.has(handle.id)) return false;
   // A transient source-marker append failure leaves its exact ready ledger item
   // for retry. Retry it before deciding the stale handle cannot retire.
   if (refreshSettlementRetryIsEligible(handle)) settleInteractiveTurnsQuietly(handle);
@@ -4402,18 +4724,48 @@ export function latchPiSessionCapabilityDenial(
   browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
   browserAuthorityScope?: Readonly<InteractiveBrowserAuthorityScope>,
 ): void {
-  // Detached Standard workspaces have no Pi handle. Start pair-scoped denial
-  // before per-runtime cleanup so revocation never depends on a live lease.
-  if (browserTeardown.kind === "revoke" && browserAuthorityScope && productionInteractiveBrowserSessionLifecycle) {
-    try {
-      const cleanup = Promise.resolve(productionInteractiveBrowserSessionLifecycle.revokeAuthority(
-        browserAuthorityScope,
-        browserTeardown.reason,
-      ));
-      void trackInteractiveBrowserLifecycleCleanup(cleanup).catch(() => undefined);
-    } catch { /* the durable denial remains authoritative */ }
+  // Capture detached pair-owned targets before any denial notification. Share
+  // this exact retryable step with every affected creation/live owner.
+  const lifecycle = productionInteractiveBrowserSessionLifecycle;
+  const pairCleanup = browserTeardown.kind === "revoke" && browserAuthorityScope && lifecycle
+    ? capturedBrowserCleanupStep(() => lifecycle.captureAuthorityCleanup(browserAuthorityScope, browserTeardown.reason))
+    : undefined;
+  const owners = [...new Set(runtimeIds)].map((id) => {
+    const handle = lookup.get(id);
+    const priorTeardown = sessionBrowserTeardownIntents.get(id);
+    const priorAction = priorTeardown?.action;
+    const effectiveTeardown = priorAction
+      && browserTeardownSeverity(priorAction) >= browserTeardownSeverity(browserTeardown)
+      ? priorAction
+      : browserTeardown;
+    const browserCleanups = [...(priorTeardown?.browserCleanups ?? [])];
+    if (pairCleanup) browserCleanups.push(pairCleanup);
+    else if (!priorAction || browserTeardownSeverity(effectiveTeardown) > browserTeardownSeverity(priorAction)) {
+      const binding = handle?.protectedBrowserRuntime?.binding
+        ?? (handle ? capabilityAuthorityCleanup.get(handle)?.browserRuntime?.binding
+          : pendingInteractiveBrowserAuthority.get(id)?.binding);
+      browserCleanups.push(capturedBrowserCleanupStep(() => effectiveTeardown.kind === "close_session"
+        ? lifecycle?.captureSessionWorkspaceCleanup(id, effectiveTeardown.reason)
+        : effectiveTeardown.kind === "revoke" && binding
+          ? lifecycle?.captureAuthorityCleanup({ capabilityId: binding.capabilityId,
+              projectId: binding.projectId, agentProfileId: binding.agentProfileId }, effectiveTeardown.reason)
+          : undefined));
+    }
+    return { id, handle, effectiveTeardown, browserCleanups };
+  });
+  for (const { id, effectiveTeardown, browserCleanups } of owners) {
+    // Publish every target snapshot/epoch before any pair or runtime callback.
+    const generation = getPiSessionCapabilityDenialGeneration(id) + 1n;
+    sessionCapabilityDenialGenerations.set(id, generation);
+    sessionBrowserTeardownIntents.set(id, { generation, action: effectiveTeardown, browserCleanups });
   }
-  for (const id of new Set(runtimeIds)) {
+  for (const { id, effectiveTeardown, browserCleanups } of owners) {
+    unconfirmedSessionCleanups.get(id)?.upgrade?.(effectiveTeardown, browserCleanups.at(-1));
+  }
+  if (pairCleanup) {
+    void trackInteractiveBrowserLifecycleCleanup(runCleanupStep(pairCleanup, false)).catch(() => undefined);
+  }
+  for (const { id, handle, effectiveTeardown, browserCleanups } of owners) {
     // Cancel every human-input continuation synchronously, including for a
     // starting runtime with no published handle. A late UI response must not
     // wake tool work after durable capability denial.
@@ -4422,77 +4774,86 @@ export function latchPiSessionCapabilityDenial(
     getSudoBridge().cancelSession(id);
     getCommandGuardIdentityBridge().cancelSession(id);
     getCommandGuardApprovalBridge().cancelSession(id);
-    // Advance first and without awaiting or requiring a published handle. This
-    // is the authoritative starting-runtime revocation latch.
-    const generation = getPiSessionCapabilityDenialGeneration(id) + 1n;
-    sessionCapabilityDenialGenerations.set(id, generation);
-    const priorTeardown = sessionBrowserTeardownIntents.get(id);
-    const priorAction = priorTeardown?.action;
-    const effectiveTeardown = priorAction
-      && browserTeardownSeverity(priorAction) >= browserTeardownSeverity(browserTeardown)
-      ? priorAction
-      : browserTeardown;
-    sessionBrowserTeardownIntents.set(id, { generation, action: effectiveTeardown });
-    const handle = lookup.get(id);
-    if (handle) latchPiSessionHandleCapabilityDenial(handle, effectiveTeardown);
+    if (handle) latchPiSessionHandleCapabilityDenial(handle, effectiveTeardown,
+      browserCleanups.at(-1)?.rawBrowserCleanup);
   }
 }
 
 /** Post-latch cleanup. Starting runtimes are awaited and re-latched; live
  * agent work and host process groups are aborted before the denied runtime is destroyed. */
 export async function cleanupPiSessionCapabilityDenial(runtimeIds: readonly string[]): Promise<void> {
-  await Promise.allSettled([...new Set(runtimeIds)].map(async (id) => {
-    const pending = sessionCreations.get(id);
-    if (pending) await pending.catch(() => undefined);
-    const handle = sessions.get(id);
-    if (!handle) {
-      clearBrowserTeardownIntent(id, getPiSessionCapabilityDenialGeneration(id));
-      return;
+  // destroy captures the exact owner before awaiting startup. A failure is not
+  // proof of retirement; attempt all owners, then propagate the retained receipt.
+  const results = await Promise.allSettled([...new Set(runtimeIds)].map((id) =>
+    destroyPiSession(id, currentBrowserTeardownIntent(id) ?? DEFAULT_BROWSER_TEARDOWN)));
+  const browserResults = await Promise.allSettled([...interactiveBrowserLifecycleCleanupTasks]);
+  for (const result of [...results, ...browserResults]) {
+    if (result.status === "rejected") {
+      if (result.reason instanceof PiSessionCleanupUnconfirmedError) throw result.reason;
+      throw new Error("Runtime authority cleanup is unconfirmed");
     }
-    const browserTeardown = currentBrowserTeardownIntent(id) ?? DEFAULT_BROWSER_TEARDOWN;
-    latchPiSessionHandleCapabilityDenial(handle, browserTeardown);
-    await beginPiSessionAuthorityCleanup(handle, browserTeardown);
-    await stopPiSessionIfIdle(id).catch(() => false);
-  }));
-  await Promise.allSettled([...interactiveBrowserLifecycleCleanupTasks]);
+  }
 }
 
 export async function closePiSessionAuthorities(
   handle: PiSessionHandle,
   browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
+  capturedCleanup?: () => Promise<void>,
 ): Promise<void> {
-  latchPiSessionHandleCapabilityDenial(handle, browserTeardown);
-  await beginPiSessionAuthorityCleanup(handle, browserTeardown);
+  // Direct external callers also freeze Standard targets before notification.
+  const previous = capabilityAuthorityCleanup.get(handle);
+  const runtime = handle.protectedBrowserRuntime ?? previous?.browserRuntime;
+  if (!capturedCleanup && previous && browserTeardownSeverity(browserTeardown) <= previous.browserSeverity) {
+    capturedCleanup = previous.browserCapturedCleanup;
+  } else if (!capturedCleanup && runtime?.kind === "standard" && browserTeardown.kind !== "detach") {
+    const lifecycle = productionInteractiveBrowserSessionLifecycle;
+    capturedCleanup = capturedBrowserCleanupStep(() => browserTeardown.kind === "close_session"
+      ? lifecycle?.captureSessionWorkspaceCleanup(handle.id, browserTeardown.reason)
+      : lifecycle?.captureAuthorityCleanup({ capabilityId: runtime.binding.capabilityId,
+          projectId: runtime.binding.projectId, agentProfileId: runtime.binding.agentProfileId }, browserTeardown.reason))
+      .rawBrowserCleanup;
+  }
+  latchPiSessionHandleCapabilityDenial(handle, browserTeardown, capturedCleanup);
+  await beginPiSessionAuthorityCleanup(handle, browserTeardown, true, capturedCleanup);
 }
 
+/** External runtime owner only: awaiting this from one of the session's own
+ * pending prompts would wait on that invocation's completion and deadlock. */
 export async function disposePiAgentSession(handle: PiSessionHandle): Promise<void> {
   if (!handle.agentSessionDisposal) {
-    handle.agentSessionShutdown ??= (async () => {
-      try {
-        const runner = handle.session.extensionRunner;
-        if (runner.hasHandlers("session_shutdown")) {
-          await runner.emit({ type: "session_shutdown", reason: "quit" });
-        }
-      } catch {
-        // Faulty extension shutdown must not prevent low-level disposal.
+    let resolveDisposal!: () => void;
+    let rejectDisposal!: (error: unknown) => void;
+    const disposal = new Promise<void>((resolve, reject) => {
+      resolveDisposal = resolve;
+      rejectDisposal = reject;
+    });
+    // Publish before callbacks; every reentrant observer joins this exact attempt.
+    handle.agentSessionDisposal = disposal;
+    void disposal.catch(() => {
+      if (handle.agentSessionDisposal === disposal) handle.agentSessionDisposal = undefined;
+    });
+    void (async () => {
+      if (!agentSessionShutdownCompleted.has(handle)) {
+        try {
+          const runner = handle.session.extensionRunner;
+          if (runner.hasHandlers("session_shutdown")) {
+            await runner.emit({ type: "session_shutdown", reason: "quit" });
+          }
+        } catch {
+          // Failed hooks cannot skip disposal; a retry must not replay shutdown.
+        } finally { agentSessionShutdownCompleted.add(handle); }
       }
-    })();
-    handle.agentSessionDisposal = (async () => {
-      await handle.agentSessionShutdown;
-      // Disposal only detaches SDK listeners; it does not terminate an active
-      // run. The canonical idle contract must confirm cleanup first. A throw
-      // retains the admission and subscriber for retry of this exact runtime.
-      if (interviewAdmissions.get(handle)?.size && !handle.session.isIdle) {
-        throw new Error("Interview delivery runtime cleanup is incomplete");
+      if (!agentSessionDisposed.has(handle)) {
+        await abortAndDrainPiSessionPrompts(handle.session);
+        handle.session.dispose();
+        agentSessionDisposed.add(handle);
       }
-      handle.session.dispose();
+      // Only confirmed drain/disposal may retire accepted delivery ownership.
+      // Keep persistence observation attached if any required phase fails.
       reconcileInterviewAdmissionsQuietly(handle);
       retireDisposedInterviewAdmissions(handle);
       try { handle.liveStreamingMessageUnsubscribe?.(); } catch { /* best effort */ }
-    })().catch((error) => {
-      handle.agentSessionDisposal = undefined;
-      throw error;
-    });
+    })().then(resolveDisposal, () => rejectDisposal(new Error("Session SDK disposal is unconfirmed")));
   }
   await handle.agentSessionDisposal;
 }
@@ -4500,89 +4861,124 @@ export async function disposePiAgentSession(handle: PiSessionHandle): Promise<vo
 export async function destroyPiSession(
   id: string,
   browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
+  expectedHandle?: PiSessionHandle,
 ): Promise<void> {
-  // Resolve waiting external writes before abort/disposal can block on their
-  // extension hooks. This is deliberately safe even when no live handle exists
-  // (for example a stop/archive racing a just-finished session).
-  getActionApprovalBridge().cancelSession(id, "session destroyed");
-  getInterviewBridge().cancelSession(id);
-  getSudoBridge().cancelSession(id);
-  getCommandGuardIdentityBridge().cancelSession(id);
-  getCommandGuardApprovalBridge().cancelSession(id);
-  const pendingCreation = sessionCreations.get(id);
-  if (pendingCreation) {
-    const generation = getPiSessionCapabilityDenialGeneration(id) + 1n;
-    sessionCapabilityDenialGenerations.set(id, generation);
-    sessionBrowserTeardownIntents.set(id, { generation, action: browserTeardown });
-    await pendingCreation.catch(() => undefined);
-  }
-  const teardownIntentGeneration = sessionBrowserTeardownIntents.get(id)?.generation;
+  // Capture before any cancellation or await. Old work has no authority over a
+  // new handle, a new pending creation, or its id-keyed approval/identity maps.
   const handle = sessions.get(id);
-  if (!handle) {
-    if (browserTeardown.kind === "close_session") {
-      await productionInteractiveBrowserSessionLifecycle?.closeSessionWorkspaces(id, browserTeardown.reason);
-    }
-    if (teardownIntentGeneration !== undefined) clearBrowserTeardownIntent(id, teardownIntentGeneration);
+  if (expectedHandle && handle !== expectedHandle) return;
+  const retained = unconfirmedSessionCleanups.get(id);
+  if (retained) {
+    await attemptReservedCleanup(retained, browserTeardown);
     return;
   }
-  const browserBinding = handle.protectedBrowserRuntime?.binding;
-  await closePiSessionAuthorities(handle, browserTeardown);
-  if (browserTeardown.kind === "close_session") {
-    await productionInteractiveBrowserSessionLifecycle?.closeSessionWorkspaces(id, browserTeardown.reason);
-  } else if (browserTeardown.kind === "revoke" && browserBinding) {
-    await productionInteractiveBrowserSessionLifecycle?.revokeAuthority({
-      capabilityId: browserBinding.capabilityId,
-      projectId: browserBinding.projectId,
-      agentProfileId: browserBinding.agentProfileId,
-    }, browserTeardown.reason);
+  const pendingCreation = sessionCreations.get(id);
+  if (pendingCreation && !handle) {
+    // The creation promise already owns this exact starting generation. Its
+    // single catch path reserves all partial cleanup before invoking closers.
+    // Sharing that owner avoids a destroy/creation-cleanup promise cycle.
+    latchPiSessionCapabilityDenial([id], sessions, browserTeardown);
+    await pendingCreation.catch((error) => {
+      if (error instanceof PiSessionCleanupUnconfirmedError && cleanupReceiptOwners.has(error)) throw error;
+    });
+    return; // Never adopt a successor after the original startup drains.
   }
-  try {
-    if (handle.session.isStreaming) {
-      await handle.session.abort();
-    }
-  } catch {
-    // ignore
+
+  const lifecycle = productionInteractiveBrowserSessionLifecycle;
+  const browserRuntime = handle?.protectedBrowserRuntime
+    ?? (handle ? capabilityAuthorityCleanup.get(handle)?.browserRuntime : undefined);
+  const browserBinding = browserRuntime?.binding;
+  const generation = getPiSessionCapabilityDenialGeneration(id);
+  const priorIntent = sessionBrowserTeardownIntents.get(id);
+  let teardownIntentGeneration = priorIntent?.generation;
+  if (priorIntent && browserTeardownSeverity(priorIntent.action) > browserTeardownSeverity(browserTeardown)) {
+    browserTeardown = priorIntent.action;
   }
-  await disposePiAgentSession(handle);
-  handle.events.removeAllListeners();
-  if (handle.sessionFile) invalidateSessionFileSnapshot(handle.sessionFile);
-  // Concurrent best-effort refresh retirement and lazy creation may both wait
-  // on teardown of this exact old object. Never let a late old destroy delete
-  // a coherently published replacement or its identity mappings.
-  const removedCurrentHandle = sessions.get(id) === handle;
-  if (removedCurrentHandle) sessions.delete(id);
-  if (teardownIntentGeneration !== undefined) clearBrowserTeardownIntent(id, teardownIntentGeneration);
-  maybeStopIdleCleanupTimer();
-  piSessionManagerToWebSessionId.delete(handle.session.sessionManager);
-  if (removedCurrentHandle) {
-    for (const [cwd, sid] of cwdToSessionId) {
-      if (sid === id) cwdToSessionId.delete(cwd);
+  const steps: CleanupStep[] = [...(priorIntent?.browserCleanups ?? [])];
+  if (handle) steps.push(cleanupStep(() => abortAndDrainPiSessionPrompts(handle.session)));
+  let cancelled = false;
+  const reservation = createCleanupReservation(id, async (retryFailed) => {
+    await completeCleanupSteps(steps, retryFailed);
+    if (handle) {
+      await disposePiAgentSession(handle);
+      handle.events.removeAllListeners();
     }
-    for (const [piSessionId, sid] of piSessionToWebSessionId) {
-      if (sid === id) piSessionToWebSessionId.delete(piSessionId);
+    // Shutdown/removal observers can add a stronger phase. Do not retry a
+    // failed phase here; only drain newly appended work before confirmation.
+    await completeCleanupSteps(steps, false);
+  }, () => handle ? sessions.get(id) === handle
+    : !sessions.has(id) && !sessionCreations.has(id) && getPiSessionCapabilityDenialGeneration(id) === generation,
+  () => {
+    if (teardownIntentGeneration !== undefined) clearBrowserTeardownIntent(id, teardownIntentGeneration);
+    if (!handle) return;
+    if (handle.sessionFile) invalidateSessionFileSnapshot(handle.sessionFile);
+    const removedCurrentHandle = sessions.get(id) === handle;
+    if (removedCurrentHandle) sessions.delete(id);
+    maybeStopIdleCleanupTimer();
+    if (sessions.get(id)?.session.sessionManager !== handle.session.sessionManager) {
+      piSessionManagerToWebSessionId.delete(handle.session.sessionManager);
     }
-    for (const [sessionFile, sid] of piSessionFileToWebSessionId) {
-      if (sid === id) piSessionFileToWebSessionId.delete(sessionFile);
+    if (removedCurrentHandle) {
+      for (const [cwd, sid] of cwdToSessionId) {
+        if (sid === id) cwdToSessionId.delete(cwd);
+      }
+      for (const [piSessionId, sid] of piSessionToWebSessionId) {
+        if (sid === id) piSessionToWebSessionId.delete(piSessionId);
+      }
+      for (const [sessionFile, sid] of piSessionFileToWebSessionId) {
+        if (sid === id) piSessionFileToWebSessionId.delete(sessionFile);
+      }
     }
-  }
+  }, browserTeardown);
+  reservation.teardownSeverity = 0;
+  reservation.upgrade = (action, preCaptured) => {
+    const severity = browserTeardownSeverity(action);
+    const intent = sessionBrowserTeardownIntents.get(id);
+    if (preCaptured && intent?.browserCleanups?.includes(preCaptured)) teardownIntentGeneration = intent.generation;
+    if (severity <= reservation.teardownSeverity && (!preCaptured || steps.includes(preCaptured))) return;
+    reservation.teardownSeverity = Math.max(reservation.teardownSeverity, severity);
+    reservation.revision++;
+    const captured = preCaptured ?? (priorIntent && browserTeardownSeverity(priorIntent.action) >= severity
+      ? priorIntent.browserCleanups?.at(-1)
+      : capturedBrowserCleanupStep(() => action.kind === "close_session"
+        ? lifecycle?.captureSessionWorkspaceCleanup(id, action.reason)
+        : action.kind === "revoke" && browserBinding
+          ? lifecycle?.captureAuthorityCleanup({ capabilityId: browserBinding.capabilityId,
+              projectId: browserBinding.projectId, agentProfileId: browserBinding.agentProfileId }, action.reason)
+          : undefined));
+    for (const step of preCaptured ? intent?.browserCleanups ?? [] : []) {
+      if (!steps.includes(step)) steps.push(step);
+    }
+    if (captured && !steps.includes(captured)) steps.push(captured);
+    const authority = handle
+      ? cleanupStep(() => closePiSessionAuthorities(handle, action, captured?.rawBrowserCleanup))
+      : undefined;
+    if (authority) steps.push(authority);
+    // All ownership, phase promises and raw snapshots precede notifications.
+    if (!cancelled) {
+      cancelled = true;
+      getActionApprovalBridge().cancelSession(id, "session destroyed");
+      getInterviewBridge().cancelSession(id);
+      getSudoBridge().cancelSession(id);
+      getCommandGuardIdentityBridge().cancelSession(id);
+      getCommandGuardApprovalBridge().cancelSession(id);
+    }
+    if (authority) void runCleanupStep(authority, false).catch(() => undefined);
+    if (captured) void runCleanupStep(captured, false).catch(() => undefined);
+  };
+  // Initial observers and failed retries share one exact receipt/completion,
+  // not merely a by-id slot installed after the first failure.
+  unconfirmedSessionCleanups.set(id, reservation);
+  await attemptReservedCleanup(reservation, browserTeardown);
 }
 
 export async function stopPiSession(
   id: string,
   browserTeardown: PiSessionBrowserTeardown = DEFAULT_BROWSER_TEARDOWN,
 ): Promise<void> {
-  getActionApprovalBridge().cancelSession(id, "session stopped");
-  const pending = sessionCreations.get(id);
-  if (pending) {
-    // Stop is itself a synchronous starting-runtime denial, not permission for
-    // the old creation to publish briefly before being destroyed.
-    latchPiSessionCapabilityDenial([id], sessions, browserTeardown);
-    try {
-      await pending;
-    } catch {
-      // A failed creation leaves no live session to stop.
-    }
-  }
+  // The exact destroy owner must capture browser targets before notifications
+  // or startup awaits. Do not pre-cancel, adopt a successor, or implicitly retry
+  // a failed creation cleanup here.
   await destroyPiSession(id, browserTeardown);
 }
 
@@ -5636,20 +6032,33 @@ export async function abortInteractiveTurn(
     handle.queuedBrowserMessages?.clear();
     dropManualCompactionMessageQueue(handle);
   }
+  const generation = handle.runtimeGeneration;
+  const settlement = {};
+  interactiveAbortSettlements.set(handle, settlement);
   if (handle.session.isCompacting) handle.session.abortCompaction();
-  await handle.session.abort();
-  // An interrupted turn can end without a terminal pi lifecycle event (for
-  // example when the abort lands during auto or manual compaction). Clients
-  // gate their "running" UI state on agent_settled/compaction_end, so emit a
-  // synthetic settle after the abort whenever the top-level run is no longer
-  // streaming. This is idempotent for already-idle sessions and guarantees a
-  // deterministic exit from the running state for every live subscriber.
-  if (!handle.session.isStreaming) {
+  const abort = handle.session.abort();
+  // Snapshot immediately after synchronous cancellation, before any await lets
+  // a newer prompt enter. This observer never waits from inside a prompt hook.
+  const pendingPrompts = handle.session.pendingPromptCount > 0
+    ? handle.session.waitForPendingPrompts()
+    : Promise.resolve();
+  // Keep interruption responsive while an uncooperative preflight drains. SDK
+  // isIdle/isStreaming and abort completion alone cannot justify agent_settled.
+  void Promise.all([abort, pendingPrompts]).then(() => {
+    if (interactiveAbortSettlements.get(handle) !== settlement) return;
+    interactiveAbortSettlements.delete(handle);
+    if (sessions.get(handle.id) !== handle || handle.runtimeGeneration !== generation
+      || handle.capabilityAuthorityDenied || handle.session.isStreaming
+      || handle.session.isCompacting || handle.session.pendingPromptCount !== 0) return;
     try {
-      handle.events?.emit?.("message", { type: "agent_settled" } satisfies SerializedMessage);
+      handle.events.emit("message", { type: "agent_settled" } satisfies SerializedMessage);
     } catch { /* a failing observer cannot break abort completion */ }
-  }
-  schedulePiSessionCapabilityRefreshRetirement(handle);
+    schedulePiSessionCapabilityRefreshRetirement(handle);
+  }, () => {
+    if (interactiveAbortSettlements.get(handle) === settlement) interactiveAbortSettlements.delete(handle);
+    // An unsuccessful drain has no authority to fabricate an idle event.
+  });
+  await abort;
   return clearedQueue;
 }
 

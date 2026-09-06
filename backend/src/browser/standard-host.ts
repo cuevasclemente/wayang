@@ -1128,12 +1128,27 @@ export class StandardBrowserProfileHost {
     }
   }
 
-  async closeWorkspace(sourceSessionId: string, _reason: string, closedAt = Date.now()): Promise<void> {
+  /** Includes cleanup-pending records; null captures the absence of a target. */
+  workspaceCleanupGeneration(sourceSessionId: string): string | null {
+    return this.workspaces.get(sourceSessionId)?.generation ?? null;
+  }
+
+  async closeWorkspace(
+    sourceSessionId: string,
+    _reason: string,
+    closedAt = Date.now(),
+    expectedGeneration?: string | null,
+  ): Promise<void> {
     const workspace = this.workspaces.get(sourceSessionId);
-    if (!workspace) return;
+    if (!workspace || (expectedGeneration !== undefined && workspace.generation !== expectedGeneration)) return;
     if (workspace.cleanupPromise) return workspace.cleanupPromise;
-    let cleanup!: Promise<void>;
-    cleanup = (async () => {
+    // Publish the joining promise before viewer/VNC callbacks can synchronously
+    // reenter cleanup. Only this attempt owns the drain and its closedAt.
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const cleanup = new Promise<void>((done, failed) => { resolve = done; reject = failed; });
+    workspace.cleanupPromise = cleanup;
+    void (async () => {
       if (!workspace.closed) {
         workspace.closed = true;
         workspace.runtimeGeneration = null;
@@ -1161,10 +1176,16 @@ export class StandardBrowserProfileHost {
         if (this.workspaces.size === 0) this.emptySince = closedAt;
       }
       if (failures.length > 0) throw new AggregateError(failures, "Standard browser workspace cleanup is pending");
-    })().finally(() => {
-      if (workspace.cleanupPromise === cleanup) workspace.cleanupPromise = undefined;
-    });
-    workspace.cleanupPromise = cleanup;
+    })().then(
+      () => {
+        if (workspace.cleanupPromise === cleanup) workspace.cleanupPromise = undefined;
+        resolve();
+      },
+      (error) => {
+        if (workspace.cleanupPromise === cleanup) workspace.cleanupPromise = undefined;
+        reject(error);
+      },
+    );
     return cleanup;
   }
 

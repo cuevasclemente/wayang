@@ -513,8 +513,9 @@ test("interview admission identity survives observation deadlines", async (suite
       const initial = f.deliver(record);
       await f.advance(30_001);
       timedOut(initial);
-      await assert.rejects(disposePiAgentSession(f.handle), /cleanup is incomplete/);
-      assert.equal(f.handle.acceptedTopLevelWorkCount, 1, "listener disposal cannot claim active-run cleanup");
+      assert.equal(f.handle.acceptedTopLevelWorkCount, 1);
+      // Explicit disposal now aborts and awaits prompt drainage. This case checks
+      // that idle state and a failed disposer still cannot retire an admission.
       // Direct SDK control models an out-of-band clear with no Wayang receipt.
       // Empty queues alone cannot free the admission, even once Pi is idle.
       f.handle.session.clearQueue();
@@ -527,7 +528,7 @@ test("interview admission identity survives observation deadlines", async (suite
         throw new Error("Synthetic disposal failure");
       });
       try {
-        await assert.rejects(disposePiAgentSession(f.handle), /Synthetic disposal failure/);
+        await assert.rejects(disposePiAgentSession(f.handle), /Session SDK disposal is unconfirmed/);
         assert.equal(f.handle.acceptedTopLevelWorkCount, 1);
       } finally { dispose.mock.restore(); }
       await disposePiAgentSession(f.handle);
