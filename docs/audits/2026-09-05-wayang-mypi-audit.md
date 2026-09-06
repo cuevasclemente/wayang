@@ -2,6 +2,8 @@
 
 Date: 2026-09-05. Private maintainer report; no remote publication or production backend deployment performed.
 
+**Follow-up:** the prioritized SDK, interview, startup-deadline and team lifecycle corrections were subsequently implemented and validated. See `2026-09-06-wayang-mypi-followup.md` for current source/activation state; the findings below remain the initial audit's historical checkpoint.
+
 ## Executive result
 
 The owner-prioritized delegation outage is repaired and real subagents have completed work. Six initial evaluators, isolated implementation specialists, and independent reviewers contributed through the actual Agent Teams tools. No direct-process policy workaround was used.
