@@ -8,7 +8,7 @@ The remaining prioritized correctness findings from the initial audit are implem
 
 Owner explicitly approved local canonical Pi changes, focused checks/tests, unpublished artifact builds/commits and downstream pins. Owner selected **wait-only** cancellation for `subagent_send`: cancelling or reaching its five-minute deadline detaches the observer, retains child execution/ownership, and permits later reporting. Explicit stop requests termination and confirms exit/stream closure, or reports bounded failure while retaining unresolved ownership.
 
-A separate questionnaire asks whether to integrate all three local main branches. At this report checkpoint that decision is pending. No canonical dependency install/build, installed-extension update, service restart, remote push, or private-state purge was performed during this follow-up.
+Owner subsequently approved all-three local-main integration, which is now complete. Wayang fast-forwarded from `eaa7da5` to reviewed `c658313`, myPi main from `493e5e1` to reviewed `276386c`; subsequent documentation-only closeout commits record this result. Pi main fast-forwarded from `64e4a7f4` to merge `363cef07`, preserving both the reviewed `29082030` contracts and existing main metadata. No canonical dependency install/build, installed-extension update, service restart, remote push, or private-state purge was performed during this follow-up.
 
 ## What changed
 
@@ -71,7 +71,7 @@ The older pagination-order E2E failure documented in the initial audit and peer 
 
 ## Remaining decisions and limitations
 
-- Local-main integration is separately awaiting the open owner questionnaire; installation/restart/deployment remains excluded regardless of that answer.
+- Local-main integration is approved and complete. Installation/restart/deployment remains separately excluded. Combined Pi source passed full check (no formatter fixes), the same 116 SDK tests/2 skips, 2 core tests and 2 retained metadata tests; package trees were verified identical to their respective reviewed parents. Sampled served frontend/backend and installed Agent Teams files retained their pre-integration hashes. myPi's divergent root recovery branch and Pi's existing untracked directories were preserved.
 - Performance architecture and inclusion of the previously approved automation retirement were asked but not selected in this follow-up. No feature removal, authority redesign or startup private-state purge was performed. Original measured fsync/header costs and retirement conflicts remain in the initial report.
 - Uncooperative hooks or unconfirmed cleanup may intentionally retain ownership until recovery. These are cooperative logical-authority and local lifecycle contracts—not proof of hostile-process containment, remote-effect rollback, or every best-effort viewer/download transport terminating.
 - The scheduler's internal same-process stop/start stale-row handling was noted as a further unexecuted embedding edge; production startup currently calls it once per server process. No general scheduler redesign is claimed.
