@@ -42,8 +42,9 @@ export interface InteractiveBrowserToolRuntime {
   toolForName(name: string): ToolDefinition | undefined;
   preflight(): InteractiveBrowserAllowDecision;
   detachAgentLease(reason: AgentLeaseDetachReason): Promise<void>;
-  closeSessionWorkspaces(reason: SessionWorkspaceCloseReason): Promise<void>;
-  revokeAuthority(reason: BrowserAuthorityRevokeReason): Promise<void>;
+  /** Standard runtimes reuse the bridge's pre-notification snapshot when supplied. */
+  closeSessionWorkspaces(reason: SessionWorkspaceCloseReason, capturedCleanup?: () => Promise<void>): Promise<void>;
+  revokeAuthority(reason: BrowserAuthorityRevokeReason, capturedCleanup?: () => Promise<void>): Promise<void>;
 }
 
 /** Capability factory result validated before publication by pi-bridge. */
@@ -75,6 +76,15 @@ export function assertInteractiveBrowserToolCatalog(runtime: InteractiveBrowserT
  * Archive/delete and authority denial must not depend on a live Pi handle.
  */
 export interface InteractiveBrowserSessionLifecyclePort {
+  /** Freeze exact targets synchronously; retain the returned operation for retries. */
+  captureSessionWorkspaceCleanup(
+    sourceSessionId: string,
+    reason: SessionWorkspaceCloseReason,
+  ): () => Promise<void>;
+  captureAuthorityCleanup(
+    scope: Readonly<InteractiveBrowserAuthorityScope>,
+    reason: BrowserAuthorityRevokeReason,
+  ): () => Promise<void>;
   closeSessionWorkspaces(
     sourceSessionId: string,
     reason: SessionWorkspaceCloseReason,
