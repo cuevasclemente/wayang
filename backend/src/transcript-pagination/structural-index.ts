@@ -395,6 +395,7 @@ export interface StructuralTranscriptIndexOptions {
 export class StructuralTranscriptIndex {
   private readonly db: DatabaseType;
   private readonly builds = new Map<string, Promise<StructuralIndexRevision>>();
+  private readonly buildSearchLimits = new Map<string, boolean>();
   private readonly fullBuildProofs = new Map<string, string>();
   private readonly searchUnsafeBuilds = new Set<string>();
   private readonly latestBuildKeys = new Map<string, string>();
@@ -435,7 +436,16 @@ export class StructuralTranscriptIndex {
     this.latestBuildKeys.set(sessionId, key);
     this.cancelSupersededWorkerTasks(sessionId, key);
     const existingBuild = this.builds.get(key);
-    if (existingBuild) return existingBuild;
+    if (existingBuild) {
+      // A caller must not inherit the other mode's resource admission. In
+      // particular, cold search cannot join a UI worker lacking searchLimits.
+      // Retry after completion; an exact completed full-build cache is reusable
+      // without initiating or prolonging any unbounded UI body work.
+      if (this.buildSearchLimits.get(key) !== (options.allowAppend === false)) {
+        throw new Error("Transcript structural build busy with another admission mode");
+      }
+      return existingBuild;
+    }
     const stored = this.readRevision(sessionId);
     if (stored && stored.filePath === canonicalPath && revisionsExactlyEqual(stored, current)
       && (stored.complete || stored.error !== "building")) {
@@ -460,12 +470,15 @@ export class StructuralTranscriptIndex {
       catch { /* unsafe append falls through to an epoch rebuild */ }
     }
     const workerFingerprint = expectedFingerprint ?? fingerprintFromRevision(current);
+    this.buildSearchLimits.set(key,options.allowAppend === false);
     const build = this.fullBuild(
       sessionId, canonicalPath, key, workerFingerprint, current, authorizationGuard, options.allowAppend === false,
     );
     this.builds.set(key, build);
     try { return await build; }
-    finally { if (this.builds.get(key) === build) this.builds.delete(key); }
+    finally {
+      if (this.builds.get(key) === build) { this.builds.delete(key); this.buildSearchLimits.delete(key); }
+    }
   }
 
   async around(
@@ -625,6 +638,11 @@ export class StructuralTranscriptIndex {
     authorizationGuard: () => boolean): Promise<StructuralIndexRevision> {
     if (!authorizationGuard()) throw new Error("Search structural authorization changed");
     const expectedKey = structuralBuildKey(sessionId, path.resolve(filePath), readTranscriptFileRevision(filePath, expectedFingerprint));
+    if (this.builds.has(expectedKey) && this.buildSearchLimits.get(expectedKey) !== true) {
+      // Check before purge as well: a partially published UI build is still
+      // UI-owned work, not a search cold-build proof to cancel or inherit.
+      throw new Error("Transcript structural build busy with another admission mode");
+    }
     // A previously cached UI append refresh carries no full-prefix proof. A
     // cold/restarted search must establish it, not inherit that optimization.
     if (this.readRevision(sessionId) && this.fullBuildProofs.get(sessionId) !== expectedKey) this.purge(sessionId);
@@ -882,6 +900,7 @@ export class StructuralTranscriptIndex {
     const pending = [...this.builds.values()];
     await Promise.allSettled(pending);
     this.builds.clear();
+    this.buildSearchLimits.clear();
     this.latestBuildKeys.clear();
     this.activeWorkerTasks.clear();
     try { this.db.close(); } catch { /* already closed */ }

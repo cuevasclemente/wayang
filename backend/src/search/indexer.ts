@@ -11,6 +11,7 @@ import { invalidateTranscriptPaginationSession } from "../transcript-pagination/
 import { getStructuralTranscriptIndex, type StructuralIndexRevision } from "../transcript-pagination/structural-index.js";
 import { SearchQueue, SearchQueueUnavailableError, type SearchPriority } from "./queue.js";
 import { extractSearchDocuments } from "./extraction.js";
+import { SEARCH_EXTRACTION_VERSION, searchSourceRevisionKey } from "./revision.js";
 import { beginGeneration, cleanupSearchChunks, getIndexCoverageSnapshot as coverageSnapshot,
   getSearchPublicationMetrics, invalidatePublication, metadataRevision, publishGeneration, publishMetadata,
   recordSearchOutcome, recordSearchQueued, stageDocuments, yieldSearchTurn, type SearchOutcome } from "./publication.js";
@@ -37,16 +38,69 @@ let includeThinking = false;
 let phase = "idle";
 let projectionPaused = false;
 let ownerStopped = false;
-const EXTRACTION_VERSION = "message-document-v1:text-only:128KiB";
+let producerEpoch = 0;
+const producers = new Set<Promise<unknown>>();
+function trackProducer<T>(work: Promise<T>): Promise<T> {
+  producers.add(work);
+  void work.then(() => producers.delete(work),() => producers.delete(work));
+  return work;
+}
 export function setIncludeThinking(v: boolean): void { includeThinking = v; }
 export function getIncludeThinking(): boolean { return includeThinking; }
-export function startSearchQueue(): void { ownerStopped = false; projectionPaused = false; queue.start(); }
-export async function stopSearchQueue(): Promise<void> { ownerStopped = true; await queue.stop(); }
+export function startSearchQueue(): void { producerEpoch++; ownerStopped = false; projectionPaused = false; queue.start(); }
+export async function stopSearchQueue(): Promise<void> {
+  ownerStopped = true;
+  producerEpoch++;
+  await queue.stop();
+  await Promise.allSettled([...producers]);
+}
 export function resumeSearchQueueAfterProjection(): void {
   if (projectionPaused && !ownerStopped) { projectionPaused = false; queue.start(); }
 }
 export function getSearchQueueStatus() { return { ...queue.status(), phase, projectionPaused, publication: getSearchPublicationMetrics() }; }
-export function getIndexCoverageSnapshot(allowedIds: ReadonlySet<string>) { return coverageSnapshot(getSearchDb(), allowedIds); }
+export function getIndexCoverageSnapshot(allowedIds: ReadonlySet<string>) {
+  if (ownerStopped) throw new SearchQueueUnavailableError("Search owner stopped");
+  return coverageSnapshot(getSearchDb(), allowedIds);
+}
+
+/** Cheap discovery only: no structural build, extraction, staging or raw stat.
+ * The watcher calls this in small yielded batches independently of queue drain.
+ * Exact Standard header authorization still precedes file revision observation.
+ */
+export function searchSessionNeedsIndex(sessionId: string): boolean {
+  if (ownerStopped || projectionPaused || queue.status().stopped
+    || queue.hasWork((key) => JSON.parse(key)[0] === sessionId)) return false;
+  const durable = getStore().sessions.find((candidate) => candidate.id === sessionId);
+  if (!durable) return false;
+  const row = {...durable};
+  if (policyDenial(row)) return false;
+  const authorized = row.pi_session_file
+    ? authorizeExactStandardTranscript(row.pi_session_file,{expectedSessionId:sessionId}) : null;
+  if (row.pi_session_file && !authorized) return false;
+  const revisionKey = searchSourceRevisionKey(row.pi_session_file,authorized?.fingerprint ?? null);
+  const db = getSearchDb();
+  const state = db.prepare(`SELECT w.*,p.valid,p.source_revision,m.revision AS metadata_revision FROM search_work_state w
+    LEFT JOIN search_publication p ON p.session_id=w.session_id
+    LEFT JOIN search_session_metadata m ON m.session_id=w.session_id WHERE w.session_id=?`).get(sessionId) as {
+      successful_revision:string|null;attempted_revision:string|null;outcome:string;retry_at:number;error_code:string|null;
+      valid:number|null;source_revision:string|null;metadata_revision:string|null;queued_at:number;chunk_bytes:number;
+    } | undefined;
+  if (!state) return true;
+  const metadata = metadataRevision(row);
+  const current = getStore().sessions.find((candidate) => candidate.id === sessionId);
+  if (!current || current.pi_session_file !== row.pi_session_file || metadataRevision(current) !== metadata) return true;
+  const sameComplete = state.successful_revision === revisionKey && state.error_code === null;
+  const samePartial = state.outcome === "partial" && state.attempted_revision === revisionKey;
+  if (state.valid === 1 && state.source_revision !== null && state.metadata_revision === metadata && (sameComplete || samePartial)) {
+    // Reconstruct deferred admission after a restart/overflow without extracting
+    // an already-current body or leaving the coverage projection stuck queued.
+    if (state.queued_at) recordSearchOutcome(db,sessionId,revisionKey,
+      samePartial ? "partial" : row.pi_session_file ? "current" : "metadata_only",state.error_code,state.chunk_bytes);
+    return false;
+  }
+  if (state.attempted_revision === revisionKey && (state.outcome === "unsupported" || state.retry_at > Date.now())) return false;
+  return true;
+}
 
 class Invalidated extends Error {}
 class MetadataChanged extends Error {}
@@ -57,7 +111,14 @@ function recoveryMarkerMatches(sessionId: string, markerId: string): boolean {
   return marker?.id === markerId && Boolean(row?.pi_session_file) && marker.pi_session_file === row!.pi_session_file;
 }
 
-export async function indexSession(sessionId: string, options: IndexerOptions = {}): Promise<IndexResult> {
+export function indexSession(sessionId: string, options: IndexerOptions = {}): Promise<IndexResult> {
+  // Admission rejection must precede even getSearchDb()/queued bookkeeping:
+  // shutdown may already have closed the handle and must never reopen it.
+  if (ownerStopped) return Promise.resolve({sessionId,chunkCount:0,skipped:true,retryable:true,error:"Search owner stopped"});
+  return trackProducer(indexSessionRequest(sessionId,options));
+}
+
+async function indexSessionRequest(sessionId: string, options: IndexerOptions): Promise<IndexResult> {
   if (options.recoveryMarkerId && !recoveryMarkerMatches(sessionId,options.recoveryMarkerId)) {
     return {sessionId,chunkCount:0,skipped:true,retryable:true,error:"Search recovery marker changed"};
   }
@@ -135,7 +196,7 @@ async function indexSessionAttempt(sessionId: string, options: IndexerOptions, s
   const invalidation = invalidations.get(sessionId) ?? 0;
   const expectedMetadata = JSON.stringify([metadataRevision(row),row.catalog_mutation_version ?? 0,row.pi_session_file]);
   const db = getSearchDb();
-  const revisionKey = JSON.stringify([filePath,fingerprint ?? null,EXTRACTION_VERSION]);
+  const revisionKey = searchSourceRevisionKey(filePath,fingerprint ?? null);
   const authCurrent = (): boolean => !signal.aborted && !transcriptMutationFences.has(sessionId)
     && (invalidations.get(sessionId) ?? 0) === invalidation
     && getPolicyGeneration() === policyGeneration && !policyDenial(row,options.recoveryMarkerId)
@@ -160,8 +221,8 @@ async function indexSessionAttempt(sessionId: string, options: IndexerOptions, s
     const sameComplete = state?.successful_revision === revisionKey && state.error_code === null;
     const samePartial = state?.outcome === "partial" && state.attempted_revision === revisionKey;
     if (state && !options.force && !options.recoveryMarkerId && (sameComplete || samePartial)) {
-      const publication = db.prepare("SELECT valid FROM search_publication WHERE session_id=?").get(sessionId) as {valid:number}|undefined;
-      if (publication?.valid === 1) {
+      const publication = db.prepare("SELECT valid,source_revision FROM search_publication WHERE session_id=?").get(sessionId) as {valid:number;source_revision:string|null}|undefined;
+      if (publication?.valid === 1 && publication.source_revision !== null) {
         db.transaction(() => publishMetadata(db,row))();
         const outcome: SearchOutcome = state.error_code === "included_record_limit" ? "partial" : filePath ? "current" : "metadata_only";
         recordSearchOutcome(db,sessionId,revisionKey,outcome,state.error_code,state.chunk_bytes);
@@ -229,7 +290,8 @@ async function indexSessionAttempt(sessionId: string, options: IndexerOptions, s
         sessionId,filePath,fingerprint?.mtimeMs ?? null,fingerprint?.size ?? null,Date.now(),documents+1,SCHEMA_VERSION,
         unsupported ? "included_record_limit" : null);
       recordSearchOutcome(db,sessionId,revisionKey,outcome,unsupported ? "included_record_limit" : null,bytes);
-    });
+    },{filePath,fingerprint:fingerprint ?? null,extractionVersion:SEARCH_EXTRACTION_VERSION,
+      transcriptEpoch:structural?.transcriptEpoch ?? null});
     phase = "cleanup";
     await cleanupSearchChunks(db,{sessionId,maxBatches:4});
     guard();
@@ -262,13 +324,17 @@ async function indexSessionAttempt(sessionId: string, options: IndexerOptions, s
 function cancelSessionWork(sessionId: string): void {
   queue.cancelWhere((key) => JSON.parse(key)[0] === sessionId);
 }
-export async function removeSession(sessionId: string): Promise<void> {
+export function removeSession(sessionId: string): Promise<void> {
+  if (ownerStopped) return Promise.reject(new SearchQueueUnavailableError("Search owner stopped"));
+  const epoch = producerEpoch;
   cancelSessionWork(sessionId);
   purgeSessionIndex(sessionId);
   invalidateTranscriptPaginationSession(sessionId);
-  await cleanupSearchChunks(getSearchDb(),{sessionId,maxBatches:4});
+  return trackProducer(cleanupSearchChunks(getSearchDb(),{sessionId,maxBatches:4,
+    shouldContinue:() => !ownerStopped && epoch === producerEpoch}).then(() => undefined));
 }
 export function beginTranscriptMutationSearchFence(sessionId: string): void {
+  if (ownerStopped) throw new SearchQueueUnavailableError("Search owner stopped");
   if (transcriptMutationFences.has(sessionId)) throw new Error("A transcript mutation search fence is already active");
   transcriptMutationFences.add(sessionId);
   cancelSessionWork(sessionId);
@@ -277,6 +343,7 @@ export function beginTranscriptMutationSearchFence(sessionId: string): void {
 }
 export function endTranscriptMutationSearchFence(sessionId: string): void { transcriptMutationFences.delete(sessionId); }
 export function purgePolicyDeniedSessions(options: {ensureSearchDb?: () => unknown} = {}): {purged:number;errors:number} {
+  if (ownerStopped) return {purged:0,errors:1};
   try { (options.ensureSearchDb ?? getSearchDb)(); }
   catch { console.error("[search] policy purge unavailable"); return {purged:0,errors:1}; }
   let purged = 0; let errors = 0;
@@ -288,13 +355,19 @@ export function purgePolicyDeniedSessions(options: {ensureSearchDb?: () => unkno
   }
   return {purged,errors};
 }
-export async function reindexAll(options: IndexerOptions = {}): Promise<IndexBatchSummary> {
+export function reindexAll(options: IndexerOptions = {}): Promise<IndexBatchSummary> {
+  if (ownerStopped) return Promise.resolve({total:0,indexed:0,skipped:0,errors:1,durationMs:0});
+  return trackProducer(reindexAllAttempt(options,producerEpoch));
+}
+async function reindexAllAttempt(options: IndexerOptions, epoch: number): Promise<IndexBatchSummary> {
   const start = Date.now();
   ensureDreamPolicyProjection();
   const sessions = listSessions(true);
   let indexed = 0; let skipped = 0; let errors = 0;
   for (const row of sessions) {
-    if (options.priority === "background" && queue.status().stopped) break;
+    // Manual and background corpus producers share the same lifecycle fence.
+    // A rapid stop/start must not revive a predecessor's loop either.
+    if (ownerStopped || epoch !== producerEpoch || queue.status().stopped) break;
     try {
       const result = await indexSession(row.id,options);
       if (result.skipped) skipped++; else indexed++;

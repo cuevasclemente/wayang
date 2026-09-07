@@ -50,6 +50,9 @@ export class SearchQueue<T> {
   }
 
   hasPending(matches: (key: string) => boolean): boolean { return [...this.pending.keys()].some(matches); }
+  hasWork(matches: (key: string) => boolean): boolean {
+    return Boolean(this.active && matches(this.active.job.key)) || this.hasPending(matches);
+  }
 
   /** Reject old pending intents and abort active work without admitting a replacement. */
   cancelWhere(matches: (key: string) => boolean): void {
