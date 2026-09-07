@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
-import { parseSearchQuery, SearchQueryError } from "./query-parser.js";
+import { parseSearchQuery, SearchQueryError, type ParsedSearchQuery } from "./query-parser.js";
 import { queryKeywordSessions, sanitizeSnippet, MARK_OPEN, MARK_CLOSE } from "./query-sql.js";
 import type { SearchFilters } from "./types.js";
 import type { SearchBodyAuthorization } from "./query-authorization.js";
@@ -33,12 +33,16 @@ function fixture() {
     const keys = Object.keys(fields);
     db.prepare(`INSERT INTO chunks (${keys.join(',')}) VALUES (${keys.map(key => '@' + key).join(',')})`).run(fields);
   }
-  function search(query: string, filters: SearchFilters = {}, ids = [...allowed], cwds = ["/synthetic"],
+  function searchParsed(parsed: ParsedSearchQuery, filters: SearchFilters = {}, ids = [...allowed], cwds = ["/synthetic"],
     bodies: readonly SearchBodyAuthorization[] = ids.map(sessionId => ({ sessionId,
       generation: "synthetic-generation", transcriptEpoch: "synthetic-epoch" }))) {
-    return queryKeywordSessions(db, parseSearchQuery(query), ids, cwds, filters, bodies);
+    return queryKeywordSessions(db, parsed, ids, cwds, filters, bodies);
   }
-  return { db, add, search };
+  function search(query: string, filters: SearchFilters = {}, ids = [...allowed], cwds = ["/synthetic"],
+    bodies?: readonly SearchBodyAuthorization[]) {
+    return searchParsed(parseSearchQuery(query), filters, ids, cwds, bodies);
+  }
+  return { db, add, search, searchParsed };
 }
 
 test("any-unit admission; whole-session distinct coverage beats repetition and recency", () => {
@@ -106,6 +110,48 @@ test("more than 200 best chunk hits cannot crowd out sessions; facets precede re
     assert.equal(limited.rows.length, 3);
     assert.deepEqual(limited.facets.cwds, [{ value: "/synthetic", count: 81 }]);
     assert.deepEqual(limited.facets.models, [{ value: "test-model", count: 81 }]);
+  } finally { f.db.close(); }
+});
+
+test("session limiting precedes anchor selection without changing full-session ranks or facets", () => {
+  const f = fixture();
+  try {
+    f.add("winner", "alpha", { message_id: "first-not-best" });
+    f.add("winner", "alpha beta", { message_id: "best-two-units" });
+    f.add("winner", "gamma", { message_id: "third-unit" });
+    for (let index = 0; index < 80; index++) f.add(`other-${index}`, "alpha beta");
+    const limited = f.search("alpha beta gamma", { limit: 1 });
+    const full = f.search("alpha beta gamma", { limit: 100 });
+    assert.deepEqual(limited.rows, full.rows.slice(0, 1));
+    assert.deepEqual(limited.facets, full.facets);
+    assert.equal(limited.facets.cwds[0].count, 81);
+    assert.equal(limited.rows[0].coverage, 3);
+    assert.equal(limited.rows[0].message_id, "best-two-units",
+      "the metadata representative must never replace the best message anchor");
+    assert.equal(limited.rows[0].transcript_epoch, "synthetic-epoch");
+    const html = sanitizeSnippet(limited.rows[0].snippet);
+    assert.match(html, /<mark>alpha<\/mark>/);
+    assert.match(html, /<mark>beta<\/mark>/);
+  } finally { f.db.close(); }
+});
+
+test("unpublished FTS rows cannot appear but may change BM25 tie-breaking", () => {
+  const f = fixture();
+  try {
+    f.add("a", "alpha");
+    f.add("b", "beta");
+    for (let index = 0; index < 40; index++) f.add(`unrelated-${index}`, "filler");
+    const before = f.search("alpha beta");
+    assert.deepEqual(before.rows.map(row => row.session_id), ["a", "b"]);
+    f.db.transaction(() => {
+      for (let index = 0; index < 200; index++) f.add("unpublished", "alpha", { published: 0 });
+    })();
+    const after = f.search("alpha beta");
+    assert.deepEqual(after.rows.map(row => row.session_id), ["b", "a"],
+      "shared FTS document frequency includes unpublished rows even though admission excludes them");
+    assert.ok(after.rows.every(row => row.coverage === 1));
+    assert.deepEqual(after.facets, before.facets);
+    assert.equal(after.rows.some(row => row.session_id === "unpublished"), false);
   } finally { f.db.close(); }
 });
 
@@ -243,24 +289,44 @@ test("SQL/view failure is a typed safe error, never empty successful results", (
   } finally { f.db.close(); }
 });
 
-test("synthetic common-term baseline: bounded output over 10,000 matching chunks", (t) => {
+test("synthetic common-term baseline: 2 and 16 distinct units on the same 10,000-row corpus", (t) => {
   const f = fixture();
   try {
+    const terms = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi".split(" ");
+    const text = `${terms.join(" ")} ${"filler ".repeat(30)}`;
     f.db.transaction(() => {
       for (let s = 0; s < 500; s++) {
-        for (let c = 0; c < 20; c++) f.add(`session-${s}`, `common alpha ${"filler ".repeat(30)}${c % 2 ? "beta" : "gamma"}`);
+        for (let c = 0; c < 20; c++) f.add(`session-${s}`, text);
       }
     })();
-    const measurements: number[] = [];
-    for (let run = 0; run < 4; run++) {
-      const start = performance.now();
-      const out = f.search("common alpha beta gamma", { limit: 30 });
-      measurements.push(Math.round((performance.now() - start) * 10) / 10);
-      assert.equal(out.rows.length, 30);
-      assert.ok(out.rows.every(row => row.coverage === 4));
-      assert.equal(out.facets.cwds[0].count, 500);
+    const roundMs = (duration: number) => Math.round(duration * 10) / 10;
+    for (const unitCount of [2, 16]) {
+      const query = terms.slice(0, unitCount).join(" ");
+      const parseStart = performance.now();
+      const parsed = parseSearchQuery(query);
+      const parseOnceMs = roundMs(performance.now() - parseStart);
+      assert.equal(parsed.units.length, unitCount);
+      // Both modes use the identical database, filters, witnesses and query.
+      // "preparsed" excludes parser work; "included" reparses on every call.
+      // These timings exclude fixture setup and real filesystem authorization.
+      for (const parseMode of ["preparsed", "included"] as const) {
+        const measurements: number[] = [];
+        for (let run = 0; run < 4; run++) {
+          const start = performance.now();
+          const out = parseMode === "preparsed"
+            ? f.searchParsed(parsed, { limit: 30 }) : f.search(query, { limit: 30 });
+          measurements.push(roundMs(performance.now() - start));
+          assert.equal(out.rows.length, 30);
+          assert.ok(out.rows.every(row => row.coverage === unitCount));
+          assert.equal(out.facets.cwds[0].count, 500);
+          assert.deepEqual(out.rows.map(row => row.session_id),
+            Array.from({ length: 500 }, (_, index) => `session-${index}`).sort().slice(0, 30));
+        }
+        t.diagnostic(JSON.stringify({ synthetic_chunks: 10000, sessions: 500,
+          distinct_common_units: unitCount, parse_mode: parseMode, parse_once_ms: parseOnceMs,
+          query_ms: measurements }));
+      }
     }
-    t.diagnostic(JSON.stringify({ synthetic_chunks: 10000, sessions: 500, query_ms: measurements }));
   } finally { f.db.close(); }
 });
 
