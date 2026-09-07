@@ -1,0 +1,13 @@
+# Pi904e4012 Wayang consumer — Sceptre with TTS preserved
+
+Explicit basefc0a8de7024d461ff6ab1e2c71468a000ebdd7c0, including reviewed TTS7db3875; producer549fbbf integrated as160952a. Owner selected Sceptre-only TTS and a separate Tribe candidate. No TTS or other production runtime files changed here.
+
+Parent generated this branch's exact triplet pins/lock independently, preserving marked18.0.5 and all unrelated dependency versions. Shared vendor test, consistency test and Pi documentation paragraph were applied as the exact three-file diff from validated Tribe committed consumer ed15a0c53f206a57ed03a0f8978a646c6ae2622f; no broad Tribe merge or dirty-work copying. Full source artifacts and distinct host manifests remain separate.
+
+Selected Pi904e4012047428abeaa5f47f4b6fa759069eb987: SDK22027c0b21f7ba9b246bf1a326514fe4dfcd27e57fb3b65af9d319d6bc1c015e, core0f8609a3e31c714a0e412378a7acaee7957717771f9cb2422f84493374cf2579, AI3483e2cd07ebe8add88fd2bb2c1dcf8afec8da200dcbdb67e3fc715f307d0802. Source/catalog proofe414296b8ce7c62bfd5df7bd9cb4ece7b4bac1fb001fb546fc39dca7c09a7ba6. SDK version0.85.0-wayang.904e4012; core/AI retain0.85.0. Old archives retained.
+
+Fresh exact-lock offline ignore-scripts/include-dev installs; better-sqlite3 separately built with its explicit build-release command against matching local Node26.4.0 headers, not a downloaded prebuild. All47 changed versions/paths remain inside Pi dependency closure. Actual deployer archive/installed-file/SRI/ESM/public-entrypoint proof passes: pi-stack-deploy/release-output/pi085-consumer-proofs-20260907/sceptre.json.
+
+Full make check:1293backend pass/10existing skips,20frontend pass,67scripts pass, builds pass. Existing lint/chunk-size warnings remain. Selected browser set69/69 includes the full60 audit regressions plus9TTS playback cases, including native synthetic WAV EOF. Fresh isolated loopback servers and synthetic homes/Pi state; no real broker/account/provider tests. Independent reviewer approved the shared consumer adaptations; no new runtime diff to review. The prior pagination baseline exclusion remains unclaimed.
+
+Evidence: /tmp/pi085-wayang-sceptre-{check,e2e}.log; /tmp/pi085-consumer-artifact-proofs.log; /tmp/pi085-consumer-lock-audit.json. Preserve the peer's already published Sceptre TTS frontend, two staged backend modules and rollback through final activation planning. This source commit neither activates nor restarts them. Native/full-stack assembly, drift/rollback checks and normal privileged activation are still required. No canonical/main mutation, host install, identity/private-state transfer or push.
