@@ -63,6 +63,26 @@ test("recovery can displace lower-priority bounded pending admission", async () 
   release();await active;await deferred;assert.equal(await recovery,"recovered");await q.stop();
 });
 
+test("successors wait through completion acknowledgement microtasks, including reentrant enqueue", async () => {
+  const q=new SearchQueue<string>({cooldownMs:0});
+  const order:string[]=[];
+  let release!:()=>void;
+  const first=q.enqueue("recovery","mutation",async()=>{await new Promise<void>((r)=>{release=r;});return "published";});
+  await turn();
+  const ordinary=q.enqueue("ordinary","manual",async()=>{order.push("ordinary");return "ordinary";});
+  let reentrant!:Promise<string>;
+  const acknowledged=first.then(async()=>{
+    await Promise.resolve();
+    reentrant=q.enqueue("reentrant","manual",async()=>{order.push("reentrant");return "reentrant";});
+    await Promise.resolve();
+    order.push("acknowledged");
+  });
+  release();await acknowledged;
+  assert.deepEqual(order,["acknowledged"]);
+  await Promise.all([ordinary,reentrant]);
+  assert.equal(order[0],"acknowledged");await q.stop();
+});
+
 test("stop cancels running work, rejects pending admission and drains", async () => {
   const q = new SearchQueue<string>();
   const running = q.enqueue("active","manual",async (signal) => {

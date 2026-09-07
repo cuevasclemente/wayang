@@ -24,6 +24,7 @@ import {
 import { recoverTranscriptRecoveryJournal } from "./transcript-recovery.js";
 import { closeSearchDb, getSearchDb } from "./search/db.js";
 import { removeSession as removeSearchSession } from "./search/indexer.js";
+import { getPublishedSearchRevision } from "./search/revision.js";
 import { authorizeExactStandardTranscript } from "./standard-transcript-authorization.js";
 
 function environment(name: string) {
@@ -132,6 +133,9 @@ test("event marker persistence failure mutates nothing; durable marker recovers 
       "SELECT COUNT(*) AS n FROM session_index_state WHERE session_id = ?",
     ).get(session.id) as { n: number };
     assert.equal(indexed.n, 1, "fresh search commits before durable marker removal");
+    const publication=getPublishedSearchRevision(getSearchDb(),session.id);
+    assert.equal(publication.kind,"published","cleared event recovery must retain a current flip witness, not only bookkeeping");
+    if(publication.kind==="published") assert.equal(publication.filePath,file);
   } finally {
     await stopSessionCatalog();
     f.cleanup();

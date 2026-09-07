@@ -54,6 +54,17 @@ export interface SearchSourceRow {
   sourceLength: number;
 }
 
+export class SearchStructuralStaleError extends Error {
+  readonly code = "search_structure_stale";
+  constructor() { super("Search structural revision is stale; retry with current cache evidence"); }
+}
+export class SearchStructuralUnsupportedError extends Error {
+  readonly code = "search_structure_unsupported";
+  constructor(readonly reason: "topology" | "malformed" | "record_limit" | "file_limit" | "event_id_limit") {
+    super(`Search structure unsupported: ${reason}`);
+  }
+}
+
 export interface SearchSourcePage {
   rows: SearchSourceRow[];
   nextOrdinal: number;
@@ -653,16 +664,22 @@ export class StructuralTranscriptIndex {
 
   assertSearchRevision(revision: StructuralIndexRevision, authorizationGuard: () => boolean,
     options: { exactFileAlreadyAuthorized?: boolean } = {}): void {
-    if (!authorizationGuard()) throw new Error("Search structural authorization changed");
+    if (!authorizationGuard()) throw new SearchStructuralStaleError();
     const stored = this.readRevision(revision.sessionId);
-    if (this.searchUnsafeBuilds.has(revision.sessionId)) throw new Error("Search structure unsupported: malformed or unanchored records");
-    if (!revision.complete || !stored?.complete || stored.transcriptEpoch !== revision.transcriptEpoch
-      || !revisionsExactlyEqual(stored, revision)
-      // Only the search owner may reuse its just-completed synchronous exact
-      // fingerprint/header authorization; default callers re-open the file.
-      || (!options.exactFileAlreadyAuthorized
-        && !revisionsExactlyEqual(revision, readTranscriptFileRevision(revision.filePath, fingerprintFromRevision(revision))))) {
-      throw new Error("Search structural revision is stale or unsupported");
+    // Cache replacement/missing/building evidence is transient, even when a
+    // different newer revision is itself unsupported. Compare identity first.
+    if (!stored || stored.transcriptEpoch !== revision.transcriptEpoch || !revisionsExactlyEqual(stored,revision)
+      || stored.error === "building") throw new SearchStructuralStaleError();
+    if (!revision.complete || !stored.complete) throw new SearchStructuralUnsupportedError("topology");
+    if (this.searchUnsafeBuilds.has(revision.sessionId)) throw new SearchStructuralUnsupportedError("malformed");
+    // Only the search owner may reuse its just-completed synchronous exact
+    // fingerprint/header authorization; default callers re-open the file.
+    if (!options.exactFileAlreadyAuthorized) {
+      try {
+        if (!revisionsExactlyEqual(revision,readTranscriptFileRevision(revision.filePath,fingerprintFromRevision(revision)))) {
+          throw new SearchStructuralStaleError();
+        }
+      } catch { throw new SearchStructuralStaleError(); }
     }
   }
 
@@ -687,7 +704,7 @@ export class StructuralTranscriptIndex {
     const rows: SearchSourceRow[] = [];
     for (const row of candidates) {
       if (row.eventType === "message" && (row.role === "user" || row.role === "assistant")) {
-        if (!row.eventId) throw new Error("Search event ID unsupported");
+        if (!row.eventId) throw new SearchStructuralUnsupportedError("event_id_limit");
         // Over-limit records are offset-only negatives, not admitted reads.
         const cost = row.sourceLength <= 1024*1024 ? row.sourceLength : 0;
         if (rows.length && sourceBytes + cost > 1024*1024) return {rows,nextOrdinal,done:false};
@@ -1020,7 +1037,9 @@ export class StructuralTranscriptIndex {
           if (timer) clearTimeout(timer);
           task.cancelWorker = undefined;
           void worker.terminate().finally(() => {
-            if (message.workerError) reject(new Error(message.workerError));
+            if (message.workerError === "Search structural record unsupported") reject(new SearchStructuralUnsupportedError("record_limit"));
+            else if (message.workerError === "Search structural file unsupported") reject(new SearchStructuralUnsupportedError("file_limit"));
+            else if (message.workerError) reject(new Error(message.workerError));
             else resolve(message);
           });
         });

@@ -46,6 +46,7 @@ import {
   beginTranscriptMutationSearchFence,
   endTranscriptMutationSearchFence,
   indexSession,
+  acknowledgeSearchRecovery,
 } from "./search/indexer.js";
 
 export { DELETED_EVENT_TOMBSTONE, INVALIDATED_DERIVED_EVENT_TOMBSTONE };
@@ -206,7 +207,8 @@ export interface TranscriptMutationDependencies {
   releaseSearchFence(id: string): void;
   invalidateSnapshots(sessionFile: string | null): void;
   reconcileMetadata(id: string): Promise<number>;
-  forceReindex(id: string, recoveryMarkerId?: string): Promise<void>;
+  /** Production returns a same-turn publication-CAS/marker-clear callback. */
+  forceReindex(id: string, recoveryMarkerId?: string): Promise<void | (() => boolean)>;
   getCatalogGeneration(): number;
   publishInvalidation(id: string, catalogGeneration: number): void;
 }
@@ -416,7 +418,9 @@ function productionDependencies(): TranscriptMutationDependencies {
     async forceReindex(id, recoveryMarkerId) {
       try {
         const result = await indexSession(id, { force: true, recoveryMarkerId });
-        if (!result.error) return;
+        if (!result.error) return recoveryMarkerId
+          ? () => acknowledgeSearchRecovery(id,recoveryMarkerId,result)
+          : undefined;
       } catch { /* fixed public error below */ }
       throw new TranscriptMutationError(
         "Search reindex failed after transcript mutation.",
@@ -879,8 +883,8 @@ export class TranscriptMutationService {
       reconciledGeneration = await this.dependencies.reconcileMetadata(sessionId);
       this.dependencies.releaseSearchFence(sessionId);
       searchFenced = false;
-      await this.dependencies.forceReindex(sessionId, recoveryMarkerId);
-      if (!this.dependencies.clearRecoveryMarker(recoveryMarkerId)) {
+      const acknowledgeSearch = await this.dependencies.forceReindex(sessionId, recoveryMarkerId);
+      if (!(acknowledgeSearch ? acknowledgeSearch() : this.dependencies.clearRecoveryMarker(recoveryMarkerId))) {
         throw new TranscriptMutationError(
           "Transcript recovery journal could not be finalized; search remains unavailable for this session.",
           503,
@@ -950,15 +954,16 @@ export class TranscriptMutationService {
         searchFenced = false;
       }
       let winnerReindexed = false;
+      let acknowledgeWinner: void | (() => boolean) = undefined;
       if (shouldReindexWinner && !retainSearchFence) {
         try {
-          await this.dependencies.forceReindex(sessionId, recoveryMarkerId ?? undefined);
+          acknowledgeWinner = await this.dependencies.forceReindex(sessionId, recoveryMarkerId ?? undefined);
           winnerReindexed = true;
         } catch { /* stale index was already purged */ }
       }
       if (canonicalChanged && winnerReindexed && recoveryMarkerId) {
         try {
-          if (this.dependencies.clearRecoveryMarker(recoveryMarkerId)) recoveryMarkerId = null;
+          if (acknowledgeWinner ? acknowledgeWinner() : this.dependencies.clearRecoveryMarker(recoveryMarkerId)) recoveryMarkerId = null;
         } catch { /* durable marker keeps search denied for startup recovery */ }
       }
       if (canonicalChanged && reconciledGeneration !== null) invalidationNeeded = true;

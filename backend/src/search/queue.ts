@@ -16,6 +16,7 @@ export class SearchQueue<T> {
   private pending = new Map<string, Job<T>>();
   private active: { job: Job<T>; controller: AbortController } | null = null;
   private timer: NodeJS.Timeout | null = null;
+  private handoff: NodeJS.Immediate | null = null;
   private stopped = false;
   private nextBackgroundAt = 0;
   private completed = 0;
@@ -69,7 +70,9 @@ export class SearchQueue<T> {
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
+    if (this.handoff) clearImmediate(this.handoff);
     this.timer = null;
+    this.handoff = null;
     for (const job of this.pending.values()) job.reject(new SearchQueueUnavailableError("Search queue stopped"));
     this.pending.clear();
     const active = this.active;
@@ -83,7 +86,7 @@ export class SearchQueue<T> {
       completed: this.completed };
   }
   private pump(): void {
-    if (this.active || this.stopped) return;
+    if (this.active || this.stopped || this.handoff) return;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     const now = Date.now();
@@ -110,10 +113,13 @@ export class SearchQueue<T> {
       this.completed++;
       this.active = null;
       this.nextBackgroundAt = Date.now() + (this.options.cooldownMs ?? 5_000);
-      this.pump();
+      // A recovery completion's promise chain must get its acknowledgement turn
+      // before any successor can invalidate its newly published generation.
+      // Keep this barrier even when enqueue()/start() runs in a waiter microtask.
+      if (!this.stopped) this.handoff = setImmediate(() => { this.handoff = null; this.pump(); });
     };
-    // Finish bookkeeping before waking completion waiters; stop() really drains
-    // the active slot, and a next producer cannot observe a resolved active job.
+    // Complete bookkeeping before waking waiters, but start successors only on
+    // the following event-loop turn. stop() can cancel that handoff too.
     void Promise.resolve().then(() => job.run(controller.signal)).then((result) => {
       completed(); job.resolve(result);
     }, (error) => { completed(); job.reject(error); });
