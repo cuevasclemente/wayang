@@ -833,6 +833,88 @@ test("malformed tails remain unsupported across retries rather than silently cur
   assert.equal(indexerMod.getIndexCoverageSnapshot(new Set([id])).counts.unsupported,1);
 });
 
+test("exact recovery survives a queued ordinary successor and duplicate exact requests until acknowledgement", async () => {
+  const blocker=seedSession({title:"Recovery queue blocker",transcript:[{role:"user",text:"blocker"}]});
+  const id=seedSession({title:"Recovery successor",transcript:[{role:"user",text:"retained recovered body"}]});
+  let unblock!:()=>void;let blocked!:()=>void;
+  const blockGate=new Promise<void>((r)=>{unblock=r;});const blockReached=new Promise<void>((r)=>{blocked=r;});
+  const blocking=indexerMod.indexSession(blocker,{force:true,afterChunkingForTests:async()=>{blocked();await blockGate;}});
+  await blockReached;
+  // This ordinary request is genuinely queued before the durable marker exists.
+  const ordinary=indexerMod.indexSession(id);
+  const recovery=await import("../transcript-recovery-journal.js");
+  const row=dbMod.getStore().sessions.find((candidate)=>candidate.id===id)!;
+  const marker=recovery.createEventReconcileMarker(id,row.pi_session_file!);
+  let release!:()=>void;let reached!:()=>void;
+  const gate=new Promise<void>((r)=>{release=r;});const paused=new Promise<void>((r)=>{reached=r;});
+  let extracts=0;
+  const first=indexerMod.indexSession(id,{force:true,recoveryMarkerId:marker.id,afterChunkingForTests:async()=>{extracts++;reached();await gate;}});
+  unblock();await blocking;await paused;
+  const duplicate=indexerMod.indexSession(id,{force:true,recoveryMarkerId:marker.id});
+  const deferred=indexerMod.indexSession(id,{force:true});
+  const queuedBeforeRelease=indexerMod.getSearchQueueStatus().queued;
+  release();
+  try {
+    const [result,duplicateResult,deferredResult]=await Promise.all([first,duplicate,deferred]);
+    assert.ok(deferredResult.error,"ordinary admission during the marker is deferred without purging");
+    assert.ok(queuedBeforeRelease>=1);
+    assert.equal(result.error,undefined);assert.equal(duplicateResult.error,undefined);
+    assert.equal(result.publicationGeneration,duplicateResult.publicationGeneration);
+    assert.equal(extracts,1);
+    assert.equal(indexerMod.isSearchRecoveryPublicationCurrent(id,marker.id,result),true);
+    assert.equal(indexerMod.acknowledgeSearchRecovery(id,marker.id,result),true);
+    assert.equal(recovery.eventRecoveryMarkerForSession(id),undefined);
+    assert.equal((await ordinary).error,undefined);
+    const publication=searchDbMod.getSearchDb().prepare("SELECT generation,valid FROM search_publication WHERE session_id=?").get(id) as {generation:string;valid:number};
+    assert.deepEqual(publication,{generation:result.publicationGeneration,valid:1});
+  } finally {release();recovery.clearTranscriptRecoveryMarker(marker.id);}
+});
+
+test("marker acknowledgement rejects a lost publication even after a successful indexing result", async () => {
+  const id=seedSession({title:"Lost recovery witness",transcript:[{role:"user",text:"current recovered body"}]});
+  const recovery=await import("../transcript-recovery-journal.js");
+  const row=dbMod.getStore().sessions.find((candidate)=>candidate.id===id)!;
+  const marker=recovery.createEventReconcileMarker(id,row.pi_session_file!);
+  try {
+    const result=await indexerMod.indexSession(id,{force:true,recoveryMarkerId:marker.id});
+    assert.equal(result.error,undefined);
+    searchDbMod.getSearchDb().prepare("UPDATE search_publication SET valid=0 WHERE session_id=?").run(id);
+    assert.equal(indexerMod.acknowledgeSearchRecovery(id,marker.id,result),false);
+    assert.equal(recovery.eventRecoveryMarkerForSession(id)?.id,marker.id);
+  } finally {recovery.clearTranscriptRecoveryMarker(marker.id);}
+});
+
+test("repairing oversized metadata retries without a transcript fingerprint change", async () => {
+  const id=seedSession({title:"Repair metadata",goal:"x".repeat(129*1024),transcript:[{role:"user",text:"small body"}]});
+  const row=dbMod.getStore().sessions.find((candidate)=>candidate.id===id)!;
+  const before=fs.statSync(row.pi_session_file!);
+  const first=await indexerMod.indexSession(id);
+  assert.equal(first.outcome,"unsupported");
+  const db=searchDbMod.getSearchDb();
+  assert.equal((db.prepare("SELECT error_code FROM search_work_state WHERE session_id=?").get(id) as {error_code:string}).error_code,"metadata_unsupported");
+  assert.equal(indexerMod.searchSessionNeedsIndex(id),false,"unchanged oversized metadata is a stable negative");
+  row.goal="repaired short goal";dbMod.flush();
+  assert.equal(indexerMod.searchSessionNeedsIndex(id),true);
+  const repaired=await indexerMod.indexSession(id);
+  assert.equal(repaired.error,undefined);assert.equal(repaired.outcome,"current");
+  const after=fs.statSync(row.pi_session_file!);
+  assert.equal(after.mtimeMs,before.mtimeMs);assert.equal(after.ctimeMs,before.ctimeMs);assert.equal(after.ino,before.ino);
+  assert.deepEqual(db.prepare("SELECT DISTINCT goal FROM search_chunks_current WHERE session_id=?").all(id),[{goal:"repaired short goal"}]);
+});
+
+test("structural cache invalidation after staging is retryable, not a permanent unsupported revision", async () => {
+  const id=seedSession({title:"Transient structural cache",transcript:[{role:"user",text:"canonical retained body"}]});
+  let invalidated=false;
+  const first=await indexerMod.indexSession(id,{afterStageForTests(){
+    if(!invalidated){invalidated=true;transcriptIndexMod.getStructuralTranscriptIndex().purge(id);}
+  }});
+  assert.equal(first.retryable,true);assert.equal(first.outcome,"stale");
+  assert.equal((searchDbMod.getSearchDb().prepare("SELECT error_code FROM search_work_state WHERE session_id=?").get(id) as {error_code:string}).error_code,"structural_stale");
+  assert.equal(indexerMod.searchSessionNeedsIndex(id),true);
+  const retried=await indexerMod.indexSession(id);
+  assert.equal(retried.error,undefined);assert.equal(retried.outcome,"current");
+});
+
 test("discovery visits 697 catalog IDs in bounded yielded batches without awaiting extraction", async () => {
   indexerMod.startSearchQueue();
   const ids=Array.from({length:697},(_,i)=>`discovery-synthetic-${i}`);

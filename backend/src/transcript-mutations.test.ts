@@ -97,6 +97,7 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
   let reconcileHook: (() => void) | undefined;
   let reconcileFailure: Error | undefined;
   let reindexHook: (() => void) | undefined;
+  let reindexAcknowledgement: (() => boolean) | undefined;
   const dependencies: TranscriptMutationDependencies = {
     getSession: (id) => id === "session-1" ? ({ id, pi_session_file: "/synthetic/session.jsonl", cwd: "/synthetic" } as any) : undefined,
     validatePin: async () => ({ ok: pinOk, pinConfigured: true, ...(pinOk ? {} : { error: "Incorrect command guard identity PIN." }) }),
@@ -138,7 +139,7 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
       if (reconcileFailure) throw reconcileFailure;
       return 7;
     },
-    async forceReindex() { events.push("force-reindex"); reindexHook?.(); },
+    async forceReindex() { events.push("force-reindex"); reindexHook?.(); return reindexAcknowledgement; },
     getCatalogGeneration() { return 11; },
     publishInvalidation(_id, generation) {
       assert.equal(runtimeLocked, false, "invalidation must publish only after runtime unlock");
@@ -159,6 +160,7 @@ function fixture(entries: CanonicalEntry[], activeIds = entries.map((entry) => e
     setReconcileHook(callback: () => void) { reconcileHook = callback; },
     setReconcileFailure(error: Error) { reconcileFailure = error; },
     setReindexHook(callback: () => void) { reindexHook = callback; },
+    setReindexAcknowledgement(callback: () => boolean) { reindexAcknowledgement = callback; },
     setPublishHook(callback: () => void) { publishHook = callback; },
     isRuntimeLocked() { return runtimeLocked; },
     hasRecoveryMarker() { return recoveryMarkerExists; },
@@ -220,6 +222,18 @@ test("collection can omit payload while exact lookup always returns the full can
     (error: any) => error instanceof TranscriptMutationError
       && error.statusCode === 404 && error.code === "event_not_found",
   );
+});
+
+test("a lost search publication at final acknowledgement keeps the recovery marker", async () => {
+  const target=message("target",null,"before");
+  const f=fixture([target]);
+  let acknowledgements=0;
+  f.setReindexAcknowledgement(()=>{acknowledgements++;return false;});
+  await assert.rejects(f.service.mutateEvent("session-1","target","edit",{
+    pin:"opaque-test-pin",expectedEntry:target,replacementEntry:message("target",null,"after"),
+  }),(error:unknown)=>error instanceof TranscriptMutationError && error.code==="mutation_recovery_attention");
+  assert.equal(acknowledgements,1);
+  assert.equal(f.hasRecoveryMarker(),true,"failed publication CAS must not fall back to unconditional marker clear");
 });
 
 test("edit atomically invalidates all summaries including sibling branches, then reconciles and force reindexes", async () => {

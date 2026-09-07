@@ -1,25 +1,28 @@
 /** Bounded search queue -> exact structural offsets -> worker -> staged generation -> synchronous CAS flip. */
+import { createHash } from "node:crypto";
 import { getStore, type SessionRow } from "../db.js";
 import { getPolicyGeneration } from "../policy.js";
 import { authorizeExactStandardTranscript } from "../standard-transcript-authorization.js";
 import { listSessions } from "../sessions.js";
-import { eventRecoveryMarkerForSession } from "../transcript-recovery-journal.js";
+import { eventRecoveryMarkerForSession, clearTranscriptRecoveryMarker } from "../transcript-recovery-journal.js";
 import { getSearchDb, SCHEMA_VERSION } from "./db.js";
 import { isSessionIndexable } from "./policy-filter.js";
 import { DreamPolicyProjectionUnavailableError, ensureDreamPolicyProjection } from "./policy-projection.js";
 import { invalidateTranscriptPaginationSession } from "../transcript-pagination/service.js";
-import { getStructuralTranscriptIndex, type StructuralIndexRevision } from "../transcript-pagination/structural-index.js";
+import { getStructuralTranscriptIndex, SearchStructuralStaleError, SearchStructuralUnsupportedError, type StructuralIndexRevision } from "../transcript-pagination/structural-index.js";
 import { SearchQueue, SearchQueueUnavailableError, type SearchPriority } from "./queue.js";
 import { extractSearchDocuments } from "./extraction.js";
-import { SEARCH_EXTRACTION_VERSION, searchSourceRevisionKey } from "./revision.js";
+import { SEARCH_EXTRACTION_VERSION, searchSourceRevisionKey, getPublishedSearchRevision } from "./revision.js";
 import { beginGeneration, cleanupSearchChunks, getIndexCoverageSnapshot as coverageSnapshot,
   getSearchPublicationMetrics, invalidatePublication, metadataRevision, publishGeneration, publishMetadata,
-  recordSearchOutcome, recordSearchQueued, stageDocuments, yieldSearchTurn, type SearchOutcome } from "./publication.js";
+  recordSearchOutcome, recordSearchQueued, stageDocuments, yieldSearchTurn, SearchMetadataUnsupportedError, type SearchOutcome } from "./publication.js";
 
 export interface IndexResult {
   sessionId: string; chunkCount: number; skipped: boolean;
   policySkipped?: boolean; mutationFenced?: boolean; retryable?: boolean; error?: string;
   outcome?: SearchOutcome;
+  /** Backend reconciliation receipt; must still be verified at marker clearance. */
+  publicationGeneration?: string;
 }
 export interface IndexBatchSummary { total: number; indexed: number; skipped: number; errors: number; durationMs: number }
 export interface IndexerOptions {
@@ -40,6 +43,9 @@ let projectionPaused = false;
 let ownerStopped = false;
 let producerEpoch = 0;
 const producers = new Set<Promise<unknown>>();
+// One marker denotes one reconciliation operation, not successive force jobs.
+// Keep a successful receipt until acknowledgement; duplicate callers revalidate it.
+const recoveryRequests = new Map<string, {sessionId:string;work:Promise<IndexResult>}>();
 function trackProducer<T>(work: Promise<T>): Promise<T> {
   producers.add(work);
   void work.then(() => producers.delete(work),() => producers.delete(work));
@@ -51,6 +57,7 @@ export function startSearchQueue(): void { producerEpoch++; ownerStopped = false
 export async function stopSearchQueue(): Promise<void> {
   ownerStopped = true;
   producerEpoch++;
+  recoveryRequests.clear();
   await queue.stop();
   await Promise.allSettled([...producers]);
 }
@@ -98,8 +105,23 @@ export function searchSessionNeedsIndex(sessionId: string): boolean {
       samePartial ? "partial" : row.pi_session_file ? "current" : "metadata_only",state.error_code,state.chunk_bytes);
     return false;
   }
-  if (state.attempted_revision === revisionKey && (state.outcome === "unsupported" || state.retry_at > Date.now())) return false;
+  if (negativeOutcomeMatches(state,revisionKey,row)) return false;
   return true;
+}
+
+function metadataFailureRevision(sourceKey: string, row: SessionRow): string {
+  // Only fields contributing to the bounded metadata document belong here;
+  // recency/archive churn must not repeatedly retry the same oversized goal.
+  const digest = createHash("sha256").update(JSON.stringify([row.title,row.goal,row.cwd,row.model])).digest("hex");
+  return JSON.stringify(["metadata",sourceKey,digest]);
+}
+function negativeOutcomeMatches(state: {attempted_revision:string|null;outcome:string;retry_at:number;error_code:string|null},
+  sourceKey: string, row: SessionRow): boolean {
+  const expected = state.error_code === "metadata_unsupported" ? metadataFailureRevision(sourceKey,row) : sourceKey;
+  const stable = state.error_code === "metadata_unsupported" || state.error_code === "unsupported_structure" || state.error_code === "malformed_record";
+  // Old mixed 'unsupported_structure_or_metadata' rows are ambiguous and get
+  // one normal retry rather than retaining the prior poisoned negative cache.
+  return state.attempted_revision === expected && ((state.outcome === "unsupported" && stable) || state.retry_at > Date.now());
 }
 
 class Invalidated extends Error {}
@@ -111,14 +133,72 @@ function recoveryMarkerMatches(sessionId: string, markerId: string): boolean {
   return marker?.id === markerId && Boolean(row?.pi_session_file) && marker.pi_session_file === row!.pi_session_file;
 }
 
+function recoveryDeferred(sessionId: string): IndexResult {
+  return {sessionId,chunkCount:0,skipped:true,retryable:true,error:"Search deferred while transcript recovery is pending or changed"};
+}
+
+/** Revalidate the exact successful flip, not merely an enqueue/result flag. */
+export function isSearchRecoveryPublicationCurrent(sessionId: string, markerId: string, result: IndexResult): boolean {
+  if (ownerStopped || result.sessionId !== sessionId || result.error || result.skipped || result.outcome !== "current"
+    || !result.publicationGeneration || !recoveryMarkerMatches(sessionId,markerId)) return false;
+  try {
+    const policyGeneration = getPolicyGeneration();
+    const row = getStore().sessions.find((candidate) => candidate.id === sessionId);
+    if (!row?.pi_session_file || policyDenial(row,markerId)) return false;
+    const db = getSearchDb();
+    const published = getPublishedSearchRevision(db,sessionId);
+    if (published.kind !== "published" || published.generation !== result.publicationGeneration
+      || published.filePath !== row.pi_session_file || !published.fingerprint || !published.transcriptEpoch
+      || published.extractionVersion !== SEARCH_EXTRACTION_VERSION) return false;
+    if (!authorizeExactStandardTranscript(row.pi_session_file,{expectedSessionId:sessionId,expectedFingerprint:published.fingerprint})) return false;
+    const state = db.prepare(`SELECT w.outcome,w.successful_revision,w.error_code,m.revision AS metadata_revision
+      FROM search_work_state w JOIN search_session_metadata m ON m.session_id=w.session_id WHERE w.session_id=?`)
+      .get(sessionId) as {outcome:string;successful_revision:string|null;error_code:string|null;metadata_revision:string}|undefined;
+    const current = getStore().sessions.find((candidate) => candidate.id === sessionId);
+    if (!current || state?.outcome !== "current" || state.error_code !== null
+      || state.successful_revision !== searchSourceRevisionKey(published.filePath,published.fingerprint)
+      || state.metadata_revision !== metadataRevision(current)) return false;
+    const final = getPublishedSearchRevision(db,sessionId);
+    return !ownerStopped && getPolicyGeneration() === policyGeneration && recoveryMarkerMatches(sessionId,markerId)
+      && final.kind === "published" && final.generation === result.publicationGeneration;
+  } catch { return false; }
+}
+function checkedRecoveryResult(sessionId: string, markerId: string, result: IndexResult): IndexResult {
+  if (isSearchRecoveryPublicationCurrent(sessionId,markerId,result)) return result;
+  return {...result,error:result.error ?? "Search recovery did not retain its complete current publication"};
+}
+
+/** No await between fresh publication/policy/fingerprint CAS and marker clear. */
+export function acknowledgeSearchRecovery(sessionId: string, markerId: string, result: IndexResult): boolean {
+  if (!isSearchRecoveryPublicationCurrent(sessionId,markerId,result)) return false;
+  const cleared = clearTranscriptRecoveryMarker(markerId);
+  if (cleared) recoveryRequests.delete(markerId);
+  return cleared;
+}
+
 export function indexSession(sessionId: string, options: IndexerOptions = {}): Promise<IndexResult> {
   // Admission rejection must precede even getSearchDb()/queued bookkeeping:
   // shutdown may already have closed the handle and must never reopen it.
   if (ownerStopped) return Promise.resolve({sessionId,chunkCount:0,skipped:true,retryable:true,error:"Search owner stopped"});
+  const marker = options.recoveryMarkerId;
+  if (marker) {
+    const previous = recoveryRequests.get(marker);
+    if (previous?.sessionId === sessionId) return trackProducer(previous.work.then(result => {
+      const checked = checkedRecoveryResult(sessionId,marker,result);
+      if (checked.error && recoveryRequests.get(marker)?.work===previous.work) recoveryRequests.delete(marker);
+      return checked;
+    }));
+    const work = trackProducer(indexSessionRequest(sessionId,options));
+    recoveryRequests.set(marker,{sessionId,work});
+    const forget = () => {if(recoveryRequests.get(marker)?.work===work)recoveryRequests.delete(marker);};
+    void work.then(result => {if(result.error || !recoveryMarkerMatches(sessionId,marker))forget();},forget);
+    return work;
+  }
   return trackProducer(indexSessionRequest(sessionId,options));
 }
 
 async function indexSessionRequest(sessionId: string, options: IndexerOptions): Promise<IndexResult> {
+  if (!options.recoveryMarkerId && eventRecoveryMarkerForSession(sessionId)) return recoveryDeferred(sessionId);
   if (options.recoveryMarkerId && !recoveryMarkerMatches(sessionId,options.recoveryMarkerId)) {
     return {sessionId,chunkCount:0,skipped:true,retryable:true,error:"Search recovery marker changed"};
   }
@@ -163,11 +243,7 @@ async function indexSessionRequest(sessionId: string, options: IndexerOptions): 
     // Existing mutation/startup callers interpret !error as reconciliation. Do
     // not let partial, denied, fenced, cancelled, stale-marker or skipped work
     // clear their durable recovery barrier, including shortcut results.
-    if (options.recoveryMarkerId && (result.error || result.outcome !== "current" || result.skipped
-      || !recoveryMarkerMatches(sessionId,options.recoveryMarkerId))) {
-      return {...result,error:result.error ?? "Search recovery did not reconcile the complete transcript"};
-    }
-    return result;
+    return options.recoveryMarkerId ? checkedRecoveryResult(sessionId,options.recoveryMarkerId,result) : result;
   } catch (error) {
     if (error instanceof SearchQueueUnavailableError) {
       // Durable dirty state survives admission pressure and is revisited by the
@@ -179,6 +255,10 @@ async function indexSessionRequest(sessionId: string, options: IndexerOptions): 
 }
 
 async function indexSessionAttempt(sessionId: string, options: IndexerOptions, signal: AbortSignal): Promise<IndexResult> {
+  // An ordinary request queued before marker creation is deferred, not a
+  // reason to purge the recovery operation's newly published generation.
+  if (!options.recoveryMarkerId && eventRecoveryMarkerForSession(sessionId)) return recoveryDeferred(sessionId);
+  if (options.recoveryMarkerId && !recoveryMarkerMatches(sessionId,options.recoveryMarkerId)) return recoveryDeferred(sessionId);
   if (transcriptMutationFences.has(sessionId)) {
     purgeSessionIndex(sessionId);
     return {sessionId,chunkCount:0,skipped:true,mutationFenced:true};
@@ -230,8 +310,7 @@ async function indexSessionAttempt(sessionId: string, options: IndexerOptions, s
           ...(outcome === "partial" ? {error:"Some included transcript records exceed search limits"} : {})};
       }
     }
-    if (!options.force && !options.recoveryMarkerId && state?.attempted_revision === revisionKey
-      && (state.outcome === "unsupported" || state.retry_at > Date.now())) {
+    if (!options.force && !options.recoveryMarkerId && state && negativeOutcomeMatches(state,revisionKey,row)) {
       // Preserve stable negatives/backoff despite the queued admission marker.
       db.prepare("UPDATE search_work_state SET queued_at=0,requested_revision=? WHERE session_id=?").run(revisionKey,sessionId);
       return {sessionId,chunkCount:0,skipped:true,outcome:state.outcome as SearchOutcome,retryable:state.outcome !== "unsupported"};
@@ -295,12 +374,14 @@ async function indexSessionAttempt(sessionId: string, options: IndexerOptions, s
     phase = "cleanup";
     await cleanupSearchChunks(db,{sessionId,maxBatches:4});
     guard();
-    return {sessionId,chunkCount:documents+1,skipped:false,outcome,
+    return {sessionId,chunkCount:documents+1,skipped:false,outcome,publicationGeneration:generation,
       ...(unsupported ? {error:"Some included transcript records exceed search limits"} : {})};
   } catch (error) {
     if (error instanceof MetadataChanged) throw error;
     if (error instanceof DreamPolicyProjectionUnavailableError) throw error;
     if (error instanceof Invalidated || !authCurrent()) {
+      if ((!options.recoveryMarkerId && eventRecoveryMarkerForSession(sessionId))
+        || (options.recoveryMarkerId && !recoveryMarkerMatches(sessionId,options.recoveryMarkerId))) return recoveryDeferred(sessionId);
       // A prior fence already denied and purged this job. Do not let a late
       // predecessor invalidate/cancel a newly queued exact recovery request.
       if ((invalidations.get(sessionId) ?? 0) !== invalidation) {
@@ -310,11 +391,15 @@ async function indexSessionAttempt(sessionId: string, options: IndexerOptions, s
     }
     invalidatePublication(db,sessionId);
     const code = error instanceof Error ? error.message : "index_failed";
-    const stable = code.includes("topology") || code.includes("unsupported") || code === "malformed_record";
-    const outcome = stable ? "unsupported" : "failed";
-    // Persist content-free typed failure. Never persist worker/native errors,
-    // which may contain transcript bytes or private paths.
-    recordSearchOutcome(db,sessionId,revisionKey,outcome,stable ? "unsupported_structure_or_metadata" : "index_failed");
+    const metadataFailure = error instanceof SearchMetadataUnsupportedError;
+    const stale = error instanceof SearchStructuralStaleError;
+    const stable = metadataFailure || error instanceof SearchStructuralUnsupportedError || code === "malformed_record";
+    const outcome = stale ? "stale" : stable ? "unsupported" : "failed";
+    // Typed cache invalidation is immediately retryable. Stable negatives bind
+    // the inputs that can repair them, never an arbitrary exception substring.
+    recordSearchOutcome(db,sessionId,metadataFailure ? metadataFailureRevision(revisionKey,row) : revisionKey,outcome,
+      metadataFailure ? "metadata_unsupported" : stale ? "structural_stale" : error instanceof SearchStructuralUnsupportedError
+        ? "unsupported_structure" : code === "malformed_record" ? "malformed_record" : "index_failed");
     return {sessionId,chunkCount:0,skipped:true,retryable:!stable,outcome,error:stable ? "Search input unsupported" : "Search indexing failed"};
   } finally {
     if (generation) db.prepare("UPDATE search_generations SET active=0 WHERE generation=?").run(generation);
@@ -349,6 +434,10 @@ export function purgePolicyDeniedSessions(options: {ensureSearchDb?: () => unkno
   let purged = 0; let errors = 0;
   const reclaimBudget = {bytes:128*1024,rows:16};
   for (const row of listSessions(true)) {
+    const recovery = eventRecoveryMarkerForSession(row.id);
+    // A recovery marker alone denies ordinary queries/work, not its own exact
+    // reconciliation. Real privacy/quarantine revocation must still purge it.
+    if (recovery && !policyDenial(row,recovery.id)) continue;
     if (!policyDenial(row)) continue;
     try { cancelSessionWork(row.id); purgeSessionIndex(row.id,reclaimBudget); invalidateTranscriptPaginationSession(row.id); purged++; }
     catch { errors++; }
@@ -383,6 +472,7 @@ function policyDenial(row: SessionRow, recoveryMarkerId?: string): boolean {
 }
 function purgeSessionIndex(sessionId: string, reclaimBudget = {bytes:128*1024,rows:16}): void {
   invalidations.set(sessionId,(invalidations.get(sessionId) ?? 0)+1);
+  for (const [marker,request] of recoveryRequests) if(request.sessionId===sessionId)recoveryRequests.delete(marker);
   const db = getSearchDb();
   db.transaction(() => {
     invalidatePublication(db,sessionId);

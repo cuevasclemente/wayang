@@ -11,6 +11,9 @@ export const SEARCH_STAGE_MAX_ROWS = 16;
 export const SEARCH_STAGE_MAX_BYTES = 128 * 1024;
 export const SEARCH_GLOBAL_STAGING_BYTES = 64 * 1024 * 1024;
 export const SEARCH_WAL_PAUSE_BYTES = 64 * 1024 * 1024;
+export class SearchMetadataUnsupportedError extends Error {
+  constructor() { super("metadata_unsupported"); }
+}
 export type SearchOutcome = "queued" | "running" | "current" | "metadata_only" | "partial" | "unsupported" | "failed" | "stale";
 const metrics = { stageTransactions: 0, maxStageMs: 0, slowStageTransactions: 0, cleanupRows: 0, cleanupCandidates: 0, maxCleanupMs: 0, maxPublishMs: 0, walBytes: 0, walPressurePauses: 0, stageBytes: 0 };
 const cleanupCursors = new WeakMap<Database, Map<string, number>>();
@@ -76,7 +79,7 @@ export function publishMetadata(db: Database, row: SessionRow): void {
   if (old?.revision === revision) return;
   assertWalAdmission(db);
   const text = [row.title,row.goal,`cwd: ${row.cwd}`,row.model ? `model: ${row.model}` : ""].filter(Boolean).join("\n\n");
-  if (Buffer.byteLength(text) > SEARCH_MAX_DOCUMENT_BYTES) throw new Error("metadata_unsupported");
+  if (Buffer.byteLength(text) > SEARCH_MAX_DOCUMENT_BYTES) throw new SearchMetadataUnsupportedError();
   db.prepare(`INSERT INTO search_session_metadata VALUES(?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(session_id) DO UPDATE SET cwd=excluded.cwd,title=excluded.title,goal=excluded.goal,
     model=excluded.model,provider=excluded.provider,created_at=excluded.created_at,last_active=excluded.last_active,

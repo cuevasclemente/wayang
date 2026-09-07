@@ -3,6 +3,7 @@ import {
   beginTranscriptMutationSearchFence,
   endTranscriptMutationSearchFence,
   indexSession,
+  acknowledgeSearchRecovery,
   removeSession as removeSearchSession,
 } from "./search/indexer.js";
 import { getSessionById } from "./sessions.js";
@@ -38,7 +39,7 @@ async function recoverEventReconcile(marker: ReturnType<typeof listTranscriptRec
       recoveryMarkerId: marker.id,
     });
     if (indexed.error || indexed.mutationFenced) throw new Error("Event recovery search reindex failed");
-    if (!clearTranscriptRecoveryMarker(marker.id)) throw new Error("Event recovery marker could not be cleared");
+    if (!acknowledgeSearchRecovery(marker.session_id,marker.id,indexed)) throw new Error("Event recovery publication changed before marker acknowledgement");
     return true;
   } catch {
     if (!searchFenced) {
