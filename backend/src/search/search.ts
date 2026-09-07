@@ -5,6 +5,9 @@ import { listIndexableSessionAuthorizations } from "./policy-filter.js";
 import { getSearchStatus } from "./status.js";
 import { authorizeSearchQueryBodies, getVisibleBodySessionIds, type SearchQueryAuthorization } from "./query-authorization.js";
 import { getPublishedSearchRevision, SEARCH_EXTRACTION_VERSION } from "./revision.js";
+import { prepareSearchQuery } from "./query-prepare.js";
+import { executeRevalidatedSearch } from "./query-release.js";
+import { getSearchQueryPool } from "./query-worker-client.js";
 import { parseSearchQuery, SearchQueryError } from "./query-parser.js";
 import { queryKeywordSessions, sanitizeSnippet } from "./query-sql.js";
 import type { SearchFilters, SearchResponse, SearchResult } from "./types.js";
@@ -37,6 +40,41 @@ export function runSearch(query: string, filters: SearchFilters = {}): SearchRes
     throw new SearchQueryError("search_unavailable");
   }
 
+  return formatSearchResponse(trimmed, start, matched, authorization, status);
+}
+
+/** Lead may fold this aggregate into the shared response type during integration. */
+export type AsyncSearchResponse = SearchResponse & { metadata_revision_rejected: number };
+
+/** Production route API. Never release worker snippets/facets without full reauthorization. */
+export async function runSearchAsync(query: string, filters: SearchFilters = {}, options: { signal?: AbortSignal } = {}): Promise<AsyncSearchResponse> {
+  const start = performance.now();
+  const pool = getSearchQueryPool();
+  const epoch = pool.status().epoch;
+  const guard = () => {
+    pool.assertRunning(epoch);
+    if (options.signal?.aborted) throw new SearchQueryError("search_cancelled");
+  };
+  guard();
+  const parsed = parseSearchQuery(query);
+  const trimmed = query.trim();
+  if (trimmed.length < 2 || !parsed.match) return { ...emptyResponse(trimmed, start), metadata_revision_rejected: 0 };
+  const stableFilters = { ...filters };
+  const { prepared, result } = await executeRevalidatedSearch({
+    prepare: () => prepareSearchQuery(parsed, stableFilters),
+    execute: prepared => prepared.request.metadataSessionIds.length && prepared.request.allowedCwds.length
+      ? pool.query(prepared.request, options.signal) : Promise.resolve({ rows: [], facets: { cwds: [], models: [] } }),
+    guard,
+    signal: options.signal,
+  });
+  guard();
+  const response = formatSearchResponse(trimmed, start, result, prepared.authorization, getSearchStatus(prepared.eligibleSessionIds));
+  if (prepared.rejectedMetadataSessionIds.length && !response.degraded) response.degraded = "index_incomplete";
+  return { ...response, metadata_revision_rejected: prepared.rejectedMetadataSessionIds.length };
+}
+
+function formatSearchResponse(trimmed: string, start: number, matched: ReturnType<typeof queryKeywordSessions>, authorization: SearchQueryAuthorization,
+  status: Pick<SearchResponse, "coverage" | "degraded">): SearchResponse {
   const results: SearchResult[] = matched.rows.map((row, index) => ({
     session_id: row.session_id, title: row.title, cwd: row.cwd, model: row.model,
     last_active: row.last_active, archived: !!row.archived,
