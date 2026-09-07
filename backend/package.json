@@ -26,9 +26,9 @@
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.65",
-    "@earendil-works/pi-agent-core": "file:earendil-works-pi-agent-core-0.84.1-wayang.29082030.tgz",
-    "@earendil-works/pi-ai": "file:earendil-works-pi-ai-0.84.1-wayang.61da6928.tgz",
-    "@earendil-works/pi-coding-agent": "file:earendil-works-pi-coding-agent-0.84.1-wayang.29082030.tgz",
+    "@earendil-works/pi-agent-core": "file:earendil-works-pi-agent-core-0.85.0-wayang.904e4012.tgz",
+    "@earendil-works/pi-ai": "file:earendil-works-pi-ai-0.85.0-wayang.3483e2cd.tgz",
+    "@earendil-works/pi-coding-agent": "file:earendil-works-pi-coding-agent-0.85.0-wayang.904e4012.tgz",
     "@modelcontextprotocol/sdk": "1.29.0",
     "better-sqlite3": "^12.10.0",
     "express": "^4.21.0",
