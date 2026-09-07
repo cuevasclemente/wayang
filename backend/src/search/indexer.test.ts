@@ -10,6 +10,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { performance } from "node:perf_hooks";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-indexer-"));
 const piSessionsRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-indexer-pi-"));
@@ -33,6 +34,156 @@ const transcriptIndexMod = await import("../transcript-pagination/structural-ind
 const transcriptAuthorizationMod = await import("../standard-transcript-authorization.js");
 
 dbMod.init();
+
+// Register first so the production timing high-water counters normally belong
+// to this benchmark. Report their baseline too; these are not resettable counters.
+// This measures one synthetic catalog entry, not production corpus/storage load.
+test("synthetic benchmark: 20k topology, bounded documents, excluded giant record and parent timer progress", async (t) => {
+  const publication = await import("./publication.js");
+  const extraction = await import("./extraction.js");
+  const topologyEvents = 20_000;
+  const includedDocuments = 2_000;
+  assert.ok(topologyEvents < transcriptIndexMod.TRANSCRIPT_INDEX_MAX_TOPOLOGY_ENTRIES);
+  const id = seedSession({id:"synthetic-benchmark-20k",title:"Synthetic bounded indexing benchmark",transcript:[]});
+  const row = dbMod.getStore().sessions.find((candidate) => candidate.id === id)!;
+  const file = row.pi_session_file!;
+  let expectedTextBytes = 0;
+  let includedSourceBytes = 0;
+  let excludedRecordBytes = 0;
+  let lines: string[] = [];
+  // Fixture construction is outside the measured interval and never reads live
+  // transcripts. Batching also avoids retaining all serialized topology in RAM.
+  for (let i = 0; i < topologyEvents; i++) {
+    const included = i % 10 === 0;
+    const giant = i === 10_001;
+    const text = giant ? "synthetic excluded payload ".repeat(300_000).slice(0,7*1024*1024)
+      : included && (i === 0 || i === 10) ? "bounded document ".repeat(8192).slice(0,extraction.SEARCH_MAX_DOCUMENT_BYTES)
+      : `synthetic ${included ? "included" : "excluded"} event ${i}`;
+    const line = JSON.stringify({type:"message",id:`bench-${i}`,parentId:i ? `bench-${i-1}` : null,
+      message:{role:included ? (i % 20 === 0 ? "user" : "assistant") : "toolResult",content:[{type:"text",text}]}})+"\n";
+    if (included) {
+      assert.ok(Buffer.byteLength(text) <= extraction.SEARCH_MAX_DOCUMENT_BYTES);
+      expectedTextBytes += Buffer.byteLength(text);
+      includedSourceBytes += Buffer.byteLength(line);
+    }
+    if (giant) excludedRecordBytes = Buffer.byteLength(line);
+    lines.push(line);
+    if (lines.length === 128 || i === topologyEvents-1) {fs.appendFileSync(file,lines.join(""));lines=[];}
+  }
+  assert.ok(excludedRecordBytes > extraction.SEARCH_MAX_RECORD_BYTES);
+  assert.ok(excludedRecordBytes <= 8*1024*1024,"excluded physical record must remain inside cold structural admission");
+  assert.ok(expectedTextBytes <= extraction.SEARCH_MAX_GENERATION_BYTES);
+  assert.ok(transcriptAuthorizationMod.authorizeExactStandardTranscript(file,{expectedSessionId:id}));
+  const db = searchDbMod.getSearchDb();
+  const structure = transcriptIndexMod.getStructuralTranscriptIndex();
+  const workersBefore = structure.getWorkerInstrumentation().workersStarted;
+  const before = publication.getSearchPublicationMetrics();
+  const countBodies = db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id=? AND role IN ('user','assistant')");
+  const remaining = db.prepare("SELECT COUNT(*) AS n,COALESCE(SUM(length(CAST(text AS BLOB))),0) AS bytes FROM chunks WHERE session_id=?");
+  let previousRows = 0;
+  let previousStageBytes = before.stageBytes;
+  let stageHooks = 0;
+  let maxStageRows = 0;
+  let maxStageBytes = 0;
+  let firstStageAt: number | undefined;
+  let extractionDoneAt: number | undefined;
+  let sampledExtractionAt: number | undefined;
+  let timerTicks = 0;
+  let maxTimerGapMs = 0;
+  let cleanupMaxRows = 0;
+  let cleanupMaxBytes = 0;
+  let cleanupMaxCandidates = 0;
+  let cleanupPasses = 0;
+  const rssBefore = process.memoryUsage().rss;
+  let peakRss = rssBefore;
+  const started = performance.now();
+  let lastTick = started;
+  const timer = setInterval(() => {
+    const now = performance.now();
+    timerTicks++;
+    maxTimerGapMs = Math.max(maxTimerGapMs,now-lastTick);lastTick=now;
+    peakRss = Math.max(peakRss,process.memoryUsage().rss);
+    if (indexerMod.getSearchQueueStatus().phase === "extracting") sampledExtractionAt ??= now;
+  },5);
+  let indexFinishedAt: number | undefined;
+  let cleanupStartedAt: number | undefined;
+  let indexMaxTimerGapMs = 0;
+  try {
+    const result = await indexerMod.indexSession(id,{force:true,
+      afterStageForTests() {
+        firstStageAt ??= performance.now();
+        const stagedRows = (countBodies.get(id) as {n:number}).n;
+        const stagedBytes = publication.getSearchPublicationMetrics().stageBytes;
+        const rows = stagedRows-previousRows;
+        const bytes = stagedBytes-previousStageBytes;
+        assert.ok(rows > 0 && rows <= publication.SEARCH_STAGE_MAX_ROWS);
+        assert.ok(bytes > 0 && bytes <= publication.SEARCH_STAGE_MAX_BYTES);
+        maxStageRows=Math.max(maxStageRows,rows);maxStageBytes=Math.max(maxStageBytes,bytes);
+        previousRows=stagedRows;previousStageBytes=stagedBytes;stageHooks++;
+      },
+      afterChunkingForTests() {extractionDoneAt=performance.now();},
+    });
+    indexFinishedAt=performance.now();
+    indexMaxTimerGapMs=Math.max(maxTimerGapMs,indexFinishedAt-lastTick);
+    assert.equal(result.error,undefined);assert.equal(result.outcome,"current");
+    assert.equal(result.chunkCount,includedDocuments+1);
+    assert.equal(previousRows,includedDocuments);
+    assert.equal(previousStageBytes-before.stageBytes,expectedTextBytes);
+    assert.equal(structure.getWorkerInstrumentation().workersStarted-workersBefore,1,"cold exact structural build");
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM search_chunks_current WHERE session_id=?").get(id) as {n:number}).n,includedDocuments+1);
+    assert.equal(db.prepare("SELECT id FROM chunks WHERE session_id=? AND message_id='bench-10001'").get(id),undefined);
+    assert.ok(timerTicks > 0,"the parent timer must progress while workers index");
+    assert.ok(stageHooks > 0);
+
+    // Measure real reclamation, not just candidate scans over retained rows.
+    // The generation has finished; invalidate before yielding to cleanup.
+    cleanupStartedAt=performance.now();
+    publication.invalidatePublication(db,id);
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM search_chunks_current WHERE session_id=?").get(id) as {n:number}).n,0);
+    let prior = remaining.get(id) as {n:number;bytes:number};
+    for (; prior.n > 0 && cleanupPasses < includedDocuments+4; cleanupPasses++) {
+      const candidatesBefore = publication.getSearchPublicationMetrics().cleanupCandidates;
+      const removed = await publication.cleanupSearchChunks(db,{sessionId:id,maxBatches:1});
+      const after = remaining.get(id) as {n:number;bytes:number};
+      const candidates = publication.getSearchPublicationMetrics().cleanupCandidates-candidatesBefore;
+      assert.equal(prior.n-after.n,removed);
+      assert.ok(removed <= publication.SEARCH_STAGE_MAX_ROWS);
+      assert.ok(prior.bytes-after.bytes <= publication.SEARCH_STAGE_MAX_BYTES);
+      assert.ok(candidates <= 64);
+      cleanupMaxRows=Math.max(cleanupMaxRows,removed);
+      cleanupMaxBytes=Math.max(cleanupMaxBytes,prior.bytes-after.bytes);
+      cleanupMaxCandidates=Math.max(cleanupMaxCandidates,candidates);
+      prior=after;
+    }
+    assert.equal(prior.n,0,"bounded cleanup passes must eventually reclaim all synthetic documents");
+  } finally {
+    clearInterval(timer);
+    const finished = performance.now();
+    maxTimerGapMs=Math.max(maxTimerGapMs,finished-lastTick);
+    peakRss=Math.max(peakRss,process.memoryUsage().rss);
+    const after = publication.getSearchPublicationMetrics();
+    t.diagnostic(JSON.stringify({benchmark:"synthetic-search-20k",topologyEvents,includedDocuments,
+      excludedRecordBytes,fixtureBytes:fs.statSync(file).size,includedSourceBytesFromFixture:includedSourceBytes,
+      coldIndexWallMs:indexFinishedAt === undefined ? null : indexFinishedAt-started,
+      preFirstStageMs:firstStageAt === undefined ? null : firstStageAt-started,
+      sampledExtractionThroughStagingMs:sampledExtractionAt === undefined || extractionDoneAt === undefined ? null : extractionDoneAt-sampledExtractionAt,
+      cleanupWallMs:cleanupStartedAt === undefined ? null : finished-cleanupStartedAt,
+      wallMs:finished-started,timerIntervalMs:5,timerTicks,indexMaxTimerGapMs,maxTimerGapMs,
+      stageTransactions:after.stageTransactions-before.stageTransactions,stageTextBytes:after.stageBytes-before.stageBytes,
+      maxStageRows,maxStageBytes,cleanupPasses,cleanupMaxRows,cleanupMaxBytes,cleanupMaxCandidates,
+      cleanupRows:after.cleanupRows-before.cleanupRows,maxStageMs:after.maxStageMs,maxPublishMs:after.maxPublishMs,maxCleanupMs:after.maxCleanupMs,
+      timingMaximaBaseline:{stage:before.maxStageMs,publish:before.maxPublishMs,cleanup:before.maxCleanupMs},
+      peakObservedRssDeltaBytes:peakRss-rssBefore,finalRssDeltaBytes:process.memoryUsage().rss-rssBefore,
+      caveat:"No speed/RSS SLA. Timings include test hooks and authorization; extraction start/RSS are sampled, publication maxima are process-wide; fixture construction/teardown excluded."}));
+    // Do not make later corpus tests silently repeat this benchmark. Keep its
+    // synthetic file on disk for inspection, but remove its catalog/index entry.
+    await indexerMod.removeSession(id);
+    fs.renameSync(file,path.join(tmpRoot,"synthetic-benchmark-20k.jsonl"));
+    const store = dbMod.getStore();
+    const position = store.sessions.findIndex((candidate) => candidate.id === id);
+    if (position >= 0) {store.sessions.splice(position,1);dbMod.flush();}
+  }
+});
 
 test("policy purge contains search DB initialization failure to one attempt", () => {
   let attempts = 0;
@@ -149,6 +300,7 @@ function writeFixture(sessionId: string, cwd: string, transcript: Array<{ role: 
 }
 
 function seedSession(opts: {
+  id?: string;
   title: string;
   goal?: string;
   archived?: boolean;
@@ -156,7 +308,7 @@ function seedSession(opts: {
   transcript: Array<{ role: "user" | "assistant"; text: string; id?: string }>;
 }): string {
   const store = dbMod.getStore();
-  const id = `sess-${store.sessions.length + 1}`;
+  const id = opts.id ?? `sess-${store.sessions.length + 1}`;
   const cwd = opts.cwd ?? path.join(tmpRoot, `proj-${id}`);
   fs.mkdirSync(cwd, { recursive: true });
   const { project } = projectsMod.ensureProjectForCwd(cwd);

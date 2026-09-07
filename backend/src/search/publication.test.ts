@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import Database, { type Database as DatabaseType } from "better-sqlite3";
 import type { SessionRow } from "../db.js";
 import { migrate, SCHEMA_VERSION } from "./db.js";
 import { beginGeneration, stageDocuments, publishMetadata, publishGeneration, invalidatePublication,
-  cleanupSearchChunks, recordSearchOutcome, recordSearchQueued, getIndexCoverageSnapshot, getSearchPublicationMetrics } from "./publication.js";
+  cleanupSearchChunks, recordSearchOutcome, recordSearchQueued, getIndexCoverageSnapshot, getSearchPublicationMetrics,
+  SEARCH_WAL_PAUSE_BYTES } from "./publication.js";
 const row = {id:"synthetic",cwd:"/synthetic",title:"title",goal:"goal",model:"model",provider:null,created_at:1,last_active:2,archived:0,error:null} as SessionRow;
 function database() {const db=new Database(":memory:");db.pragma("foreign_keys=ON");migrate(db);return db;}
 function visible(db: DatabaseType) { return db.prepare("SELECT text FROM search_chunks_current ORDER BY id").all() as Array<{text:string}>; }
@@ -48,6 +52,94 @@ test("byte/row stage limits fail before insertion and outcomes back off durably"
     assert.equal(getIndexCoverageSnapshot(db,new Set()).total,0,"caller authorization set is authoritative");
   } finally {db.close();}
 });
+test("pinned SQLite reader holds WAL admission closed until checkpoint/truncate, without blocking denial or cleanup",async(t)=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),"search-wal-pressure-synthetic-"));
+  const file=path.join(root,"search.db");
+  const db=new Database(file);
+  let reader:DatabaseType|undefined;
+  const walBytes=()=>fs.statSync(`${file}-wal`).size;
+  type Checkpoint={busy:number;log:number;checkpointed:number};
+  try {
+    db.pragma("journal_mode=WAL");db.pragma("synchronous=NORMAL");
+    db.pragma("foreign_keys=ON");db.pragma("busy_timeout=0");
+    db.pragma("wal_autocheckpoint=1000");db.pragma("journal_size_limit=8388608");
+    migrate(db);
+    const generation=beginGeneration(db,row.id);
+    stageDocuments(db,row.id,generation,"epoch",[{chunkIndex:0,role:"user",text:"abandoned synthetic body"}]);
+    // A small reusable BLOB makes real WAL frames without a 64 MiB JS buffer,
+    // huge FTS tokens, a fake/sparse WAL, or ever touching a canonical database.
+    const payloadBytes=256*1024;
+    const payloads=[Buffer.alloc(payloadBytes,0x61),Buffer.alloc(payloadBytes,0x62)];
+    db.exec("CREATE TABLE synthetic_wal_pressure(id INTEGER PRIMARY KEY,revision INTEGER NOT NULL,payload BLOB NOT NULL)");
+    db.prepare("INSERT INTO synthetic_wal_pressure VALUES(1,0,?)").run(payloads[0]);
+    assert.equal((db.pragma("wal_checkpoint(TRUNCATE)") as Checkpoint[])[0].busy,0);
+    reader=new Database(file,{readonly:true,fileMustExist:true});
+    reader.pragma("busy_timeout=0");reader.exec("BEGIN");
+    assert.equal((reader.prepare("SELECT revision FROM synthetic_wal_pressure WHERE id=1").get() as {revision:number}).revision,0);
+    const update=db.prepare("UPDATE synthetic_wal_pressure SET revision=revision+1,payload=? WHERE id=1");
+    const maxWrites=Math.ceil(SEARCH_WAL_PAUSE_BYTES/payloadBytes)+8;
+    let writes=0;
+    while(walBytes()<SEARCH_WAL_PAUSE_BYTES && writes<maxWrites) {
+      update.run(payloads[(writes+1)%2]);writes++;
+      if(writes%8===0)await new Promise<void>((resolve)=>setImmediate(resolve));
+    }
+    const walAtPause=walBytes();
+    assert.ok(walAtPause>=SEARCH_WAL_PAUSE_BYTES,"the pinned reader must prevent automatic checkpoint/reset");
+    assert.ok(walAtPause<SEARCH_WAL_PAUSE_BYTES+1024*1024,"fixture stops after the first bounded crossing, not indefinite WAL growth");
+    assert.equal((reader.prepare("SELECT revision FROM synthetic_wal_pressure WHERE id=1").get() as {revision:number}).revision,0,
+      "reader still owns its original snapshot while the writer has advanced");
+    assert.equal((db.prepare("SELECT revision FROM synthetic_wal_pressure WHERE id=1").get() as {revision:number}).revision,writes);
+    const blockedCheckpoint=(db.pragma("wal_checkpoint(TRUNCATE)") as Checkpoint[])[0];
+    assert.equal(blockedCheckpoint.busy,1);
+    assert.ok(blockedCheckpoint.log>blockedCheckpoint.checkpointed);
+    const before=getSearchPublicationMetrics();
+    const isWalPressure=(error:unknown)=>error instanceof Error && error.message==="wal_pressure";
+    for(let attempt=0;attempt<3;attempt++) {
+      assert.throws(()=>beginGeneration(db,"denied-synthetic-generation"),isWalPressure);
+      assert.throws(()=>stageDocuments(db,row.id,generation,"epoch",[{chunkIndex:1,role:"user",text:"must not stage"}]),isWalPressure);
+      assert.throws(()=>db.transaction(()=>publishMetadata(db,row))(),isWalPressure);
+    }
+    assert.equal(walBytes(),walAtPause,"repeated denied text admission must not itself append WAL frames");
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM search_generations").get() as {n:number}).n,1);
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM chunks").get() as {n:number}).n,1);
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM search_session_metadata").get() as {n:number}).n,0);
+    assert.equal(getSearchPublicationMetrics().stageTransactions,before.stageTransactions);
+    assert.equal(getSearchPublicationMetrics().walPressurePauses-before.walPressurePauses,9);
+
+    // This is an admission WATERMARK, not a disk quota. The last admitted
+    // bounded transaction can cross it; denial/state/cleanup must remain able
+    // to write even while the reader keeps WAL bytes above the watermark.
+    invalidatePublication(db,row.id);
+    db.prepare("UPDATE search_generations SET active=0 WHERE generation=?").run(generation);
+    recordSearchOutcome(db,row.id,"synthetic-revision","failed","wal_pressure");
+    assert.equal(await cleanupSearchChunks(db,{sessionId:row.id,maxBatches:1}),1);
+    assert.deepEqual(visible(db),[]);
+    const walAfterDenialAndCleanup=walBytes();
+    assert.ok(walAfterDenialAndCleanup>walAtPause);
+    assert.throws(()=>beginGeneration(db,"still-denied"),isWalPressure);
+
+    reader.exec("ROLLBACK");
+    const checkpoint=(db.pragma("wal_checkpoint(TRUNCATE)") as Checkpoint[])[0];
+    assert.equal(checkpoint.busy,0);
+    assert.equal(walBytes(),0,"release and explicit truncation remove the observed admission pressure");
+    const recovered=beginGeneration(db,row.id);
+    stageDocuments(db,row.id,recovered,"epoch",[{chunkIndex:0,role:"user",text:"recovered synthetic body"}]);
+    db.transaction(()=>publishMetadata(db,row))();
+    publishGeneration(db,row,recovered,()=>recordSearchOutcome(db,row.id,"recovered-revision","current"));
+    assert.equal(visible(db).length,2);
+    assert.ok(visible(db).some((chunk)=>chunk.text==="recovered synthetic body"));
+    assert.equal(getSearchPublicationMetrics().stageTransactions,before.stageTransactions+1);
+    t.diagnostic(JSON.stringify({benchmark:"synthetic-pinned-reader-wal",watermarkBytes:SEARCH_WAL_PAUSE_BYTES,
+      payloadBytes,writes,walAtPause,blockedCheckpoint,walAfterDenialAndCleanup,checkpoint,
+      walAfterRecovery:walBytes(),admissionRecovered:true,
+      caveat:"Admission watermark, not a hard filesystem quota; release alone is insufficient evidence until checkpoint/reset/truncate reduces observed WAL size."}));
+  } finally {
+    if(reader?.inTransaction)reader.exec("ROLLBACK");
+    reader?.close();db.close();
+    // Synthetic files remain available for lead inspection; no live paths used.
+  }
+});
+
 test("cleanup bounds candidate scans even when a large published prefix has no garbage",async()=>{
   const db=database();
   try {
