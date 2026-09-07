@@ -460,7 +460,10 @@ test("metadata generation CAS retries a paused stale clone and commits only the 
   const rows = db.prepare("SELECT DISTINCT goal, title FROM search_chunks_current WHERE session_id = ?").all(id) as Array<{ goal: string | null; title: string }>;
   assert.deepEqual(rows, [{ goal: newGoal, title: "Metadata CAS fixture" }]);
   assert.equal(searchMod.runSearch("platypus").results.some((row) => row.session_id === id), true);
-  assert.equal(searchMod.runSearch("old metadata projection").results.some((row) => row.session_id === id), false);
+  // Words now admit optional OR matches; shared 'metadata projection' words
+  // legitimately match the new goal. Assert the removed term/phrase instead.
+  assert.equal(searchMod.runSearch("old").results.some((row) => row.session_id === id), false);
+  assert.equal(searchMod.runSearch('"old metadata projection"').results.some((row) => row.session_id === id), false);
 });
 
 test("repeated metadata churn purges and returns a fixed retryable indexing error", async () => {

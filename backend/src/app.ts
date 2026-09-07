@@ -340,7 +340,9 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
     Promise.resolve().then(() => stopSessionCatalog()),
     Promise.resolve().then(() => stopAllApps()),
     Promise.resolve().then(() => stopAllBrowsers()),
-    Promise.resolve().then(() => closeTranscriptPagination()),
+    // Search workers use revision-bound structural offsets: drain/cancel them
+    // before closing the structural database they depend on.
+    Promise.resolve().then(async () => { await stopWatcher(); await closeTranscriptPagination(); }),
     Promise.resolve().then(() => closeDerivedTodoProjectionService()),
     Promise.resolve().then(() => closeArtifactRegistry()),
   ]);
@@ -547,7 +549,7 @@ export function start() {
     shutdownServicesStarted = true;
     clearInterval(ttsCleanupInterval);
     schedulerManager.stop();
-    stopWatcher();
+    void stopWatcher().catch(() => console.error("[search] shutdown incomplete"));
     stopLatencyMetrics();
     void stopSessionCatalog().catch((err) => console.error("[session-catalog] Failed to stop:", err));
     stopAllApps().catch((err) => console.error("[apps] Failed to stop apps:", err));

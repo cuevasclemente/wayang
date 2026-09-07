@@ -1115,7 +1115,13 @@ export interface SessionSearchResponse {
   took_ms: number;
   results: SessionSearchResult[];
   facets: SessionSearchFacets;
-  degraded?: "semantic_off" | "indexing_in_progress";
+  degraded?: "semantic_off" | "indexing_in_progress" | "indexing_paused" | "index_incomplete" | "index_unavailable";
+  coverage?: {
+    total: number;
+    counts: Record<"queued" | "running" | "current" | "metadata_only" | "partial" | "unsupported" | "failed" | "stale" | "legacy" | "missing", number>;
+    retrying: number;
+    oldest_pending_age_ms: number;
+  };
 }
 
 export interface SessionSearchFilters {
@@ -1163,7 +1169,12 @@ export interface SessionSearchHealth {
   last_error?: string;
   schema_version: number;
   embedder: "off" | "http";
+  degraded?: SessionSearchResponse["degraded"];
+  coverage?: SessionSearchResponse["coverage"];
   watcher?: {
+    started: boolean;
+    background_indexing_enabled: boolean;
+    policy_projection_available: boolean;
     backfill_done: boolean;
     backfill_running: boolean;
     last_tick_at: number | null;
