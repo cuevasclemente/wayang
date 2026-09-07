@@ -2,12 +2,14 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import Database from "better-sqlite3";
+import Database, { type Database as DatabaseType } from "better-sqlite3";
 import { parseSearchQuery } from "./query-parser.js";
 import { queryDatabaseSnapshot } from "./query-snapshot.js";
 import type { QueryWorkerRequest } from "./query-worker-protocol.js";
 
-export function createQueryWorkerFixture(sessions = 3, chunksPerSession = 2) {
+export function createQueryWorkerFixture(sessions = 3, chunksPerSession = 2): {
+  db: DatabaseType; dbPath: string; root: string; ids: string[]; terms: string; request: (query?: string) => QueryWorkerRequest;
+} {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-readonly-query-"));
   const dbPath = path.join(root, "search.db");
   const db = new Database(dbPath);

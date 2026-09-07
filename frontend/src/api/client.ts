@@ -1115,6 +1115,8 @@ export interface SessionSearchResponse {
   took_ms: number;
   results: SessionSearchResult[];
   facets: SessionSearchFacets;
+  body_revision_rejected?: number;
+  metadata_revision_rejected?: number;
   degraded?: "semantic_off" | "indexing_in_progress" | "indexing_paused" | "index_incomplete" | "index_unavailable";
   coverage?: {
     total: number;

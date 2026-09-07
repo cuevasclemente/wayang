@@ -14,11 +14,11 @@ import {
   getWatcherStatus,
   indexSession,
   reindexAll,
-  runSearch,
   SCHEMA_VERSION,
 } from "../search/index.js";
 import type { SearchFilters } from "../search/index.js";
 import { SearchQueryError } from "../search/query-parser.js";
+import { runSearchAsync } from "../search/search.js";
 import { getSearchStatus } from "../search/status.js";
 import { getSearchQueueStatus } from "../search/indexer.js";
 
@@ -66,7 +66,7 @@ function parseEpoch(v: unknown): number | undefined {
   return undefined;
 }
 
-router.get("/sessions/search", (req: Request, res: Response) => {
+router.get("/sessions/search", async (req: Request, res: Response) => {
   const ip = req.ip || req.socket.remoteAddress || "unknown";
   if (!rateLimit(ip)) {
     res.status(429).json({ error: "rate_limited" });
@@ -91,16 +91,26 @@ router.get("/sessions/search", (req: Request, res: Response) => {
     limit: typeof req.query.limit === "string" ? Number(req.query.limit) : undefined,
   };
 
+  const controller = new AbortController();
+  const cancelDisconnected = () => { if (!res.writableEnded) controller.abort(); };
+  res.once("close", cancelDisconnected);
   try {
-    const response = runSearch(q, filters);
-    res.json(response);
+    await runSearchAsync(q, filters, {
+      signal: controller.signal,
+      // No await between final authorization and transport release.
+      release: response => { if (!controller.signal.aborted) res.json(response); },
+    });
   } catch (err) {
+    if (controller.signal.aborted || res.headersSent) return;
     if (err instanceof SearchQueryError) {
-      res.status(err.code === "search_unavailable" ? 503 : 400).json({ error: err.message, code: err.code });
+      const inputError = ["query_too_long", "too_many_units", "unit_too_long", "unmatched_quote", "empty_unit", "invalid_query"].includes(err.code);
+      res.status(inputError ? 400 : err.code === "search_busy" ? 429 : 503).json({ error: err.message, code: err.code });
     } else {
       console.error("[search] query unavailable");
       res.status(503).json({ error: "Search is temporarily unavailable.", code: "search_unavailable" });
     }
+  } finally {
+    res.off("close", cancelDisconnected);
   }
 });
 

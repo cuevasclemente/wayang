@@ -60,6 +60,7 @@ import { clearAppsAgentToken, installAppsAgentToken, isAppsAgentRequest, recogni
 import { CredentialBroker } from "./browser/credentials.js";
 import { schedulerManager } from "./scheduler/manager.js";
 import { startWatcher, stopWatcher } from "./search/index.js";
+import { startSearchQueryWorker, stopSearchQueryWorker } from "./search/query-worker-client.js";
 import { drainSubmittedInterviews } from "./interview-delivery.js";
 import { getSessionById, startSessionCatalog, stopSessionCatalog } from "./sessions.js";
 import { getLatencyMetricsSnapshot, recordLatencyMetric, startLatencyMetrics, stopLatencyMetrics } from "./latency-metrics.js";
@@ -342,7 +343,11 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
     Promise.resolve().then(() => stopAllBrowsers()),
     // Search workers use revision-bound structural offsets: drain/cancel them
     // before closing the structural database they depend on.
-    Promise.resolve().then(async () => { await stopWatcher(); await closeTranscriptPagination(); }),
+    Promise.resolve().then(async () => {
+      await stopSearchQueryWorker();
+      await stopWatcher();
+      await closeTranscriptPagination();
+    }),
     Promise.resolve().then(() => closeDerivedTodoProjectionService()),
     Promise.resolve().then(() => closeArtifactRegistry()),
   ]);
@@ -353,6 +358,7 @@ export async function closeWayangServer(server: http.Server): Promise<void> {
 }
 
 export function start() {
+  startSearchQueryWorker();
   const config = getConfig();
   const browserDiagnostic = getBrowserExecutableDiagnostic({ requestedTransport: config.browser.transport });
   if (config.browser.transport === "vnc" && browserDiagnostic.vncAvailable === false) {
@@ -549,6 +555,7 @@ export function start() {
     shutdownServicesStarted = true;
     clearInterval(ttsCleanupInterval);
     schedulerManager.stop();
+    void stopSearchQueryWorker().catch(() => console.error("[search] query shutdown incomplete"));
     void stopWatcher().catch(() => console.error("[search] shutdown incomplete"));
     stopLatencyMetrics();
     void stopSessionCatalog().catch((err) => console.error("[session-catalog] Failed to stop:", err));
