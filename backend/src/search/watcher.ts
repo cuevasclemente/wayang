@@ -187,3 +187,4 @@ export async function indexSessionNow(sessionId: string, indexOne: typeof indexS
   if (!isSearchBackgroundIndexingEnabled() || getSearchQueueStatus().stopped) return;
   try {await indexOne(sessionId,{priority:"recent",delayMs:RECENT_DEBOUNCE_MS});}
   catch {console.error("[search] recent indexing request failed");}
+}

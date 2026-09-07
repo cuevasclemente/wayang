@@ -117,7 +117,7 @@ export function getSearchHealthSnapshot() {
     indexed_sessions: indexed,
     pending: Math.max(0, total - indexed),
     errored: errors,
-    last_error: errors ? "Some eligible sessions have incomplete or failed indexing." : watcher.lastError ? "Search maintenance is degraded." : undefined,
+    last_error: errors ? "Some eligible sessions have incomplete or failed indexing." : watcher.lastError ?? undefined,
     ...status,
     queue: getSearchQueueStatus(),
     schema_version: SCHEMA_VERSION,
