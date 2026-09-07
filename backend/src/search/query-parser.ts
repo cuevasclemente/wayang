@@ -1,9 +1,12 @@
 /** Bounded literal keyword/optional-phrase grammar. No Boolean or prefix syntax. */
+import Database, { type Database as DatabaseType } from "better-sqlite3";
+
 export const MAX_QUERY_CHARS = 2048;
 export const MAX_QUERY_UNITS = 16;
 export const MAX_UNIT_CHARS = 128;
 // Current coverage indexes complete bounded message documents. Phrase matches
-// never cross message IDs; legacy chunk coverage remains incomplete until rebuilt.
+// never cross message IDs; legacy BODY is hidden until its revision is rebuilt.
+// Currently authorized legacy metadata remains searchable.
 
 export type SearchQueryErrorCode =
   | "query_too_long" | "too_many_units" | "unit_too_long"
@@ -78,7 +81,42 @@ export function parseSearchQuery(query: string): ParsedSearchQuery {
     seen.add(text);
     units.push({ text, phrase, match: `text : "${text.replaceAll('"', '""')}"` });
   }
-  return { units, match: units.length ? units.map((unit) => unit.match).join(" OR ") : null };
+  const distinct = deduplicateTokenizedUnits(units);
+  return { units: distinct, match: distinct.length ? distinct.map((unit) => unit.match).join(" OR ") : null };
+}
+
+/**
+ * Use SQLite's actual tokenizer, not JS Unicode categories/diacritic heuristics.
+ * Query material is bounded above before allocation, lives only in a disposable
+ * :memory: database, and is never inserted into the transcript index or logs.
+ * Instance vocabulary preserves token order AND repetitions inside each phrase.
+ */
+function deduplicateTokenizedUnits(units: SearchUnit[]): SearchUnit[] {
+  if (!units.length) return [];
+  let db: DatabaseType | undefined;
+  try {
+    db = new Database(":memory:");
+    db.exec(`CREATE VIRTUAL TABLE query_input USING fts5(text, tokenize='unicode61 remove_diacritics 2');
+      CREATE VIRTUAL TABLE query_vocab USING fts5vocab(query_input, 'instance');`);
+    const insert = db.prepare("INSERT INTO query_input(rowid, text) VALUES (?, ?)");
+    db.transaction(() => units.forEach((unit, index) => insert.run(index + 1, unit.text)))();
+    const vocabulary = db.prepare("SELECT doc, term FROM query_vocab ORDER BY doc, offset").all() as Array<{ doc: number; term: string }>;
+    const sequences = units.map(() => [] as string[]);
+    for (const token of vocabulary) sequences[token.doc - 1].push(token.term);
+    const seen = new Set<string>();
+    return units.filter((_unit, index) => {
+      if (!sequences[index].length) throw new SearchQueryError("empty_unit");
+      const key = JSON.stringify(sequences[index]);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  } catch (error) {
+    if (error instanceof SearchQueryError) throw error;
+    throw new SearchQueryError("search_unavailable");
+  } finally {
+    try { db?.close(); } catch { throw new SearchQueryError("search_unavailable"); }
+  }
 }
 
 export function buildFtsExpression(query: string): string | null {
