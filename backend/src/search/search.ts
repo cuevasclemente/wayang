@@ -6,7 +6,8 @@ import { getSearchStatus } from "./status.js";
 import { authorizeSearchQueryBodies, getVisibleBodySessionIds, type SearchQueryAuthorization } from "./query-authorization.js";
 import { getPublishedSearchRevision, SEARCH_EXTRACTION_VERSION } from "./revision.js";
 import { prepareSearchQuery } from "./query-prepare.js";
-import { executeRevalidatedSearch } from "./query-release.js";
+import { executeRevalidatedSearch, assertSynchronousSearchRelease, invokeSearchRelease,
+  type SynchronousSearchRelease } from "./query-release.js";
 import { getSearchQueryPool } from "./query-worker-client.js";
 import { parseSearchQuery, SearchQueryError } from "./query-parser.js";
 import { queryKeywordSessions, sanitizeSnippet } from "./query-sql.js";
@@ -46,9 +47,17 @@ export function runSearch(query: string, filters: SearchFilters = {}): SearchRes
 /** Lead may fold this aggregate into the shared response type during integration. */
 export type AsyncSearchResponse = SearchResponse & { metadata_revision_rejected: number };
 
-/** Production route API. Never release worker snippets/facets without full reauthorization. */
-export async function runSearchAsync(query: string, filters: SearchFilters = {}, options: { signal?: AbortSignal } = {}): Promise<AsyncSearchResponse> {
+/** Production routes MUST send inside options.release, synchronously, and must
+ * NOT send the awaited return value. Promise results are fixture-only snapshots;
+ * policy may change in microtasks before an awaiting caller resumes.
+ */
+export async function runSearchAsync(query: string, filters: SearchFilters = {}, options: {
+  signal?: AbortSignal;
+  release?: SynchronousSearchRelease<[AsyncSearchResponse]>;
+} = {}): Promise<AsyncSearchResponse> {
   const start = performance.now();
+  const release = options.release;
+  assertSynchronousSearchRelease(release);
   const pool = getSearchQueryPool();
   const epoch = pool.status().epoch;
   const guard = () => {
@@ -58,19 +67,30 @@ export async function runSearchAsync(query: string, filters: SearchFilters = {},
   guard();
   const parsed = parseSearchQuery(query);
   const trimmed = query.trim();
-  if (trimmed.length < 2 || !parsed.match) return { ...emptyResponse(trimmed, start), metadata_revision_rejected: 0 };
+  if (trimmed.length < 2 || !parsed.match) {
+    const response = { ...emptyResponse(trimmed, start), metadata_revision_rejected: 0 };
+    guard();
+    invokeSearchRelease(release, response);
+    return response;
+  }
   const stableFilters = { ...filters };
-  const { prepared, result } = await executeRevalidatedSearch({
+  let response!: AsyncSearchResponse;
+  await executeRevalidatedSearch({
     prepare: () => prepareSearchQuery(parsed, stableFilters),
     execute: prepared => prepared.request.metadataSessionIds.length && prepared.request.allowedCwds.length
       ? pool.query(prepared.request, options.signal) : Promise.resolve({ rows: [], facets: { cwds: [], models: [] } }),
     guard,
     signal: options.signal,
+    release: (prepared, result) => {
+      // Formatting/status and the actual transport callback stay in the final
+      // validation stack: do not move this work after the await above.
+      const formatted = formatSearchResponse(trimmed, start, result, prepared.authorization, getSearchStatus(prepared.eligibleSessionIds));
+      if (prepared.rejectedMetadataSessionIds.length && !formatted.degraded) formatted.degraded = "index_incomplete";
+      response = { ...formatted, metadata_revision_rejected: prepared.rejectedMetadataSessionIds.length };
+      invokeSearchRelease(release, response);
+    },
   });
-  guard();
-  const response = formatSearchResponse(trimmed, start, result, prepared.authorization, getSearchStatus(prepared.eligibleSessionIds));
-  if (prepared.rejectedMetadataSessionIds.length && !response.degraded) response.degraded = "index_incomplete";
-  return { ...response, metadata_revision_rejected: prepared.rejectedMetadataSessionIds.length };
+  return response;
 }
 
 function formatSearchResponse(trimmed: string, start: number, matched: ReturnType<typeof queryKeywordSessions>, authorization: SearchQueryAuthorization,
