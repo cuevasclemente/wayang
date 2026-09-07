@@ -11,7 +11,9 @@ export const MAX_UNIT_CHARS = 128;
 export type SearchQueryErrorCode =
   | "query_too_long" | "too_many_units" | "unit_too_long"
   | "unmatched_quote" | "empty_unit"
-  | "invalid_query" | "search_unavailable";
+  | "invalid_query" | "search_unavailable" | "search_busy" | "search_timeout"
+  | "search_cancelled" | "search_changed" | "search_stopped"
+  | "search_request_too_large" | "search_result_too_large";
 
 /** Fixed public messages only: never attach SQL, paths, or the query as a cause. */
 export class SearchQueryError extends Error {
@@ -24,6 +26,13 @@ export class SearchQueryError extends Error {
       empty_unit: "Each search word or phrase must contain searchable text.",
       invalid_query: "Separate search words and quoted phrases with whitespace.",
       search_unavailable: "Search is temporarily unavailable.",
+      search_busy: "Search is busy. Try again shortly.",
+      search_timeout: "Search exceeded its time limit. Try fewer words or narrower filters.",
+      search_cancelled: "Search was cancelled.",
+      search_changed: "Search coverage changed during this request. Try again shortly.",
+      search_stopped: "Search is shutting down.",
+      search_request_too_large: "Search coverage exceeds the query resource limit.",
+      search_result_too_large: "Search results exceed the response limit. Try narrower filters.",
     };
     super(messages[code]);
     this.name = "SearchQueryError";
