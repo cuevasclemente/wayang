@@ -196,6 +196,65 @@ test("async cancellation fails safely without releasing a response", async () =>
   } finally { f.exclude(); }
 });
 
+test("production callback sends inside validation; awaited values carry no later release authority", async () => {
+  const f = fixture();
+  const events: string[] = [];
+  let sends = 0;
+  try {
+    const pending = search.runSearchAsync(f.term, {}, {
+      release: response => {
+        assert.equal(f.row.legacy_private_session_quarantine, false);
+        assert.equal(response.results[0].session_id, f.id);
+        assert.equal(response.results[0].best_message_id, "exact");
+        sends++;
+        events.push("send");
+        queueMicrotask(() => { f.exclude(); events.push("revoke"); });
+      },
+    });
+    await pending;
+    events.push("await-resumed");
+    assert.equal(sends, 1);
+    assert.deepEqual(events, ["send", "revoke", "await-resumed"]);
+  } finally { f.exclude(); }
+});
+
+test("production callback never receives stale snippets/facets after pre-release revocation", async () => {
+  const f = fixture();
+  const sentIds: string[][] = [];
+  try {
+    const pending = search.runSearchAsync(f.term, {}, {
+      release: response => {
+        sentIds.push(response.results.map(result => result.session_id));
+        assert.deepEqual(response.facets, { cwds: [], models: [] });
+      },
+    });
+    f.exclude();
+    await pending;
+    assert.deepEqual(sentIds, [[]], "only the freshly revalidated empty response may be sent");
+  } finally { f.exclude(); }
+});
+
+test("production callback failure propagates once without a duplicate send", async () => {
+  const f = fixture();
+  let sends = 0;
+  const error = new search.SearchQueryError("search_changed");
+  try {
+    await assert.rejects(search.runSearchAsync(f.term, {}, {
+      release: () => { sends++; throw error; },
+    }), (actual: unknown) => actual === error);
+    assert.equal(sends, 1);
+  } finally { f.exclude(); }
+});
+
+test("short-query responses also invoke the transport callback synchronously", async () => {
+  let sent = false;
+  const pending = search.runSearchAsync(" ", {}, {
+    release: response => { assert.deepEqual(response.results, []); sent = true; },
+  });
+  assert.equal(sent, true);
+  await pending;
+});
+
 test.after(async () => {
   await workers.stopSearchQueryWorker();
   searchDb.closeSearchDb();
