@@ -57,6 +57,7 @@ export interface SearchResponse {
   coverage?: SearchCoverage;
   /** Freshly rejected stale body coverage, aggregate only. */
   body_revision_rejected?: number;
+  metadata_revision_rejected?: number;
 }
 
 export interface SearchFilters {

@@ -51,5 +51,5 @@ function execute(message: unknown): QueryWorkerReply {
 process.once("message", (message: unknown) => {
   const reply = execute(message);
   if (!process.send) { process.exitCode = 1; return; }
-  process.send(reply, () => { if (process.connected) process.disconnect(); });
+  process.send(reply, () => { if (process.connected) process.disconnect?.(); });
 });
