@@ -833,6 +833,76 @@ test("malformed tails remain unsupported across retries rather than silently cur
   assert.equal(indexerMod.getIndexCoverageSnapshot(new Set([id])).counts.unsupported,1);
 });
 
+test("discovery visits 697 catalog IDs in bounded yielded batches without awaiting extraction", async () => {
+  indexerMod.startSearchQueue();
+  const ids=Array.from({length:697},(_,i)=>`discovery-synthetic-${i}`);
+  const observed=new Set<string>();let calls=0;let catalogs=0;
+  let release!:()=>void;const gate=new Promise<void>((resolve)=>{release=resolve;});
+  const fake:typeof indexerMod.indexSession=async(sessionId)=>{calls++;await gate;return {sessionId,chunkCount:0,skipped:true};};
+  let yielded=false;setImmediate(()=>{yielded=true;});
+  try {
+    for(let batch=0;batch<Math.ceil(ids.length/watcherMod.SEARCH_DISCOVERY_BATCH_SIZE);batch++) {
+      const before=observed.size;
+      await watcherMod.runWatcherTickForTests(fake,{resetSweep:batch===0,
+        sessionIds:()=>{catalogs++;return ids;},needsIndex:(id)=>{observed.add(id);return true;}});
+      assert.ok(observed.size-before<=16);
+    }
+    assert.equal(observed.size,697);assert.equal(catalogs,1);
+    assert.equal(calls,64,"discovery admission memory stays capped even while extraction is blocked");
+    assert.equal(yielded,true);
+    assert.ok(Math.ceil(697/16)*watcherMod.SEARCH_DISCOVERY_INTERVAL_MS<=5*60_000,
+      "nominal discovery sweep is minutes, not hundreds of minutes (excluding I/O time)");
+  } finally {release();await watcherMod.stopWatcher();indexerMod.startSearchQueue();}
+});
+
+test("cheap discovery skips unchanged bodies and notices metadata without extracting", async () => {
+  const id=seedSession({title:"Discovery metadata",transcript:[{role:"user",text:"unchanged body"}]});
+  await indexerMod.indexSession(id);
+  const stages=indexerMod.getSearchQueueStatus().publication.stageTransactions;
+  const workers=transcriptIndexMod.getStructuralTranscriptIndex().getWorkerInstrumentation().workersStarted;
+  assert.equal(indexerMod.searchSessionNeedsIndex(id),false);
+  const row=dbMod.getStore().sessions.find((candidate)=>candidate.id===id)!;
+  row.title="Changed through metadata only";dbMod.flush();
+  assert.equal(indexerMod.searchSessionNeedsIndex(id),true);
+  assert.equal(indexerMod.getSearchQueueStatus().publication.stageTransactions,stages);
+  assert.equal(transcriptIndexMod.getStructuralTranscriptIndex().getWorkerInstrumentation().workersStarted,workers);
+});
+
+test("manual corpus producers stop and drain rather than continuing admission after shutdown", async () => {
+  for(let i=0;i<3;i++)seedSession({title:`Shutdown batch ${i}`,transcript:[{role:"user",text:"synthetic body"}]});
+  let release!:()=>void;let reached!:()=>void;
+  const gate=new Promise<void>((resolve)=>{release=resolve;});
+  const paused=new Promise<void>((resolve)=>{reached=resolve;});
+  let hooks=0;
+  const batch=indexerMod.reindexAll({force:true,afterChunkingForTests:async()=>{hooks++;reached();await gate;}});
+  await paused;
+  const stopping=indexerMod.stopSearchQueue();
+  release();await stopping;
+  const summary=await batch;
+  assert.equal(hooks,1);
+  assert.ok(summary.indexed+summary.skipped<summary.total,"manual producer must break, not visit every session after stop");
+  indexerMod.startSearchQueue();
+});
+
+test("stopped owner rejects every producer before reopening or writing search.db", async () => {
+  await indexerMod.stopSearchQueue();searchDbMod.closeSearchDb();
+  const dbPath=searchDbMod.getSearchDbPath();const parked=`${dbPath}.stopped-fixture`;
+  fs.renameSync(dbPath,parked);fs.mkdirSync(dbPath);
+  try {
+    const result=await indexerMod.indexSession("stopped-synthetic",{force:true});
+    assert.match(result.error!,/owner stopped/);
+    assert.equal((await indexerMod.reindexAll({force:true})).errors,1);
+    await assert.rejects(indexerMod.removeSession("stopped-synthetic"),/owner stopped/);
+    assert.throws(()=>indexerMod.beginTranscriptMutationSearchFence("stopped-synthetic"),/owner stopped/);
+    let opens=0;
+    assert.deepEqual(indexerMod.purgePolicyDeniedSessions({ensureSearchDb:()=>{opens++;throw Error("must not open");}}),{purged:0,errors:1});
+    assert.equal(opens,0);
+    assert.equal(indexerMod.searchSessionNeedsIndex("stopped-synthetic"),false);
+    assert.throws(()=>indexerMod.getIndexCoverageSnapshot(new Set()),/owner stopped/);
+    assert.equal(fs.statSync(dbPath).isDirectory(),true);
+  } finally {fs.rmdirSync(dbPath);fs.renameSync(parked,dbPath);indexerMod.startSearchQueue();}
+});
+
 // Cleanup hook — done via process exit; we leave synthetic fixtures for inspection.
 test("close db handles", async () => {
   await indexerMod.stopSearchQueue();

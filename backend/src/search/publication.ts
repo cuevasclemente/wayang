@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import type { Database } from "better-sqlite3";
 import type { SessionRow } from "../db.js";
 import type { Chunk } from "./types.js";
+import { encodePublishedSearchSource, type PublishedSearchSource } from "./revision.js";
 import { SEARCH_MAX_DOCUMENT_BYTES, SEARCH_MAX_GENERATION_BYTES } from "./extraction.js";
 
 export const SEARCH_STAGE_MAX_ROWS = 16;
@@ -92,11 +93,13 @@ export function publishMetadata(db: Database, row: SessionRow): void {
     VALUES(?,'','',0,0,-1,'meta',?,'metadata')`).run(row.id,text);
 }
 
-export function publishGeneration(db: Database, row: SessionRow, generation: string, commitState: () => void): void {
+export function publishGeneration(db: Database, row: SessionRow, generation: string, commitState: () => void,
+  source?: PublishedSearchSource): void {
   const start = performance.now();
   db.transaction(() => {
-    db.prepare(`INSERT INTO search_publication(session_id,generation,valid) VALUES(?,?,1)
-      ON CONFLICT(session_id) DO UPDATE SET generation=excluded.generation,valid=1`).run(row.id,generation);
+    db.prepare(`INSERT INTO search_publication(session_id,generation,valid,source_revision) VALUES(?,?,1,?)
+      ON CONFLICT(session_id) DO UPDATE SET generation=excluded.generation,valid=1,source_revision=excluded.source_revision`)
+      .run(row.id,generation,source ? encodePublishedSearchSource(source) : null);
     commitState();
   })();
   metrics.maxPublishMs = Math.max(metrics.maxPublishMs,performance.now()-start);
@@ -105,13 +108,17 @@ export function publishGeneration(db: Database, row: SessionRow, generation: str
 /** At most 16 rows and 128 KiB of known text per transaction; never in the flip.
  * A legacy over-limit row is deleted alone to guarantee eventual reclamation.
  */
-export async function cleanupSearchChunks(db: Database, options: { sessionId?: string; maxBatches?: number } = {}): Promise<number> {
+export async function cleanupSearchChunks(db: Database, options: {
+  sessionId?: string; maxBatches?: number; shouldContinue?: () => boolean;
+} = {}): Promise<number> {
+  if (options.shouldContinue && !options.shouldContinue()) return 0;
   let removed = 0;
   let cursors = cleanupCursors.get(db);
   if (!cursors) { cursors = new Map(); cleanupCursors.set(db,cursors); }
   const cursorKey = options.sessionId ?? "";
   let cursor = cursors.get(cursorKey) ?? 0;
   for (let batch = 0; batch < (options.maxBatches ?? 4); batch++) {
+    if (options.shouldContinue && !options.shouldContinue()) return removed;
     // Bound the candidate scan BEFORE visibility filtering; LIMIT on matching
     // garbage alone can still walk every published row in a healthy corpus.
     const candidates = db.prepare(`WITH candidates AS MATERIALIZED (
@@ -150,6 +157,7 @@ export async function cleanupSearchChunks(db: Database, options: { sessionId?: s
     removed += ids.length;
     await yieldSearchTurn();
   }
+  if (options.shouldContinue && !options.shouldContinue()) return removed;
   if (cursor) cursors.set(cursorKey,cursor); else cursors.delete(cursorKey);
   // Candidate-bounded bookkeeping too. An active empty generation belongs to
   // a worker awaiting its first source/batch and must never be reclaimed.
@@ -198,18 +206,19 @@ export function getIndexCoverageSnapshot(db: Database, allowedIds: ReadonlySet<s
   const counts: Record<SearchOutcome | "legacy" | "missing", number> = { queued:0,running:0,current:0,metadata_only:0,partial:0,
     unsupported:0,failed:0,stale:0,legacy:0,missing:0 };
   const state = db.prepare(`SELECT w.outcome,w.requested_revision,w.successful_revision,w.dirty_since,w.queued_at,w.retry_at,
-    p.valid,s.session_id AS legacy FROM (SELECT ? AS session_id) a
+    p.valid,p.source_revision,s.session_id AS legacy FROM (SELECT ? AS session_id) a
     LEFT JOIN search_work_state w ON w.session_id=a.session_id LEFT JOIN search_publication p ON p.session_id=a.session_id
     LEFT JOIN session_index_state s ON s.session_id=a.session_id`);
   let oldestPendingAgeMs = 0;
   let retrying = 0;
   for (const id of allowedIds) {
     const row = state.get(id) as { outcome: SearchOutcome | null; requested_revision:string|null; successful_revision:string|null;
-      dirty_since:number|null;queued_at:number|null;retry_at:number|null; valid:number|null;legacy:string|null };
+      dirty_since:number|null;queued_at:number|null;retry_at:number|null; valid:number|null;source_revision:string|null;legacy:string|null };
     let outcome: keyof typeof counts = row.queued_at && row.outcome !== "running" ? "queued"
       : row.outcome ?? (row.legacy ? "legacy" : "missing");
     if (!Object.hasOwn(counts,outcome)) outcome = "unsupported";
     if ((outcome === "current" || outcome === "metadata_only") && (row.valid !== 1 || row.requested_revision !== row.successful_revision)) outcome = "stale";
+    if ((outcome === "current" || outcome === "metadata_only") && row.source_revision === null) outcome = "legacy";
     counts[outcome]++;
     if (row.retry_at) retrying++;
     if (!["current","metadata_only"].includes(outcome) && row.dirty_since) oldestPendingAgeMs = Math.max(oldestPendingAgeMs,Date.now()-row.dirty_since);

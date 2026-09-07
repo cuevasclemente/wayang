@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getConfig } from "../config.js";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 let _db: DatabaseType | null = null;
 
@@ -109,7 +109,8 @@ function applyGenerationSchema(db: DatabaseType): void {
     CREATE TABLE IF NOT EXISTS search_publication (
       session_id TEXT PRIMARY KEY,
       generation TEXT NOT NULL,
-      valid INTEGER NOT NULL DEFAULT 1
+      valid INTEGER NOT NULL DEFAULT 1,
+      source_revision TEXT
     );
     CREATE TABLE IF NOT EXISTS search_session_metadata (
       session_id TEXT PRIMARY KEY,
@@ -155,6 +156,10 @@ function applyGenerationSchema(db: DatabaseType): void {
       WHERE (p.session_id IS NULL AND c.generation='legacy')
          OR (p.valid=1 AND (c.generation=p.generation OR c.generation='metadata'));
   `);
+  const publicationColumns = db.prepare("PRAGMA table_info(search_publication)").all() as Array<{name:string}>;
+  if (!publicationColumns.some((column) => column.name === "source_revision")) {
+    db.exec("ALTER TABLE search_publication ADD COLUMN source_revision TEXT");
+  }
 }
 
 function applySchemaV1(db: DatabaseType): void {
