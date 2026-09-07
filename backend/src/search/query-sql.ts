@@ -79,6 +79,13 @@ export function queryKeywordSessions(
       FROM chunks_fts JOIN search_chunks_current c ON c.id = chunks_fts.rowid
       WHERE chunks_fts MATCH @unit_${index} AND ${where.join(" AND ")}`;
   });
+  // Coverage/lexical scores and facets still see ALL authorized matching hits.
+  // The view overlays one current session metadata projection on every row;
+  // metadata_id is only a cheap representative for those identical fields,
+  // never the message anchor. Legacy body rows are already denied above.
+  // Best-chunk aggregation/windowing is deferred until top sessions are known.
+  // BM25 still uses shared-FTS corpus statistics, including unpublished rows;
+  // visibility filtering does NOT provide staging-independent lexical ranking.
   const sql = `
     WITH body_witnesses AS MATERIALIZED (
       SELECT json_extract(value, '$.sessionId') AS session_id,
@@ -88,29 +95,31 @@ export function queryKeywordSessions(
     ),
     hits AS MATERIALIZED (${legs.join(" UNION ALL ")}),
     session_scores AS MATERIALIZED (
-      SELECT session_id, COUNT(DISTINCT unit) AS coverage, MIN(lexical) AS lexical
+      SELECT session_id, COUNT(DISTINCT unit) AS coverage, MIN(lexical) AS lexical,
+        MIN(id) AS metadata_id
       FROM hits GROUP BY session_id
     ),
-    chunk_scores AS (
-      SELECT id, session_id, COUNT(DISTINCT unit) AS coverage, MIN(lexical) AS lexical
-      FROM hits GROUP BY id, session_id
-    ),
-    ranked_chunks AS (
-      SELECT id, session_id,
-        ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY coverage DESC, lexical ASC, id ASC) AS position
-      FROM chunk_scores
-    ),
     sessions AS MATERIALIZED (
-      SELECT c.id, c.session_id, c.cwd, c.title, c.model, c.last_active,
-        c.archived, c.role, c.message_id, c.transcript_epoch, c.active_branch,
+      SELECT s.session_id, c.cwd, c.title, c.model, c.last_active, c.archived,
         s.coverage, s.lexical
-      FROM session_scores s JOIN ranked_chunks r ON r.session_id = s.session_id AND r.position = 1
-      JOIN search_chunks_current c ON c.id = r.id
+      FROM session_scores s JOIN search_chunks_current c ON c.id = s.metadata_id
     ),
     top_sessions AS MATERIALIZED (
       SELECT * FROM sessions
       ORDER BY coverage DESC, lexical ASC, last_active DESC, session_id COLLATE BINARY ASC
       LIMIT @limit
+    ),
+    selected_hits AS MATERIALIZED (
+      SELECT * FROM hits WHERE session_id IN (SELECT session_id FROM top_sessions)
+    ),
+    chunk_scores AS (
+      SELECT id, session_id, COUNT(DISTINCT unit) AS coverage, MIN(lexical) AS lexical
+      FROM selected_hits GROUP BY id, session_id
+    ),
+    ranked_chunks AS (
+      SELECT id, session_id,
+        ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY coverage DESC, lexical ASC, id ASC) AS position
+      FROM chunk_scores
     )
     SELECT
       (SELECT json_group_array(json_object(
@@ -120,7 +129,12 @@ export function queryKeywordSessions(
         'active_branch', t.active_branch, 'coverage', t.coverage, 'lexical', t.lexical,
         'snippet', (SELECT snippet(chunks_fts, 0, @mark_open, @mark_close, '…', 16)
           FROM chunks_fts WHERE chunks_fts.rowid = t.id AND chunks_fts MATCH @match)
-      )) FROM top_sessions t) AS results_json,
+      )) FROM (
+        SELECT s.*, c.id, c.role, c.message_id, c.transcript_epoch, c.active_branch
+        FROM top_sessions s JOIN ranked_chunks r ON r.session_id = s.session_id AND r.position = 1
+        JOIN search_chunks_current c ON c.id = r.id
+        ORDER BY s.coverage DESC, s.lexical ASC, s.last_active DESC, s.session_id COLLATE BINARY ASC
+      ) t) AS results_json,
       (SELECT json_group_array(json_object('value', cwd, 'count', n))
         FROM (SELECT cwd, COUNT(*) AS n FROM sessions GROUP BY cwd ORDER BY n DESC, cwd COLLATE BINARY ASC)) AS cwds_json,
       (SELECT json_group_array(json_object('value', model, 'count', n))
