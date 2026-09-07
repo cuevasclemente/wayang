@@ -5,6 +5,7 @@ import Database from "better-sqlite3";
 import { parseSearchQuery, SearchQueryError } from "./query-parser.js";
 import { queryKeywordSessions, sanitizeSnippet, MARK_OPEN, MARK_CLOSE } from "./query-sql.js";
 import type { SearchFilters } from "./types.js";
+import type { SearchBodyAuthorization } from "./query-authorization.js";
 
 function fixture() {
   const db = new Database(":memory:");
@@ -15,7 +16,7 @@ function fixture() {
       last_active INTEGER DEFAULT 1, archived INTEGER DEFAULT 0, has_error INTEGER DEFAULT 0,
       role TEXT DEFAULT 'user', text TEXT, message_id TEXT DEFAULT 'exact-message',
       transcript_epoch TEXT DEFAULT 'synthetic-epoch', active_branch INTEGER DEFAULT 1,
-      published INTEGER DEFAULT 1
+      published INTEGER DEFAULT 1, generation TEXT DEFAULT 'synthetic-generation'
     );
     CREATE INDEX chunks_session ON chunks(session_id);
     CREATE VIRTUAL TABLE chunks_fts USING fts5(text, title, goal, content='chunks', content_rowid='id',
@@ -32,8 +33,10 @@ function fixture() {
     const keys = Object.keys(fields);
     db.prepare(`INSERT INTO chunks (${keys.join(',')}) VALUES (${keys.map(key => '@' + key).join(',')})`).run(fields);
   }
-  function search(query: string, filters: SearchFilters = {}, ids = [...allowed], cwds = ["/synthetic"]) {
-    return queryKeywordSessions(db, parseSearchQuery(query), ids, cwds, filters);
+  function search(query: string, filters: SearchFilters = {}, ids = [...allowed], cwds = ["/synthetic"],
+    bodies: readonly SearchBodyAuthorization[] = ids.map(sessionId => ({ sessionId,
+      generation: "synthetic-generation", transcriptEpoch: "synthetic-epoch" }))) {
+    return queryKeywordSessions(db, parseSearchQuery(query), ids, cwds, filters, bodies);
   }
   return { db, add, search };
 }
@@ -139,6 +142,40 @@ test("current-view publication, active branch and both authorization gates prece
   } finally { f.db.close(); }
 });
 
+test("revision-bound body witnesses gate all hits, facets, coverage and limits but retain metadata", () => {
+  const f = fixture();
+  try {
+    f.add("stale", "bodycanary alpha beta", { model: "stale-model" });
+    f.add("stale", "metadataonly", { role: "meta", active_branch: 0, message_id: null });
+    f.add("valid", "bodycanary alpha");
+    const bodies = [{ sessionId: "valid", generation: "synthetic-generation", transcriptEpoch: "synthetic-epoch" }];
+    const out = f.search("bodycanary alpha beta", { limit: 1 }, ["stale", "valid"], ["/synthetic"], bodies);
+    assert.deepEqual(out.rows.map(r => [r.session_id, r.coverage]), [["valid", 2]]);
+    assert.deepEqual(out.facets.models, [{ value: "test-model", count: 1 }]);
+    assert.deepEqual(out.facets.cwds, [{ value: "/synthetic", count: 1 }]);
+    assert.equal(f.search("metadataonly", {}, ["stale"], ["/synthetic"], []).rows[0].session_id, "stale");
+    assert.equal(f.search("bodycanary", {}, ["stale"], ["/synthetic"], []).rows.length, 0);
+    for (const witness of [
+      { sessionId: "stale", generation: "wrong-generation", transcriptEpoch: "synthetic-epoch" },
+      { sessionId: "stale", generation: "synthetic-generation", transcriptEpoch: "wrong-epoch" },
+    ]) assert.equal(f.search("bodycanary", {}, ["stale"], ["/synthetic"], [witness]).rows.length, 0);
+    // The lower-level API cannot accidentally upgrade metadata IDs into body grants.
+    const missing = queryKeywordSessions(f.db, parseSearchQuery("bodycanary"), ["stale"], ["/synthetic"]);
+    assert.deepEqual(missing, { rows: [], facets: { cwds: [], models: [] } });
+  } finally { f.db.close(); }
+});
+
+test("FTS-equivalent accent and Unicode-punctuation units cannot inflate session coverage", () => {
+  const f = fixture();
+  try {
+    f.add("cafe-only", "café cafe cafe", { last_active: 999 });
+    f.add("two-units", "cafe beta", { last_active: 1 });
+    assert.deepEqual(f.search("cafe café beta").rows.map(r => [r.session_id, r.coverage]), [["two-units", 2], ["cafe-only", 1]]);
+    f.add("phrase", "alpha beta");
+    assert.deepEqual(f.search('"alpha—beta" "alpha beta"').rows.map(r => [r.session_id, r.coverage]), [["phrase", 1]]);
+  } finally { f.db.close(); }
+});
+
 test("all existing filters and text-only metadata matching are preserved", () => {
   const f = fixture();
   try {
@@ -169,7 +206,7 @@ test("view metadata overlays stamped legacy metadata for result presentation and
     f.db.exec(`DROP VIEW search_chunks_current;
       CREATE VIEW search_chunks_current AS SELECT id, session_id, cwd, 'fresh' AS title,
         'new-goal' AS goal, 'new-model' AS model, 99 AS last_active, 1 AS archived,
-        has_error, role, text, message_id, transcript_epoch, active_branch FROM chunks WHERE published = 1`);
+        has_error, role, text, message_id, transcript_epoch, active_branch, generation FROM chunks WHERE published = 1`);
     assert.equal(f.search("needle").rows.length, 0);
     const out = f.search("needle", { archived: "true", model: "new-model", since: 99, has_goal: true });
     assert.equal(out.rows[0].title, "fresh");

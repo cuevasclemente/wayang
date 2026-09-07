@@ -26,6 +26,16 @@ test("NFC/case/whitespace and equivalent punctuation units deduplicate", () => {
   assert.equal(buildFtsExpression("  \t\n "), null);
 });
 
+test("distinct units use actual unicode61 token sequences, including accents and Unicode punctuation", () => {
+  assert.deepEqual(parseSearchQuery("cafe café beta").units.map(unit => unit.text), ["cafe", "beta"]);
+  assert.equal(parseSearchQuery('"alpha—beta" "alpha beta" "alpha、beta"').units.length, 1);
+  assert.equal(parseSearchQuery('"café café" "cafe cafe"').units.length, 1);
+  assert.equal(parseSearchQuery('"alpha beta" "beta alpha" "alpha alpha"').units.length, 3);
+  assert.equal(parseSearchQuery('"cafe" "cafe cafe"').units.length, 2,
+    "phrase repetition is significant even though duplicate whole units are not");
+  assert.equal(parseSearchQuery("ł l").units.length, 2, "do not invent folds absent from unicode61");
+});
+
 test("malformed input never becomes a truncated or silently broadened query", () => {
   fails('"private canary', "unmatched_quote");
   fails('""', "empty_unit");

@@ -55,6 +55,8 @@ export interface SearchResponse {
   facets: SearchFacets;
   degraded?: "semantic_off" | "indexing_in_progress" | "indexing_paused" | "index_incomplete" | "index_unavailable";
   coverage?: SearchCoverage;
+  /** Freshly rejected stale body coverage, aggregate only. */
+  body_revision_rejected?: number;
 }
 
 export interface SearchFilters {

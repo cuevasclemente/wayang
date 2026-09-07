@@ -2,6 +2,7 @@
 import type { Database } from "better-sqlite3";
 import type { ChunkRole, SearchFacets, SearchFilters } from "./types.js";
 import { SearchQueryError, type ParsedSearchQuery } from "./query-parser.js";
+import type { SearchBodyAuthorization } from "./query-authorization.js";
 
 export const MARK_OPEN = "\u0001MARK_OPEN\u0001";
 export const MARK_CLOSE = "\u0001MARK_CLOSE\u0001";
@@ -22,13 +23,16 @@ export interface KeywordSessionRow {
   lexical: number;
 }
 
-/** Callers MUST supply freshly authorized IDs AND project roots, not catalog visibility. */
+/** Callers MUST supply fresh metadata IDs/project roots plus revision-bound body witnesses.
+ * Omitting body witnesses fails closed to metadata-only results (including legacy metadata).
+ */
 export function queryKeywordSessions(
   db: Database,
   parsed: ParsedSearchQuery,
   allowedSessionIds: string[],
   allowedCwds: string[],
   filters: SearchFilters = {},
+  bodyAuthorizations: readonly SearchBodyAuthorization[] = [],
 ): { rows: KeywordSessionRow[]; facets: SearchFacets } {
   if (!parsed.match || !allowedSessionIds.length || !allowedCwds.length) {
     return { rows: [], facets: { cwds: [], models: [] } };
@@ -37,6 +41,7 @@ export function queryKeywordSessions(
     match: parsed.match,
     policy_session_ids: JSON.stringify(allowedSessionIds),
     policy_cwds: JSON.stringify(allowedCwds),
+    body_authorizations: JSON.stringify(bodyAuthorizations),
     limit: Number.isFinite(filters.limit) ? Math.max(1, Math.min(Math.floor(filters.limit!), 100)) : 30,
     mark_open: MARK_OPEN,
     mark_close: MARK_CLOSE,
@@ -44,9 +49,12 @@ export function queryKeywordSessions(
   const where = [
     "c.session_id IN (SELECT value FROM json_each(@policy_session_ids))",
     "c.cwd IN (SELECT value FROM json_each(@policy_cwds))",
-    // Metadata remains searchable without a message anchor. Never admit a
-    // legacy/off-branch body row merely because the session is authorized.
-    "(c.role = 'meta' OR (c.role IN ('user', 'assistant') AND c.active_branch = 1))",
+    // This admission precedes every MATCH aggregation, snippet, facet and limit.
+    // Current owner authorization alone must not admit legacy or stale bodies.
+    `(c.role = 'meta' OR (c.role IN ('user', 'assistant') AND c.active_branch = 1
+      AND c.message_id IS NOT NULL
+      AND (c.session_id, c.generation, c.transcript_epoch) IN
+        (SELECT session_id, generation, transcript_epoch FROM body_witnesses)))`,
   ];
   const archived = filters.archived ?? "false";
   if (archived === "false") where.push("c.archived = 0");
@@ -72,7 +80,13 @@ export function queryKeywordSessions(
       WHERE chunks_fts MATCH @unit_${index} AND ${where.join(" AND ")}`;
   });
   const sql = `
-    WITH hits AS MATERIALIZED (${legs.join(" UNION ALL ")}),
+    WITH body_witnesses AS MATERIALIZED (
+      SELECT json_extract(value, '$.sessionId') AS session_id,
+        json_extract(value, '$.generation') AS generation,
+        json_extract(value, '$.transcriptEpoch') AS transcript_epoch
+      FROM json_each(@body_authorizations)
+    ),
+    hits AS MATERIALIZED (${legs.join(" UNION ALL ")}),
     session_scores AS MATERIALIZED (
       SELECT session_id, COUNT(DISTINCT unit) AS coverage, MIN(lexical) AS lexical
       FROM hits GROUP BY session_id
