@@ -11,7 +11,6 @@
 import { Router, type Request, type Response } from "express";
 import { listIndexableSessions } from "../search/policy-filter.js";
 import {
-  getSearchDb,
   getWatcherStatus,
   indexSession,
   reindexAll,
@@ -19,6 +18,11 @@ import {
   SCHEMA_VERSION,
 } from "../search/index.js";
 import type { SearchFilters } from "../search/index.js";
+import { SearchQueryError } from "../search/query-parser.js";
+import { getSearchStatus } from "../search/status.js";
+import { getSearchQueueStatus } from "../search/indexer.js";
+
+let fullReindex: Promise<unknown> | undefined;
 
 export const router = Router();
 
@@ -90,31 +94,32 @@ router.get("/sessions/search", (req: Request, res: Response) => {
   try {
     const response = runSearch(q, filters);
     res.json(response);
-  } catch (err: any) {
-    console.error("[search] /sessions/search failed:", err);
-    res.status(500).json({ error: err?.message || String(err) });
+  } catch (err) {
+    if (err instanceof SearchQueryError) {
+      res.status(err.code === "search_unavailable" ? 503 : 400).json({ error: err.message, code: err.code });
+    } else {
+      console.error("[search] query unavailable");
+      res.status(503).json({ error: "Search is temporarily unavailable.", code: "search_unavailable" });
+    }
   }
 });
 
 export function getSearchHealthSnapshot() {
-  const db = getSearchDb();
-  const allowedSessionIds = new Set(listIndexableSessions().map((session) => session.id));
-  const states = db
-    .prepare("SELECT session_id, error, indexed_at_ms FROM session_index_state")
-    .all() as Array<{ session_id: string; error: string | null; indexed_at_ms: number }>;
-  const allowedStates = states.filter((state) => allowedSessionIds.has(state.session_id));
-  const total = allowedSessionIds.size;
-  const indexed = allowedStates.length;
-  const errors = allowedStates
-    .filter((state) => state.error)
-    .sort((a, b) => b.indexed_at_ms - a.indexed_at_ms);
+  const allowedSessionIds = listIndexableSessions().map((session) => session.id);
+  const status = getSearchStatus(allowedSessionIds);
+  const counts = status.coverage!.counts;
+  const total = allowedSessionIds.length;
+  const indexed = counts.current + counts.metadata_only;
+  const errors = counts.failed + counts.unsupported + counts.partial;
   const watcher = getWatcherStatus();
   return {
     total_sessions: total,
     indexed_sessions: indexed,
     pending: Math.max(0, total - indexed),
-    errored: errors.length,
-    last_error: errors[0]?.error ?? watcher.lastError ?? undefined,
+    errored: errors,
+    last_error: errors ? "Some eligible sessions have incomplete or failed indexing." : watcher.lastError ? "Search maintenance is degraded." : undefined,
+    ...status,
+    queue: getSearchQueueStatus(),
     schema_version: SCHEMA_VERSION,
     embedder: "off" as const,
     watcher: {
@@ -131,8 +136,8 @@ export function getSearchHealthSnapshot() {
 router.get("/sessions/search/health", (_req: Request, res: Response) => {
   try {
     res.json(getSearchHealthSnapshot());
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message || String(err) });
+  } catch {
+    res.status(503).json({ error: "Search health is temporarily unavailable." });
   }
 });
 
@@ -146,15 +151,16 @@ router.post("/sessions/search/reindex", async (req: Request, res: Response) => {
     }
     // Async: kick off and return immediately so the client isn't blocked on
     // the full corpus pass.
-    reindexAll({ force: true })
+    fullReindex ??= reindexAll({ force: true })
       .then((summary) =>
         console.log(
           `[search] reindex(force) summary total=${summary.total} indexed=${summary.indexed} errors=${summary.errors}`,
         ),
       )
-      .catch((err) => console.error("[search] reindex(force) failed:", err));
+      .catch(() => console.error("[search] manual reindex failed"))
+      .finally(() => { fullReindex = undefined; });
     res.status(202).json({ queued: -1, note: "background_reindex_started" });
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message || String(err) });
+  } catch {
+    res.status(503).json({ error: "Search indexing is temporarily unavailable." });
   }
 });

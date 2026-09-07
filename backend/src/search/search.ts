@@ -2,7 +2,7 @@
 import { buildProjectPolicyProjection } from "../policy.js";
 import { getSearchDb } from "./db.js";
 import { listIndexableSessions } from "./policy-filter.js";
-import { getWatcherStatus } from "./watcher.js";
+import { getSearchStatus } from "./status.js";
 import { parseSearchQuery, SearchQueryError } from "./query-parser.js";
 import { queryKeywordSessions, sanitizeSnippet } from "./query-sql.js";
 import type { SearchFilters, SearchResponse, SearchResult } from "./types.js";
@@ -19,13 +19,15 @@ export function runSearch(query: string, filters: SearchFilters = {}): SearchRes
   if (trimmed.length < 2 || !parsed.match) return emptyResponse(trimmed, start);
 
   let matched: ReturnType<typeof queryKeywordSessions>;
+  let status: Pick<SearchResponse, "coverage" | "degraded">;
   try {
     // Exact query-time authorization is independent of physical purge success.
     // Catalog visibility alone does not authorize search content or facets.
     const allowedCwds = buildProjectPolicyProjection().projects
       .filter((project) => project.global_index).map((project) => project.cwd);
     const allowedSessionIds = listIndexableSessions().map((session) => session.id);
-    if (!allowedCwds.length || !allowedSessionIds.length) return emptyResponse(trimmed, start);
+    status = getSearchStatus(allowedSessionIds);
+    if (!allowedCwds.length || !allowedSessionIds.length) return { ...emptyResponse(trimmed, start), ...status };
     matched = queryKeywordSessions(getSearchDb(), parsed, allowedSessionIds, allowedCwds, filters);
   } catch {
     throw new SearchQueryError("search_unavailable");
@@ -50,20 +52,18 @@ export function runSearch(query: string, filters: SearchFilters = {}): SearchRes
   }));
   return {
     ...emptyResponse(trimmed, start),
+    ...status,
     results,
     facets: matched.facets,
   };
 }
 
 function emptyResponse(q: string, startedAt: number): SearchResponse {
-  const watcher = getWatcherStatus();
-  const degraded =
-    !watcher.backfillDone && watcher.backfillRunning ? ("indexing_in_progress" as const) : undefined;
   return {
     query: q,
     took_ms: Math.round((performance.now() - startedAt) * 10) / 10,
     results: [],
     facets: { cwds: [], models: [] },
-    degraded,
+    ...getSearchStatus(),
   };
 }
