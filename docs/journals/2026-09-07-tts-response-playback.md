@@ -36,6 +36,10 @@ Release commit `5a533da` contains only the TTS patch on that baseline. Cherry-pi
 
 ## Activation status
 
-Prepared and validated; runtime publication/restart verification to be recorded below. No canonical dependency install, Pi/myPi upgrade, service environment edit, private-state migration, remote push, or Tribe-Mac activation is authorized by this TTS-only release.
+Published TTS-only release `5a533da` to The-Sceptre: additive frontend assets and atomic index, plus exactly `backend/dist/tts-text.js` and `backend/dist/routes/tts.js` staged for restart. All 788 other backend files remain byte-identical. Source main fast-forwarded to `7f8da26` without canonical build/install. No Pi/myPi upgrade, service environment edit, private-state migration, remote push, or Tribe-Mac activation.
+
+HTTP bytes verified for index, main JS, CSS, PDF chunk and worker; health HTTP 200, backend PID still 439605 before restart. Main asset `assets/index-BAoLPaRq.js`; index SHA256 `6f240cd8a91539b2af79e38e03e3e611a1f223d50976dad461a5b223865598e0`. Exact uninstrumented release assets additionally passed all 9 TTS browser tests against an isolated preview server without rebuilding. Durable rollback: `/home/clemente/src/wayang-release-backups/tts-20260907` (previous modules/index, before/published hashes). Old frontend assets retained.
+
+Backend remains staged until normal privileged restart approval and observed post-restart verification. Do not report staged code as loaded. Memoriki handoff: `synthesis/wayang-tts-current.md`.
 
 Expected runtime allowlist: `backend/dist/tts-text.js`, `backend/dist/routes/tts.js`, new hashed frontend assets, and atomic `frontend/dist/index.html`. Preserve all other backend bytes/dependencies and old frontend assets. Keep backups of the two previous backend modules and frontend index before publication. Restart requires the normal privileged approval tool; record scheduled versus observed activation accurately. A source main merge must not run canonical build/install.
