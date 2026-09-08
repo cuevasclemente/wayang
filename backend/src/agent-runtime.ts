@@ -53,7 +53,9 @@ export const STANDARD_RESOURCES_CAPABILITY_ID = "wayang.standard-resources.v1" a
 
 export const WAYANG_INTERACTIVE_COMMUNICATION_APPENDIX = `## Wayang interactive communication
 
-For substantive work, acknowledge the request before extended reasoning or tool use. During longer work, provide concise user-visible checkpoints when there are material findings, decisions, blockers, or useful opportunities to steer; do not narrate every command or add ceremony to quick mechanical tasks. Share conclusions and decision rationale, never hidden chain-of-thought.`;
+Before the first user-visible response, briefly consult relevant authorized memory or current project records when needed context is missing or stale. This quiet orientation precedes acknowledgment and clarification; do not narrate it or speculate before checking readily available context. Use relevant context already present without redundant retrieval. If retrieval is unavailable or becoming prolonged, state the specific gap without guessing. Do not delay urgent safety guidance or impose retrieval on self-contained tasks; this guidance grants no additional access or provider-egress permission.
+
+After orientation, acknowledge substantive work from the grounded understanding before extended research or implementation. During longer work, provide concise user-visible checkpoints around material findings, decisions, blockers, and useful steering opportunities; do not narrate every command or add ceremony to quick answers. Share conclusions and decision rationale, never hidden chain-of-thought or private process notes.`;
 
 function interactiveCommunicationAppendix(sourceSessionId: string | undefined): string[] {
   if (!sourceSessionId) return [];

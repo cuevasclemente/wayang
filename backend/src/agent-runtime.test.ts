@@ -314,6 +314,20 @@ test("memory-first privacy routing gives Standard Memoriki guidance and Protecte
   assert.doesNotMatch(protectedPrompt, /source[-_ ]?session|project[-_ ]?id/i);
 });
 
+test("interactive communication orders bounded orientation before acknowledgment without expanding authority", () => {
+  const prompt = WAYANG_INTERACTIVE_COMMUNICATION_APPENDIX;
+  assert.match(prompt, /Before the first user-visible response/);
+  assert.match(prompt, /authorized memory or current project records/);
+  assert.match(prompt, /quiet orientation precedes acknowledgment and clarification/);
+  assert.match(prompt, /without redundant retrieval/);
+  assert.match(prompt, /unavailable or becoming prolonged/);
+  assert.match(prompt, /Do not delay urgent safety guidance/);
+  assert.match(prompt, /grants no additional access or provider-egress permission/);
+  assert.ok(prompt.indexOf("Before the first user-visible response") < prompt.indexOf("After orientation, acknowledge"));
+  assert.doesNotMatch(prompt, /acknowledge the request before extended reasoning or tool use/);
+  assert.doesNotMatch(prompt, /Memoriki|Wren|Clemente|GLM|Sol|\/home\//);
+});
+
 test("interactive communication appendix reaches restricted and Standard sessions but not scheduled runs", async () => {
   const f = fixture("wayang-runtime-interactive-communication-");
   try {
@@ -345,6 +359,24 @@ test("interactive communication appendix reaches restricted and Standard session
     assert.equal(standard.restricted, false);
     assert.deepEqual(standard.resourceLoader.getAppendSystemPrompt(), [
       "synthetic global append",
+      "synthetic profile overlay",
+      WAYANG_INTERACTIVE_COMMUNICATION_APPENDIX,
+    ]);
+
+    const protectedCwd = path.join(f.dir, "protected-project");
+    fs.mkdirSync(protectedCwd, { recursive: true });
+    const protectedProject = createProject({
+      cwd: protectedCwd,
+      default_agent_profile_id: profile.id,
+      access_policy: { privacy_mode: "protected", allowed_agent_profile_ids: [profile.id] },
+    });
+    const protectedSession = createSession(protectedProject.cwd, { agentProfileId: profile.id });
+    const restricted = await buildAgentResourceLoader({
+      cwd: protectedProject.cwd, agentDir: f.agentDir, agentProfile: profile,
+      project: protectedProject, sourceSessionId: protectedSession.id,
+    });
+    assert.equal(restricted.restricted, true);
+    assert.deepEqual(restricted.resourceLoader.getAppendSystemPrompt(), [
       "synthetic profile overlay",
       WAYANG_INTERACTIVE_COMMUNICATION_APPENDIX,
     ]);
