@@ -1552,9 +1552,21 @@ const DEFAULT_MODELS: Record<string, string> = {
 
 /** Providers intentionally unavailable through Wayang, without deleting pi auth. */
 const WAYANG_HIDDEN_PROVIDERS = new Set(["openrouter"]);
+/** Curated discovery lanes; other existing sessions remain resolvable. */
+const WAYANG_CATALOG_PROVIDERS = new Set([
+  "moonshotai",
+  "openai-codex",
+  "openrouter-zdr",
+  "together",
+  "zai",
+]);
 
 export function isWayangProviderVisible(provider: string): boolean {
   return !WAYANG_HIDDEN_PROVIDERS.has(provider);
+}
+
+export function isWayangCatalogProviderVisible(provider: string): boolean {
+  return WAYANG_CATALOG_PROVIDERS.has(provider);
 }
 
 /** Provider → env var name(s) mapping for auto-detection */
@@ -2175,11 +2187,12 @@ export async function listModels(options: {
     options.reviewedExternalModels ?? REVIEWED_EXTERNAL_MODELS,
   );
   const models = uniqueModels([...dynamicModels.models, ...registry.getAll()])
-    .filter((model) => isWayangProviderVisible(String(model.provider)))
+    .filter((model) => isWayangCatalogProviderVisible(String(model.provider)))
     .filter((model) => String(model.provider) !== "together" || isCuratedTogetherModel(model.id))
     .map((model) => modelToWebInfo(registry, model));
   const seenModelKeys = new Set(models.map((model) => dynamicModelKey(model.provider, model.id)));
   for (const model of reviewed.models) {
+    if (!isWayangCatalogProviderVisible(model.provider)) continue;
     const key = dynamicModelKey(model.provider, model.id);
     if (!seenModelKeys.has(key)) {
       models.push(model);
