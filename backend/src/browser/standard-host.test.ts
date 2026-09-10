@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 import type { ProtectedBrowserBinding, ProtectedBrowserOperation } from "./types.js";
-import { StandardBrowserProfileHost, type StandardBrowserHostBackend, type StandardBrowserHostBackendCallbacks } from "./standard-host.js";
+import { StandardBrowserProfileHost, STANDARD_BROWSER_WORKSPACE_CLEANUP_GRACE_MS, type StandardBrowserHostBackend, type StandardBrowserHostBackendCallbacks } from "./standard-host.js";
 import type { BrowserProfileRow } from "./profile-catalog-store.js";
 import { BrowserStorageOwnershipRegistry } from "./profile-storage-registry.js";
 
@@ -22,6 +22,7 @@ class FakeBackend implements StandardBrowserHostBackend {
   viewerAttachGate: Promise<void> | null = null;
   viewerAttachmentCloses = 0;
   executeGate: Promise<void> | null = null;
+  closeGate: Promise<void> | null = null;
   private serial = 0;
   constructor(private readonly callbacks: StandardBrowserHostBackendCallbacks) {
     this.targets.set("restored", { id: "restored", url: "https://restore.invalid" });
@@ -39,10 +40,16 @@ class FakeBackend implements StandardBrowserHostBackend {
     return { ...target };
   }
   async closeTarget(targetId: string) {
+    if (this.closeGate) await this.closeGate;
     this.closed.push(targetId);
     if (this.closeFailures.has(targetId)) throw new Error("synthetic target close failed");
     this.targets.delete(targetId);
     this.callbacks.targetDestroyed(targetId);
+  }
+  simulateUnexpectedExit() {
+    this.running = false;
+    this.targets.clear();
+    this.callbacks.unexpectedExit();
   }
   async cancelDownload(guid: string) { this.canceledDownloads.push(guid); }
   async execute(targetId: string, operation: ProtectedBrowserOperation, authorize: () => Promise<void>) {
@@ -243,6 +250,123 @@ test("cleanup generation includes failed closed records for exact retry", async 
     await f.host.closeWorkspace(exact.sourceSessionId, "cleanup_retry", 123, captured);
     assert.equal(f.host.workspaceCleanupGeneration(exact.sourceSessionId), null);
     assert.equal(f.host.emptySinceTimestamp(), 123);
+  } finally { f.backend().closeFailures.clear(); await f.host.close(); }
+});
+
+test("stopped backend cleanup reaches a terminal state and unblocks workspace rebinding", async () => {
+  const f = hostFixture();
+  try {
+    const exact = binding("session-a");
+    const workspace = f.host.bindWorkspace(exact);
+    await f.host.execute(exact, workspace.generation, { kind: "start" });
+    const target = [...f.backend().targets.keys()][0]!;
+    f.backend().closeFailures.add(target);
+    await assert.rejects(f.host.closeWorkspace(exact.sourceSessionId, "archive"), /cleanup is pending/);
+    assert.throws(() => f.host.bindWorkspace(binding("session-a", "replacement-runtime")), /cleanup is pending/);
+    // The backend exits without delivering destruction events for its targets.
+    await f.backend().stop();
+    await f.host.closeWorkspace(exact.sourceSessionId, "cleanup_retry");
+    assert.deepEqual(f.host.cleanupPendingSessionIds(), []);
+    assert.doesNotThrow(() => f.host.bindWorkspace(binding("session-a", "replacement-runtime")));
+  } finally { f.backend().closeFailures.clear(); await f.host.close(); }
+});
+
+test("aged pending workspace cleanup releases the session for a replacement bind", async () => {
+  const f = hostFixture();
+  try {
+    const aged = Date.now() - (STANDARD_BROWSER_WORKSPACE_CLEANUP_GRACE_MS + 1000);
+    const fresh = binding("session-a");
+    const freshWorkspace = f.host.bindWorkspace(fresh);
+    await f.host.execute(fresh, freshWorkspace.generation, { kind: "start" });
+    const freshTarget = [...f.backend().targets.keys()][0]!;
+    f.backend().closeFailures.add(freshTarget);
+    await assert.rejects(f.host.closeWorkspace(fresh.sourceSessionId, "archive"), /cleanup is pending/);
+    // Inside the grace window the pending drain still fences a replacement bind.
+    assert.throws(() => f.host.bindWorkspace(binding("session-a", "replacement-runtime")), /cleanup is pending/);
+    assert.equal(f.host.canBindWorkspace(fresh.sourceSessionId), false);
+
+    // Past the grace window the stale record may no longer block a new runtime.
+    const agedBinding = binding("session-b");
+    const agedWorkspace = f.host.bindWorkspace(agedBinding);
+    await f.host.execute(agedBinding, agedWorkspace.generation, { kind: "start" });
+    const agedTarget = [...f.backend().targets.keys()].find((id) => id !== freshTarget)!;
+    f.backend().closeFailures.add(agedTarget);
+    await assert.rejects(f.host.closeWorkspace(agedBinding.sourceSessionId, "archive", aged), /cleanup is pending/);
+    assert.equal(f.host.canBindWorkspace(agedBinding.sourceSessionId), true);
+    const replacement = f.host.bindWorkspace(binding("session-b", "replacement-runtime"));
+    assert.notEqual(replacement.generation, agedWorkspace.generation);
+    assert.equal(f.host.workspaceCleanupGeneration(agedBinding.sourceSessionId), replacement.generation);
+    assert.equal(f.host.cleanupPendingSessionIds().includes(agedBinding.sourceSessionId), false);
+    // The wedged leftover tab stays a bounded backend-lifecycle concern.
+    assert.equal(f.backend().targets.has(agedTarget), true);
+    await f.host.closeWorkspace(agedBinding.sourceSessionId, "archive", 123, replacement.generation);
+    assert.equal(f.host.workspaceCleanupGeneration(agedBinding.sourceSessionId), null);
+  } finally { f.backend().closeFailures.clear(); await f.host.close(); }
+});
+
+test("unexpected backend exit finalizes pending closed workspaces immediately", async () => {
+  const f = hostFixture();
+  try {
+    const exact = binding("session-a");
+    const workspace = f.host.bindWorkspace(exact);
+    await f.host.execute(exact, workspace.generation, { kind: "start" });
+    const target = [...f.backend().targets.keys()][0]!;
+    f.backend().closeFailures.add(target);
+    await assert.rejects(f.host.closeWorkspace(exact.sourceSessionId, "archive"), /cleanup is pending/);
+    assert.deepEqual(f.host.cleanupPendingSessionIds(), [exact.sourceSessionId]);
+    f.backend().simulateUnexpectedExit();
+    assert.deepEqual(f.host.cleanupPendingSessionIds(), []);
+    assert.doesNotThrow(() => f.host.bindWorkspace(binding("session-a", "replacement-runtime")));
+  } finally { f.backend().closeFailures.clear(); await f.host.close(); }
+});
+
+test("replacement bind after the grace window fences an in-flight drain from the fresh record", async () => {
+  const f = hostFixture();
+  let releaseClose!: () => void;
+  const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+  let closing: Promise<void> | undefined;
+  try {
+    const exact = binding("session-a");
+    const workspace = f.host.bindWorkspace(exact);
+    await f.host.execute(exact, workspace.generation, { kind: "start" });
+    const target = [...f.backend().targets.keys()][0]!;
+    f.backend().closeGate = closeGate;
+    const aged = Date.now() - (STANDARD_BROWSER_WORKSPACE_CLEANUP_GRACE_MS + 1000);
+    closing = f.host.closeWorkspace(exact.sourceSessionId, "archive", aged);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(f.host.cleanupPendingSessionIds().length, 1);
+    const replacement = f.host.bindWorkspace(binding("session-a", "replacement-runtime"));
+    assert.notEqual(replacement.generation, workspace.generation);
+    releaseClose();
+    await closing;
+    assert.equal(f.host.hasWorkspace(exact.sourceSessionId, replacement.generation), true, "old drain deleted the replacement record");
+    assert.equal(f.backend().targets.has(target), false);
+    await f.host.closeWorkspace(exact.sourceSessionId, "archive", 123, replacement.generation);
+    assert.equal(f.host.workspaceCleanupGeneration(exact.sourceSessionId), null);
+  } finally {
+    releaseClose();
+    await Promise.allSettled([closing]);
+    f.backend().closeGate = null;
+    await f.host.close();
+  }
+});
+
+test("sweep retry after a grace recovery never closes the replacement record", async () => {
+  const f = hostFixture();
+  try {
+    const exact = binding("session-a");
+    const workspace = f.host.bindWorkspace(exact);
+    await f.host.execute(exact, workspace.generation, { kind: "start" });
+    const target = [...f.backend().targets.keys()][0]!;
+    f.backend().closeFailures.add(target);
+    const aged = Date.now() - (STANDARD_BROWSER_WORKSPACE_CLEANUP_GRACE_MS + 1000);
+    await assert.rejects(f.host.closeWorkspace(exact.sourceSessionId, "archive", aged), /cleanup is pending/);
+    const pending = f.host.cleanupPendingSessionIds();
+    // A replacement bind lands between the sweep snapshot and its retry.
+    const replacement = f.host.bindWorkspace(binding("session-a", "replacement-runtime"));
+    await f.host.retryPendingWorkspaceCleanup(pending[0]!, 123);
+    assert.equal(f.host.hasWorkspace(exact.sourceSessionId, replacement.generation), true);
+    assert.equal(f.host.cleanupPendingSessionIds().includes(exact.sourceSessionId), false);
   } finally { f.backend().closeFailures.clear(); await f.host.close(); }
 });
 

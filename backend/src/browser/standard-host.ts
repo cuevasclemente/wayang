@@ -17,6 +17,9 @@ export const MAX_STANDARD_BROWSER_MUTATION_QUEUE = 32;
 export const MAX_STANDARD_BROWSER_DOWNLOADS_PER_WORKSPACE = 4;
 export const MAX_STANDARD_BROWSER_DOWNLOADS_PER_HOST = 16;
 export const MAX_STANDARD_BROWSER_STAGED_BYTES_PER_HOST = 256 * 1024 * 1024;
+/** A closed workspace blocks a replacement bind at most this long, even when
+ * its target cleanup keeps failing against a dead or wedged backend. */
+export const STANDARD_BROWSER_WORKSPACE_CLEANUP_GRACE_MS = 5 * 60 * 1000;
 
 function agentVisibleUrl(value: string | undefined): string | undefined {
   if (!value) return undefined;
@@ -134,6 +137,7 @@ interface WorkspaceRecord {
   binding: ProtectedBrowserBinding;
   latestDownload?: InteractiveBrowserDownloadState;
   closed: boolean;
+  closedAt: number;
   cleanupPromise?: Promise<void>;
 }
 
@@ -235,7 +239,8 @@ export class StandardBrowserProfileHost {
 
   canBindWorkspace(sourceSessionId: string): boolean {
     const workspace = this.workspaces.get(sourceSessionId);
-    return Boolean(workspace && !workspace.closed) || (!workspace && this.workspaces.size < MAX_STANDARD_BROWSER_WORKSPACES_PER_HOST);
+    if (!workspace) return this.workspaces.size < MAX_STANDARD_BROWSER_WORKSPACES_PER_HOST;
+    return !workspace.closed || this.closedWorkspaceRecoverable(workspace);
   }
 
   bindWorkspace(binding: Readonly<ProtectedBrowserBinding>): { generation: string; reused: boolean } {
@@ -248,7 +253,15 @@ export class StandardBrowserProfileHost {
       workspace.lastActivityAt = Date.now();
       return { generation: workspace.generation, reused: true };
     }
-    if (workspace?.closed) throw new Error("Standard browser workspace cleanup is pending");
+    if (workspace?.closed) {
+      // The old runtime generation was already torn down by an authorized
+      // close; a stuck drain must never block a replacement runtime forever.
+      if (!this.closedWorkspaceRecoverable(workspace)) {
+        throw new Error("Standard browser workspace cleanup is pending");
+      }
+      this.finalizeClosedWorkspace(workspace);
+      workspace = undefined;
+    }
     if (this.workspaces.size >= MAX_STANDARD_BROWSER_WORKSPACES_PER_HOST) {
       throw new Error("Standard Browser Profile workspace limit reached");
     }
@@ -266,10 +279,33 @@ export class StandardBrowserProfileHost {
       controlTransition: false,
       binding: { ...binding },
       closed: false,
+      closedAt: 0,
     };
     this.workspaces.set(binding.sourceSessionId, workspace);
     this.emptySince = null;
     return { generation: workspace.generation, reused: false };
+  }
+
+  /** Whether a closed workspace record can no longer protect anything and a
+   * replacement bind may finalize it instead of waiting for its drain. */
+  private closedWorkspaceRecoverable(workspace: WorkspaceRecord): boolean {
+    return workspace.targets.size === 0
+      || !this.backend.running
+      || Date.now() - workspace.closedAt >= STANDARD_BROWSER_WORKSPACE_CLEANUP_GRACE_MS;
+  }
+
+  /** Drop a closed workspace record whose leftover cleanup is best-effort;
+   * any in-flight drain keeps operating on its own detached record. */
+  private finalizeClosedWorkspace(workspace: WorkspaceRecord): void {
+    for (const targetId of [...workspace.targets.keys()]) {
+      if (this.targetOwners.get(targetId) === workspace.sourceSessionId) this.targetOwners.delete(targetId);
+    }
+    workspace.targets.clear();
+    workspace.activeTargetId = null;
+    if (this.workspaces.get(workspace.sourceSessionId) === workspace) {
+      this.workspaces.delete(workspace.sourceSessionId);
+      if (this.workspaces.size === 0) this.emptySince = Date.now();
+    }
   }
 
   private exactWorkspace(binding: Readonly<ProtectedBrowserBinding>, workspaceGeneration: string): WorkspaceRecord {
@@ -809,7 +845,12 @@ export class StandardBrowserProfileHost {
 
   private onUnexpectedExit(): void {
     this.startupReconciled = false;
-    for (const workspace of this.workspaces.values()) {
+    for (const workspace of [...this.workspaces.values()]) {
+      if (workspace.closed) {
+        // The backend is gone, so its pending cleanup can protect nothing.
+        this.finalizeClosedWorkspace(workspace);
+        continue;
+      }
       workspace.targets.clear();
       workspace.activeTargetId = null;
       workspace.controlGeneration += 1;
@@ -1114,6 +1155,15 @@ export class StandardBrowserProfileHost {
       .map((workspace) => workspace.sourceSessionId);
   }
 
+  /** Retry only an already-closed record's drain. A replacement bind after
+   * grace recovery owns the session's live record and must never be closed
+   * by a stale sweep snapshot. */
+  async retryPendingWorkspaceCleanup(sourceSessionId: string, closedAt = Date.now()): Promise<void> {
+    const workspace = this.workspaces.get(sourceSessionId);
+    if (!workspace?.closed) return;
+    return this.closeWorkspace(sourceSessionId, "cleanup_retry", closedAt, workspace.generation);
+  }
+
   emptySinceTimestamp(): number | null {
     return this.workspaces.size === 0 && !this.vncController ? this.emptySince : null;
   }
@@ -1151,6 +1201,7 @@ export class StandardBrowserProfileHost {
     void (async () => {
       if (!workspace.closed) {
         workspace.closed = true;
+        workspace.closedAt = closedAt;
         workspace.runtimeGeneration = null;
         await Promise.all([
           this.closeWorkspaceViewers(sourceSessionId),
@@ -1162,18 +1213,29 @@ export class StandardBrowserProfileHost {
       const failures: unknown[] = [];
       for (const targetId of [...workspace.targets.keys()]) {
         try {
-          await this.backend.closeTarget(targetId);
+          // A stopped backend cannot own live targets; its bookkeeping is
+          // already torn down, so cleanup always reaches a terminal state.
+          if (this.backend.running) await this.backend.closeTarget(targetId);
           if (this.targetOwners.get(targetId) === sourceSessionId) this.targetOwners.delete(targetId);
           workspace.targets.delete(targetId);
         } catch (error) {
-          // A destruction event may have won the race with a rejected close.
-          if (workspace.targets.has(targetId)) failures.push(error);
+          if (workspace.targets.has(targetId) && this.backend.running) {
+            // A destruction event may have won the race with a rejected close.
+            failures.push(error);
+            continue;
+          }
+          if (this.targetOwners.get(targetId) === sourceSessionId) this.targetOwners.delete(targetId);
+          workspace.targets.delete(targetId);
         }
       }
       if (workspace.targets.size === 0) {
         workspace.activeTargetId = null;
-        this.workspaces.delete(sourceSessionId);
-        if (this.workspaces.size === 0) this.emptySince = closedAt;
+        // A replacement bind may have re-bound this session with a fresh
+        // record; only the exact original record may be deleted here.
+        if (this.workspaces.get(sourceSessionId) === workspace) {
+          this.workspaces.delete(sourceSessionId);
+          if (this.workspaces.size === 0) this.emptySince = closedAt;
+        }
       }
       if (failures.length > 0) throw new AggregateError(failures, "Standard browser workspace cleanup is pending");
     })().then(
