@@ -51,6 +51,50 @@ test("workspace tool assembly is Standard-interactive only and preserves exact n
   ]);
 });
 
+test("workspace tool schemas use provider-compatible top-level objects", () => {
+  for (const tool of createWorkspaceToolDefinitions({ sourceSessionId: "immutable-source" })) {
+    const parameters = tool.parameters as Record<string, unknown>;
+    assert.equal(parameters.type, "object", `${tool.name} parameters must be a top-level object`);
+    assert.equal("anyOf" in parameters, false, `${tool.name} must not use a top-level anyOf`);
+    assert.equal("oneOf" in parameters, false, `${tool.name} must not use a top-level oneOf`);
+  }
+});
+
+test("workspace read tool retains strict action-specific fields behind its object schema", async () => {
+  const calls: Array<{ sourceSessionId: string; request: unknown }> = [];
+  const service = {
+    async read(sourceSessionId: string, request: unknown) {
+      calls.push({ sourceSessionId, request });
+      return { ok: true };
+    },
+  };
+  const read = createWorkspaceToolDefinitions({ sourceSessionId: "immutable-source", service: service as any })
+    .find((tool) => tool.name === WAYANG_WORKSPACE_READ_TOOL_NAME)!;
+  const execute = read.execute as any;
+  const valid = [
+    { action: "get_workspace_settings" },
+    { action: "get_agent_profile_references", id: "profile" },
+    { action: "list_projects" },
+    { action: "get_project", id: "project" },
+    { action: "list_agent_profiles" },
+    { action: "get_agent_profile", id: "profile" },
+    { action: "get_project_instructions_metadata", project_id: "project" },
+    { action: "get_project_instructions", project_id: "project" },
+  ];
+
+  for (const params of valid) await execute("synthetic-call", params);
+  assert.deepEqual(calls, valid.map((request) => ({ sourceSessionId: "immutable-source", request })));
+
+  for (const params of [
+    { action: "get_project" },
+    { action: "list_projects", id: "incompatible" },
+    { action: "get_project", id: "project", project_id: "incompatible" },
+  ]) {
+    await assert.rejects(() => execute("synthetic-invalid", params), /requires id|incompatible fields/);
+  }
+  assert.equal(calls.length, valid.length, "invalid action shapes must not reach the workspace service");
+});
+
 test("workspace change tool schema accepts explicit null default pairs and stays strict", () => {
   const change = createWorkspaceToolDefinitions({ sourceSessionId: "immutable-source" })
     .find((tool) => tool.name === WAYANG_WORKSPACE_CHANGE_TOOL_NAME)!;

@@ -101,16 +101,56 @@ const Mutation = Type.Union([
   }, { additionalProperties: false }),
 ]);
 
-const ReadParameters = Type.Union([
-  Type.Object({ action: Type.Literal("get_workspace_settings") }, { additionalProperties: false }),
-  Type.Object({ action: Type.Literal("get_agent_profile_references"), id: Type.String() }, { additionalProperties: false }),
-  Type.Object({ action: Type.Literal("list_projects") }, { additionalProperties: false }),
-  Type.Object({ action: Type.Literal("get_project"), id: Type.String() }, { additionalProperties: false }),
-  Type.Object({ action: Type.Literal("list_agent_profiles") }, { additionalProperties: false }),
-  Type.Object({ action: Type.Literal("get_agent_profile"), id: Type.String() }, { additionalProperties: false }),
-  Type.Object({ action: Type.Literal("get_project_instructions_metadata"), project_id: Type.String() }, { additionalProperties: false }),
-  Type.Object({ action: Type.Literal("get_project_instructions"), project_id: Type.String() }, { additionalProperties: false }),
-]);
+// OpenAI-compatible APIs require tool parameters to be a top-level object.
+// Keep action-specific strictness in canonicalizeReadAction rather than using a
+// top-level union, which some providers reject before inference begins.
+const ReadParameters = Type.Object({
+  action: Type.Union([
+    Type.Literal("get_workspace_settings"),
+    Type.Literal("get_agent_profile_references"),
+    Type.Literal("list_projects"),
+    Type.Literal("get_project"),
+    Type.Literal("list_agent_profiles"),
+    Type.Literal("get_agent_profile"),
+    Type.Literal("get_project_instructions_metadata"),
+    Type.Literal("get_project_instructions"),
+  ]),
+  id: Type.Optional(Type.String()),
+  project_id: Type.Optional(Type.String()),
+}, { additionalProperties: false });
+
+function canonicalizeReadAction(params: Record<string, unknown>): WorkspaceReadAction {
+  const requireExactFields = (...fields: string[]): void => {
+    const expected = new Set(["action", ...fields]);
+    if (Object.keys(params).some((key) => !expected.has(key))) {
+      throw new WorkspaceStoreError(`Workspace read action ${String(params.action)} received incompatible fields`);
+    }
+    for (const field of fields) {
+      if (typeof params[field] !== "string") {
+        throw new WorkspaceStoreError(`Workspace read action ${String(params.action)} requires ${field}`);
+      }
+    }
+  };
+
+  switch (params.action) {
+    case "get_workspace_settings":
+    case "list_projects":
+    case "list_agent_profiles":
+      requireExactFields();
+      return { action: params.action };
+    case "get_agent_profile_references":
+    case "get_project":
+    case "get_agent_profile":
+      requireExactFields("id");
+      return { action: params.action, id: params.id as string };
+    case "get_project_instructions_metadata":
+    case "get_project_instructions":
+      requireExactFields("project_id");
+      return { action: params.action, project_id: params.project_id as string };
+    default:
+      throw new WorkspaceStoreError("Unknown workspace read action");
+  }
+}
 
 function textResult(value: unknown) {
   const serialized = JSON.stringify(value);
@@ -137,7 +177,7 @@ export function createWorkspaceToolDefinitions(options: WorkspaceToolFactoryOpti
     ],
     parameters: ReadParameters,
     async execute(_toolCallId, params) {
-      return textResult(await service.read(sourceSessionId, params as WorkspaceReadAction));
+      return textResult(await service.read(sourceSessionId, canonicalizeReadAction(params)));
     },
   });
 
