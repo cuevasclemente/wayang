@@ -455,7 +455,7 @@ export class StandardBrowserProfileHostService implements InteractiveBrowserSess
     for (const [profileId, host] of [...this.hosts]) {
       for (const sourceSessionId of host.cleanupPendingSessionIds()) {
         try {
-          await host.closeWorkspace(sourceSessionId, "cleanup_retry", now);
+          await host.retryPendingWorkspaceCleanup(sourceSessionId, now);
           const leases = this.workspaceLeases.get(sourceSessionId);
           leases?.delete(profileId);
           if (leases?.size === 0) this.workspaceLeases.delete(sourceSessionId);
