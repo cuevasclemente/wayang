@@ -40,6 +40,7 @@ import {
   latchPiSessionCapabilityDenial,
   interviewSubmissionContent,
   isCuratedTogetherModel,
+  isWayangCatalogProviderVisible,
   isWayangProviderVisible,
   listModels,
   listSlashCommandsForHandle,
@@ -3093,7 +3094,7 @@ test("overflow retry provenance persists without a browser subscriber", () => {
   assert.equal(leaf.data.overflowEntryId, overflowId);
 });
 
-test("Wayang exposes only the curated Together catalog and hides OpenRouter", async () => {
+test("Wayang exposes only the curated Together catalog and hides legacy providers", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-provider-catalog-policy-"));
   const cwd = path.join(dir, "project");
   const agentDir = path.join(dir, "agent");
@@ -3101,8 +3102,15 @@ test("Wayang exposes only the curated Together catalog and hides OpenRouter", as
   fs.mkdirSync(agentDir, { recursive: true });
 
   try {
+    assert.equal(isWayangProviderVisible("anthropic"), true);
     assert.equal(isWayangProviderVisible("openrouter"), false);
-    assert.equal(isWayangProviderVisible("together"), true);
+    assert.equal(isWayangCatalogProviderVisible("anthropic"), false);
+    assert.equal(isWayangCatalogProviderVisible("claude-code"), false);
+    assert.equal(isWayangCatalogProviderVisible("narwhal-horn"), false);
+    assert.equal(isWayangCatalogProviderVisible("openrouter"), false);
+    for (const provider of ["moonshotai", "openai-codex", "openrouter-zdr", "together", "zai"]) {
+      assert.equal(isWayangCatalogProviderVisible(provider), true);
+    }
     assert.equal(isCuratedTogetherModel("zai-org/GLM-5.3-Flash"), true);
     assert.equal(isCuratedTogetherModel("zai-org/GLM-5.3"), true);
     assert.equal(isCuratedTogetherModel("mistralai/Mistral-7B-Instruct-v0.1"), false);
@@ -3116,6 +3124,8 @@ test("Wayang exposes only the curated Together catalog and hides OpenRouter", as
     assert.deepEqual(curated, [{ id: "zai-org/GLM-5.3-Flash", type: "chat" }]);
 
     const result = await listModels({ cwd, agentDir, includeDynamicModels: false });
+    assert.equal(result.models.some((model) => model.provider === "anthropic"), false);
+    assert.equal(result.models.some((model) => model.provider === "narwhal-horn"), false);
     assert.equal(result.models.some((model) => model.provider === "openrouter"), false);
     assert.equal(
       result.models.filter((model) => model.provider === "together").every((model) => isCuratedTogetherModel(model.id)),
@@ -3202,7 +3212,7 @@ function syntheticReviewedModel(extensionPath?: string) {
   }];
 }
 
-test("listModels statically projects the reviewed Narwhal model without executing its extension", async () => {
+test("listModels hides a reviewed legacy provider without executing its extension", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-provider-"));
   const cwd = path.join(dir, "project");
   const homeDir = path.join(dir, "home");
@@ -3221,12 +3231,11 @@ test("listModels statically projects the reviewed Narwhal model without executin
       includeDynamicModels: false,
       reviewedExternalModels: syntheticReviewedModel(extensionPath),
     });
-    const narwhal = result.models.find(
-      (model) => model.provider === "narwhal-horn" && model.id === "qwen3.8-flash-next",
+    assert.equal(
+      result.models.some((model) => model.provider === "narwhal-horn"),
+      false,
+      "a reviewed runtime provider outside the curated discovery lanes must remain hidden",
     );
-    assert.ok(narwhal, "reviewed Narwhal model descriptor must be listed");
-    assert.equal(narwhal?.contextWindow, 262144, "native Flash-Next context window must be preserved");
-    assert.equal(narwhal?.available, true, "configured synthetic key must mark the model available");
     assert.ok(
       !result.error?.includes("Reviewed provider artifact"),
       `healthy reviewed projection must not report an integrity error, got: ${result.error ?? "<none>"}`,
