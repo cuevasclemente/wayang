@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getConfig } from "../config.js";
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 4;
 
 let _db: DatabaseType | null = null;
 
@@ -28,12 +28,23 @@ export function getSearchDb(): DatabaseType {
   fs.mkdirSync(dataDir, { recursive: true });
   const dbPath = getSearchDbPath();
   const db = new Database(dbPath);
-  db.pragma("journal_mode = WAL");
-  db.pragma("synchronous = NORMAL");
-  db.pragma("foreign_keys = ON");
-  migrate(db);
-  _db = db;
-  return db;
+  try {
+    db.pragma("journal_mode = WAL");
+    db.pragma("synchronous = NORMAL");
+    // Reclaim an oversized WAL on its next reset; publication additionally pauses
+    // text admission at a watermark while a reader prevents checkpoint progress.
+    db.pragma("journal_size_limit = 8388608");
+    db.pragma("foreign_keys = ON");
+    migrate(db);
+    // No worker survives process restart. Its unpublished generations may be
+    // reclaimed; previously published coverage is not invalidated here.
+    db.exec("UPDATE search_generations SET active=0 WHERE active=1; UPDATE search_work_state SET outcome='stale',queued_at=0 WHERE outcome IN ('running','queued') OR queued_at>0;");
+    _db = db;
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 }
 
 export function closeSearchDb(): void {
@@ -47,7 +58,7 @@ export function closeSearchDb(): void {
   }
 }
 
-function migrate(db: DatabaseType): void {
+export function migrate(db: DatabaseType): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS search_meta (
       key   TEXT PRIMARY KEY,
@@ -59,15 +70,13 @@ function migrate(db: DatabaseType): void {
   if (currentVersion === SCHEMA_VERSION) return;
 
   if (currentVersion > SCHEMA_VERSION) {
-    // Downgrade: drop and rebuild rather than carry forward an unknown schema.
-    dropAll(db);
-  } else if (currentVersion > 0 && currentVersion < SCHEMA_VERSION) {
-    // No incremental migrations yet — clean rebuild on bump.
-    dropAll(db);
+    throw new Error("Search database schema is newer than this runtime; refusing destructive downgrade");
   }
-
-  applySchemaV1(db);
-  writeSchemaVersion(db, SCHEMA_VERSION);
+  db.transaction(() => {
+    applySchemaV1(db);
+    applyGenerationSchema(db);
+    writeSchemaVersion(db, SCHEMA_VERSION);
+  })();
 }
 
 function readSchemaVersion(db: DatabaseType): number {
@@ -89,16 +98,68 @@ function writeSchemaVersion(db: DatabaseType, v: number): void {
   ).run(String(v));
 }
 
-function dropAll(db: DatabaseType): void {
+function applyGenerationSchema(db: DatabaseType): void {
+  const columns = new Set((db.prepare("PRAGMA table_info(chunks)").all() as Array<{ name: string }>).map((r) => r.name));
+  // Older supported stores gain columns without deleting their valid coverage.
+  if (!columns.has("transcript_epoch")) db.exec("ALTER TABLE chunks ADD COLUMN transcript_epoch TEXT");
+  if (!columns.has("active_branch")) db.exec("ALTER TABLE chunks ADD COLUMN active_branch INTEGER NOT NULL DEFAULT 0");
+  if (!columns.has("generation")) db.exec("ALTER TABLE chunks ADD COLUMN generation TEXT NOT NULL DEFAULT 'legacy'");
   db.exec(`
-    DROP TABLE IF EXISTS chunk_vectors;
-    DROP TABLE IF EXISTS chunks_fts;
-    DROP TRIGGER IF EXISTS chunks_ai;
-    DROP TRIGGER IF EXISTS chunks_ad;
-    DROP TRIGGER IF EXISTS chunks_au;
-    DROP TABLE IF EXISTS chunks;
-    DROP TABLE IF EXISTS session_index_state;
+    CREATE INDEX IF NOT EXISTS chunks_generation ON chunks(session_id, generation, id);
+    CREATE TABLE IF NOT EXISTS search_publication (
+      session_id TEXT PRIMARY KEY,
+      generation TEXT NOT NULL,
+      valid INTEGER NOT NULL DEFAULT 1,
+      source_revision TEXT
+    );
+    CREATE TABLE IF NOT EXISTS search_session_metadata (
+      session_id TEXT PRIMARY KEY,
+      cwd TEXT NOT NULL, title TEXT NOT NULL, goal TEXT, model TEXT, provider TEXT,
+      created_at INTEGER NOT NULL, last_active INTEGER NOT NULL,
+      archived INTEGER NOT NULL, has_error INTEGER NOT NULL,
+      revision TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS search_generations (
+      generation TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+      text_bytes INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+      active INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS search_work_state (
+      session_id TEXT PRIMARY KEY,
+      requested_revision TEXT,
+      attempted_revision TEXT,
+      successful_revision TEXT,
+      outcome TEXT NOT NULL DEFAULT 'queued',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      retry_at INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL,
+      error_code TEXT,
+      chunk_bytes INTEGER NOT NULL DEFAULT 0,
+      dirty_since INTEGER NOT NULL DEFAULT 0,
+      queued_at INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE VIEW IF NOT EXISTS search_chunks_current AS
+      SELECT c.id AS rowid, c.id, c.session_id,
+        COALESCE(m.cwd,c.cwd) AS cwd, COALESCE(m.title,c.title) AS title,
+        CASE WHEN m.session_id IS NULL THEN c.goal ELSE m.goal END AS goal,
+        CASE WHEN m.session_id IS NULL THEN c.model ELSE m.model END AS model,
+        CASE WHEN m.session_id IS NULL THEN c.provider ELSE m.provider END AS provider,
+        COALESCE(m.created_at,c.created_at) AS created_at,
+        COALESCE(m.last_active,c.last_active) AS last_active,
+        COALESCE(m.archived,c.archived) AS archived,
+        COALESCE(m.has_error,c.has_error) AS has_error,
+        c.chunk_index,c.role,c.text,c.message_id,c.source_offset,
+        c.transcript_epoch,c.active_branch,c.generation
+      FROM chunks c
+      LEFT JOIN search_publication p ON p.session_id=c.session_id
+      LEFT JOIN search_session_metadata m ON m.session_id=c.session_id
+      WHERE (p.session_id IS NULL AND c.generation='legacy')
+         OR (p.valid=1 AND (c.generation=p.generation OR c.generation='metadata'));
   `);
+  const publicationColumns = db.prepare("PRAGMA table_info(search_publication)").all() as Array<{name:string}>;
+  if (!publicationColumns.some((column) => column.name === "source_revision")) {
+    db.exec("ALTER TABLE search_publication ADD COLUMN source_revision TEXT");
+  }
 }
 
 function applySchemaV1(db: DatabaseType): void {

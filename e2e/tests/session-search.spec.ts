@@ -76,7 +76,7 @@ async function seedSessionWithTranscript(
   expect(importRes.ok(), `import failed: ${await importRes.text()}`).toBe(true);
 
   // Force a synchronous, per-session reindex so the chunk is searchable
-  // without waiting for the 30s mtime tick.
+  // without waiting for low-load background discovery/extraction.
   const reindex = await request.post("/api/sessions/search/reindex", {
     data: { session_id: session.id },
   });
@@ -199,4 +199,71 @@ test("clicking a search result navigates into the chat", async ({ page, request 
   await expect(
     page.getByTestId("chat-message-list").getByText("Find the place I was debugging websocket disconnection storms.", { exact: true }),
   ).toBeVisible({ timeout: 30_000 });
+});
+
+test("independent words rank coverage across messages and quoted phrases stay optional", async ({ page, request }) => {
+  const both = await seedSessionWithTranscript(request, {
+    title: "e2e full keyword coverage",
+    transcript: [
+      { role: "user", text: "rainkeyworddemo in one message" },
+      { role: "assistant", text: "leatherkeyworddemo in another message" },
+    ],
+  });
+  const one = await seedSessionWithTranscript(request, {
+    title: "e2e single keyword coverage",
+    transcript: [{ role: "user", text: "rainkeyworddemo rainkeyworddemo repeated" }],
+  });
+  const phrase = await seedSessionWithTranscript(request, {
+    title: "e2e optional phrase coverage",
+    transcript: [{ role: "user", text: "suede jacket advice" }],
+  });
+  const response = await request.get('/api/sessions/search?q=rainkeyworddemo%20leatherkeyworddemo');
+  expect(response.ok()).toBe(true);
+  const body = await response.json();
+  const ids = body.results.map((result: { session_id: string }) => result.session_id);
+  expect(ids.indexOf(both.id)).toBeGreaterThanOrEqual(0);
+  expect(ids.indexOf(one.id)).toBeGreaterThan(ids.indexOf(both.id));
+  await page.goto("/");
+  await typeSearchQuery(page, 'rainkeyworddemo "suede jacket"');
+  await expect(page.locator(`[data-session-id="${one.id}"][data-testid="session-search-result"]`)).toBeVisible();
+  await expect(page.locator(`[data-session-id="${phrase.id}"][data-testid="session-search-result"]`)).toBeVisible();
+});
+
+test("result order remains relevance-first across projects rather than regrouping by recency", async ({ page }) => {
+  const result = (id: string, cwd: string, lastActive: number) => ({ session_id: id, title: id,
+    cwd, model: null, last_active: lastActive, archived: false, score: 1, best_role: "meta", snippet_html: "matched" });
+  await page.route("**/api/sessions/search?**", route => route.fulfill({ json: {
+    query: "rank", took_ms: 1, results: [result("first", "/synthetic/older", 1),
+      result("second", "/synthetic/newer", 99999), result("third", "/synthetic/older", 2)],
+    facets: { cwds: [], models: [] },
+  } }));
+  await page.goto("/");
+  await typeSearchQuery(page, "rank");
+  await expect(page.getByTestId("session-search-result")).toHaveCount(3);
+  expect(await page.getByTestId("session-search-result").evaluateAll(elements => elements.map(element => element.getAttribute("data-session-id"))))
+    .toEqual(["first", "second", "third"]);
+});
+
+for (const [degraded, explanation] of [
+  ["indexing_paused", "Automatic indexing is paused"],
+  ["index_incomplete", "The search index is incomplete"],
+  ["indexing_in_progress", "Indexing is in progress"],
+  ["index_unavailable", "Search indexing is unavailable"],
+] as const) {
+  test(`empty search explains ${degraded}`, async ({ page }) => {
+    await page.route("**/api/sessions/search?**", route => route.fulfill({ json: {
+      query: "empty", took_ms: 1, results: [], facets: { cwds: [], models: [] }, degraded,
+    } }));
+    await page.goto("/");
+    await typeSearchQuery(page, "empty");
+    await expect(page.getByTestId("session-search-status")).toContainText(explanation);
+    await expect(page.getByTestId("session-search-empty")).toHaveText("No matches in currently indexed content.");
+  });
+}
+
+test("malformed quoted input shows a useful error, not ordinary no matches", async ({ page }) => {
+  await page.goto("/");
+  await typeSearchQuery(page, '"unclosed');
+  await expect(page.getByText("Search failed: Close each quoted search phrase.", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("session-search-empty")).toHaveCount(0);
 });

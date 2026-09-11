@@ -213,7 +213,8 @@ test("recovers from malformed lines without aborting", async () => {
   const file = tempFile("malformed.jsonl", lines);
   const { chunks, stats } = await chunkJsonlFile(file, baseMeta);
   const allText = chunks.map((c) => c.text).join("\n");
-  assert.match(allText, /User: ok/);
-  assert.match(allText, /Assistant: fine/);
+  assert.match(allText, /ok/);
+  assert.match(allText, /fine/);
+  assert.doesNotMatch(allText, /User:|Assistant:/);
   assert.equal(stats.skippedParseErrors, 2);
 });

@@ -10,6 +10,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { performance } from "node:perf_hooks";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-indexer-"));
 const piSessionsRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-indexer-pi-"));
@@ -33,6 +34,156 @@ const transcriptIndexMod = await import("../transcript-pagination/structural-ind
 const transcriptAuthorizationMod = await import("../standard-transcript-authorization.js");
 
 dbMod.init();
+
+// Register first so the production timing high-water counters normally belong
+// to this benchmark. Report their baseline too; these are not resettable counters.
+// This measures one synthetic catalog entry, not production corpus/storage load.
+test("synthetic benchmark: 20k topology, bounded documents, excluded giant record and parent timer progress", async (t) => {
+  const publication = await import("./publication.js");
+  const extraction = await import("./extraction.js");
+  const topologyEvents = 20_000;
+  const includedDocuments = 2_000;
+  assert.ok(topologyEvents < transcriptIndexMod.TRANSCRIPT_INDEX_MAX_TOPOLOGY_ENTRIES);
+  const id = seedSession({id:"synthetic-benchmark-20k",title:"Synthetic bounded indexing benchmark",transcript:[]});
+  const row = dbMod.getStore().sessions.find((candidate) => candidate.id === id)!;
+  const file = row.pi_session_file!;
+  let expectedTextBytes = 0;
+  let includedSourceBytes = 0;
+  let excludedRecordBytes = 0;
+  let lines: string[] = [];
+  // Fixture construction is outside the measured interval and never reads live
+  // transcripts. Batching also avoids retaining all serialized topology in RAM.
+  for (let i = 0; i < topologyEvents; i++) {
+    const included = i % 10 === 0;
+    const giant = i === 10_001;
+    const text = giant ? "synthetic excluded payload ".repeat(300_000).slice(0,7*1024*1024)
+      : included && (i === 0 || i === 10) ? "bounded document ".repeat(8192).slice(0,extraction.SEARCH_MAX_DOCUMENT_BYTES)
+      : `synthetic ${included ? "included" : "excluded"} event ${i}`;
+    const line = JSON.stringify({type:"message",id:`bench-${i}`,parentId:i ? `bench-${i-1}` : null,
+      message:{role:included ? (i % 20 === 0 ? "user" : "assistant") : "toolResult",content:[{type:"text",text}]}})+"\n";
+    if (included) {
+      assert.ok(Buffer.byteLength(text) <= extraction.SEARCH_MAX_DOCUMENT_BYTES);
+      expectedTextBytes += Buffer.byteLength(text);
+      includedSourceBytes += Buffer.byteLength(line);
+    }
+    if (giant) excludedRecordBytes = Buffer.byteLength(line);
+    lines.push(line);
+    if (lines.length === 128 || i === topologyEvents-1) {fs.appendFileSync(file,lines.join(""));lines=[];}
+  }
+  assert.ok(excludedRecordBytes > extraction.SEARCH_MAX_RECORD_BYTES);
+  assert.ok(excludedRecordBytes <= 8*1024*1024,"excluded physical record must remain inside cold structural admission");
+  assert.ok(expectedTextBytes <= extraction.SEARCH_MAX_GENERATION_BYTES);
+  assert.ok(transcriptAuthorizationMod.authorizeExactStandardTranscript(file,{expectedSessionId:id}));
+  const db = searchDbMod.getSearchDb();
+  const structure = transcriptIndexMod.getStructuralTranscriptIndex();
+  const workersBefore = structure.getWorkerInstrumentation().workersStarted;
+  const before = publication.getSearchPublicationMetrics();
+  const countBodies = db.prepare("SELECT COUNT(*) AS n FROM chunks WHERE session_id=? AND role IN ('user','assistant')");
+  const remaining = db.prepare("SELECT COUNT(*) AS n,COALESCE(SUM(length(CAST(text AS BLOB))),0) AS bytes FROM chunks WHERE session_id=?");
+  let previousRows = 0;
+  let previousStageBytes = before.stageBytes;
+  let stageHooks = 0;
+  let maxStageRows = 0;
+  let maxStageBytes = 0;
+  let firstStageAt: number | undefined;
+  let extractionDoneAt: number | undefined;
+  let sampledExtractionAt: number | undefined;
+  let timerTicks = 0;
+  let maxTimerGapMs = 0;
+  let cleanupMaxRows = 0;
+  let cleanupMaxBytes = 0;
+  let cleanupMaxCandidates = 0;
+  let cleanupPasses = 0;
+  const rssBefore = process.memoryUsage().rss;
+  let peakRss = rssBefore;
+  const started = performance.now();
+  let lastTick = started;
+  const timer = setInterval(() => {
+    const now = performance.now();
+    timerTicks++;
+    maxTimerGapMs = Math.max(maxTimerGapMs,now-lastTick);lastTick=now;
+    peakRss = Math.max(peakRss,process.memoryUsage().rss);
+    if (indexerMod.getSearchQueueStatus().phase === "extracting") sampledExtractionAt ??= now;
+  },5);
+  let indexFinishedAt: number | undefined;
+  let cleanupStartedAt: number | undefined;
+  let indexMaxTimerGapMs = 0;
+  try {
+    const result = await indexerMod.indexSession(id,{force:true,
+      afterStageForTests() {
+        firstStageAt ??= performance.now();
+        const stagedRows = (countBodies.get(id) as {n:number}).n;
+        const stagedBytes = publication.getSearchPublicationMetrics().stageBytes;
+        const rows = stagedRows-previousRows;
+        const bytes = stagedBytes-previousStageBytes;
+        assert.ok(rows > 0 && rows <= publication.SEARCH_STAGE_MAX_ROWS);
+        assert.ok(bytes > 0 && bytes <= publication.SEARCH_STAGE_MAX_BYTES);
+        maxStageRows=Math.max(maxStageRows,rows);maxStageBytes=Math.max(maxStageBytes,bytes);
+        previousRows=stagedRows;previousStageBytes=stagedBytes;stageHooks++;
+      },
+      afterChunkingForTests() {extractionDoneAt=performance.now();},
+    });
+    indexFinishedAt=performance.now();
+    indexMaxTimerGapMs=Math.max(maxTimerGapMs,indexFinishedAt-lastTick);
+    assert.equal(result.error,undefined);assert.equal(result.outcome,"current");
+    assert.equal(result.chunkCount,includedDocuments+1);
+    assert.equal(previousRows,includedDocuments);
+    assert.equal(previousStageBytes-before.stageBytes,expectedTextBytes);
+    assert.equal(structure.getWorkerInstrumentation().workersStarted-workersBefore,1,"cold exact structural build");
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM search_chunks_current WHERE session_id=?").get(id) as {n:number}).n,includedDocuments+1);
+    assert.equal(db.prepare("SELECT id FROM chunks WHERE session_id=? AND message_id='bench-10001'").get(id),undefined);
+    assert.ok(timerTicks > 0,"the parent timer must progress while workers index");
+    assert.ok(stageHooks > 0);
+
+    // Measure real reclamation, not just candidate scans over retained rows.
+    // The generation has finished; invalidate before yielding to cleanup.
+    cleanupStartedAt=performance.now();
+    publication.invalidatePublication(db,id);
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM search_chunks_current WHERE session_id=?").get(id) as {n:number}).n,0);
+    let prior = remaining.get(id) as {n:number;bytes:number};
+    for (; prior.n > 0 && cleanupPasses < includedDocuments+4; cleanupPasses++) {
+      const candidatesBefore = publication.getSearchPublicationMetrics().cleanupCandidates;
+      const removed = await publication.cleanupSearchChunks(db,{sessionId:id,maxBatches:1});
+      const after = remaining.get(id) as {n:number;bytes:number};
+      const candidates = publication.getSearchPublicationMetrics().cleanupCandidates-candidatesBefore;
+      assert.equal(prior.n-after.n,removed);
+      assert.ok(removed <= publication.SEARCH_STAGE_MAX_ROWS);
+      assert.ok(prior.bytes-after.bytes <= publication.SEARCH_STAGE_MAX_BYTES);
+      assert.ok(candidates <= 64);
+      cleanupMaxRows=Math.max(cleanupMaxRows,removed);
+      cleanupMaxBytes=Math.max(cleanupMaxBytes,prior.bytes-after.bytes);
+      cleanupMaxCandidates=Math.max(cleanupMaxCandidates,candidates);
+      prior=after;
+    }
+    assert.equal(prior.n,0,"bounded cleanup passes must eventually reclaim all synthetic documents");
+  } finally {
+    clearInterval(timer);
+    const finished = performance.now();
+    maxTimerGapMs=Math.max(maxTimerGapMs,finished-lastTick);
+    peakRss=Math.max(peakRss,process.memoryUsage().rss);
+    const after = publication.getSearchPublicationMetrics();
+    t.diagnostic(JSON.stringify({benchmark:"synthetic-search-20k",topologyEvents,includedDocuments,
+      excludedRecordBytes,fixtureBytes:fs.statSync(file).size,includedSourceBytesFromFixture:includedSourceBytes,
+      coldIndexWallMs:indexFinishedAt === undefined ? null : indexFinishedAt-started,
+      preFirstStageMs:firstStageAt === undefined ? null : firstStageAt-started,
+      sampledExtractionThroughStagingMs:sampledExtractionAt === undefined || extractionDoneAt === undefined ? null : extractionDoneAt-sampledExtractionAt,
+      cleanupWallMs:cleanupStartedAt === undefined ? null : finished-cleanupStartedAt,
+      wallMs:finished-started,timerIntervalMs:5,timerTicks,indexMaxTimerGapMs,maxTimerGapMs,
+      stageTransactions:after.stageTransactions-before.stageTransactions,stageTextBytes:after.stageBytes-before.stageBytes,
+      maxStageRows,maxStageBytes,cleanupPasses,cleanupMaxRows,cleanupMaxBytes,cleanupMaxCandidates,
+      cleanupRows:after.cleanupRows-before.cleanupRows,maxStageMs:after.maxStageMs,maxPublishMs:after.maxPublishMs,maxCleanupMs:after.maxCleanupMs,
+      timingMaximaBaseline:{stage:before.maxStageMs,publish:before.maxPublishMs,cleanup:before.maxCleanupMs},
+      peakObservedRssDeltaBytes:peakRss-rssBefore,finalRssDeltaBytes:process.memoryUsage().rss-rssBefore,
+      caveat:"No speed/RSS SLA. Timings include test hooks and authorization; extraction start/RSS are sampled, publication maxima are process-wide; fixture construction/teardown excluded."}));
+    // Do not make later corpus tests silently repeat this benchmark. Keep its
+    // synthetic file on disk for inspection, but remove its catalog/index entry.
+    await indexerMod.removeSession(id);
+    fs.renameSync(file,path.join(tmpRoot,"synthetic-benchmark-20k.jsonl"));
+    const store = dbMod.getStore();
+    const position = store.sessions.findIndex((candidate) => candidate.id === id);
+    if (position >= 0) {store.sessions.splice(position,1);dbMod.flush();}
+  }
+});
 
 test("policy purge contains search DB initialization failure to one attempt", () => {
   let attempts = 0;
@@ -77,6 +228,8 @@ test("paused watcher work preserves policy refresh while suppressing transcript 
     assert.equal(status.backgroundIndexingEnabled, false);
     assert.equal(status.backfillRunning, false);
     watcherMod.stopWatcher();
+    await indexerMod.stopSearchQueue();
+    indexerMod.startSearchQueue(); // This test continues with explicit manual work.
     assert.equal(watcherMod.getWatcherStatus().started, false);
 
     await watcherMod.runWatcherTickForTests(fakeIndex);
@@ -147,6 +300,7 @@ function writeFixture(sessionId: string, cwd: string, transcript: Array<{ role: 
 }
 
 function seedSession(opts: {
+  id?: string;
   title: string;
   goal?: string;
   archived?: boolean;
@@ -154,7 +308,7 @@ function seedSession(opts: {
   transcript: Array<{ role: "user" | "assistant"; text: string; id?: string }>;
 }): string {
   const store = dbMod.getStore();
-  const id = `sess-${store.sessions.length + 1}`;
+  const id = opts.id ?? `sess-${store.sessions.length + 1}`;
   const cwd = opts.cwd ?? path.join(tmpRoot, `proj-${id}`);
   fs.mkdirSync(cwd, { recursive: true });
   const { project } = projectsMod.ensureProjectForCwd(cwd);
@@ -455,10 +609,13 @@ test("metadata generation CAS retries a paused stale clone and commits only the 
   assert.ok(hookCalls >= 2, "metadata mutation must retry from a fresh durable row");
 
   const db = searchDbMod.getSearchDb();
-  const rows = db.prepare("SELECT DISTINCT goal, title FROM chunks WHERE session_id = ?").all(id) as Array<{ goal: string | null; title: string }>;
+  const rows = db.prepare("SELECT DISTINCT goal, title FROM search_chunks_current WHERE session_id = ?").all(id) as Array<{ goal: string | null; title: string }>;
   assert.deepEqual(rows, [{ goal: newGoal, title: "Metadata CAS fixture" }]);
   assert.equal(searchMod.runSearch("platypus").results.some((row) => row.session_id === id), true);
-  assert.equal(searchMod.runSearch("old metadata projection").results.some((row) => row.session_id === id), false);
+  // Words now admit optional OR matches; shared 'metadata projection' words
+  // legitimately match the new goal. Assert the removed term/phrase instead.
+  assert.equal(searchMod.runSearch("old").results.some((row) => row.session_id === id), false);
+  assert.equal(searchMod.runSearch('"old metadata projection"').results.some((row) => row.session_id === id), false);
 });
 
 test("repeated metadata churn purges and returns a fixed retryable indexing error", async () => {
@@ -599,6 +756,8 @@ test("standard allowlist live-filters stale profile chunks from query, facets, a
     assert.equal((db.prepare("SELECT COUNT(*) AS n FROM session_index_state WHERE session_id = ?").get(id) as { n: number }).n, 0);
   } finally {
     watcherMod.stopWatcher();
+    await indexerMod.stopSearchQueue();
+    indexerMod.startSearchQueue();
     if (previousPause === undefined) delete process.env.WAYANG_SEARCH_BACKGROUND_INDEXING;
     else process.env.WAYANG_SEARCH_BACKGROUND_INDEXING = previousPause;
   }
@@ -730,8 +889,257 @@ test("search returns empty for short queries without throwing", () => {
   assert.deepEqual(out.results, []);
 });
 
-// Cleanup hook — done via process exit; we leave the temp dir for inspection if needed.
+test("metadata-only edits preserve body IDs and do not schedule extraction or structural body reads", async () => {
+  const id = seedSession({title:"Metadata independent",transcript:[{role:"user",text:"body stays immutable"}]});
+  await indexerMod.indexSession(id);
+  const db = searchDbMod.getSearchDb();
+  const before = db.prepare("SELECT id,text FROM chunks WHERE session_id=? AND role='user'").all(id);
+  const stages = indexerMod.getSearchQueueStatus().publication.stageTransactions;
+  const workers = transcriptIndexMod.getStructuralTranscriptIndex().getWorkerInstrumentation().workersStarted;
+  const row = dbMod.getStore().sessions.find((s) => s.id === id)!;
+  row.title = "Updated title"; row.goal = "Updated goal"; row.archived = 1; row.last_active++;
+  dbMod.flush();
+  const result = await indexerMod.indexSession(id);
+  assert.equal(result.skipped,true);
+  assert.deepEqual(db.prepare("SELECT id,text FROM chunks WHERE session_id=? AND role='user'").all(id),before);
+  assert.equal(indexerMod.getSearchQueueStatus().publication.stageTransactions,stages);
+  assert.equal(transcriptIndexMod.getStructuralTranscriptIndex().getWorkerInstrumentation().workersStarted,workers);
+  assert.deepEqual(db.prepare("SELECT DISTINCT title,goal,archived FROM search_chunks_current WHERE session_id=?").all(id),
+    [{title:"Updated title",goal:"Updated goal",archived:1}]);
+});
+
+test("revocation after a staged batch denies unpublished text and cannot flip publication", async () => {
+  const id = seedSession({title:"Staging revoke",transcript:[{role:"user",text:"staged private canary"}]});
+  const row = dbMod.getStore().sessions.find((s) => s.id === id)!;
+  let yielded = false;
+  const result = await indexerMod.indexSession(id,{force:true,afterStageForTests() {
+    yielded = true; row.legacy_private_session_quarantine = true; dbMod.flush();
+  }});
+  assert.equal(yielded,true);
+  assert.equal(result.policySkipped,true);
+  assert.deepEqual(searchDbMod.getSearchDb().prepare("SELECT id FROM search_chunks_current WHERE session_id=?").all(id),[]);
+});
+
+test("partial coverage is stable but never a successful mutation reconciliation", async () => {
+  const id = seedSession({title:"Partial recovery",transcript:[{role:"user",text:"x".repeat(128*1024+1)}]});
+  const first = await indexerMod.indexSession(id);
+  assert.equal(first.outcome,"partial"); assert.ok(first.error);
+  const db = searchDbMod.getSearchDb();
+  const state = db.prepare("SELECT successful_revision FROM search_work_state WHERE session_id=?").get(id) as {successful_revision:string|null};
+  assert.equal(state.successful_revision,null,"partial is not complete revision evidence");
+  const stages = indexerMod.getSearchQueueStatus().publication.stageTransactions;
+  const second = await indexerMod.indexSession(id);
+  assert.equal(second.outcome,"partial"); assert.ok(second.error);
+  assert.equal(indexerMod.getSearchQueueStatus().publication.stageTransactions,stages);
+  const recovery = await import("../transcript-recovery-journal.js");
+  const row = dbMod.getStore().sessions.find((s) => s.id === id)!;
+  const marker = recovery.createEventReconcileMarker(id,row.pi_session_file!);
+  try {
+    const result = await indexerMod.indexSession(id,{recoveryMarkerId:marker.id});
+    assert.ok(result.error,"the mutation caller uses !error as its completion gate");
+    assert.equal(result.skipped,true);
+    assert.equal(recovery.eventRecoveryMarkerForSession(id)?.id,marker.id);
+    assert.deepEqual(db.prepare("SELECT id FROM search_chunks_current WHERE session_id=?").all(id),[]);
+  } finally { recovery.clearTranscriptRecoveryMarker(marker.id); }
+});
+
+test("a fence cancels old pending intent and the late active result cannot cancel exact recovery", async () => {
+  const id = seedSession({title:"Queued mutation recovery",transcript:[{role:"user",text:"old body"}]});
+  let release!: () => void; let reached!: () => void;
+  const gate = new Promise<void>((r) => { release=r; });
+  const paused = new Promise<void>((r) => { reached=r; });
+  const active = indexerMod.indexSession(id,{force:true,afterChunkingForTests:async()=>{reached();await gate;}});
+  await paused;
+  let oldPendingRan = false;
+  const pending = indexerMod.indexSession(id,{force:true,afterChunkingForTests:()=>{oldPendingRan=true;}});
+  const recovery = await import("../transcript-recovery-journal.js");
+  const row = dbMod.getStore().sessions.find((s) => s.id === id)!;
+  const marker = recovery.createEventReconcileMarker(id,row.pi_session_file!);
+  indexerMod.beginTranscriptMutationSearchFence(id);
+  indexerMod.endTranscriptMutationSearchFence(id);
+  const winner = indexerMod.indexSession(id,{force:true,recoveryMarkerId:marker.id});
+  release();
+  try {
+    assert.ok((await active).error);
+    assert.ok((await pending).error);
+    assert.equal(oldPendingRan,false);
+    const result = await winner;
+    assert.equal(result.error,undefined);assert.equal(result.outcome,"current");assert.equal(result.skipped,false);
+    assert.ok(searchDbMod.getSearchDb().prepare("SELECT id FROM search_chunks_current WHERE session_id=?").get(id));
+    const stale = await indexerMod.indexSession(id,{force:true,recoveryMarkerId:"wrong-marker"});
+    assert.ok(stale.error);
+    assert.equal(recovery.eventRecoveryMarkerForSession(id)?.id,marker.id);
+  } finally { recovery.clearTranscriptRecoveryMarker(marker.id); }
+});
+
+test("malformed tails remain unsupported across retries rather than silently current", async () => {
+  const id = seedSession({title:"Malformed tail",transcript:[{role:"user",text:"valid preceding body"}]});
+  const row = dbMod.getStore().sessions.find((s) => s.id === id)!;
+  fs.appendFileSync(row.pi_session_file!, '{"type":"message","id":');
+  const first = await indexerMod.indexSession(id);
+  assert.equal(first.outcome,"unsupported");assert.ok(first.error);
+  const workers = transcriptIndexMod.getStructuralTranscriptIndex().getWorkerInstrumentation().workersStarted;
+  const second = await indexerMod.indexSession(id);
+  assert.equal(second.outcome,"unsupported");
+  assert.equal(transcriptIndexMod.getStructuralTranscriptIndex().getWorkerInstrumentation().workersStarted,workers);
+  assert.equal(indexerMod.getIndexCoverageSnapshot(new Set([id])).counts.unsupported,1);
+});
+
+test("exact recovery survives a queued ordinary successor and duplicate exact requests until acknowledgement", async () => {
+  const blocker=seedSession({title:"Recovery queue blocker",transcript:[{role:"user",text:"blocker"}]});
+  const id=seedSession({title:"Recovery successor",transcript:[{role:"user",text:"retained recovered body"}]});
+  let unblock!:()=>void;let blocked!:()=>void;
+  const blockGate=new Promise<void>((r)=>{unblock=r;});const blockReached=new Promise<void>((r)=>{blocked=r;});
+  const blocking=indexerMod.indexSession(blocker,{force:true,afterChunkingForTests:async()=>{blocked();await blockGate;}});
+  await blockReached;
+  // This ordinary request is genuinely queued before the durable marker exists.
+  const ordinary=indexerMod.indexSession(id);
+  const recovery=await import("../transcript-recovery-journal.js");
+  const row=dbMod.getStore().sessions.find((candidate)=>candidate.id===id)!;
+  const marker=recovery.createEventReconcileMarker(id,row.pi_session_file!);
+  let release!:()=>void;let reached!:()=>void;
+  const gate=new Promise<void>((r)=>{release=r;});const paused=new Promise<void>((r)=>{reached=r;});
+  let extracts=0;
+  const first=indexerMod.indexSession(id,{force:true,recoveryMarkerId:marker.id,afterChunkingForTests:async()=>{extracts++;reached();await gate;}});
+  unblock();await blocking;await paused;
+  const duplicate=indexerMod.indexSession(id,{force:true,recoveryMarkerId:marker.id});
+  const deferred=indexerMod.indexSession(id,{force:true});
+  const queuedBeforeRelease=indexerMod.getSearchQueueStatus().queued;
+  release();
+  try {
+    const [result,duplicateResult,deferredResult]=await Promise.all([first,duplicate,deferred]);
+    assert.ok(deferredResult.error,"ordinary admission during the marker is deferred without purging");
+    assert.ok(queuedBeforeRelease>=1);
+    assert.equal(result.error,undefined);assert.equal(duplicateResult.error,undefined);
+    assert.equal(result.publicationGeneration,duplicateResult.publicationGeneration);
+    assert.equal(extracts,1);
+    assert.equal(indexerMod.isSearchRecoveryPublicationCurrent(id,marker.id,result),true);
+    assert.equal(indexerMod.acknowledgeSearchRecovery(id,marker.id,result),true);
+    assert.equal(recovery.eventRecoveryMarkerForSession(id),undefined);
+    assert.equal((await ordinary).error,undefined);
+    const publication=searchDbMod.getSearchDb().prepare("SELECT generation,valid FROM search_publication WHERE session_id=?").get(id) as {generation:string;valid:number};
+    assert.deepEqual(publication,{generation:result.publicationGeneration,valid:1});
+  } finally {release();recovery.clearTranscriptRecoveryMarker(marker.id);}
+});
+
+test("marker acknowledgement rejects a lost publication even after a successful indexing result", async () => {
+  const id=seedSession({title:"Lost recovery witness",transcript:[{role:"user",text:"current recovered body"}]});
+  const recovery=await import("../transcript-recovery-journal.js");
+  const row=dbMod.getStore().sessions.find((candidate)=>candidate.id===id)!;
+  const marker=recovery.createEventReconcileMarker(id,row.pi_session_file!);
+  try {
+    const result=await indexerMod.indexSession(id,{force:true,recoveryMarkerId:marker.id});
+    assert.equal(result.error,undefined);
+    searchDbMod.getSearchDb().prepare("UPDATE search_publication SET valid=0 WHERE session_id=?").run(id);
+    assert.equal(indexerMod.acknowledgeSearchRecovery(id,marker.id,result),false);
+    assert.equal(recovery.eventRecoveryMarkerForSession(id)?.id,marker.id);
+  } finally {recovery.clearTranscriptRecoveryMarker(marker.id);}
+});
+
+test("repairing oversized metadata retries without a transcript fingerprint change", async () => {
+  const id=seedSession({title:"Repair metadata",goal:"x".repeat(129*1024),transcript:[{role:"user",text:"small body"}]});
+  const row=dbMod.getStore().sessions.find((candidate)=>candidate.id===id)!;
+  const before=fs.statSync(row.pi_session_file!);
+  const first=await indexerMod.indexSession(id);
+  assert.equal(first.outcome,"unsupported");
+  const db=searchDbMod.getSearchDb();
+  assert.equal((db.prepare("SELECT error_code FROM search_work_state WHERE session_id=?").get(id) as {error_code:string}).error_code,"metadata_unsupported");
+  assert.equal(indexerMod.searchSessionNeedsIndex(id),false,"unchanged oversized metadata is a stable negative");
+  row.goal="repaired short goal";dbMod.flush();
+  assert.equal(indexerMod.searchSessionNeedsIndex(id),true);
+  const repaired=await indexerMod.indexSession(id);
+  assert.equal(repaired.error,undefined);assert.equal(repaired.outcome,"current");
+  const after=fs.statSync(row.pi_session_file!);
+  assert.equal(after.mtimeMs,before.mtimeMs);assert.equal(after.ctimeMs,before.ctimeMs);assert.equal(after.ino,before.ino);
+  assert.deepEqual(db.prepare("SELECT DISTINCT goal FROM search_chunks_current WHERE session_id=?").all(id),[{goal:"repaired short goal"}]);
+});
+
+test("structural cache invalidation after staging is retryable, not a permanent unsupported revision", async () => {
+  const id=seedSession({title:"Transient structural cache",transcript:[{role:"user",text:"canonical retained body"}]});
+  let invalidated=false;
+  const first=await indexerMod.indexSession(id,{afterStageForTests(){
+    if(!invalidated){invalidated=true;transcriptIndexMod.getStructuralTranscriptIndex().purge(id);}
+  }});
+  assert.equal(first.retryable,true);assert.equal(first.outcome,"stale");
+  assert.equal((searchDbMod.getSearchDb().prepare("SELECT error_code FROM search_work_state WHERE session_id=?").get(id) as {error_code:string}).error_code,"structural_stale");
+  assert.equal(indexerMod.searchSessionNeedsIndex(id),true);
+  const retried=await indexerMod.indexSession(id);
+  assert.equal(retried.error,undefined);assert.equal(retried.outcome,"current");
+});
+
+test("discovery visits 697 catalog IDs in bounded yielded batches without awaiting extraction", async () => {
+  indexerMod.startSearchQueue();
+  const ids=Array.from({length:697},(_,i)=>`discovery-synthetic-${i}`);
+  const observed=new Set<string>();let calls=0;let catalogs=0;
+  let release!:()=>void;const gate=new Promise<void>((resolve)=>{release=resolve;});
+  const fake:typeof indexerMod.indexSession=async(sessionId)=>{calls++;await gate;return {sessionId,chunkCount:0,skipped:true};};
+  let yielded=false;setImmediate(()=>{yielded=true;});
+  try {
+    for(let batch=0;batch<Math.ceil(ids.length/watcherMod.SEARCH_DISCOVERY_BATCH_SIZE);batch++) {
+      const before=observed.size;
+      await watcherMod.runWatcherTickForTests(fake,{resetSweep:batch===0,
+        sessionIds:()=>{catalogs++;return ids;},needsIndex:(id)=>{observed.add(id);return true;}});
+      assert.ok(observed.size-before<=16);
+    }
+    assert.equal(observed.size,697);assert.equal(catalogs,1);
+    assert.equal(calls,64,"discovery admission memory stays capped even while extraction is blocked");
+    assert.equal(yielded,true);
+    assert.ok(Math.ceil(697/16)*watcherMod.SEARCH_DISCOVERY_INTERVAL_MS<=5*60_000,
+      "nominal discovery sweep is minutes, not hundreds of minutes (excluding I/O time)");
+  } finally {release();await watcherMod.stopWatcher();indexerMod.startSearchQueue();}
+});
+
+test("cheap discovery skips unchanged bodies and notices metadata without extracting", async () => {
+  const id=seedSession({title:"Discovery metadata",transcript:[{role:"user",text:"unchanged body"}]});
+  await indexerMod.indexSession(id);
+  const stages=indexerMod.getSearchQueueStatus().publication.stageTransactions;
+  const workers=transcriptIndexMod.getStructuralTranscriptIndex().getWorkerInstrumentation().workersStarted;
+  assert.equal(indexerMod.searchSessionNeedsIndex(id),false);
+  const row=dbMod.getStore().sessions.find((candidate)=>candidate.id===id)!;
+  row.title="Changed through metadata only";dbMod.flush();
+  assert.equal(indexerMod.searchSessionNeedsIndex(id),true);
+  assert.equal(indexerMod.getSearchQueueStatus().publication.stageTransactions,stages);
+  assert.equal(transcriptIndexMod.getStructuralTranscriptIndex().getWorkerInstrumentation().workersStarted,workers);
+});
+
+test("manual corpus producers stop and drain rather than continuing admission after shutdown", async () => {
+  for(let i=0;i<3;i++)seedSession({title:`Shutdown batch ${i}`,transcript:[{role:"user",text:"synthetic body"}]});
+  let release!:()=>void;let reached!:()=>void;
+  const gate=new Promise<void>((resolve)=>{release=resolve;});
+  const paused=new Promise<void>((resolve)=>{reached=resolve;});
+  let hooks=0;
+  const batch=indexerMod.reindexAll({force:true,afterChunkingForTests:async()=>{hooks++;reached();await gate;}});
+  await paused;
+  const stopping=indexerMod.stopSearchQueue();
+  release();await stopping;
+  const summary=await batch;
+  assert.equal(hooks,1);
+  assert.ok(summary.indexed+summary.skipped<summary.total,"manual producer must break, not visit every session after stop");
+  indexerMod.startSearchQueue();
+});
+
+test("stopped owner rejects every producer before reopening or writing search.db", async () => {
+  await indexerMod.stopSearchQueue();searchDbMod.closeSearchDb();
+  const dbPath=searchDbMod.getSearchDbPath();const parked=`${dbPath}.stopped-fixture`;
+  fs.renameSync(dbPath,parked);fs.mkdirSync(dbPath);
+  try {
+    const result=await indexerMod.indexSession("stopped-synthetic",{force:true});
+    assert.match(result.error!,/owner stopped/);
+    assert.equal((await indexerMod.reindexAll({force:true})).errors,1);
+    await assert.rejects(indexerMod.removeSession("stopped-synthetic"),/owner stopped/);
+    assert.throws(()=>indexerMod.beginTranscriptMutationSearchFence("stopped-synthetic"),/owner stopped/);
+    let opens=0;
+    assert.deepEqual(indexerMod.purgePolicyDeniedSessions({ensureSearchDb:()=>{opens++;throw Error("must not open");}}),{purged:0,errors:1});
+    assert.equal(opens,0);
+    assert.equal(indexerMod.searchSessionNeedsIndex("stopped-synthetic"),false);
+    assert.throws(()=>indexerMod.getIndexCoverageSnapshot(new Set()),/owner stopped/);
+    assert.equal(fs.statSync(dbPath).isDirectory(),true);
+  } finally {fs.rmdirSync(dbPath);fs.renameSync(parked,dbPath);indexerMod.startSearchQueue();}
+});
+
+// Cleanup hook — done via process exit; we leave synthetic fixtures for inspection.
 test("close db handles", async () => {
+  await indexerMod.stopSearchQueue();
   searchDbMod.closeSearchDb();
   await transcriptIndexMod.closeStructuralTranscriptIndex();
 });

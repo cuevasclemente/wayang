@@ -46,6 +46,7 @@ import {
   type WorkspaceProject,
 } from "../api/client";
 import { formatRelativeTime } from "../utils/time";
+import { searchStatusMessage } from "../lib/search-status";
 import { SessionResultSnippet } from "../components/SessionResultSnippet";
 import { observeHumanAttention } from "../browserNotifications";
 import { humanAttentionAriaLabel } from "../humanAttention";
@@ -413,7 +414,9 @@ export function SessionsPanel({
           setSearchState({
             kind: "error",
             query: trimmedQuery,
-            message: err instanceof ApiError ? `HTTP ${err.status}` : String(err),
+            message: err instanceof ApiError && err.body && typeof err.body === "object"
+              && "error" in err.body && typeof err.body.error === "string"
+              ? err.body.error : "Search is temporarily unavailable. Please try again.",
           });
         });
     }, SEARCH_DEBOUNCE_MS);
@@ -699,6 +702,7 @@ export function SessionsPanel({
             onChange={(e) => setSearchInput(e.target.value)}
             placeholder="Search sessions…"
             aria-label="Search session history"
+            aria-describedby="session-search-help"
             data-testid="session-search-input"
             className="w-full rounded bg-neutral-900 border border-neutral-800 pl-7 pr-7 py-1.5 text-xs text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:border-blue-600"
           />
@@ -714,6 +718,14 @@ export function SessionsPanel({
             </button>
           )}
         </div>
+        <p id="session-search-help" className="mt-1 text-[10px] text-neutral-500">
+          Words match independently; quote a phrase. More matches rank higher.
+        </p>
+        {searchState.kind === "ready" && searchStatusMessage(searchState.response) && (
+          <p role="status" data-testid="session-search-status" className="mt-1 text-[11px] text-amber-400">
+            {searchStatusMessage(searchState.response)}
+          </p>
+        )}
         <div className="mt-1.5 flex items-center justify-between">
           <button
             type="button"
@@ -730,11 +742,6 @@ export function SessionsPanel({
               {searchState.response.results.length === 1 ? "" : "s"} ·
               {" "}
               {searchState.response.took_ms.toFixed(0)} ms
-              {searchState.response.degraded === "indexing_in_progress" && (
-                <span className="ml-1 text-amber-400" title="Initial backfill still running">
-                  · indexing…
-                </span>
-              )}
             </span>
           )}
           {searchState.kind === "loading" && (
@@ -1035,42 +1042,24 @@ function SearchResultsList({
   onSelect: (result: SessionSearchResult) => void;
 }) {
   if (response.results.length === 0) {
-    const empty =
-      response.degraded === "indexing_in_progress"
-        ? "Indexing in progress… try again in a moment."
-        : "No matches.";
+    const empty = searchStatusMessage(response)
+      ? "No matches in currently indexed content."
+      : "No matches.";
     return <div className="p-4 text-sm text-neutral-500" data-testid="session-search-empty">{empty}</div>;
   }
-  // Group by cwd for visual consistency with the default tree.
-  const groups = new Map<string, SessionSearchResult[]>();
-  for (const r of response.results) {
-    const list = groups.get(r.cwd) ?? [];
-    list.push(r);
-    groups.set(r.cwd, list);
-  }
-  const ordered = [...groups.entries()].sort((a, b) => {
-    const aLast = Math.max(...a[1].map((r) => r.last_active));
-    const bLast = Math.max(...b[1].map((r) => r.last_active));
-    return bLast - aLast;
-  });
+  // Preserve server relevance across projects; only label contiguous project
+  // runs. Regrouping by project/recency would undo distinct-unit ranking.
   return (
     <div className="py-1" data-testid="session-search-results">
-      {ordered.map(([cwd, items]) => (
-        <div key={cwd}>
-          <div className="flex items-center gap-1.5 px-3 py-1 text-[10px] uppercase tracking-wider text-neutral-500">
-            <Folder size={11} />
-            <span className="truncate" title={cwd}>
-              {cwd}
-            </span>
-          </div>
-          {items.map((r) => (
-            <SearchResultRow
-              key={r.session_id + ":" + (r.best_message_id ?? "")}
-              result={r}
-              active={r.session_id === activeSessionId}
-              onSelect={onSelect}
-            />
-          ))}
+      {response.results.map((result, index) => (
+        <div key={result.session_id}>
+          {(index === 0 || response.results[index - 1].cwd !== result.cwd) && (
+            <div className="flex items-center gap-1.5 px-3 py-1 text-[10px] uppercase tracking-wider text-neutral-500">
+              <Folder size={11} />
+              <span className="truncate" title={result.cwd}>{result.cwd}</span>
+            </div>
+          )}
+          <SearchResultRow result={result} active={result.session_id === activeSessionId} onSelect={onSelect} />
         </div>
       ))}
     </div>

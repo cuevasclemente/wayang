@@ -39,12 +39,25 @@ export interface SearchFacets {
   models: Array<{ value: string; count: number }>;
 }
 
+export type SearchCoverageOutcome = "queued" | "running" | "current" | "metadata_only" | "partial" | "unsupported" | "failed" | "stale" | "legacy" | "missing";
+export interface SearchCoverage {
+  /** Last observed indexing state, not a fresh transcript scan. */
+  total: number;
+  counts: Record<SearchCoverageOutcome, number>;
+  retrying: number;
+  oldest_pending_age_ms: number;
+}
+
 export interface SearchResponse {
   query: string;
   took_ms: number;
   results: SearchResult[];
   facets: SearchFacets;
-  degraded?: "semantic_off" | "indexing_in_progress";
+  degraded?: "semantic_off" | "indexing_in_progress" | "indexing_paused" | "index_incomplete" | "index_unavailable";
+  coverage?: SearchCoverage;
+  /** Freshly rejected stale body coverage, aggregate only. */
+  body_revision_rejected?: number;
+  metadata_revision_rejected?: number;
 }
 
 export interface SearchFilters {
@@ -66,6 +79,8 @@ export interface SearchHealth {
   last_error?: string;
   schema_version: number;
   embedder: "off" | "http";
+  coverage?: SearchCoverage;
+  degraded?: SearchResponse["degraded"];
   watcher?: {
     started: boolean;
     background_indexing_enabled: boolean;

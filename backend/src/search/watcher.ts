@@ -1,250 +1,190 @@
-/**
- * search/watcher.ts — Background reindexer.
- *
- * Strategy:
- *   - On boot, kick off a `reindexAll()` after a short delay so the http
- *     listen is not blocked.
- *   - Every WATCH_INTERVAL_MS, diff `last_active` and `pi_session_file` mtimes
- *     against `session_index_state` and reindex changed sessions.
- *
- * Cheaper and more deterministic than chokidar-watching ~160 jsonl files
- * spread across project subdirectories.
- */
-
-import * as fs from "node:fs";
+/** Bounded metadata/header discovery is independent of slow, queued extraction. */
 import { getPolicyGeneration, onPolicyChanged } from "../policy.js";
 import { listSessions } from "../sessions.js";
 import { getSearchDb } from "./db.js";
-import { indexSession, purgePolicyDeniedSessions, reindexAll } from "./indexer.js";
-import {
-  DreamPolicyProjectionUnavailableError,
-  ensureDreamPolicyProjection,
-  startDreamPolicyProjection,
-  stopDreamPolicyProjection,
-} from "./policy-projection.js";
+import { indexSession, purgePolicyDeniedSessions, searchSessionNeedsIndex, getSearchQueueStatus,
+  startSearchQueue, stopSearchQueue, resumeSearchQueueAfterProjection } from "./indexer.js";
+import { cleanupSearchChunks, yieldSearchTurn } from "./publication.js";
+import { DreamPolicyProjectionUnavailableError, ensureDreamPolicyProjection,
+  startDreamPolicyProjection, stopDreamPolicyProjection } from "./policy-projection.js";
 
-const WATCH_INTERVAL_MS = 30_000;
-const BOOT_DELAY_MS = 2_000;
-
+export const SEARCH_DISCOVERY_INTERVAL_MS = 5_000;
+export const SEARCH_DISCOVERY_BATCH_SIZE = 16;
+const POLICY_HEARTBEAT_MS = 30_000;
+const BOOT_DELAY_MS = 2 * 60_000;
+const RECENT_DEBOUNCE_MS = 2 * 60_000;
+const MAX_DISCOVERY_ADMISSIONS = 64;
 let timer: NodeJS.Timeout | null = null;
+let discoveryTimer: NodeJS.Timeout | null = null;
 let bootTimer: NodeJS.Timeout | null = null;
+let tickTask: Promise<void> | null = null;
+let cleanupTask: Promise<void> | null = null;
+const admissions = new Map<string, Promise<void>>();
+let sweepIds: string[] = [];
+let sweepOffset = 0;
+let sweepNeedsWork = false;
+let lifecycle = 0;
 let lastError: string | null = null;
 let lastTickAt: number | null = null;
 let backfillDone = false;
-let backfillRunning = false;
 let unsubscribePolicy: (() => void) | null = null;
 let started = false;
 let backgroundIndexingEnabled = isSearchBackgroundIndexingEnabled();
 let policyProjectionAvailable = false;
 const POLICY_PROJECTION_ERROR = "Dream policy projection is unavailable";
 
-export function isSearchBackgroundIndexingEnabled(
-  value = process.env.WAYANG_SEARCH_BACKGROUND_INDEXING,
-): boolean {
+export function isSearchBackgroundIndexingEnabled(value = process.env.WAYANG_SEARCH_BACKGROUND_INDEXING): boolean {
   if (value === undefined || value === "" || value === "1") return true;
   if (value === "0") return false;
   throw new Error("WAYANG_SEARCH_BACKGROUND_INDEXING must be 0 or 1");
 }
-
-export function refreshSearchPolicyProjection(
-  ensureProjection: () => unknown = ensureDreamPolicyProjection,
-  refreshGeneration: () => unknown = getPolicyGeneration,
-): boolean {
+export function refreshSearchPolicyProjection(ensureProjection: () => unknown = ensureDreamPolicyProjection,
+  refreshGeneration: () => unknown = getPolicyGeneration): boolean {
   try {
-    refreshGeneration();
-    ensureProjection();
-    policyProjectionAvailable = true;
+    refreshGeneration(); ensureProjection(); policyProjectionAvailable = true;
+    resumeSearchQueueAfterProjection();
     if (lastError === POLICY_PROJECTION_ERROR) lastError = null;
     return true;
-  } catch {
-    policyProjectionAvailable = false;
-    lastError = POLICY_PROJECTION_ERROR;
-    return false;
-  }
+  } catch { policyProjectionAvailable = false; lastError = POLICY_PROJECTION_ERROR; return false; }
 }
-
-export function runPausedPolicyHeartbeat(
-  ensureProjection: () => unknown = ensureDreamPolicyProjection,
-  refreshGeneration: () => unknown = getPolicyGeneration,
-): void {
+export function runPausedPolicyHeartbeat(ensureProjection: () => unknown = ensureDreamPolicyProjection,
+  refreshGeneration: () => unknown = getPolicyGeneration): void {
   lastTickAt = Date.now();
-  if (!refreshSearchPolicyProjection(ensureProjection, refreshGeneration)) {
+  if (!refreshSearchPolicyProjection(ensureProjection,refreshGeneration)) {
     console.error("[search] paused policy projection refresh remains unavailable");
   }
 }
-
 export function startWatcher(): void {
   if (started) return;
   backgroundIndexingEnabled = isSearchBackgroundIndexingEnabled();
+  lifecycle++;
+  sweepIds = []; sweepOffset = 0; sweepNeedsWork = false; backfillDone = false;
+  startSearchQueue();
   const purgeForPolicy = (): void => {
     const result = purgePolicyDeniedSessions();
     if (result.errors > 0) lastError = `Policy purge failed for ${result.errors} session(s)`;
   };
   try {
-    getPolicyGeneration();
-    startDreamPolicyProjection();
-    refreshSearchPolicyProjection();
-    purgeForPolicy();
+    getPolicyGeneration(); startDreamPolicyProjection(); refreshSearchPolicyProjection(); purgeForPolicy();
     unsubscribePolicy = onPolicyChanged(purgeForPolicy);
     started = true;
   } catch (error) {
-    unsubscribePolicy?.();
-    unsubscribePolicy = null;
-    stopDreamPolicyProjection();
+    unsubscribePolicy?.(); unsubscribePolicy = null; stopDreamPolicyProjection();
+    void stopSearchQueue();
     throw error;
   }
+  timer = setInterval(() => {
+    if (!started) return;
+    if (!backgroundIndexingEnabled) runPausedPolicyHeartbeat();
+    else refreshSearchPolicyProjection();
+    void runCleanup();
+  },POLICY_HEARTBEAT_MS);
+  timer.unref?.();
   if (!backgroundIndexingEnabled) {
     console.warn("[search] background indexing paused by WAYANG_SEARCH_BACKGROUND_INDEXING=0");
-    timer = setInterval(() => runPausedPolicyHeartbeat(), WATCH_INTERVAL_MS);
-    timer.unref?.();
     return;
   }
+  // Boot uses the same discovery cursor, not a second serial corpus producer.
   bootTimer = setTimeout(() => {
     bootTimer = null;
-    runBackfill().catch((err) => {
-      lastError = err instanceof Error ? err.message : String(err);
-      console.error("[search] initial backfill failed:", err);
-    });
-  }, BOOT_DELAY_MS);
+    const run = () => {
+      if (!started) return;
+      void tick().catch(() => { lastError = "Search discovery failed"; });
+    };
+    run();
+    if (started) {
+      discoveryTimer = setInterval(run,SEARCH_DISCOVERY_INTERVAL_MS);
+      discoveryTimer.unref?.();
+    }
+  },BOOT_DELAY_MS);
   bootTimer.unref?.();
-
-  timer = setInterval(() => {
-    tick().catch((err) => {
-      lastError = err instanceof Error ? err.message : String(err);
-      console.error("[search] watcher tick failed:", err);
-    });
-  }, WATCH_INTERVAL_MS);
-  timer.unref?.();
 }
-
-export function stopWatcher(): void {
-  started = false;
+export function stopWatcher(): Promise<void> {
+  started = false; lifecycle++;
+  const queueStopped = stopSearchQueue();
   if (timer) clearInterval(timer);
+  if (discoveryTimer) clearInterval(discoveryTimer);
   if (bootTimer) clearTimeout(bootTimer);
-  timer = null;
-  bootTimer = null;
-  unsubscribePolicy?.();
-  unsubscribePolicy = null;
-  stopDreamPolicyProjection();
+  timer = null; discoveryTimer = null; bootTimer = null;
+  unsubscribePolicy?.(); unsubscribePolicy = null; stopDreamPolicyProjection();
+  return Promise.all([queueStopped,tickTask,cleanupTask,...admissions.values()]).then(() => undefined);
+}
+export function getWatcherStatus() {
+  return {lastError,lastTickAt,backfillDone,
+    backfillRunning:!backfillDone && Boolean(tickTask || admissions.size),started,
+    backgroundIndexingEnabled:started ? backgroundIndexingEnabled : isSearchBackgroundIndexingEnabled(),policyProjectionAvailable};
 }
 
-export function getWatcherStatus(): {
-  lastError: string | null;
-  lastTickAt: number | null;
-  backfillDone: boolean;
-  backfillRunning: boolean;
-  started: boolean;
-  backgroundIndexingEnabled: boolean;
-  policyProjectionAvailable: boolean;
-} {
-  return {
-    lastError,
-    lastTickAt,
-    backfillDone,
-    backfillRunning,
-    started,
-    backgroundIndexingEnabled: started ? backgroundIndexingEnabled : isSearchBackgroundIndexingEnabled(),
-    policyProjectionAvailable,
-  };
+interface DiscoveryTestPorts {
+  sessionIds?: () => string[];
+  needsIndex?: (sessionId: string) => boolean;
+  resetSweep?: boolean;
 }
-
-async function runBackfill(): Promise<void> {
-  if (backfillRunning) return;
-  backfillRunning = true;
-  try {
-    const summary = await reindexAll();
-    console.log(
-      `[search] backfill done: total=${summary.total} indexed=${summary.indexed} skipped=${summary.skipped} errors=${summary.errors} durationMs=${summary.durationMs}`,
-    );
-  } finally {
-    backfillRunning = false;
-    backfillDone = true;
-  }
+function tick(indexOne: typeof indexSession = indexSession, ports: DiscoveryTestPorts = {}): Promise<void> {
+  if (tickTask) return tickTask;
+  if (getSearchQueueStatus().stopped) return Promise.resolve();
+  const work = discoverBatch(indexOne,ports,lifecycle);
+  tickTask = work;
+  void work.then(() => {if(tickTask===work)tickTask=null;},() => {if(tickTask===work)tickTask=null;});
+  return work;
 }
-
-async function tick(indexOne: typeof indexSession = indexSession): Promise<void> {
+async function discoverBatch(indexOne: typeof indexSession, ports: DiscoveryTestPorts, expectedLifecycle: number): Promise<void> {
   lastTickAt = Date.now();
-  // Detect policy-bearing repository writes even if their caller omitted the
-  // eager notification hook; onPolicyChanged performs the purge.
   getPolicyGeneration();
-  const db = getSearchDb();
-  const sessions = listSessions(true);
-  const states = new Map<
-    string,
-    { pi_session_file: string | null; file_mtime_ms: number | null; file_size: number | null }
-  >();
-  for (const r of db
-    .prepare(
-      "SELECT session_id, pi_session_file, file_mtime_ms, file_size FROM session_index_state",
-    )
-    .all() as Array<{
-    session_id: string;
-    pi_session_file: string | null;
-    file_mtime_ms: number | null;
-    file_size: number | null;
-  }>) {
-    states.set(r.session_id, {
-      pi_session_file: r.pi_session_file,
-      file_mtime_ms: r.file_mtime_ms,
-      file_size: r.file_size,
-    });
+  // One batch-global prerequisite. No per-session projection retry storm.
+  ensureDreamPolicyProjection();
+  if (ports.resetSweep) { sweepIds=[]; sweepOffset=0; }
+  if (!sweepIds.length) {
+    // Freeze only catalog IDs for one sweep so recency reordering cannot starve
+    // older sessions. No corpus-wide authorization walk or transcript scan.
+    sweepIds = (ports.sessionIds ?? (() => listSessions(true).map(row=>row.id)))();
+    sweepOffset = 0; sweepNeedsWork = false;
   }
-
-  for (const s of sessions) {
-    const st = states.get(s.id);
-    let needsReindex = false;
-    if (!st) {
-      needsReindex = true;
-    } else if ((st.pi_session_file ?? null) !== (s.pi_session_file ?? null)) {
-      needsReindex = true;
-    } else if (s.pi_session_file) {
+  const end = Math.min(sweepOffset+SEARCH_DISCOVERY_BATCH_SIZE,sweepIds.length);
+  while (sweepOffset < end) {
+    if (expectedLifecycle !== lifecycle || getSearchQueueStatus().stopped) return;
+    const id = sweepIds[sweepOffset++];
+    const needed = (ports.needsIndex ?? searchSessionNeedsIndex)(id);
+    sweepNeedsWork ||= needed;
+    if (needed && !admissions.has(id) && admissions.size < MAX_DISCOVERY_ADMISSIONS) {
+      // Deliberately do NOT await extraction here. Dirty overflow is revisited
+      // on later sweeps; queue capacity, priority and cooldown remain authoritative.
       try {
-        const stat = fs.statSync(s.pi_session_file);
-        if (stat.mtimeMs !== st.file_mtime_ms || stat.size !== st.file_size) {
-          needsReindex = true;
-        }
-      } catch {
-        // File removed; still update state.
-        needsReindex = true;
-      }
+        const work = indexOne(id,{priority:"background"});
+        const settled = work.then((result) => {if(result.error)lastError="Search indexing incomplete";},(error) => {
+          lastError = error instanceof DreamPolicyProjectionUnavailableError ? POLICY_PROJECTION_ERROR : "Search refresh failed";
+        });
+        admissions.set(id,settled);
+        void settled.then(() => {if(admissions.get(id)===settled)admissions.delete(id);});
+      } catch { lastError="Search admission failed"; }
     }
-    if (needsReindex) {
-      try {
-        await indexOne(s.id);
-      } catch (err) {
-        if (err instanceof DreamPolicyProjectionUnavailableError) throw err;
-        console.error(`[search] tick indexSession(${s.id}) failed:`, err);
-      }
-    }
+    await yieldSearchTurn();
+  }
+  if (sweepOffset >= sweepIds.length) {
+    // This flag is discovery bookkeeping, never a substitute for durable
+    // current/partial/failed coverage counts exposed by the status owner.
+    backfillDone = !sweepNeedsWork && admissions.size===0;
+    sweepIds=[]; sweepOffset=0;
   }
 }
-
-/** @internal Deterministic watcher-cycle seam for synthetic tests. */
-export async function runWatcherTickForTests(
-  indexOne: typeof indexSession = indexSession,
-): Promise<void> {
-  if (!isSearchBackgroundIndexingEnabled()) {
-    getPolicyGeneration();
-    return;
-  }
-  await tick(indexOne);
+function runCleanup(): Promise<void> {
+  if (cleanupTask) return cleanupTask;
+  const expectedLifecycle = lifecycle;
+  cleanupTask = Promise.resolve().then(async () => {
+    if (!started || expectedLifecycle !== lifecycle) return;
+    try { await cleanupSearchChunks(getSearchDb(),{maxBatches:4,
+      shouldContinue:()=>started && expectedLifecycle===lifecycle}); }
+    catch { lastError="Search cleanup failed"; }
+  }).finally(() => {cleanupTask=null;});
+  return cleanupTask;
 }
-
-/**
- * Public hook: call when a specific session has just had its pi_session_file
- * discovered/changed, so it can be indexed immediately rather than waiting
- * for the next tick.
- */
-export async function indexSessionNow(
-  sessionId: string,
-  indexOne: typeof indexSession = indexSession,
-): Promise<void> {
-  if (!isSearchBackgroundIndexingEnabled()) return;
-  try {
-    // indexSession ensures the complete current decision before a newly linked
-    // transcript can be considered by external Dream enumeration.
-    await indexOne(sessionId);
-  } catch (err) {
-    console.error(`[search] immediate indexSession(${sessionId}) failed:`, err);
-  }
+/** @internal Deterministic discovery-cycle seam; uses only synthetic fixture ports. */
+export async function runWatcherTickForTests(indexOne: typeof indexSession = indexSession, ports: DiscoveryTestPorts = {}): Promise<void> {
+  if (!isSearchBackgroundIndexingEnabled()) {getPolicyGeneration();return;}
+  await tick(indexOne,ports);
+}
+export async function indexSessionNow(sessionId: string, indexOne: typeof indexSession = indexSession): Promise<void> {
+  if (!isSearchBackgroundIndexingEnabled() || getSearchQueueStatus().stopped) return;
+  try {await indexOne(sessionId,{priority:"recent",delayMs:RECENT_DEBOUNCE_MS});}
+  catch {console.error("[search] recent indexing request failed");}
 }
