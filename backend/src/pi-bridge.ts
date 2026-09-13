@@ -1557,6 +1557,9 @@ const WAYANG_CATALOG_PROVIDERS = new Set([
   "moonshotai",
   "openai-codex",
   "openrouter-zdr",
+  // Non-ZDR OpenRouter lane. Deliberately separate from openrouter-zdr so the
+  // picker never presents a non-ZDR model as if it were ZDR-routed.
+  "openrouter-metered",
   "together",
   "zai",
 ]);
