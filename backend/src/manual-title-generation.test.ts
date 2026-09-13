@@ -22,7 +22,7 @@ import {
   setManualTitleProviderForTests,
   type ManualTitleGenerationDependencies,
 } from "./manual-title-generation.js";
-import type { TitleProvider } from "./terra-title-provider.js";
+import type { TitleProvider } from "./deepseek-title-provider.js";
 
 interface Fixture {
   root: string;
@@ -328,7 +328,7 @@ test("rename during provider request defeats commit", async () => {
   }
 });
 
-test("no completed turn fails without preparing Terra", async () => {
+test("no completed turn fails without preparing the title provider", async () => {
   const f = fixture();
   try {
     const fake = new FakeProvider(() => "Must not generate");
@@ -343,7 +343,7 @@ test("no completed turn fails without preparing Terra", async () => {
   }
 });
 
-test("explicit action retains the configured Terra disclosure gate", () => {
+test("explicit action retains the configured title disclosure gate", () => {
   const f = fixture();
   try {
     appendExchange(f.manager, 1);

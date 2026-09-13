@@ -10,7 +10,7 @@ import {
   normalizeGeneratedTitle,
   type TitleSourceProjection,
 } from "./session-title-policy.js";
-import { TerraTitleProvider, type TitleProvider } from "./terra-title-provider.js";
+import { DeepSeekTitleProvider, type TitleProvider } from "./deepseek-title-provider.js";
 import { isSessionRuntimeMutationLocked } from "./session-runtime-mutation-lock.js";
 import { authorizeProjectAction } from "./policy.js";
 import { protectedAutoTitleEnabled, wayangAutoTitleEnabled } from "./session-title-service.js";
@@ -80,7 +80,7 @@ export class ManualTitleGenerationError extends Error {
 const jobs = new Map<string, ManualTitleGenerationJob>();
 const POLL_DELAY_MS = 250;
 const TERMINAL_TTL_MS = 5 * 60 * 1_000;
-let provider: TitleProvider = new TerraTitleProvider();
+let provider: TitleProvider = new DeepSeekTitleProvider();
 
 function nameStateEqual(left: SessionNameState, right: SessionNameState): boolean {
   return left.name === right.name && left.entryId === right.entryId;
@@ -319,7 +319,7 @@ export function enqueueManualTitleGeneration(
   if (!row) throw new ManualTitleGenerationError("Session not found", 404, "session_not_found");
   if (!explicitTitleDisclosureAllowed(row)) {
     throw new ManualTitleGenerationError(
-      "Terra title disclosure is not enabled for this session",
+      "Automatic title disclosure is not enabled for this session",
       403,
       "title_generation_disabled",
     );
@@ -365,14 +365,14 @@ export function cancelManualTitleGeneration(sessionId: string, code = "session_r
 
 /** Synthetic provider seam. It cannot enable production disclosure. */
 export function setManualTitleProviderForTests(next: TitleProvider | null): void {
-  provider = next ?? new TerraTitleProvider();
+  provider = next ?? new DeepSeekTitleProvider();
 }
 
 /** Reset process-local queue state; models a Wayang restart in tests. */
 export function resetManualTitleGenerationForTests(): void {
   for (const job of jobs.values()) clearJobTimer(job);
   jobs.clear();
-  provider = new TerraTitleProvider();
+  provider = new DeepSeekTitleProvider();
 }
 
 /** Run one queued job without waiting for its polling timer. */
