@@ -10,7 +10,7 @@ interface AutoTitleFixture {
 /**
  * Browser-only contract fixture for session auto-titles.
  *
- * It deliberately does not emulate Terra or title generation. Instead, it
+ * It deliberately does not emulate DeepSeek or title generation. Instead, it
  * models the backend boundary the frontend consumes: the catalog keeps the
  * provisional title through two completed exchanges and exposes a canonical
  * title after the third completion. ChatPanel's existing session-change
@@ -290,7 +290,7 @@ test("Generate title confirms, shows progress, and refreshes the row", async ({ 
   const row = page.locator(`[data-testid="session-row"][data-session-id="${session.id}"]`);
   await row.hover();
   page.once("dialog", async (dialog) => {
-    expect(dialog.message()).toContain("openai-codex/gpt-5.6-terra");
+    expect(dialog.message()).toContain("openrouter/deepseek/deepseek-v4.1-flash");
     expect(dialog.message()).toContain("first one to three completed turns");
     await dialog.accept();
   });

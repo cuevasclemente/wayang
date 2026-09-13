@@ -236,7 +236,7 @@ router.put("/sessions/:id/title", (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
-// Explicit Terra title generation
+// Explicit DeepSeek V4.1 title generation
 // ---------------------------------------------------------------------------
 
 function manualTitleGenerationBusy(sessionId: string): boolean {

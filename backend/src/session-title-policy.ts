@@ -4,8 +4,8 @@ import {
   wayangInteractiveTurnSourceFromEntry,
 } from "./interactive-turn-provenance.js";
 
-export const AUTO_TITLE_MODEL_PROVIDER = "openai-codex";
-export const AUTO_TITLE_MODEL_ID = "gpt-5.6-terra";
+export const AUTO_TITLE_MODEL_PROVIDER = "openrouter";
+export const AUTO_TITLE_MODEL_ID = "deepseek/deepseek-v4.1-flash";
 export const AUTO_TITLE_MAX_CODE_POINTS = 80;
 export const AUTO_TITLE_TOTAL_INPUT_CODE_POINTS = 12 * 1024;
 export const AUTO_TITLE_SIDE_CODE_POINTS = 1_900;
