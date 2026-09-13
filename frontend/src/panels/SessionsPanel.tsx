@@ -572,8 +572,8 @@ export function SessionsPanel({
     const currentTitle = session.title.trim();
     const replacement = currentTitle ? `replace “${currentTitle}”` : "name this untitled session";
     if (!window.confirm(
-      `Generate a title with openai-codex/gpt-5.6-terra and ${replacement}?\n\n`
-      + "This sends bounded prose from the first one to three completed turns to Terra. "
+      `Generate a title with openrouter/deepseek/deepseek-v4.1-flash and ${replacement}?\n\n`
+      + "This sends bounded prose from the first one to three completed turns to DeepSeek V4.1 Flash via OpenRouter with zero-data-retention routing. "
       + "A newer title change will win instead of being overwritten.",
     )) return;
     setTitleGenerationNotice(null);
