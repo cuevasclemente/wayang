@@ -24,6 +24,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
+import { fetchJsonWithRetry as fetchJsonWithTimeout } from "./dynamic-model-fetch.js";
 import { recordLatencyMetric } from "./latency-metrics.js";
 import { getInterviewBridge } from "./interview-bridge.js";
 import { markDelivered, resolveInterviewSubmissionEvidence, type InterviewRecord } from "./interviews.js";
@@ -652,7 +653,6 @@ let _modelListingRegistryPromise: Promise<{ runtime: ModelRuntime; registry: Mod
 let _modelListingRegistryError: string | undefined;
 
 const DYNAMIC_MODEL_REFRESH_MS = 5 * 60 * 1000;
-const DYNAMIC_MODEL_FETCH_TIMEOUT_MS = 8 * 1000;
 
 type DynamicModelCache = {
   fetchedAt: number;
@@ -1860,18 +1860,6 @@ function findAnthropicFamilyTemplate(registry: ModelRegistry, family: string, ma
     .filter(({ minor }) => minor >= 0 && (beforeMinor === undefined || minor <= beforeMinor))
     .sort((a, b) => b.minor - a.minor);
   return candidates[0]?.model || findProviderTemplate(registry, "anthropic");
-}
-
-async function fetchJsonWithTimeout(url: string, init: RequestInit = {}): Promise<unknown> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), DYNAMIC_MODEL_FETCH_TIMEOUT_MS);
-  try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
-    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-    return await response.json();
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 function openRouterModelToModel(registry: ModelRegistry, raw: Record<string, unknown>): Model<Api> | null {
