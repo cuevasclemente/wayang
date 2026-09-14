@@ -317,11 +317,11 @@ class TripletFixture:
             self.record_mutator(record)
         return json.dumps(self.pack_output(PACKAGE_NAMES[directory], record))
 
-    def run(self, with_proof=True, with_proof_hash=True):
+    def run(self, with_proof=True, with_proof_hash=True, hash_without_proof=False):
         argv = ["vendor-pi-artifacts.py", "--source", str(self.source), "--output", str(self.output)]
         if with_proof:
             argv += ["--catalog-proof", str(self.proof_path)]
-        if with_proof_hash:
+        if with_proof_hash or hash_without_proof:
             argv += ["--catalog-proof-sha256", self.proof_sha256]
         stdout = io.StringIO()
         make_temporary_directory = tempfile.mkdtemp
@@ -681,16 +681,39 @@ class TripletArtifactTests(unittest.TestCase):
         self.assertEqual(fixture.run(), first)
         self.assertEqual({name: (fixture.output / name).read_bytes() for name in payloads}, payloads)
 
-    def test_rejects_missing_proof_instead_of_packing_an_unprovenanced_cohort(self):
+    def test_packs_without_proof_and_records_source_catalog_integrity(self):
+        # Wayang policy: no release attestation required; the packed triplet
+        # binds the catalog bytes it was built from instead.
         fixture = self.fixture()
-        with self.assertRaises((ValueError, SystemExit)):
-            fixture.run(with_proof=False)
-        self.assertFalse(any(args[0] == "npm" for args, _ in fixture.commands))
+        result = fixture.run(with_proof=False, with_proof_hash=False)
+        self.assertEqual(result["sourceRevision"], REVISION)
+        self.assertEqual(len(result["artifacts"]), 3)
+        expected_manifest = digest(fixture.catalog_files[".manifest.json"])
+        for record in result["artifacts"]:
+            entries = archive_entries(fixture.output / record["file"])
+            manifest = json.loads(entries["package/package.json"])
+            self.assertEqual(manifest["wayangSourceRevision"], REVISION)
+            self.assertEqual(manifest["wayangAiCatalogManifestSha256"], expected_manifest)
+            self.assertNotIn("wayangAiCatalogProvenanceSha256", manifest)
+            self.assertNotIn("wayangAiCatalogDerivationSha256", manifest)
+            self.assertNotIn("wayangAiPublishedArchiveSha256", manifest)
+            if manifest["name"] == PACKAGE_NAMES["ai"]:
+                for name, body in fixture.catalog_files.items():
+                    self.assertEqual(entries[f"package/dist/providers/data/{name}"], body)
+            elif manifest["name"] == PACKAGE_NAMES["coding-agent"]:
+                self.assertEqual(manifest["wayangRequiredCoreSourceRevision"], REVISION)
+            else:
+                self.assertEqual(manifest["wayangRequiredAiSourceRevision"], REVISION)
 
-    def test_requires_independent_proof_hash_even_when_the_proof_path_is_valid(self):
+    def test_rejects_catalog_proof_without_matching_hash_or_vice_versa(self):
         fixture = self.fixture()
         with self.assertRaises((ValueError, SystemExit)):
             fixture.run(with_proof_hash=False)
+        self.assertFalse(any(args[0] == "npm" for args, _ in fixture.commands))
+        self.assertFalse(list(fixture.output.glob("*.tgz")))
+        fixture = self.fixture()
+        with self.assertRaises((ValueError, SystemExit)):
+            fixture.run(with_proof=False, hash_without_proof=True)
         self.assertFalse(any(args[0] == "npm" for args, _ in fixture.commands))
         self.assertFalse(list(fixture.output.glob("*.tgz")))
 

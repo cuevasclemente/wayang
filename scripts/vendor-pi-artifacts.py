@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Pack an already checked/built, clean Pi source revision; never install or publish.
 
-The 0.85 SDK, core and AI travel together, bound to an independently pinned
-catalog proof. Core/AI retain upstream versions; SDK shrinkwrap graph entries
+The 0.85 SDK, core and AI travel together, bound to the catalog bytes they were
+packed from. Core/AI retain upstream versions; SDK shrinkwrap graph entries
 are preserved, not assumed to deduplicate. Downstream installation and actual
 bundled-entrypoint checks remain mandatory. Failed packing stages are retained.
+
+An optional --catalog-proof/--catalog-proof-sha256 pair still records the older
+independently reviewed source-provenance.json bindings, but Wayang no longer
+requires it: a clean, committed, offline-built source at a pinned revision is
+deployable once its tests pass.
 """
 import argparse
 import base64
@@ -274,6 +279,31 @@ def catalog_contract(source, proof_path, expected_hash, revision):
     return proof, data
 
 
+def catalog_manifest_sha256(source):
+    """Bind the packed catalog bytes directly, with no external attestation file.
+
+    Wayang deploys on tests pass, so the packed triplet records what the source
+    catalog actually contains (src/dist inventory plus manifest hash) rather than
+    a separately reviewed source-provenance.json.
+    """
+    data = None
+    for tree in ("src", "dist"):
+        snapshot = tree_snapshot(source / "packages" / "ai" / tree / "providers/data")
+        if data is None:
+            data = snapshot
+        elif snapshot != data:
+            raise ValueError("AI src/dist catalog provider snapshot mismatch")
+    if data is None or data.get(".manifest.json", {}).get("sha256") != sha256(
+            regular_bytes(source / "packages/ai/dist/providers/data/.manifest.json", MAX_JSON_BYTES)):
+        raise ValueError("Catalog manifest hash mismatch")
+    manifest = read_object(source / "packages/ai/dist/providers/data/.manifest.json", "catalog manifest")
+    providers = {name: item["sha256"] for name, item in data.items() if name != ".manifest.json"}
+    if (manifest.get("schemaVersion") != 3 or manifest.get("files") != providers
+            or any("/" in name or not name.endswith(".json") for name in providers)):
+        raise ValueError("Catalog manifest provider inventory mismatch")
+    return data[".manifest.json"]["sha256"]
+
+
 def package_snapshot(root, manifest, sdk):
     # Capture publishable roots before npm; never traverse node_modules or private state.
     selectors = manifest.get("files", ["dist"])
@@ -426,14 +456,14 @@ def bounded_archive(payload):
         raise ValueError("Invalid bounded package archive") from error
 
 
-def triplet_payload(entries, directory, revision, proof, proof_hash):
+def triplet_payload(entries, directory, revision, catalog_manifest, proof, proof_hash):
     entries = dict(entries)
     manifest = parse_json(entries["package.json"][0], "package")
     manifest["wayangSourceRevision"] = revision
-    manifest["wayangAiCatalogManifestSha256"] = proof["outputManifestSha256"]
+    manifest["wayangAiCatalogManifestSha256"] = catalog_manifest
     if directory != "ai":
         manifest["wayangRequiredAiSourceRevision"] = revision
-    else:
+    elif proof is not None:
         for key, field in (("wayangAiCatalogDerivationSha256", "derivationReportSha256"),
                            ("wayangAiPublishedArchiveSha256", "publishedArchiveSha256"),
                            ("wayangAiApprovedArchiveSha256", "approvedArchiveSha256"),
@@ -486,23 +516,36 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--catalog-proof", required=True, type=Path,
-                        help="Reviewed source-provenance.json; derivation.json and data/ must be siblings")
-    parser.add_argument("--catalog-proof-sha256", required=True,
-                        help="Independently recorded full lowercase SHA256 of reviewed proof bytes")
+    parser.add_argument("--catalog-proof", type=Path,
+                        help="Optional reviewed source-provenance.json; derivation.json and data/ must be siblings")
+    parser.add_argument("--catalog-proof-sha256",
+                        help="Optional independently recorded full lowercase SHA256 of reviewed proof bytes")
     args = parser.parse_args()
-    for path in (args.source, args.output, args.catalog_proof):
+    if (args.catalog_proof is None) != (args.catalog_proof_sha256 is None):
+        raise ValueError("Supply both --catalog-proof and --catalog-proof-sha256, or neither")
+    checked = [args.source, args.output]
+    if args.catalog_proof is not None:
+        checked.append(args.catalog_proof)
+    for path in checked:
         if path.is_symlink():
             raise ValueError("Refusing a symlink source/proof/output destination")
     source = args.source.resolve(strict=True)
     output = args.output.resolve()
-    proof_path = args.catalog_proof.parent.resolve(strict=True) / args.catalog_proof.name
-    if output.is_relative_to(source) or output.is_relative_to(proof_path.parent):
+    proof_path = None
+    if args.catalog_proof is not None:
+        proof_path = args.catalog_proof.parent.resolve(strict=True) / args.catalog_proof.name
+        if output.is_relative_to(source) or output.is_relative_to(proof_path.parent):
+            raise ValueError("Artifact output must be outside source and catalog inputs")
+    elif output.is_relative_to(source):
         raise ValueError("Artifact output must be outside source and catalog inputs")
     if output.exists() and not output.is_dir():
         raise ValueError("Artifact output destination must be a directory")
     revision = source_identity(source)
-    proof, catalog = catalog_contract(source, proof_path, args.catalog_proof_sha256, revision)
+    catalog_manifest = catalog_manifest_sha256(source)
+    proof = None
+    catalog = None
+    if proof_path is not None:
+        proof, catalog = catalog_contract(source, proof_path, args.catalog_proof_sha256, revision)
     snapshots = {directory: validate_package(source / "packages" / directory, directory) for directory in PACKAGES}
     # Retain all failed npm/repack stages. Only our own successful staging tree is removed.
     staging = Path(tempfile.mkdtemp(prefix="wayang-pi-pack-")).resolve()
@@ -545,7 +588,7 @@ def main():
             required = {key for key in snapshot if key.startswith("dist/") or key in ("package.json", "npm-shrinkwrap.json")}
             if not required.issubset(entries):
                 raise ValueError("npm pack omitted required snapshot entries")
-            payload = triplet_payload(entries, directory, revision, proof, args.catalog_proof_sha256)
+            payload = triplet_payload(entries, directory, revision, catalog_manifest, proof, args.catalog_proof_sha256)
             suffix = sha256(payload)[:8] if directory == "ai" else revision[:8]
             filename = f"earendil-works-{name}-0.85.0-wayang.{suffix}.tgz"
             # Keep the verified final bytes in the stage as well for failed-stage review.
@@ -555,8 +598,11 @@ def main():
             payloads.append((output / filename, payload))
         if source_identity(source) != revision:
             raise ValueError("Source revision changed during pack")
-        if catalog_contract(source, proof_path, args.catalog_proof_sha256, revision) != (proof, catalog):
+        if catalog_manifest_sha256(source) != catalog_manifest:
             raise ValueError("Catalog snapshot changed during pack")
+        if proof_path is not None and catalog_contract(
+                source, proof_path, args.catalog_proof_sha256, revision) != (proof, catalog):
+            raise ValueError("Catalog proof changed during pack")
         if {directory: validate_package(source / "packages" / directory, directory) for directory in PACKAGES} != snapshots:
             raise ValueError("Source package snapshot changed during pack")
         if output.is_symlink():
