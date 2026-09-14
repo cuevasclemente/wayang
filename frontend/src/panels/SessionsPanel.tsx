@@ -53,6 +53,10 @@ import { humanAttentionAriaLabel } from "../humanAttention";
 
 type LoadState = "loading" | "ready" | "error";
 
+// Sidebar job navigation shows a bounded page by default and lets the owner
+// expand to the full list, so jobs beyond the first page remain reachable.
+const NAV_JOB_PAGE_SIZE = 8;
+
 interface SessionsPanelProps {
   activeSessionId: string | null;
   active: boolean;
@@ -1125,6 +1129,9 @@ function ProtectedAutomationsSection({ catalog, loading, unavailable, activeJobI
   onSelectJob?: (jobId: string | null) => void;
 }) {
   const jobs = Array.isArray(catalog.jobs) ? catalog.jobs : [];
+  const [expanded, setExpanded] = useState(false);
+  const visibleJobs = expanded ? jobs : jobs.slice(0, NAV_JOB_PAGE_SIZE);
+  const hiddenJobCount = jobs.length - visibleJobs.length;
   const productionAvailable = catalog.status?.production_services === true;
   const held = catalog.status?.activationAvailable === false;
   return (
@@ -1159,7 +1166,7 @@ function ProtectedAutomationsSection({ catalog, loading, unavailable, activeJobI
       )}
       {!loading && !unavailable && jobs.length > 0 && (
         <div className="mt-1">
-          {jobs.slice(0, 8).map((job) => (
+          {visibleJobs.map((job) => (
             <button
               key={job.id}
               type="button"
@@ -1177,7 +1184,17 @@ function ProtectedAutomationsSection({ catalog, loading, unavailable, activeJobI
               <div className="truncate font-mono text-[10px] text-neutral-600">{job.cron_expr}</div>
             </button>
           ))}
-          {jobs.length > 8 && <div className="px-3 py-1 text-[10px] text-neutral-600">+{jobs.length - 8} more</div>}
+          {jobs.length > NAV_JOB_PAGE_SIZE && (
+            <button
+              type="button"
+              data-testid="protected-automations-nav-toggle"
+              aria-expanded={expanded}
+              onClick={() => setExpanded((current) => !current)}
+              className="block w-full px-3 py-1 text-left text-[10px] text-neutral-500 hover:bg-neutral-900 hover:text-neutral-300"
+            >
+              {expanded ? "Show fewer" : `Show all ${jobs.length} jobs (+${hiddenJobCount} more)`}
+            </button>
+          )}
         </div>
       )}
     </section>
@@ -1191,6 +1208,9 @@ function ScheduledJobsSection({ jobs, projects, activeJobId, onSelectJob }: {
   onSelectJob?: (jobId: string | null) => void;
 }) {
   const safeJobs = Array.isArray(jobs) ? jobs : [];
+  const [expanded, setExpanded] = useState(false);
+  const visibleJobs = expanded ? safeJobs : safeJobs.slice(0, NAV_JOB_PAGE_SIZE);
+  const hiddenJobCount = safeJobs.length - visibleJobs.length;
   return (
     <section className="border-b border-neutral-900 py-2">
       <div className="flex items-center justify-between px-3 py-1">
@@ -1216,7 +1236,7 @@ function ScheduledJobsSection({ jobs, projects, activeJobId, onSelectJob }: {
         </button>
       ) : (
         <div className="mt-1">
-          {safeJobs.slice(0, 8).map((job) => {
+          {visibleJobs.map((job) => {
             const cwd = job.cwd.replace(/\/+$/, "") || "/";
             const protectedProject = projects.some((project) => (
               (project.cwd.replace(/\/+$/, "") || "/") === cwd
@@ -1243,7 +1263,17 @@ function ScheduledJobsSection({ jobs, projects, activeJobId, onSelectJob }: {
               </button>
             );
           })}
-          {safeJobs.length > 8 && <div className="px-3 py-1 text-[10px] text-neutral-600">+{safeJobs.length - 8} more</div>}
+          {safeJobs.length > NAV_JOB_PAGE_SIZE && (
+            <button
+              type="button"
+              data-testid="scheduled-jobs-nav-toggle"
+              aria-expanded={expanded}
+              onClick={() => setExpanded((current) => !current)}
+              className="block w-full px-3 py-1 text-left text-[10px] text-neutral-500 hover:bg-neutral-900 hover:text-neutral-300"
+            >
+              {expanded ? "Show fewer" : `Show all ${safeJobs.length} jobs (+${hiddenJobCount} more)`}
+            </button>
+          )}
         </div>
       )}
     </section>
