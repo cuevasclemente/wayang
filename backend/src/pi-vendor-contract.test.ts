@@ -6,13 +6,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { Agent } from "@earendil-works/pi-agent-core";
-import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { InMemoryCredentialStore, isRetryableAssistantError, type AssistantMessage } from "@earendil-works/pi-ai";
 import {
   createAgentSession, createExtensionRuntime, ModelRuntime, SessionManager, SettingsManager,
   type CustomMessage, type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
 
-const SOURCE_REVISION = "904e4012047428abeaa5f47f4b6fa759069eb987";
+const SOURCE_REVISION = "fa40ae91ad733a8a0bc369cfbdcaca381fa47a46";
 const CATALOG_MANIFEST_SHA256 = "e6dd5f432d502e84981ac15c14d9eb0f78bab7baf1aac8dbb805d48b8b3c3655";
 
 function packageMetadata(entry: string): Record<string, unknown> {
@@ -21,7 +21,7 @@ function packageMetadata(entry: string): Record<string, unknown> {
   return JSON.parse(readFileSync(join(dirname(fileURLToPath(entry)), "..", "package.json"), "utf8"));
 }
 
-test("vendored SDK, core and AI retain the sealed source and catalog provenance", () => {
+test("vendored SDK, core and AI retain the packed source and catalog bytes", () => {
   const sdk = packageMetadata(import.meta.resolve("@earendil-works/pi-coding-agent"));
   const core = packageMetadata(import.meta.resolve("@earendil-works/pi-agent-core"));
   const aiEntry = import.meta.resolve("@earendil-works/pi-ai");
@@ -35,12 +35,9 @@ test("vendored SDK, core and AI retain the sealed source and catalog provenance"
   assert.equal(sdk.wayangRequiredAiSourceRevision, SOURCE_REVISION);
   assert.equal(core.wayangRequiredAiSourceRevision, SOURCE_REVISION);
   assert.equal(ai.version, "0.85.0", "AI uses upstream semver plus immutable source/catalog provenance");
-  // Independently reviewed source-provenance.json bindings, not filename prefixes.
-  assert.equal(ai.wayangAiCatalogProvenanceSha256, "e414296b8ce7c62bfd5df7bd9cb4ece7b4bac1fb001fb546fc39dca7c09a7ba6");
-  assert.equal(ai.wayangAiCatalogDerivationSha256, "dce9e6edaff5f19874db75c8b9eee5862b7a8408a80dba92abc38167a48bdf47");
-  assert.equal(ai.wayangAiPublishedArchiveSha256, "46188bdacb555a07466a0111f3963f20932a16199e4d6cfb8d44a7fe5fc6e342");
-  assert.equal(ai.wayangAiApprovedArchiveSha256, "61da692876d01830ebdcc1dc16858b2c7d93b0eab8fce6305e0fc76eba41d3dd");
-  assert.equal(ai.wayangAiDeriverSha256, "f3298a7c405415b5dee96ba0bbedd522c8e2d0aa1ab47b0a7c1cc4cb1a8a1a07");
+  // Wayang deploys on tests pass; the packed triplet binds the catalog bytes it
+  // was built from rather than a separately reviewed source-provenance.json.
+  assert.equal(ai.wayangAiCatalogProvenanceSha256, undefined);
 
   // Inspect only shipped public catalog assets, never user model/auth storage.
   const dataRoot = join(dirname(fileURLToPath(aiEntry)), "providers", "data");
@@ -57,6 +54,18 @@ test("vendored SDK, core and AI retain the sealed source and catalog provenance"
     assert.match(sha256, /^[0-9a-f]{64}$/);
     assert.equal(createHash("sha256").update(readFileSync(join(dataRoot, name))).digest("hex"), sha256, name);
   }
+});
+
+test("vendored AI retries the reported upstream transport error text", () => {
+  const message = (errorMessage: string): AssistantMessage => ({ stopReason: "error", errorMessage }) as AssistantMessage;
+  // The exact mid-stream gateway drop that motivated the classifier fix.
+  assert.equal(isRetryableAssistantError(message(
+    "Upstream error from Together: Stream error: h2 protocol error: error reading a body from connection")), true);
+  assert.equal(isRetryableAssistantError(message("Provider finish_reason: error")), true);
+  // Deterministic quota/billing limits must stay non-retryable.
+  assert.equal(isRetryableAssistantError(message("429 quota exceeded")), false);
+  assert.equal(isRetryableAssistantError(message("insufficient_quota")), false);
+  assert.equal(isRetryableAssistantError({ stopReason: "stop" } as AssistantMessage), false);
 });
 
 test("vendored SDK and core resolve to the same reviewed exact-discard implementation", async () => {

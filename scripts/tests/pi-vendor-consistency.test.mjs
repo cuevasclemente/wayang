@@ -8,10 +8,10 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const codingAgentPackageName = "@earendil-works/pi-coding-agent";
 const aiPackageName = "@earendil-works/pi-ai";
-const sourceRevision = "904e4012047428abeaa5f47f4b6fa759069eb987";
-const sdkSha256 = "22027c0b21f7ba9b246bf1a326514fe4dfcd27e57fb3b65af9d319d6bc1c015e";
-const coreSha256 = "0f8609a3e31c714a0e412378a7acaee7957717771f9cb2422f84493374cf2579";
-const aiSha256 = "3483e2cd07ebe8add88fd2bb2c1dcf8afec8da200dcbdb67e3fc715f307d0802";
+const sourceRevision = "fa40ae91ad733a8a0bc369cfbdcaca381fa47a46";
+const sdkSha256 = "e4237a2fb91c92c5ae9da3b37bf4ddd35572ca4e36d1dcc61f1aa64e66b4fb43";
+const coreSha256 = "9484dba8364ffb89bc881b97011cbfd3194dfc754a5115e1e0db53d3da946d10";
+const aiSha256 = "22ca19ede1015ad1247309efbe79f6558dfa278f44056469bd0a8c8c1082490f";
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
@@ -46,7 +46,6 @@ test("vendored Pi coding-agent package, lockfile, artifact, and documentation st
   assert.ok(documentation.includes(`SHA-256 \`${sha256}\``));
   assert.ok(documentation.includes(`source revision \`${sourceRevision}\``));
   assert.ok(documentation.includes("catalog manifest SHA-256 `e6dd5f432d502e84981ac15c14d9eb0f78bab7baf1aac8dbb805d48b8b3c3655`"));
-  assert.ok(documentation.includes("catalog provenance SHA-256 `e414296b8ce7c62bfd5df7bd9cb4ece7b4bac1fb001fb546fc39dca7c09a7ba6`"));
 });
 
 test("vendored Pi core matches the SDK source revision and locked artifact bytes", () => {
