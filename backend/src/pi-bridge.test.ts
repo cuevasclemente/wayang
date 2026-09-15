@@ -2380,6 +2380,73 @@ test("the first accepted browser message starts title generation before assistan
   }
 });
 
+test("an idle browser send reports acceptance before the turn settles", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-idle-ingress-ack-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir, { id: durableRow.id });
+  manager.materialize();
+  updatePiSessionFile(durableRow.id, manager.getSessionFile()!);
+  const promptGate = deferred();
+  let promptStarted = false;
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    async prompt(content: string) {
+      promptStarted = true;
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      await promptGate.promise;
+    },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "idle-ingress-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+    events: new EventEmitter(),
+  } as unknown as PiSessionHandle;
+  try {
+    // The transport's ingress acknowledgement must land while the turn is still
+    // running: an idle prompt only resolves at settlement, so a client waiting
+    // for that would show "sending" for the whole turn.
+    let acceptedWhilePending = false;
+    let acceptCalls = 0;
+    const sending = sendBrowserMessageTurn(
+      handle,
+      "idle ingress message",
+      undefined,
+      "idle-ingress",
+      undefined,
+      {
+        onIdleTurnAccepted: () => {
+          acceptCalls++;
+          acceptedWhilePending = promptStarted;
+        },
+      },
+    );
+    const deadline = Date.now() + 2_000;
+    while (!acceptedWhilePending) {
+      if (Date.now() >= deadline) throw new Error("acceptance was not reported before the prompt settled");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(promptStarted, true);
+    // The transport records the accepted verdict itself; the bridge contract is
+    // only that it is told exactly once, after pi took the turn.
+    assert.equal(acceptCalls, 1);
+    promptGate.resolve();
+    await sending;
+    assert.equal(acceptCalls, 1, "settlement must not repeat the ingress acknowledgement");
+  } finally {
+    promptGate.resolve();
+    f.cleanup();
+  }
+});
+
 test("rejected prompt admission never discloses accepted title text", async () => {
   const f = currentTurnFixture("wayang-pi-bridge-rejected-accepted-title-");
   const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
