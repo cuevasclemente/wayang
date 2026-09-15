@@ -2547,6 +2547,25 @@ async function handleClientMessage(
             provisionalTitleText: trimmedContent || (preparedAttachments.count > 0 ? "File attachment" : rawContent),
             acceptedAt,
           },
+          {
+            // Idle sends are accepted long before the turn settles. Reporting
+            // that here is what lets a client retire its "sending" state
+            // immediately instead of waiting for the whole turn. The verdict is
+            // deliberately `accepted_user_turn: false`: the message is in, but
+            // the transcript will not contain it until the turn is written.
+            onIdleTurnAccepted: () => {
+              if (!clientMessageId) return;
+              recordBrowserMessageOutcome(sessionId, clientMessageId, "accepted", false);
+              sendPostMessageQueueSnapshot("accepted", false);
+              sendSafe(ws, {
+                type: "queued_message_ack",
+                session_id: sessionId,
+                client_message_id: clientMessageId,
+                status: "accepted",
+                cancellable: false,
+              });
+            },
+          },
         ).then((result) => {
           if (clientMessageId) {
             const messageStatus = result.queued ? "queued" : "accepted";

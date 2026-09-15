@@ -1004,6 +1004,15 @@ export function assertPiSessionAcceptsNewWork(
 export interface PiSessionTopLevelWorkOptions {
   /** Continue work accepted by an old runtime, such as its interview response. */
   acceptedContinuation?: boolean;
+  /**
+   * Called synchronously once an idle browser send has been committed to pi as
+   * a real turn. The transport uses this to report acceptance immediately:
+   * `session.prompt()` resolves only when the whole turn settles, so waiting
+   * for it leaves the client's outbox unresolved for the entire turn.
+   * Never called for steered/queued sends, whose acceptance is reported when
+   * they are captured, and never called for deferred manual-compaction sends.
+   */
+  onIdleTurnAccepted?: () => void;
 }
 
 /** Acquire one top-level-work lease. The returned release is idempotent. */
@@ -3642,7 +3651,23 @@ export async function createPiSession(
       }
       if (event.type === "message_start" || event.type === "message_update") {
         if (event.type === "message_start") {
-          markQueuedBrowserMessageStarted(handle, event.message);
+          const startedClientMessageId = markQueuedBrowserMessageStarted(handle, event.message);
+          if (startedClientMessageId) {
+            // Pi has now claimed this queued message as its own user turn.
+            // Nothing else notifies the browser, whose outbox would otherwise
+            // keep showing a permanent "queued" entry. Emitting the terminal
+            // acknowledgement here (rather than only at admission) lets every
+            // observer clear the exact correlated entry. Already-settled ids
+            // are ignored by clients, so a duplicate is harmless.
+            try {
+              handle.events.emit("message", {
+                type: "queued_message_ack",
+                client_message_id: startedClientMessageId,
+                status: "accepted",
+                cancellable: false,
+              } satisfies SerializedMessage);
+            } catch { /* a failing observer must not stop or reorder the turn */ }
+          }
           for (const turn of interactiveTurnLedger(handle).values()) {
             deferWayangAutoTitleAfterPersistedAcceptance(handle, turn);
           }
@@ -5547,6 +5572,9 @@ export async function sendBrowserMessageTurn(
         expandPromptTemplates: true,
         images,
       });
+      // Pi has taken the turn. Report it before awaiting the prompt, which
+      // resolves only at turn end (see PiSessionTopLevelWorkOptions).
+      workOptions.onIdleTurnAccepted?.();
       deferWayangAutoTitleAfterPersistedAcceptance(handle, turn);
       await prompting;
       const completedTurn = Object.freeze({
@@ -5588,6 +5616,7 @@ export async function sendMessage(
     provisionalTitleText?: string;
     acceptedAt?: number;
   },
+  workOptions: PiSessionTopLevelWorkOptions = {},
 ): Promise<BrowserMessageTurnResult> {
   const handle = sessions.get(id);
   if (!handle) throw new Error(`Session ${id} not found`);
@@ -5607,7 +5636,7 @@ export async function sendMessage(
   }
   assertRuntimeMutationUnlocked(id);
   markSessionActivity(id);
-  return sendBrowserMessageTurn(handle, content, images, clientMessageId, queuedDisplay);
+  return sendBrowserMessageTurn(handle, content, images, clientMessageId, queuedDisplay, workOptions);
 }
 
 /** @internal Shared projection seam for live reconnect and focused queue tests. */
