@@ -5522,8 +5522,18 @@ export async function sendBrowserMessageTurn(
       acceptedAt: queuedDisplay?.acceptedAt,
       acceptedContinuation: workOptions.acceptedContinuation,
     });
-    const isStreaming = handle.session.isStreaming;
-    if (isStreaming) {
+    // Gate on the full busy predicate, not isStreaming alone. Pi's AgentSession
+    // reports isStreaming === false while compaction runs without an active agent
+    // run (threshold compaction inside prompt() preflight sets isCompacting), yet
+    // prompt() still rejects with "Agent is already processing" there. Steering
+    // is safe in every busy state reached here: manual compaction is intercepted
+    // earlier by the deferral queue, and auto/preflight compaction continues or
+    // starts a run that drains queued steering messages.
+    const sessionBusy = handle.session.isStreaming
+      || handle.session.isCompacting
+      || handle.session.pendingPromptCount > 0
+      || handle.session.pendingMessageCount > 0;
+    if (sessionBusy) {
       try {
         const queueRecordId = clientMessageId ?? turn.clientMessageId;
         if (handle.queuedBrowserMessages.has(queueRecordId)) {
@@ -5752,7 +5762,11 @@ export async function resendMessage(id: string, messageId: string, includeHistor
   const releaseTopLevelWork = beginPiSessionTopLevelWork(handle);
   let releaseOwnedByTurn = false;
   try {
-    if (handle.session.isStreaming) throw new Error("Cannot resend while the agent is running");
+    // Resend navigates the tree and cannot be queued, so reject clearly while
+    // compaction is in progress instead of leaking pi's run-claim error later.
+    if (handle.session.isStreaming || handle.session.isCompacting) {
+      throw new Error("Cannot resend while the agent is running or compaction is in progress");
+    }
 
     const entry = handle.session.sessionManager.getEntry(messageId);
     if (!entry || entry.type !== "message" || entry.message?.role !== "user") {

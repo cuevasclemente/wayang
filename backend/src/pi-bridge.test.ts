@@ -2699,6 +2699,106 @@ test("queued browser message_start hides the exact queue item and projects its c
   }
 });
 
+test("compacting sessions steer instead of prompting even while isStreaming is false", async () => {
+  // Regression: pi's threshold compaction inside prompt() preflight leaves
+  // isStreaming === false while isCompacting === true, and prompt() rejects with
+  // "Agent is already processing" in that state. The busy gate must include
+  // isCompacting so the message is queued via steer instead.
+  const f = currentTurnFixture("wayang-pi-bridge-compacting-steer-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const queuedMessage = { role: "user", content: "sent during compaction" };
+  let promptCalls = 0;
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    isCompacting: true,
+    pendingPromptCount: 0,
+    pendingMessageCount: 0,
+    _steeringMessages: [],
+    _emitQueueUpdate() {},
+    agent: { steeringQueue: { messages: [] as any[] } },
+    steer(content: string) {
+      this._steeringMessages.push(content);
+      this.agent.steeringQueue.messages.push(queuedMessage);
+      return Promise.resolve();
+    },
+    getSteeringMessages() { return [...this._steeringMessages]; },
+    async prompt() { promptCalls += 1; },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "compacting-steer-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    const result = await sendBrowserMessageTurn(
+      handle,
+      "sent during compaction",
+      undefined,
+      "compacting-client-message",
+      { content: "sent during compaction" },
+    );
+    assert.deepEqual(result, { queued: true, cancellable: true });
+    assert.equal(promptCalls, 0, "compacting sessions must not take the idle prompt path");
+    assert.equal(fakeSession._steeringMessages.length, 1);
+    assert.equal([...handle.queuedBrowserMessages.values()][0]?.clientVisible, true);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("pending prompt or message counts also route browser sends to steering", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-pending-count-steer-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const queuedMessage = { role: "user", content: "sent while prompt pending" };
+  let promptCalls = 0;
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    isCompacting: false,
+    pendingPromptCount: 1,
+    pendingMessageCount: 0,
+    _steeringMessages: [],
+    _emitQueueUpdate() {},
+    agent: { steeringQueue: { messages: [] as any[] } },
+    steer(content: string) {
+      this._steeringMessages.push(content);
+      this.agent.steeringQueue.messages.push(queuedMessage);
+      return Promise.resolve();
+    },
+    getSteeringMessages() { return [...this._steeringMessages]; },
+    async prompt() { promptCalls += 1; },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "pending-count-steer-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  try {
+    const result = await sendBrowserMessageTurn(handle, "sent while prompt pending");
+    assert.deepEqual(result, { queued: true, cancellable: false });
+    assert.equal(promptCalls, 0);
+  } finally {
+    f.cleanup();
+  }
+});
+
 test("cloned repeated steering starts consume browser queue IDs in claimed FIFO order", async () => {
   const f = currentTurnFixture("wayang-pi-bridge-cloned-queued-start-");
   const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
