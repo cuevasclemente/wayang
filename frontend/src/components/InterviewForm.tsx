@@ -291,7 +291,7 @@ export function InterviewForm({
   };
 
   return (
-    <div data-testid="interview-form" className="flex max-h-[60dvh] min-h-0 flex-col overflow-hidden rounded-lg border border-blue-900/50 bg-neutral-900 md:max-h-[36rem]">
+    <div data-testid="interview-form" className="flex max-h-[52dvh] min-h-0 flex-col overflow-hidden rounded-lg border border-blue-900/50 bg-neutral-900 md:max-h-[36rem]">
       {awaitingAcknowledgement && (
         <div
           data-testid="interview-submission-status"
@@ -375,7 +375,7 @@ export function InterviewForm({
             type="button"
             onClick={() => goToTab(questions.length)}
             disabled={awaitingAcknowledgement}
-            className={`px-2.5 py-1 rounded text-xs font-mono whitespace-nowrap transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+            className={`sticky right-0 shrink-0 bg-neutral-900/95 pl-2 backdrop-blur px-2.5 py-1 rounded text-xs font-mono whitespace-nowrap transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
               currentTab === questions.length
                 ? "bg-blue-800/60 text-blue-200"
                 : allAnswered

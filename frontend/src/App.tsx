@@ -31,6 +31,7 @@ import { ScheduledJobsPanel } from "./panels/ScheduledJobsPanel";
 import { ProtectedAutomationsPanel } from "./panels/ProtectedAutomationsPanel";
 import { isCurrentSessionPath, parseSessionPath, sessionPath } from "./routing/sessionRoute";
 import { SettingsDialog, type SettingsTab } from "./components/settings/SettingsDialog";
+import { MOBILE_BREAKPOINT_QUERY, useMediaQuery } from "./hooks/useMediaQuery";
 import type { TranscriptOpenIntent } from "./transcript/windowController";
 
 type MobileTab = "sessions" | "chat" | "tools";
@@ -56,19 +57,6 @@ function initialRouteResolution(): RouteResolution {
   if (route.kind === "root") return { kind: "idle" };
   if (route.kind === "session") return { kind: "loading", requestedId: route.sessionId };
   return { kind: "not_found", requestedId: route.requestedPath };
-}
-
-function useMediaQuery(query: string): boolean {
-  const [matches, setMatches] = useState(
-    () => typeof window !== "undefined" && window.matchMedia(query).matches,
-  );
-  useEffect(() => {
-    const mql = window.matchMedia(query);
-    const handler = (e: MediaQueryListEvent) => setMatches(e.matches);
-    mql.addEventListener("change", handler);
-    return () => mql.removeEventListener("change", handler);
-  }, [query]);
-  return matches;
 }
 
 function useVisualViewportHeightVariable(): void {
@@ -125,7 +113,7 @@ function App({ authEnabled, onLogout }: AppProps) {
   const routeRequestGenerationRef = useRef(0);
   const sessionSelectionStartedAtRef = useRef<number | null>(null);
 
-  const isMobile = useMediaQuery("(max-width: 768px)");
+  const isMobile = useMediaQuery(MOBILE_BREAKPOINT_QUERY);
   const [mobileTab, setMobileTab] = useState<MobileTab>("chat");
 
   const handleSessionChange = useCallback(() => {
@@ -698,85 +686,100 @@ function HeaderBar({
   const username = me?.username ?? (meError ? "unknown" : "…");
 
   return (
-    <header className="h-10 flex items-center justify-between px-4 border-b border-neutral-900 bg-neutral-950 shrink-0">
-      <div className="flex items-center gap-2">
-        <Columns3 size={16} className="text-neutral-400" />
-        <span className="text-sm font-semibold tracking-wide text-neutral-100">
-          Wayang
-        </span>
-        {!isMobile && (
-          <div className="flex items-center gap-0.5 ml-2">
+    <header className="min-h-10 shrink-0 border-b border-neutral-900 bg-neutral-950">
+      <div className={`flex items-center justify-between gap-2 ${isMobile ? "px-3 py-1" : "h-10 px-4"}`}>
+        <div className="flex min-w-0 items-center gap-2">
+          <Columns3 size={16} className="shrink-0 text-neutral-400" />
+          <span className="truncate text-sm font-semibold tracking-wide text-neutral-100">
+            Wayang
+          </span>
+          {!isMobile && (
+            <div className="ml-2 flex items-center gap-0.5">
+              <button
+                onClick={onToggleLeft}
+                title={
+                  leftCollapsed ? "Show sessions panel" : "Hide sessions panel"
+                }
+                className="p-1 rounded text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition-colors"
+              >
+                {leftCollapsed ? (
+                  <PanelLeftOpen size={14} />
+                ) : (
+                  <PanelLeftClose size={14} />
+                )}
+              </button>
+              <button
+                onClick={onToggleRight}
+                title={
+                  rightCollapsed ? "Show tools panel" : "Hide tools panel"
+                }
+                className="p-1 rounded text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition-colors"
+              >
+                {rightCollapsed ? (
+                  <PanelRightOpen size={14} />
+                ) : (
+                  <PanelRightClose size={14} />
+                )}
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {humanAttentionCount > 0 && (
             <button
-              onClick={onToggleLeft}
-              title={
-                leftCollapsed ? "Show sessions panel" : "Hide sessions panel"
-              }
-              className="p-1 rounded text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition-colors"
+              type="button"
+              data-testid="global-human-attention-badge"
+              onClick={onOpenHumanAttention}
+              aria-label={`${humanAttentionCount} pending human-input ${humanAttentionCount === 1 ? "request" : "requests"}. Open sessions.`}
+              className="inline-flex items-center gap-1 rounded border border-amber-800/70 bg-amber-950/70 px-2 py-0.5 text-xs font-semibold text-amber-200 hover:bg-amber-900/70"
             >
-              {leftCollapsed ? (
-                <PanelLeftOpen size={14} />
-              ) : (
-                <PanelLeftClose size={14} />
-              )}
+              <BellRing size={12} aria-hidden="true" />
+              {humanAttentionCount}
             </button>
-            <button
-              onClick={onToggleRight}
-              title={
-                rightCollapsed ? "Show tools panel" : "Hide tools panel"
-              }
-              className="p-1 rounded text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 transition-colors"
-            >
-              {rightCollapsed ? (
-                <PanelRightOpen size={14} />
-              ) : (
-                <PanelRightClose size={14} />
-              )}
-            </button>
-          </div>
-        )}
-      </div>
-      <div className="flex items-center gap-2">
-        {humanAttentionCount > 0 && (
+          )}
           <button
             type="button"
-            data-testid="global-human-attention-badge"
-            onClick={onOpenHumanAttention}
-            aria-label={`${humanAttentionCount} pending human-input ${humanAttentionCount === 1 ? "request" : "requests"}. Open sessions.`}
-            className="inline-flex items-center gap-1 rounded border border-amber-800/70 bg-amber-950/70 px-2 py-0.5 text-xs font-semibold text-amber-200 hover:bg-amber-900/70"
+            onClick={onOpenSettings}
+            title="Workspace settings"
+            aria-label="Open workspace settings"
+            className="rounded p-1.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-100"
           >
-            <BellRing size={12} aria-hidden="true" />
-            {humanAttentionCount}
+            <SettingsIcon size={15} />
           </button>
-        )}
-        <button
-          type="button"
-          onClick={onOpenSettings}
-          title="Workspace settings"
-          aria-label="Open workspace settings"
-          className="rounded p-1.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-100"
-        >
-          <SettingsIcon size={15} />
-        </button>
-        <Chip title={meError ? `Error: ${meError}` : undefined}>
-          <span className="text-neutral-500">user:</span>{" "}
-          <span className="text-neutral-200">{username}</span>
-        </Chip>
-        {authEnabled && (
-          <button
-            type="button"
-            onClick={() => void onLogout()}
-            title="Log out of Wayang"
-            className="flex items-center gap-1 rounded border border-neutral-700 bg-neutral-900 px-2 py-0.5 text-xs font-medium text-neutral-300 hover:border-neutral-600 hover:bg-neutral-800 hover:text-neutral-100"
-          >
-            <LogOut size={12} />
-            Log out
-          </button>
-        )}
-        <Chip>
-          <span className="text-neutral-500">agent:</span>{" "}
-          <span className="text-green-400">pi</span>
-        </Chip>
+          {/* Account identity is redundant on a single-user instance and the
+              agent is already shown in the chat header. Keep desktop chrome
+              wide, but stay lean on mobile. */}
+          {!isMobile && (
+            <Chip title={meError ? `Error: ${meError}` : undefined}>
+              <span className="text-neutral-500">user:</span>{" "}
+              <span className="text-neutral-200">{username}</span>
+            </Chip>
+          )}
+          {authEnabled && (
+            <button
+              type="button"
+              onClick={() => void onLogout()}
+              title="Log out of Wayang"
+              aria-label="Log out of Wayang"
+              className="flex items-center gap-1 rounded border border-neutral-700 bg-neutral-900 px-2 py-0.5 text-xs font-medium text-neutral-300 hover:border-neutral-600 hover:bg-neutral-800 hover:text-neutral-100"
+            >
+              <LogOut size={12} />
+              {!isMobile && "Log out"}
+            </button>
+          )}
+          {!isMobile && (
+            <Chip>
+              <span className="text-neutral-500">agent:</span>{" "}
+              <span className="text-green-400">pi</span>
+            </Chip>
+          )}
+        </div>
       </div>
+      {isMobile && meError && (
+        <p role="status" className="truncate border-t border-neutral-900 px-3 py-0.5 text-[10px] text-amber-400">
+          user unavailable: {meError}
+        </p>
+      )}
     </header>
   );
 }
@@ -807,7 +810,7 @@ function MobileTabBar({
       data-testid="mobile-tab-bar"
       className="flex items-center justify-around border-t border-neutral-800 bg-neutral-950 shrink-0"
       style={{
-        minHeight: "calc(3.5rem + env(safe-area-inset-bottom))",
+        minHeight: "calc(3rem + env(safe-area-inset-bottom))",
         paddingBottom: "env(safe-area-inset-bottom)",
       }}
     >
@@ -816,14 +819,15 @@ function MobileTabBar({
         return (
           <button
             key={key}
+            data-testid={`mobile-tab-${key}`}
             onClick={() => onTabChange(key)}
-            className={`flex flex-col items-center gap-0.5 px-4 py-1 rounded transition-colors ${
+            className={`flex flex-col items-center gap-0.5 px-3 py-0.5 rounded transition-colors ${
               active
                 ? "text-blue-400"
                 : "text-neutral-500 hover:text-neutral-300"
             }`}
           >
-            <Icon size={20} />
+            <Icon size={18} />
             <span className="text-[10px] font-medium">{label}</span>
           </button>
         );
