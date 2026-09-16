@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Bell, Bot, FolderCog, Globe2, Loader2, Lock, Settings, X } from "lucide-react";
+import { Bell, Bot, FolderCog, Globe2, Loader2, Lock, Settings, Type, X } from "lucide-react";
 import {
   ApiError,
   fetchAgentProfiles,
@@ -15,8 +15,9 @@ import { AgentProfilesSettings } from "./AgentProfilesSettings";
 import { ProjectSettingsForm } from "./ProjectSettingsForm";
 import { BrowserNotificationsSettings } from "./BrowserNotificationsSettings";
 import { BrowserProfilesSettings } from "./BrowserProfilesSettings";
+import { DisplaySettings } from "./DisplaySettings";
 
-export type SettingsTab = "projects" | "agents" | "browser" | "notifications";
+export type SettingsTab = "projects" | "agents" | "browser" | "notifications" | "display";
 
 interface SettingsDialogProps {
   initialTab?: SettingsTab;
@@ -123,7 +124,7 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
       <div className="flex h-[min(92dvh,900px)] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-neutral-700 bg-neutral-950 shadow-2xl" onClick={(event) => event.stopPropagation()}>
         <header className="flex shrink-0 items-center gap-3 border-b border-neutral-800 px-4 py-3 sm:px-5">
           <Settings size={18} className="text-neutral-400" />
-          <div className="min-w-0 flex-1"><h2 id="workspace-settings-title" className="text-sm font-semibold text-neutral-100">Workspace settings</h2><p className="truncate text-xs text-neutral-500">Projects, agent profiles, Browser Profiles, and notification preferences</p></div>
+          <div className="min-w-0 flex-1"><h2 id="workspace-settings-title" className="text-sm font-semibold text-neutral-100">Workspace settings</h2><p className="truncate text-xs text-neutral-500">Projects, agent profiles, Browser Profiles, notifications, and display</p></div>
           <button ref={closeRef} type="button" onClick={onClose} className="rounded p-2 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100" aria-label="Close settings"><X size={17} /></button>
         </header>
 
@@ -132,9 +133,10 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
           <TabButton active={tab === "agents"} onClick={() => setTab("agents")} icon={Bot}>Agents</TabButton>
           <TabButton active={tab === "browser"} onClick={() => setTab("browser")} icon={Globe2}>Browser Profiles</TabButton>
           <TabButton active={tab === "notifications"} onClick={() => setTab("notifications")} icon={Bell}>Notifications</TabButton>
+          <TabButton active={tab === "display"} onClick={() => setTab("display")} icon={Type}>Display</TabButton>
         </div>
 
-        {tab !== "notifications" && tab !== "browser" && loading ? (
+        {tab !== "notifications" && tab !== "browser" && tab !== "display" && loading ? (
           <div className="flex flex-1 items-center justify-center gap-2 text-sm text-neutral-500"><Loader2 size={16} className="animate-spin" /> Loading settings…</div>
         ) : tab !== "notifications" && tab !== "browser" && error ? (
           <div role="alert" className="m-5 rounded border border-red-900/60 bg-red-950/30 px-4 py-3 text-sm text-red-200">{error}</div>
@@ -175,6 +177,10 @@ export function SettingsDialog({ initialTab = "projects", initialProjectCwd = nu
         ) : tab === "browser" ? (
           <main className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
             <BrowserProfilesSettings onChanged={onChanged} />
+          </main>
+        ) : tab === "display" ? (
+          <main className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
+            <DisplaySettings />
           </main>
         ) : (
           <main className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">

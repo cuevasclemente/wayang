@@ -42,6 +42,13 @@ export async function createE2eSession(request: APIRequestContext, titlePrefix: 
 export async function openSessionInUi(page: Page, session: CreatedSession): Promise<void> {
   await page.goto("/");
   const projectName = path.basename(session.cwd);
-  await page.locator("div[title]").filter({ hasText: projectName }).first().click();
+  const projectItem = page.locator("div[title]").filter({ hasText: projectName }).first();
+  await projectItem.waitFor({ state: "attached", timeout: 15_000 });
+  // On compact viewports the session list lives behind the "sessions" tab;
+  // the panel is mounted but hidden until that tab is active.
+  if (!(await projectItem.isVisible())) {
+    await page.getByTestId("mobile-tab-sessions").click();
+  }
+  await projectItem.click();
   await page.getByText(session.title, { exact: true }).click();
 }

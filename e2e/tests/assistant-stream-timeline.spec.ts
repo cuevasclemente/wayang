@@ -519,7 +519,7 @@ test("suppresses the overflow during the reattach race before compaction_start",
   const session = await createE2eSession(request, "e2e overflow recovery reattach race");
   await openSessionInUi(page, session);
 
-  await expect(page.getByTestId("chat-interrupt-button")).toBeVisible();
+  await expect(page.getByTestId("chat-composer-interrupt-button")).toBeVisible();
   await expect(page.getByText(overflow, { exact: false })).toHaveCount(0);
 });
 

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { BashMode } from "../api/client";
 
-export function BashModeStatus({ mode }: { mode: BashMode }) {
+export function BashModeStatus({ mode, compact = false }: { mode: BashMode; compact?: boolean }) {
   const [hostDetailsExpanded, setHostDetailsExpanded] = useState(false);
 
   useEffect(() => {
@@ -9,6 +9,36 @@ export function BashModeStatus({ mode }: { mode: BashMode }) {
     // intentionally collapsed whenever a fresh/reconnected host runtime appears.
     if (mode !== "host") setHostDetailsExpanded(false);
   }, [mode]);
+
+  if (mode === "host" && compact) {
+    // Compact mobile affordance: a small safety chip that opens the same
+    // disclosure instead of a full-width banner that consumes header height.
+    return (
+      <div className="relative shrink-0">
+        <button
+          type="button"
+          data-testid="bash-mode-status"
+          data-bash-mode={mode}
+          data-expanded={hostDetailsExpanded ? "true" : "false"}
+          aria-expanded={hostDetailsExpanded}
+          onClick={() => setHostDetailsExpanded((expanded) => !expanded)}
+          title="Bash runs as the Wayang OS user outside the filesystem sandbox"
+          className="inline-flex items-center gap-1 rounded border border-amber-700/70 bg-amber-950/40 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-200"
+        >
+          Host access
+        </button>
+        {hostDetailsExpanded && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="absolute left-0 top-7 z-50 w-[min(20rem,calc(100vw-1.5rem))] rounded-lg border border-amber-800/70 bg-neutral-950 p-3 text-[11px] leading-4 text-amber-100 shadow-2xl"
+          >
+            Bash commands run as the Wayang OS user outside the filesystem sandbox and can affect same-UID files, processes, credentials, network services, and existing privilege mechanisms. An authenticated remote Wayang controller can trigger those host effects; Protected and memory labels are cooperative, not same-UID isolation.
+          </div>
+        )}
+      </div>
+    );
+  }
 
   if (mode === "host") {
     return (
