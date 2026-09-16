@@ -59,9 +59,29 @@ On branch `ops/tribe-supervised-upgrade-20260915` (`docs/runbooks/`):
 
 The generated `$new/bin/wayang-backend` wrapper exports `WAYANG_AUTO_TITLE_PROVIDER=codex`, so the host-local choice lives in a public generated file and no private `.env` edit is needed. `run-with-env.mjs` only fills *undefined* keys from `.env`, so the export wins.
 
-## Status
+## Status: deployed and verified (2026-09-16)
 
-`prepare` and `verify` both succeed on Tribe against the pinned aggregate; the old runtime and launcher are unchanged. Remaining work is the supervised switch, to be run by the owner from the Mac terminal: `launchctl bootout --wait gui/501/com.wayang.server`, then `repoint`, `select`, and `launchctl bootstrap gui/501 …/com.wayang.server.plist`, then `verify` + `healthz` + a real title check on a fresh session.
+The switch was driven over SSH (owner chose that) and completed successfully:
+
+1. `launchctl bootout --wait gui/501/com.wayang.server`
+2. `tribe-wayang-upgrade.sh repoint` — `ProgramArguments[0]` now `~/.local/bin/wayang-backend`; environment dictionary unchanged (`fd410004…`), non-`ProgramArguments` plist unchanged (`3c8d174f…`)
+3. `tribe-wayang-upgrade.sh select` — selected `wayang-6275afe-519c702`
+4. `launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.wayang.server.plist`
+
+Post-switch evidence: symlink → `wayang-6275afe-519c702`; `verify` reports the new selected launcher and all 19998 public files; `healthz` → `{"status":"ok"}`; `launchctl list` shows the service running with exit 0; the running backend is the new entrypoint (`…/wayang-6275afe-519c702/wayang-runtime/backend/dist/index.js`) under the OLD Node and env-loader (as designed); the served `/` is byte-identical to the new runtime's `wayang-runtime/frontend/dist/index.html`.
+
+## Fix-forward lessons from the switch
+
+Two obstacles were hit after the first `bootstrap`, both resolved without weakening any guard:
+
+1. **Orphaned old backend held the Wayang store lock.** `bootout --wait` removed the launchd job but the old node child (of the pre-repoint launcher) survived with PPID 1, so the new backend exited with `Wayang store is already owned by live backend PID …`. The old launcher evidently did not `exec` its node child; the new generated wrapper does, so this cannot recur from the new launcher. A `repoint`-era retry must therefore confirm no orphan holds `~/.wayang` before bootstrap.
+2. **macOS error 5 on same-label rotation.** The first post-bootout `bootstrap` returned `Bootstrap failed: 5: Input/output error` — the known async-teardown race. Fixed by a longer settle (≈12s) after `bootout`, plus `launchctl enable` before `bootstrap`. (The label was not disabled; `enable` is just idempotent insurance.)
+
+The old node child also ignored `SIGTERM` and needed `SIGKILL`. None of this changes what is deployed.
+
+## Remaining: functional confirmation
+
+The release is live and serving, but automatic titles still need a real check on Tribe — that path requires the host-local `WAYANG_AUTO_SESSION_TITLE=on` setting and a Codex OAuth credential in pi's `auth.json`, neither of which this procedure reads or modifies. Confirm by starting a fresh session and watching its title generate. Noted but not acted on: several orphaned headless Chrome processes remain under `/private/tmp/wayang-e2e-*` from earlier test runs.
 
 ## Follow-ups
 
