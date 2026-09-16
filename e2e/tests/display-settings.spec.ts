@@ -21,11 +21,11 @@ test("display scale is adjustable from settings and survives a reload", async ({
   await dialog.getByRole("tab", { name: "Display" }).click();
 
   await page.getByTestId("ui-scale-preset-largest").click();
-  await expect(page.getByTestId("ui-scale-value")).toHaveText("150%");
-  expect(await rootFontSize()).toBeCloseTo(baseline * 1.5, 1);
+  await expect(page.getByTestId("ui-scale-value")).toHaveText("200%");
+  expect(await rootFontSize()).toBeCloseTo(baseline * 2, 1);
 
   await page.reload();
-  await expect.poll(rootFontSize).toBeCloseTo(baseline * 1.5, 1);
+  await expect.poll(rootFontSize).toBeCloseTo(baseline * 2, 1);
 
   await page.getByRole("button", { name: "Open workspace settings" }).click();
   await page.getByRole("dialog", { name: "Workspace settings" }).getByRole("tab", { name: "Display" }).click();

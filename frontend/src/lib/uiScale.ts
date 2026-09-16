@@ -10,8 +10,8 @@
 
 const STORAGE_KEY = "wayang:ui-scale";
 
-export const MIN_UI_SCALE = 0.9;
-export const MAX_UI_SCALE = 1.5;
+export const MIN_UI_SCALE = 0.5;
+export const MAX_UI_SCALE = 2;
 export const DEFAULT_UI_SCALE = 1;
 
 export interface UiScalePreset {
@@ -21,11 +21,12 @@ export interface UiScalePreset {
 
 /** Coarse presets shown as buttons next to the fine-grained slider. */
 export const UI_SCALE_PRESETS: readonly UiScalePreset[] = [
-  { scale: 0.9, label: "Compact" },
+  { scale: 0.5, label: "Tiny" },
+  { scale: 0.75, label: "Compact" },
   { scale: 1, label: "Default" },
-  { scale: 1.15, label: "Large" },
-  { scale: 1.3, label: "Larger" },
-  { scale: 1.5, label: "Largest" },
+  { scale: 1.25, label: "Large" },
+  { scale: 1.5, label: "Larger" },
+  { scale: 2, label: "Largest" },
 ];
 
 /** Keep a scale inside the supported range and free of float noise. */
