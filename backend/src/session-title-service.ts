@@ -16,8 +16,8 @@ import {
   titleTextBlocks,
   type TitleSourceProjection,
 } from "./session-title-policy.js";
-import { DeepSeekTitleProvider, type TitleProvider } from "./deepseek-title-provider.js";
-export type { TitleProvider } from "./deepseek-title-provider.js";
+import { createTitleProvider, type TitleProvider } from "./title-provider-select.js";
+export type { TitleProvider } from "./title-provider-select.js";
 import { fingerprintsEqual, type FileFingerprint } from "./session-metadata.js";
 import { isSessionRuntimeMutationLocked } from "./session-runtime-mutation-lock.js";
 import {
@@ -32,7 +32,7 @@ const attempted = new Set<string>();
 const interactionAttempted = new Set<string>();
 const MAX_ATTEMPT_KEYS = 4_096;
 const inFlight = new Map<string, Promise<void>>();
-let provider: TitleProvider = new DeepSeekTitleProvider();
+let provider: TitleProvider = createTitleProvider();
 
 function record(outcome: AutoTitleOutcome): void {
   telemetry.set(outcome, (telemetry.get(outcome) ?? 0) + 1);
@@ -51,7 +51,7 @@ export function autoTitleTelemetrySnapshot(): Readonly<Record<AutoTitleOutcome, 
 
 /** Synthetic provider seam. It cannot enable production disclosure. */
 export function setAutoTitleProviderForTests(next: TitleProvider | null): void {
-  provider = next ?? new DeepSeekTitleProvider();
+  provider = next ?? createTitleProvider();
   attempted.clear();
   interactionAttempted.clear();
   inFlight.clear();
