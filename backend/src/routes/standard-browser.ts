@@ -239,9 +239,17 @@ function exactRuntime(req: Request, integration: StandardBrowserIntegration): St
   return runtime;
 }
 
-function publicState(selection: StandardBrowserRouteSelection, runtime: StandardBrowserHttpRuntime) {
+export function publicState(selection: StandardBrowserRouteSelection, runtime: StandardBrowserHttpRuntime) {
   const state = runtime.workspace.host.ownerPublicState(selection.sourceSessionId, selection.workspaceGeneration);
   const params = new URLSearchParams({ session_id: selection.sourceSessionId });
+  const download = state.download ? {
+    status: state.download.status,
+    suggestedFilename: state.download.suggestedFilename,
+    ...(state.download.relativePath === undefined ? {} : { relativePath: state.download.relativePath }),
+    ...(state.download.bytes === undefined ? {} : { bytes: state.download.bytes }),
+    ...(state.download.reason === undefined ? {} : { reason: state.download.reason }),
+    updatedAt: state.download.updatedAt,
+  } : undefined;
   return {
     sessionId: selection.sourceSessionId,
     projectCwd: selection.projectCwd,
@@ -262,6 +270,7 @@ function publicState(selection: StandardBrowserRouteSelection, runtime: Standard
     activeTab: state.activeTab,
     updatedAt: state.updatedAt,
     ...(state.credentialInspection ? { credentialInspection: state.credentialInspection } : {}),
+    ...(download ? { download } : {}),
     credentialBroker: { supported: runtime.credentialsSupported, guarded: true },
   };
 }

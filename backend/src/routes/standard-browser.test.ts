@@ -4,7 +4,12 @@ import test from "node:test";
 import type { WebSocket } from "ws";
 import { StandardViewerInputError } from "../browser/standard-viewer.js";
 import type { ProtectedBrowserBinding } from "../browser/types.js";
-import { attachSelectedStandardViewer, createStandardBrowserIntegration, type StandardBrowserRouteSelection } from "./standard-browser.js";
+import {
+  attachSelectedStandardViewer,
+  createStandardBrowserIntegration,
+  publicState,
+  type StandardBrowserRouteSelection,
+} from "./standard-browser.js";
 
 function binding(): ProtectedBrowserBinding {
   return {
@@ -110,6 +115,52 @@ function viewerSelection(): StandardBrowserRouteSelection {
 }
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test("owner public state preserves only sanitized latest-download metadata", () => {
+  const selection = viewerSelection();
+  const completed = {
+    status: "completed",
+    suggestedFilename: "evidence.zip",
+    relativePath: ".wayang/browser-downloads/evidence.zip",
+    bytes: 17,
+    updatedAt: 123,
+    privateStagingPath: "/private/browser-staging/guid",
+    sourceUrl: "https://download.example/private?signature=secret",
+  };
+  const runtime = {
+    credentialsSupported: true,
+    workspace: {
+      profile: { name: "Synthetic" },
+      host: {
+        ownerPublicState() {
+          return {
+            profileId: selection.profileId,
+            sourceSessionId: selection.sourceSessionId,
+            workspaceGeneration: selection.workspaceGeneration,
+            controlGeneration: 1,
+            controlMode: "agent",
+            activeTab: null,
+            tabs: [],
+            running: true,
+            updatedAt: 124,
+            fullBrowser: { available: false, controllerActive: false, controllerGeneration: 0 },
+            download: completed,
+          };
+        },
+      },
+    },
+  } as any;
+
+  const state = publicState(selection, runtime) as any;
+  assert.deepEqual(state.download, {
+    status: "completed",
+    suggestedFilename: "evidence.zip",
+    relativePath: ".wayang/browser-downloads/evidence.zip",
+    bytes: 17,
+    updatedAt: 123,
+  });
+  assert.doesNotMatch(JSON.stringify(state), /browser-staging|signature|sourceUrl|privateStagingPath/);
+});
 
 test("a WebSocket closed during viewer opening cannot leak the resolved transport", async () => {
   const socket = new SyntheticViewerSocket();

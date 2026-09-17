@@ -304,6 +304,37 @@ test("human resume retains exact tabs and workspace activity is not host-wide", 
   await f.host.close();
 });
 
+test("completed downloads expose their sanitized Project-relative path through agent status", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-standard-download-status-"));
+  const projectDir = path.join(root, "project");
+  const stagingDir = path.join(root, "staging");
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.mkdirSync(stagingDir, { recursive: true });
+  const f = hostFixture();
+  f.backend().downloadStagingDir = stagingDir;
+  const exact = { ...binding("session-a"), projectCwd: projectDir };
+  const workspace = f.host.bindWorkspace(exact);
+  await f.host.execute(exact, workspace.generation, { kind: "start" });
+  const rawTarget = f.backend().targets.keys().next().value as string;
+
+  f.backend().beginDownload(rawTarget, "evidence");
+  fs.writeFileSync(path.join(stagingDir, "evidence"), Buffer.from("data"));
+  f.backend().progressDownload("evidence", "completed", 4);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const state = await f.host.execute(exact, workspace.generation, { kind: "status" }) as any;
+  assert.deepEqual(state.download, {
+    status: "completed",
+    suggestedFilename: "evidence.bin",
+    relativePath: ".wayang/browser-downloads/evidence.bin",
+    bytes: 4,
+    updatedAt: state.download.updatedAt,
+  });
+  assert.equal(fs.readFileSync(path.join(projectDir, state.download.relativePath), "utf8"), "data");
+  await f.host.close();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("downloads freeze exact target/workspace ownership and detach cancels before publication", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-standard-download-owner-"));
   const projectDir = path.join(root, "project");

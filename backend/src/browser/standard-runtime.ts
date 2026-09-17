@@ -70,7 +70,7 @@ export function createStandardBrowserSessionRuntime(options: {
   });
 
   const tools: ToolDefinition[] = [
-    operationTool({ name: "browser_status", label: "Browser Status", description: "Return bounded state for this session's active Browser Profile workspace.", parameters: Empty, operation: () => ({ kind: "status" }) }),
+    operationTool({ name: "browser_status", label: "Browser Status", description: "Return bounded state for this session's active Browser Profile workspace. Completed downloads report a sanitized Project-relative path and publish under .wayang/browser-downloads/.", parameters: Empty, operation: () => ({ kind: "status" }) }),
     defineTool({
       name: "browser_open", label: "Open Browser", description: "Start this session's active Browser Profile workspace and optionally navigate to an absolute HTTPS URL.",
       parameters: Type.Object({ url: Type.Optional(Type.String()) }, { additionalProperties: false }),
