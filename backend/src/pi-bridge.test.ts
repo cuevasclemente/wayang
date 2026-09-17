@@ -55,18 +55,21 @@ import {
   previewSessionAgentSwitch,
   protectedBrowserIdleRetentionIsRequired,
   projectQueuedBrowserMessages,
+  registerPiSessionHandleForTest,
   reloadAgentSessionWithMemoryFirstOverrides,
   reconcilePendingAgentSwitch,
   resolveInteractiveBrowserAuthority,
   resolveInteractiveTurn,
   retirePiSessionCapabilityRefreshIfIdle,
   sendBrowserMessageTurn,
+  sendMessage,
   sealSessionModelProviderRegistry,
   serializeEvent,
   settleInteractiveTurns,
   setSessionDefaultModel,
   setSessionModel,
   stopPiSession,
+  unregisterPiSessionHandleForTest,
   waitForScheduledPrompt,
   type PiSessionBrowserTeardown,
   type PiSessionHandle,
@@ -2795,6 +2798,187 @@ test("pending prompt or message counts also route browser sends to steering", as
     assert.deepEqual(result, { queued: true, cancellable: false });
     assert.equal(promptCalls, 0);
   } finally {
+    f.cleanup();
+  }
+});
+
+test("locked busy runtime accepts chat sends via steering instead of mutation-lock rejection", async () => {
+  // Regression: a whole-run reservation (scheduled/messaging headless prompt)
+  // or a live model switch holds the runtime mutation lock for the entire run,
+  // and the ws gate rejected every chat send with "Session transcript mutation
+  // is in progress" even though the send is only queued via steer() and writes
+  // no transcript entry synchronously. Busy runtimes must steer under the lock.
+  const f = currentTurnFixture("wayang-pi-bridge-locked-busy-send-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  const queuedMessage = { role: "user", content: "sent while lock held" };
+  let promptCalls = 0;
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: true,
+    isCompacting: false,
+    pendingPromptCount: 0,
+    pendingMessageCount: 0,
+    _steeringMessages: [],
+    _emitQueueUpdate() {},
+    agent: { steeringQueue: { messages: [] as any[] } },
+    steer(content: string) {
+      this._steeringMessages.push(content);
+      this.agent.steeringQueue.messages.push(queuedMessage);
+      return Promise.resolve();
+    },
+    getSteeringMessages() { return [...this._steeringMessages]; },
+    async prompt() {
+      promptCalls += 1;
+      throw new Error("busy locked runtimes must not take the idle prompt path");
+    },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "locked-busy-send-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  registerPiSessionHandleForTest(handle);
+  try {
+    assert.equal(acquireSessionRuntimeMutationLock(durableRow.id), true);
+    const result = await sendMessage(
+      durableRow.id,
+      "sent while lock held",
+      undefined,
+      "locked-busy-client",
+      { content: "sent while lock held" },
+    );
+    assert.deepEqual(result, { queued: true, cancellable: true });
+    assert.equal(promptCalls, 0);
+    assert.equal(fakeSession._steeringMessages.length, 1);
+  } finally {
+    releaseSessionRuntimeMutationLock(durableRow.id);
+    unregisterPiSessionHandleForTest(durableRow.id);
+    f.cleanup();
+  }
+});
+
+test("locked idle chat send waits for lock release and then dispatches normally", async () => {
+  // Transient lock holders (title writes, live model switches, transcript
+  // edits) must not turn a plain chat send into a spurious session error.
+  const f = currentTurnFixture("wayang-pi-bridge-locked-idle-wait-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const manager = SessionManager.create(f.cwd, f.sessionDir);
+  let promptCalls = 0;
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: manager,
+    isStreaming: false,
+    isCompacting: false,
+    pendingPromptCount: 0,
+    pendingMessageCount: 0,
+    _steeringMessages: [],
+    _emitQueueUpdate() {},
+    agent: { steeringQueue: { messages: [] as any[] } },
+    steer() {
+      throw new Error("idle runtimes must prompt instead of steering");
+    },
+    async prompt(content: string) {
+      promptCalls += 1;
+      manager.appendMessage({ role: "user", content, timestamp: Date.now() } as any);
+      manager.appendMessage({
+        role: "assistant",
+        content: "accepted after unlock",
+        provider: "synthetic",
+        model: "synthetic",
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as any);
+    },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "locked-idle-wait-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  registerPiSessionHandleForTest(handle);
+  try {
+    assert.equal(acquireSessionRuntimeMutationLock(durableRow.id), true);
+    const sending = sendMessage(
+      durableRow.id,
+      "sent while lock held",
+      undefined,
+      "locked-idle-wait-client",
+      { content: "sent while lock held" },
+    );
+    let settled = false;
+    void sending.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "the send must wait for the lock instead of rejecting immediately");
+    releaseSessionRuntimeMutationLock(durableRow.id);
+    const result = await sending;
+    assert.equal(result.queued, false);
+    assert.equal(promptCalls, 1, "lock release must resume the idle prompt path");
+  } finally {
+    releaseSessionRuntimeMutationLock(durableRow.id);
+    unregisterPiSessionHandleForTest(durableRow.id);
+    f.cleanup();
+  }
+});
+
+test("locked idle chat send rejects after the bounded unlock wait expires", async () => {
+  const f = currentTurnFixture("wayang-pi-bridge-locked-idle-timeout-");
+  const durableRow = createSession(f.cwd, { agentProfileId: f.profile.id });
+  const fakeSession: any = {
+    model: { provider: "synthetic-provider", id: "synthetic-model" },
+    sessionManager: SessionManager.create(f.cwd, f.sessionDir),
+    isStreaming: false,
+    isCompacting: false,
+    pendingPromptCount: 0,
+    pendingMessageCount: 0,
+    _steeringMessages: [],
+    _emitQueueUpdate() {},
+    agent: { steeringQueue: { messages: [] as any[] } },
+    async steer() { throw new Error("idle runtimes must prompt instead of steering"); },
+    async prompt() { throw new Error("the locked idle path must reject before prompting"); },
+  };
+  const handle = {
+    id: durableRow.id,
+    session: fakeSession,
+    cwd: f.cwd,
+    agentProfileId: f.profile.id,
+    runtimeGeneration: "locked-idle-timeout-generation",
+    interactiveTurns: new Map(),
+    queuedBrowserMessages: new Map(),
+    subscriberCount: 0,
+    lastActivityAt: Date.now(),
+  } as unknown as PiSessionHandle;
+  registerPiSessionHandleForTest(handle);
+  try {
+    assert.equal(acquireSessionRuntimeMutationLock(durableRow.id), true);
+    await assert.rejects(
+      sendMessage(
+        durableRow.id,
+        "sent while lock held",
+        undefined,
+        "locked-idle-timeout-client",
+        { content: "sent while lock held" },
+        {},
+        { unlockWaitMs: 25 },
+      ),
+      /Session transcript mutation is in progress/,
+    );
+  } finally {
+    releaseSessionRuntimeMutationLock(durableRow.id);
+    unregisterPiSessionHandleForTest(durableRow.id);
     f.cleanup();
   }
 });

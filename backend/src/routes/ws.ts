@@ -67,6 +67,7 @@ import {
   manualCompactionCanDeferBrowserMessage,
   manualCompactionCanInterrupt,
   piSessionHandleRequiresFreshRuntime,
+  piSessionRuntimeAcceptsSteeringById,
   getRuntimeMutationSessionState,
   sendMessage,
   resendMessage,
@@ -2440,6 +2441,7 @@ async function handleClientMessage(
       throw new Error("Quarantined legacy sessions are view-only");
     }
     if (!isSessionClientMutationAllowed(sessionId) || isManualCompactionMessageQueueActive(sessionId)) {
+      const manualQueueActive = isManualCompactionMessageQueueActive(sessionId);
       const manualCompactionAdmission = msg?.type === "message"
         ? manualCompactionCanDeferBrowserMessage(
             sessionId,
@@ -2451,7 +2453,16 @@ async function handleClientMessage(
           : msg?.type === "interrupt"
             ? manualCompactionCanInterrupt(sessionId)
             : false;
-      if (!manualCompactionAdmission) {
+      // A chat send against a busy runtime is queued via steer() and writes no
+      // transcript entry synchronously, so a lock held across a whole-run
+      // reservation (headless/messaging prompt) or a live model switch must not
+      // reject it. The manual-compaction FIFO keeps exclusive admission while
+      // its queue phase is active; sendBrowserMessageTurn still gates idle
+      // prompts on a bounded unlock wait.
+      const steeringAdmission = msg?.type === "message"
+        && !manualQueueActive
+        && piSessionRuntimeAcceptsSteeringById(sessionId);
+      if (!manualCompactionAdmission && !steeringAdmission) {
         for (const response of serializeMutationLockedRejection(sessionId, selectionId, msg)) sendSafe(ws, response);
         return;
       }

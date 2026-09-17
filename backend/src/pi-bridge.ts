@@ -1450,6 +1450,75 @@ function assertRuntimeMutationUnlocked(id: string): void {
   }
 }
 
+/** Default bounded wait for the runtime mutation lock before an idle chat send is rejected. */
+export const RUNTIME_MUTATION_UNLOCK_WAIT_MS = 10_000;
+
+/**
+ * Whether a chat send against this handle would be queued via steer() rather
+ * than dispatched as an idle prompt. Steering writes no transcript entry
+ * synchronously, so it is compatible with the runtime mutation lock held
+ * across whole-run reservations (headless/messaging prompts) and live model
+ * switches. Uses the same busy predicate as the steer gate in
+ * sendBrowserMessageTurn.
+ */
+export function piSessionRuntimeAcceptsSteering(handle: PiSessionHandle): boolean {
+  return Boolean(
+    handle.session.isStreaming
+    || handle.session.isCompacting
+    || (handle.session.pendingPromptCount ?? 0) > 0
+    || (handle.session.pendingMessageCount ?? 0) > 0,
+  );
+}
+
+/** Registry lookup variant for ws-layer admission checks without a handle. */
+export function piSessionRuntimeAcceptsSteeringById(id: string): boolean {
+  const handle = sessions.get(id);
+  return Boolean(handle && piSessionRuntimeAcceptsSteering(handle));
+}
+
+/**
+ * Synthetic-test seam: registers a fake handle in the live runtime map so
+ * registry-gated flows (e.g. sendMessage admission) can be exercised without a
+ * real SDK runtime. Production code must use createPiSession.
+ */
+export function registerPiSessionHandleForTest(handle: PiSessionHandle): void {
+  sessions.set(handle.id, handle);
+}
+
+/** Synthetic-test seam counterpart of registerPiSessionHandleForTest. */
+export function unregisterPiSessionHandleForTest(id: string): void {
+  sessions.delete(id);
+}
+
+/**
+ * Wait (bounded) for the runtime mutation lock to release. Rejects with the
+ * standard 409 only if the lock is still held after the timeout, so transient
+ * holders (title writes, live model switches, transcript edits) do not turn a
+ * plain chat send into a spurious session error.
+ */
+export async function waitForSessionRuntimeMutationUnlock(id: string, timeoutMs: number): Promise<void> {
+  if (!isSessionRuntimeMutationLocked(id)) return;
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: WorkspaceStoreError) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      removeListener();
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(() => {
+      finish(new WorkspaceStoreError("Session transcript mutation is in progress", 409));
+    }, timeoutMs);
+    const removeListener = onSessionRuntimeMutationLockChanged((lockedId, locked) => {
+      if (lockedId === id && !locked) finish();
+    });
+    // Re-check after subscribing to close the released-before-subscribe race.
+    if (!isSessionRuntimeMutationLocked(id)) finish();
+  });
+}
+
 export async function stopPiSessionIfIdle(id: string): Promise<boolean> {
   if (sessionCreations.has(id) || unconfirmedSessionCleanups.has(id)) return false;
   const handle = sessions.get(id);
@@ -5529,10 +5598,7 @@ export async function sendBrowserMessageTurn(
     // is safe in every busy state reached here: manual compaction is intercepted
     // earlier by the deferral queue, and auto/preflight compaction continues or
     // starts a run that drains queued steering messages.
-    const sessionBusy = handle.session.isStreaming
-      || handle.session.isCompacting
-      || handle.session.pendingPromptCount > 0
-      || handle.session.pendingMessageCount > 0;
+    const sessionBusy = piSessionRuntimeAcceptsSteering(handle);
     if (sessionBusy) {
       try {
         const queueRecordId = clientMessageId ?? turn.clientMessageId;
@@ -5627,6 +5693,7 @@ export async function sendMessage(
     acceptedAt?: number;
   },
   workOptions: PiSessionTopLevelWorkOptions = {},
+  options: { unlockWaitMs?: number } = {},
 ): Promise<BrowserMessageTurnResult> {
   const handle = sessions.get(id);
   if (!handle) throw new Error(`Session ${id} not found`);
@@ -5644,7 +5711,13 @@ export async function sendMessage(
       queuedDisplay ?? { content },
     );
   }
-  assertRuntimeMutationUnlocked(id);
+  // A send against a busy runtime is queued via steer() and writes no
+  // transcript entry synchronously, so the runtime mutation lock must not
+  // reject it; only the idle prompt path needs the exclusion. Transient lock
+  // holders on an idle runtime get a bounded wait before the 409.
+  if (!piSessionRuntimeAcceptsSteering(handle)) {
+    await waitForSessionRuntimeMutationUnlock(id, options.unlockWaitMs ?? RUNTIME_MUTATION_UNLOCK_WAIT_MS);
+  }
   markSessionActivity(id);
   return sendBrowserMessageTurn(handle, content, images, clientMessageId, queuedDisplay, workOptions);
 }
