@@ -3060,6 +3060,10 @@ interface ModelPickerProps {
   onClose: () => void;
   onSelect: (value: string) => void;
   className?: string;
+  /** Which edge of the trigger the panel hangs from. The mobile secondary-controls
+   *  row puts the trigger at the left edge of a narrow screen, so a right-anchored
+   *  panel would fall off-screen. */
+  panelAlign?: "left" | "right";
 }
 
 /** Model selector shared by the desktop header and the mobile
@@ -3080,6 +3084,7 @@ function ModelPicker({
   onClose,
   onSelect,
   className,
+  panelAlign = "right",
 }: ModelPickerProps) {
   return (
     <div className={`relative flex items-center gap-1 text-xs text-neutral-500 ${className ?? ""}`}>
@@ -3099,7 +3104,12 @@ function ModelPicker({
         {selectedModelLabel}
       </button>
       {isOpen && (
-        <div className="absolute right-0 top-7 z-50 w-96 max-w-[calc(100vw-2rem)] rounded-lg border border-neutral-700 bg-neutral-950 shadow-2xl">
+        <div
+          data-testid="chat-model-picker-panel"
+          className={`absolute top-full z-50 mt-1 w-96 max-w-[calc(100vw-2rem)] rounded-lg border border-neutral-700 bg-neutral-950 shadow-2xl ${
+            panelAlign === "left" ? "left-0" : "right-0"
+          }`}
+        >
           <div className="border-b border-neutral-800 p-2">
             <input
               type="text"
@@ -7583,6 +7593,7 @@ export function ChatPanel({
           >
             {modelOptions.length > 0 ? (
               <ModelPicker
+                panelAlign="left"
                 isModelSaving={isModelSaving}
                 isAgentRunning={isAgentRunning}
                 isOpen={isModelPickerOpen}

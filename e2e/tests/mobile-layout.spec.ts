@@ -133,6 +133,16 @@ test.describe("mobile layout", () => {
     await expect(menu.getByTestId("chat-model-picker-toggle")).toBeVisible();
     await expect(menu.getByTestId("transcript-event-inspector-button")).toBeVisible();
 
+    // The mobile menu puts the model trigger at the left edge of a 412px screen, so
+    // the panel must hang left; a right-anchored panel would fall off-screen.
+    await menu.getByTestId("chat-model-picker-toggle").click();
+    const modelPanel = page.getByTestId("chat-model-picker-panel");
+    await expect(modelPanel).toBeVisible();
+    const modelPanelBox = await modelPanel.boundingBox();
+    expect(modelPanelBox).not.toBeNull();
+    expect(modelPanelBox?.x ?? -1).toBeGreaterThanOrEqual(0);
+    expect((modelPanelBox?.x ?? 0) + (modelPanelBox?.width ?? 0)).toBeLessThanOrEqual(413);
+
     // Every control stays inside the viewport rather than overflowing off-screen.
     const box = await toggle.boundingBox();
     expect(box).not.toBeNull();
