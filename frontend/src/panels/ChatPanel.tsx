@@ -3064,6 +3064,12 @@ interface ModelPickerProps {
    *  row puts the trigger at the left edge of a narrow screen, so a right-anchored
    *  panel would fall off-screen. */
   panelAlign?: "left" | "right";
+  /** Models loaded before the search filter is applied. Zero means the provider
+   *  catalog itself is empty or failed, which is retryable and must not hide the
+   *  picker. */
+  totalModels: number;
+  /** Re-request the provider catalog after an empty or failed load. */
+  onRefreshModels: () => void;
 }
 
 /** Model selector shared by the desktop header and the mobile
@@ -3085,6 +3091,8 @@ function ModelPicker({
   onSelect,
   className,
   panelAlign = "right",
+  totalModels,
+  onRefreshModels,
 }: ModelPickerProps) {
   return (
     <div className={`relative flex items-center gap-1 text-xs text-neutral-500 ${className ?? ""}`}>
@@ -3144,7 +3152,22 @@ function ModelPicker({
             >
               {defaultModel ? `default (${defaultModel.name || defaultModel.id})` : "default"}
             </button>
-            {options.length === 0 ? (
+            {totalModels === 0 && options.length === 0 ? (
+              <div
+                data-testid="chat-model-picker-empty"
+                className="px-2 py-4 text-center text-xs text-neutral-500"
+              >
+                <p className="break-words">{modelError || "No models are available yet."}</p>
+                <button
+                  type="button"
+                  data-testid="chat-model-picker-retry"
+                  onClick={onRefreshModels}
+                  className="mt-2 rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-200 hover:border-neutral-500"
+                >
+                  Retry
+                </button>
+              </div>
+            ) : options.length === 0 ? (
               <div className="px-2 py-4 text-center text-xs text-neutral-500">
                 No models match “{query}”.
               </div>
@@ -3387,6 +3410,14 @@ export function ChatPanel({
     if (!isModelPickerOpen) return;
     return loadModelOptions({ refresh: true });
   }, [isModelPickerOpen, loadModelOptions]);
+
+  // The mobile header keeps the picker inside the secondary-controls menu, so
+  // opening that menu is its equivalent refresh point. Without it, a failed or
+  // empty catalog would leave a phone with no way to reach the model list at all.
+  useEffect(() => {
+    if (!mobileHeaderMenuOpen) return;
+    return loadModelOptions({ refresh: true });
+  }, [mobileHeaderMenuOpen, loadModelOptions]);
 
   useEffect(() => {
     setSelectedModelValue(sessionModelSelectValue(activeSession));
@@ -7543,8 +7574,10 @@ export function ChatPanel({
           >
             {commandGuardSaving ? "guard…" : commandGuardLabel}
           </button>
-          {!isMobile && modelOptions.length > 0 && (
+          {!isMobile && (
             <ModelPicker
+              totalModels={modelOptions.length}
+              onRefreshModels={() => { loadModelOptions({ refresh: true }); }}
               isModelSaving={isModelSaving}
               isAgentRunning={isAgentRunning}
               isOpen={isModelPickerOpen}
@@ -7591,32 +7624,30 @@ export function ChatPanel({
             data-testid="chat-mobile-controls-menu"
             className="flex w-full flex-wrap items-center gap-x-3 gap-y-2 rounded border border-neutral-800 bg-neutral-900/60 px-2 py-1.5"
           >
-            {modelOptions.length > 0 ? (
-              <ModelPicker
-                panelAlign="left"
-                isModelSaving={isModelSaving}
-                isAgentRunning={isAgentRunning}
-                isOpen={isModelPickerOpen}
-                selectedModelValue={selectedModelValue}
-                selectedModelLabel={selectedModelLabel}
-                selectedModelKnown={selectedModelKnown}
-                modelError={modelError}
-                defaultModel={defaultModel}
-                options={filteredModelOptions}
-                query={modelQuery}
-                onQueryChange={setModelQuery}
-                onToggle={() => {
-                  if (isModelSaving) return;
-                  setIsAgentPickerOpen(false);
-                  setModelQuery("");
-                  setIsModelPickerOpen((open) => !open);
-                }}
-                onClose={() => setIsModelPickerOpen(false)}
-                onSelect={(value) => void handleModelSelect(value)}
-              />
-            ) : (
-              <span className="text-[11px] text-neutral-500">No models available</span>
-            )}
+            <ModelPicker
+              panelAlign="left"
+              totalModels={modelOptions.length}
+              onRefreshModels={() => { loadModelOptions({ refresh: true }); }}
+              isModelSaving={isModelSaving}
+              isAgentRunning={isAgentRunning}
+              isOpen={isModelPickerOpen}
+              selectedModelValue={selectedModelValue}
+              selectedModelLabel={selectedModelLabel}
+              selectedModelKnown={selectedModelKnown}
+              modelError={modelError}
+              defaultModel={defaultModel}
+              options={filteredModelOptions}
+              query={modelQuery}
+              onQueryChange={setModelQuery}
+              onToggle={() => {
+                if (isModelSaving) return;
+                setIsAgentPickerOpen(false);
+                setModelQuery("");
+                setIsModelPickerOpen((open) => !open);
+              }}
+              onClose={() => setIsModelPickerOpen(false)}
+              onSelect={(value) => void handleModelSelect(value)}
+            />
             <TranscriptInspectorButton />
             {contextUsage && <ContextUsageMeter contextUsage={contextUsage} />}
             <span className="flex items-center gap-1.5 text-[11px] text-neutral-500">

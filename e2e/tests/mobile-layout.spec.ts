@@ -149,6 +149,44 @@ test.describe("mobile layout", () => {
     expect((box?.x ?? 0) + (box?.width ?? 0)).toBeLessThanOrEqual(413);
   });
 
+  test("keeps the model picker reachable when the catalog is empty or fails", async ({ page, request }) => {
+    await installMobileLayoutSocket(page);
+    // A failed or empty provider catalog used to replace the picker with a dead
+    // "No models available" label, leaving no way to retry or change the model.
+    let serveRealCatalog = false;
+    await page.route("**/api/models*", async (route) => {
+      if (serveRealCatalog) {
+        await route.continue();
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ models: [], defaultModel: null, error: "provider bootstrap failed" }),
+      });
+    });
+
+    const session = await createE2eSession(request, "e2e mobile empty model catalog");
+    await openSessionInUi(page, session);
+
+    await page.getByTestId("chat-mobile-controls-toggle").click();
+    const menu = page.getByTestId("chat-mobile-controls-menu");
+    await expect(menu).toBeVisible();
+
+    const toggle = menu.getByTestId("chat-model-picker-toggle");
+    await expect(toggle).toBeVisible();
+    await toggle.click();
+    const panel = page.getByTestId("chat-model-picker-panel");
+    await expect(panel).toBeVisible();
+    await expect(page.getByTestId("chat-model-picker-empty")).toContainText("provider bootstrap failed");
+
+    // Retrying against a healthy catalog recovers the list without a reload.
+    serveRealCatalog = true;
+    await page.getByTestId("chat-model-picker-retry").click();
+    await expect(page.getByTestId("chat-model-picker-empty")).toHaveCount(0);
+    await expect.poll(async () => panel.locator("button").count()).toBeGreaterThan(2);
+  });
+
   test("bounds the queued dock so the transcript and composer stay usable", async ({ page, request }) => {
     await installMobileLayoutSocket(page);
     const session = await createE2eSession(request, "e2e mobile queued dock");
