@@ -8,7 +8,7 @@ Wayang’s web chat loads long transcripts as bounded windows instead of transfe
 - Scrolling near the top prefetches older windows. **Load older** is also available at an unloaded edge.
 - Search results request a window centered on the exact matched active-branch message.
 - Search views provide **Jump to latest** and **Back to match** without loading every intervening message.
-- Compaction summaries remain ordinary transcript landmarks. Compaction chapter navigation is not part of this release.
+- Compaction and branch summaries are transcript landmarks, folded by default: the row keeps the summary kind and a one-line gist, and the full text expands in place. Compaction chapter navigation is not part of this release.
 - Live output remains at the transcript tail. When viewing an older/search window, Wayang reports newer activity without moving the current viewport.
 
 The initial window is limited to 200 persisted events and 512 KiB of serialized transcript content. Individual oversized events render as bounded semantic projections: Wayang preserves the event role/type, stable identity, readable text preview, timestamps, and small tool/custom metadata while replacing embedded binary media and oversized nested fields with explicit omission notes. The projection is visibly marked and reports the original encoded size; it is not the complete canonical event.

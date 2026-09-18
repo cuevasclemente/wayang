@@ -44,6 +44,11 @@ import {
   type TranscriptEventRowSummary,
 } from "../components/transcript/TranscriptMutations";
 import { transcriptMutationMarker } from "../components/transcript/transcriptMutationHelpers";
+import {
+  isFoldedSummaryCustomType,
+  summaryFoldPreview,
+  summaryFoldTitle,
+} from "../components/transcript/summaryFold";
 import { formatContextWindow } from "../utils/context-window";
 import { MOBILE_BREAKPOINT_QUERY, useMediaQuery } from "../hooks/useMediaQuery";
 import { useTtsPlayback } from "../tts/useTtsPlayback";
@@ -1116,10 +1121,13 @@ function renderTextBlock(text: string, key?: number) {
 function CollapsibleSection({
   title,
   defaultOpen = false,
+  preview,
   children,
 }: {
   title: string;
   defaultOpen?: boolean;
+  /** Optional one-line gist shown only while collapsed, so the folded row stays identifiable. */
+  preview?: string;
   children: React.ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
@@ -1134,6 +1142,9 @@ function CollapsibleSection({
         <span className="text-neutral-600">{open ? "▼" : "▶"}</span>
         {title}
       </button>
+      {!open && preview ? (
+        <div className="px-3 pb-1.5 -mt-0.5 truncate text-xs text-neutral-500">{preview}</div>
+      ) : null}
       {open && (
         <div className="px-3 py-2 border-t border-neutral-800 text-sm">
           {children}
@@ -2266,6 +2277,24 @@ function CustomMessage({ msg }: { msg: ChatMessage }) {
         : content != null
           ? JSON.stringify(content)
           : "";
+
+  // Compaction and branch summaries stand in for a large span of history, so an
+  // expanded one dominates the scroll. They fold like thinking blocks, keeping a
+  // label, a size, and one line of gist visible instead.
+  if (isFoldedSummaryCustomType(customType)) {
+    return (
+      <div data-testid="chat-message" data-role="custom" data-custom-type={customType} className="px-4">
+        <CollapsibleSection
+          title={summaryFoldTitle(customType, text)}
+          preview={summaryFoldPreview(text)}
+        >
+          <pre className="whitespace-pre-wrap text-neutral-400 font-mono text-xs leading-relaxed">
+            {text}
+          </pre>
+        </CollapsibleSection>
+      </div>
+    );
+  }
 
   return (
     <div data-testid="chat-message" data-role="custom" className="px-4 py-2 border border-neutral-800 bg-neutral-900/70 rounded-lg">
