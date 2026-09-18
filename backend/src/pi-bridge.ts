@@ -70,7 +70,6 @@ import { isSessionCapabilityEligible, resolveWorkspaceCapability } from "./works
 import { isLegacyWrenStandardRuntime } from "./legacy-wren.js";
 import { WorkspaceStoreError, type AgentProfileRow, type PendingAgentSwitch, type ProjectRow } from "./workspace-types.js";
 import {
-  REVIEWED_EXTERNAL_MODELS,
   type ReviewedExternalModelEntry,
 } from "./reviewed-provider-extensions.js";
 import { registerReviewedProviders } from "./reviewed-provider-runtime.js";
@@ -355,6 +354,15 @@ export interface WebModelInfo {
   input: string[];
   contextWindow: number;
   available: boolean;
+}
+
+/**
+ * A projected reviewed model plus the deployment-declared picker visibility from
+ * its manifest entry. `catalogVisible` is stripped before the model is handed to
+ * the catalogue payload.
+ */
+export interface ProjectedReviewedModel extends WebModelInfo {
+  catalogVisible: boolean;
 }
 
 export interface WebDefaultModelInfo {
@@ -919,7 +927,7 @@ export async function createModelContext(options: {
     const errors = await registerReviewedProviders(
       context,
       agentDir,
-      options.reviewedExternalModels ?? REVIEWED_EXTERNAL_MODELS,
+      options.reviewedExternalModels ?? getConfig().reviewedProviders.entries,
     );
     context.error = errors.length > 0 ? errors.join("\n") : undefined;
   }
@@ -1791,9 +1799,9 @@ function formatLoadErrors(errors: string[]): string | undefined {
 
 export function resolveReviewedExternalModels(
   agentDir: string,
-  entries: readonly ReviewedExternalModelEntry[] = REVIEWED_EXTERNAL_MODELS,
-): { models: WebModelInfo[]; errors: string[] } {
-  const models: WebModelInfo[] = [];
+  entries: readonly ReviewedExternalModelEntry[] = getConfig().reviewedProviders.entries,
+): { models: ProjectedReviewedModel[]; errors: string[] } {
+  const models: ProjectedReviewedModel[] = [];
   const errors: string[] = [];
   const homeDir = path.resolve(agentDir, "..", "..");
 
@@ -1856,6 +1864,7 @@ export function resolveReviewedExternalModels(
       input: [...entry.model.input],
       contextWindow: entry.model.contextWindow,
       available,
+      catalogVisible: entry.catalogVisible === true,
     });
   }
   return { models, errors };
@@ -2253,7 +2262,7 @@ export async function listModels(options: {
     : await refreshDynamicModels(registry, options.refresh ?? false);
   const reviewed = resolveReviewedExternalModels(
     options.agentDir ?? getAgentDirPath(),
-    options.reviewedExternalModels ?? REVIEWED_EXTERNAL_MODELS,
+    options.reviewedExternalModels ?? getConfig().reviewedProviders.entries,
   );
   const models = uniqueModels([...dynamicModels.models, ...registry.getAll()])
     .filter((model) => isWayangCatalogProviderVisible(String(model.provider)))
@@ -2261,10 +2270,21 @@ export async function listModels(options: {
     .map((model) => modelToWebInfo(registry, model));
   const seenModelKeys = new Set(models.map((model) => dynamicModelKey(model.provider, model.id)));
   for (const model of reviewed.models) {
-    if (!isWayangCatalogProviderVisible(model.provider)) continue;
+    // Reviewed entries declare their own picker visibility: review makes a provider
+    // resolvable, not discoverable. Cloud lanes stay curated by WAYANG_CATALOG_PROVIDERS.
+    if (!model.catalogVisible) continue;
     const key = dynamicModelKey(model.provider, model.id);
     if (!seenModelKeys.has(key)) {
-      models.push(model);
+      models.push({
+        provider: model.provider,
+        id: model.id,
+        name: model.name,
+        api: model.api,
+        reasoning: model.reasoning,
+        input: model.input,
+        contextWindow: model.contextWindow,
+        available: model.available,
+      });
       seenModelKeys.add(key);
     }
   }
@@ -2301,6 +2321,7 @@ export async function listModels(options: {
       listing.error,
       dynamicModels.error,
       formatLoadErrors(reviewed.errors),
+      formatLoadErrors(getConfig().reviewedProviders.errors),
     ),
   };
 }

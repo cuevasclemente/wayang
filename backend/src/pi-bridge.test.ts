@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
+import { resetReviewedProviderManifestCache } from "./reviewed-provider-extensions.js";
 import { Type } from "@earendil-works/pi-ai";
 import { SessionManager, SettingsManager, defineTool } from "@earendil-works/pi-coding-agent";
 import {
@@ -3544,13 +3545,14 @@ function writeSyntheticNarwhalReviewedExtension(agentDir: string, moduleMarker: 
   return extensionPath;
 }
 
-function syntheticReviewedModel(extensionPath?: string) {
+function syntheticReviewedModel(extensionPath?: string, catalogVisible?: boolean) {
   return [{
     extensionPath: "narwhal-horn/index.ts",
     sha256: extensionPath
       ? createHash("sha256").update(fs.readFileSync(extensionPath)).digest("hex")
       : "0".repeat(64),
     credentialRelativeToHome: "src/mypi/secure_data/ruminant_key",
+    ...(catalogVisible === undefined ? {} : { catalogVisible }),
     model: {
       provider: "narwhal-horn",
       id: "qwen3.8-flash-next",
@@ -3690,6 +3692,62 @@ test("reviewed provider runtime rejects unreviewed provider registrations from t
     assert.equal(context.registry.find("unexpected-provider", "unexpected"), undefined);
     assert.match(context.error ?? "", /registered an unreviewed provider/);
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("listModels offers a verified reviewed provider that declares picker visibility", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-provider-visible-"));
+  const cwd = path.join(dir, "project");
+  const homeDir = path.join(dir, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const moduleMarker = path.join(dir, "reviewed-extension-executed");
+  const credential = path.join(homeDir, "src", "mypi", "secure_data", "ruminant_key");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(path.dirname(credential), { recursive: true });
+  fs.writeFileSync(credential, "synthetic-key");
+  const extensionPath = writeSyntheticNarwhalReviewedExtension(agentDir, moduleMarker);
+
+  try {
+    const result = await listModels({
+      cwd,
+      agentDir,
+      includeDynamicModels: false,
+      reviewedExternalModels: syntheticReviewedModel(extensionPath, true),
+    });
+    const listed = result.models.filter((model) => model.provider === "narwhal-horn");
+    assert.equal(listed.length, 1, "a reviewed entry that declares its lane is offered to the picker");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(listed[0], "catalogVisible"),
+      false,
+      "the manifest declaration must not leak into the catalogue payload",
+    );
+    assert.equal(fs.existsSync(moduleMarker), false, "model listing must not execute provider code");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("listModels reports a broken reviewed provider manifest without dropping the catalogue", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wayang-reviewed-manifest-broken-"));
+  const cwd = path.join(dir, "project");
+  const agentDir = path.join(dir, "agent");
+  const manifestPath = path.join(dir, "reviewed-providers.json");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(agentDir, { recursive: true });
+  fs.writeFileSync(manifestPath, "{ not json");
+  const previous = process.env.WAYANG_REVIEWED_PROVIDERS_FILE;
+  process.env.WAYANG_REVIEWED_PROVIDERS_FILE = manifestPath;
+  resetReviewedProviderManifestCache();
+  try {
+    const result = await listModels({ cwd, agentDir, includeDynamicModels: false });
+    assert.ok(result.models.length > 0, "a broken manifest must not take the catalogue down");
+    assert.match(result.error ?? "", /Reviewed provider manifest/);
+    assert.equal(result.models.some((model) => model.provider === "narwhal-horn"), false);
+  } finally {
+    if (previous === undefined) delete process.env.WAYANG_REVIEWED_PROVIDERS_FILE;
+    else process.env.WAYANG_REVIEWED_PROVIDERS_FILE = previous;
+    resetReviewedProviderManifestCache();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

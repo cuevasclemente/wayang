@@ -12,6 +12,10 @@ import {
   DEFAULT_MEMORY_REVIEW_TOKENS,
   type MemoryFirstCompactionConfig,
 } from "./memory-first-compaction.js";
+import {
+  type ReviewedProvidersConfig,
+  resolveReviewedProvidersConfig,
+} from "./reviewed-provider-extensions.js";
 
 export interface TtsConfig {
   /** Shared TTS broker base URL; preferred for streaming/job-based playback. */
@@ -96,6 +100,7 @@ export interface Config {
   messaging: MessagingConfig;
   memoryFirstCompaction: MemoryFirstCompactionConfig;
   canonicalKvWarmup: CanonicalKvWarmupConfig;
+  reviewedProviders: ReviewedProvidersConfig;
   fileAudioExperiment: FileAudioExperimentConfig;
 }
 
@@ -383,6 +388,7 @@ export function getConfig(overrides?: Partial<Config>): Config {
       requestTimeoutMs: getPositiveEnvInt("WAYANG_CANONICAL_KV_WARMUP_REQUEST_TIMEOUT_MS", 180_000, 1_000, 600_000),
       maxTemplateBytes: getPositiveEnvInt("WAYANG_CANONICAL_KV_WARMUP_MAX_TEMPLATE_BYTES", 8 * 1024 * 1024, 1_024, 32 * 1024 * 1024),
     },
+    reviewedProviders: resolveReviewedProvidersConfig(),
     fileAudioExperiment: {
       enabled: envFlag("WAYANG_FILE_AUDIO_EXPERIMENT_ENABLED"),
       permitTtlMs: getPositiveEnvInt("WAYANG_FILE_AUDIO_EXPERIMENT_PERMIT_TTL_MS", 60_000, 1_000, 120_000),

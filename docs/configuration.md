@@ -126,6 +126,37 @@ Provider/model availability is deployment-global and does not depend on Project 
 
 Credential resolution in pi prefers a CLI override, then pi `auth.json`, then environment variables, then a custom provider key. Wayang does not accept provider keys in browser storage or URLs.
 
+#### Deployment-owned reviewed providers
+
+Wayang ships no provider literals. A deployment declares its reviewed external providers in a JSON manifest named by `WAYANG_REVIEWED_PROVIDERS_FILE`. When that variable is unset, Wayang reviews, projects, and executes no external provider artifact at all.
+
+The manifest is read once per process — there is no hot reload, so changing it requires a `wayang.service` restart — and it is validated as a whole: an unreadable or symlinked file, invalid JSON, an unknown `version`, or any entry that fails validation contributes **zero** entries and is reported through the model catalogue error field. Wayang still starts, because losing a picker entry must not take the service down. The declared hash bounds which bytes the runtime may execute, so the manifest is a trust declaration of the same weight as reviewed source: keep it owner-only (`0600`) and never put secret values in it.
+
+```json
+{
+  "version": 1,
+  "providers": [
+    {
+      "extensionPath": "local-inference/index.ts",
+      "sha256": "<64 lowercase hex characters>",
+      "credentialRelativeToHome": "secrets/local-inference-key",
+      "catalogVisible": true,
+      "model": {
+        "provider": "local-inference",
+        "id": "local-model",
+        "name": "Local model",
+        "api": "openai-completions",
+        "reasoning": true,
+        "input": ["text", "image"],
+        "contextWindow": 262144
+      }
+    }
+  ]
+}
+```
+
+`extensionPath` and `credentialRelativeToHome` must be normalized relative paths with no parent-directory segments: the former resolves under `<agentDir>/extensions`, the latter under the service user's home directory. `credentialRelativeToHome` is optional, and only regular-file presence is checked; its contents are never read. `catalogVisible` is optional and defaults to `false`, because review makes a provider resolvable rather than discoverable — a verified model reaches the picker only when its deployment declares the lane. Curated cloud lanes remain governed by `WAYANG_CATALOG_PROVIDERS` and are unaffected by the manifest. `model.api` must be an API identifier pi can serve, and `model.input` is limited to the modalities Wayang supports.
+
 ### Memory-first traditional compaction
 
 The integration is disabled by default. It keeps one physical Pi `AgentSession` and uses repeated traditional Pi compaction; it does not create capsules, logical episodes, replacement sessions, or a second content telemetry ledger.
