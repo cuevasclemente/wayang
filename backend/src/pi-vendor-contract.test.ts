@@ -12,7 +12,7 @@ import {
   type CustomMessage, type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
 
-const SOURCE_REVISION = "fa40ae91ad733a8a0bc369cfbdcaca381fa47a46";
+const SOURCE_REVISION = "4c47f7f24b59981b0b41c6b43bbff68dca74e08c";
 const CATALOG_MANIFEST_SHA256 = "e6dd5f432d502e84981ac15c14d9eb0f78bab7baf1aac8dbb805d48b8b3c3655";
 
 function packageMetadata(entry: string): Record<string, unknown> {
@@ -34,7 +34,7 @@ test("vendored SDK, core and AI retain the packed source and catalog bytes", () 
   assert.equal(sdk.wayangRequiredCoreSourceRevision, SOURCE_REVISION);
   assert.equal(sdk.wayangRequiredAiSourceRevision, SOURCE_REVISION);
   assert.equal(core.wayangRequiredAiSourceRevision, SOURCE_REVISION);
-  assert.equal(ai.version, "0.85.0", "AI uses upstream semver plus immutable source/catalog provenance");
+  assert.equal(ai.version, "0.85.1", "AI uses upstream semver plus immutable source/catalog provenance");
   // Wayang deploys on tests pass; the packed triplet binds the catalog bytes it
   // was built from rather than a separately reviewed source-provenance.json.
   assert.equal(ai.wayangAiCatalogProvenanceSha256, undefined);
@@ -75,8 +75,8 @@ test("vendored SDK and core resolve to the same reviewed exact-discard implement
   assert.equal(sdk.wayangSourceRevision, SOURCE_REVISION);
   assert.equal(sdk.wayangRequiredCoreSourceRevision, sdk.wayangSourceRevision);
   assert.equal(core.wayangSourceRevision, sdk.wayangSourceRevision);
-  assert.equal(sdk.version, `0.85.0-wayang.${String(sdk.wayangSourceRevision).slice(0, 8)}`);
-  assert.equal(core.version, "0.85.0", "core uses upstream semver plus immutable source provenance");
+  assert.equal(sdk.version, `0.85.1-wayang.${String(sdk.wayangSourceRevision).slice(0, 8)}`);
+  assert.equal(core.version, "0.85.1", "core uses upstream semver plus immutable source provenance");
 
   const root = mkdtempSync(join(tmpdir(), "wayang-vendored-pi-contract-"));
   const runtime = await ModelRuntime.create({

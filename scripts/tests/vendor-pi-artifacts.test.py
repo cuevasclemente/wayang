@@ -160,7 +160,7 @@ class TripletFixture:
         self.source_manifests = {}
         for directory, name in PACKAGE_NAMES.items():
             manifest = {
-                "name": name, "version": "0.85.0", "type": "module",
+                "name": name, "version": "0.85.1", "type": "module",
                 "main": "./dist/index.js", "types": "./dist/index.d.ts",
                 "exports": {".": {"import": "./dist/index.js", "types": "./dist/index.d.ts"}},
                 "dependencies": {"typebox": "1.3.7"},
@@ -168,15 +168,16 @@ class TripletFixture:
                 "optionalDependencies": {"synthetic-optional": "1.2.3"},
             }
             if directory != "ai":
-                manifest["dependencies"][PACKAGE_NAMES["ai"]] = "^0.85.0"
+                manifest["dependencies"][PACKAGE_NAMES["ai"]] = "^0.85.1"
             if directory == "coding-agent":
-                manifest["dependencies"][PACKAGE_NAMES["agent"]] = "^0.85.0"
+                manifest["dependencies"][PACKAGE_NAMES["agent"]] = "^0.85.1"
                 manifest["bin"] = {"pi": "dist/bundle/cli.js"}
                 manifest["exports"]["./rpc-entry"] = {"import": "./dist/bundle/rpc-entry.js"}
+                manifest["exports"]["./client"] = {
+                    "source": "./src/client/index.ts",
+                }
                 manifest["exports"]["./experimental/plugin"] = {
                     "source": "./src/experimental/plugin.ts",
-                    "types": "./dist/experimental/plugin.d.ts",
-                    "import": "./dist/experimental/plugin.js",
                 }
             elif directory == "ai":
                 manifest["bin"] = {"pi-ai": "dist/cli.js"}
@@ -187,10 +188,8 @@ class TripletFixture:
         put(self.package("ai") / "dist/cli.js", b"// synthetic AI CLI\n")
         sdk = self.package("coding-agent")
         for filename in (
-            "dist/cli.js", "dist/rpc-entry.js", "dist/client/index.js", "dist/client/index.d.ts",
-            "dist/experimental/plugin.js", "dist/experimental/plugin.d.ts",
+            "dist/cli.js", "dist/rpc-entry.js",
             "dist/bundle/cli.js", "dist/bundle/rpc-entry.js", "dist/bundle/index.js",
-            "dist/bundle/client.js", "dist/bundle/coordinator.js",
         ):
             put(sdk / filename, b'import "./chunks/chunk-SYNTHETIC.js";\n' if "/bundle/" in filename
                 else b"// synthetic modular entry\n")
@@ -206,12 +205,12 @@ class TripletFixture:
             put(sdk / "src" / filename, b"synthetic asset\n")
             put(sdk / "dist" / filename, b"synthetic asset\n")
         self.lock = {
-            "name": PACKAGE_NAMES["coding-agent"], "version": "0.85.0",
+            "name": PACKAGE_NAMES["coding-agent"], "version": "0.85.1",
             "lockfileVersion": 3, "requires": True,
             "packages": {
                 "": copy.deepcopy(self.source_manifests["coding-agent"]),
                 "node_modules/@earendil-works/pi-ai": {
-                    "version": "0.85.0", "resolved": "https://registry.invalid/pi-ai.tgz",
+                    "version": "0.85.1", "resolved": "https://registry.invalid/pi-ai.tgz",
                     "integrity": "sha512-" + base64.b64encode(b"synthetic lock fixture").decode(),
                 },
             },
@@ -309,7 +308,7 @@ class TripletFixture:
         payload = packed.read_bytes()
         record = {
             "filename": self.returned_filename or packed.name,
-            "name": PACKAGE_NAMES[directory], "version": "0.85.0",
+            "name": PACKAGE_NAMES[directory], "version": "0.85.1",
             "size": len(payload), "shasum": hashlib.sha1(payload).hexdigest(),
             "integrity": "sha512-" + base64.b64encode(hashlib.sha512(payload).digest()).decode(),
         }
@@ -574,8 +573,8 @@ class TripletArtifactTests(unittest.TestCase):
                     member = "package/" + source_file.relative_to(fixture.package(directory)).as_posix()
                     self.assertEqual(entries[member], source_file.read_bytes(), member)
             if directory == "ai":
-                self.assertEqual(manifest["version"], "0.85.0")
-                self.assertEqual(record["file"], f"earendil-works-pi-ai-0.85.0-wayang.{digest(payload)[:8]}.tgz")
+                self.assertEqual(manifest["version"], "0.85.1")
+                self.assertEqual(record["file"], f"earendil-works-pi-ai-0.85.1-wayang.{digest(payload)[:8]}.tgz")
                 for field, expected in {
                     "wayangAiCatalogDerivationSha256": fixture.proof["derivationReportSha256"],
                     "wayangAiCatalogProvenanceSha256": fixture.proof_sha256,
@@ -589,12 +588,12 @@ class TripletArtifactTests(unittest.TestCase):
             else:
                 self.assertEqual(manifest["wayangRequiredAiSourceRevision"], REVISION)
                 short_name = manifest["name"].split("/")[1]
-                self.assertEqual(record["file"], f"earendil-works-{short_name}-0.85.0-wayang.aaaaaaaa.tgz")
-                self.assertEqual(manifest["version"], "0.85.0-wayang.aaaaaaaa" if directory == "coding-agent" else "0.85.0")
+                self.assertEqual(record["file"], f"earendil-works-{short_name}-0.85.1-wayang.aaaaaaaa.tgz")
+                self.assertEqual(manifest["version"], "0.85.1-wayang.aaaaaaaa" if directory == "coding-agent" else "0.85.1")
             if directory == "coding-agent":
                 self.assertEqual(manifest["wayangRequiredCoreSourceRevision"], REVISION)
                 expected_lock = copy.deepcopy(fixture.lock)
-                expected_lock["version"] = expected_lock["packages"][""]["version"] = "0.85.0-wayang.aaaaaaaa"
+                expected_lock["version"] = expected_lock["packages"][""]["version"] = "0.85.1-wayang.aaaaaaaa"
                 self.assertEqual(json.loads(entries["package/npm-shrinkwrap.json"]), expected_lock)
                 with tarfile.open(path, "r:gz") as archive:
                     self.assertTrue(archive.getmember("package/dist/bundle/cli.js").mode & 0o111)
@@ -843,7 +842,7 @@ class TripletArtifactTests(unittest.TestCase):
         self.assertEqual(sdk_call.args[0]["npm-shrinkwrap.json"], (source_body, 0o644),
                          "Supplement the exact validated source bytes before version rewriting")
         self.assertEqual({path.name: path.read_bytes() for path in fixture.output.glob("*.tgz")}, included)
-        sdk = fixture.output / "earendil-works-pi-coding-agent-0.85.0-wayang.aaaaaaaa.tgz"
+        sdk = fixture.output / "earendil-works-pi-coding-agent-0.85.1-wayang.aaaaaaaa.tgz"
         with tarfile.open(sdk, "r:gz") as archive:
             self.assertEqual(archive.getmember("package/npm-shrinkwrap.json").mode, 0o644)
         self.assertEqual(target.read_bytes(), source_body)
@@ -948,9 +947,9 @@ class TripletArtifactTests(unittest.TestCase):
     def test_requires_modular_bundled_lazy_and_asset_files_before_npm_pack(self):
         required = [(directory, "dist/index.js") for directory in PACKAGE_NAMES]
         required += [("coding-agent", name) for name in (
-            "dist/index.d.ts", "dist/experimental/plugin.js", "dist/experimental/plugin.d.ts",
+            "dist/index.d.ts",
             "dist/bundle/cli.js", "dist/bundle/rpc-entry.js",
-            "dist/bundle/index.js", "dist/bundle/client.js", "dist/bundle/coordinator.js",
+            "dist/bundle/index.js",
             "dist/bundle/chunks/chunk-SYNTHETIC.js", "dist/modes/interactive/theme/dark.json",
             "dist/modes/interactive/assets/pi.png", "dist/core/export-html/template.html",
             "dist/core/export-html/template.css", "dist/core/export-html/template.js",
@@ -1100,7 +1099,7 @@ class TripletArtifactTests(unittest.TestCase):
             with self.subTest(change=change):
                 fixture = self.fixture()
                 fixture.output.mkdir()
-                target = fixture.output / "earendil-works-pi-coding-agent-0.85.0-wayang.aaaaaaaa.tgz"
+                target = fixture.output / "earendil-works-pi-coding-agent-0.85.1-wayang.aaaaaaaa.tgz"
                 sentinel = fixture.source.parent / "sentinel"
                 sentinel.write_bytes(b"do not overwrite\n")
                 if change == "different-bytes":

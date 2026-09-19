@@ -28,6 +28,12 @@ import sys
 import tarfile
 import tempfile
 
+# The upstream Pi release this producer packs. Core and AI keep this version; the
+# SDK becomes "<version>-wayang.<source-prefix>". Re-pinning Wayang to a newer
+# upstream release means changing this constant and the packed filenames it
+# derives, then re-running the producer tests against the matching fixture.
+UPSTREAM_VERSION = "0.85.1"
+
 
 def command(*args, cwd):
     # Trusted git/npm only; avoid unbounded in-memory subprocess capture.
@@ -76,6 +82,14 @@ PACKAGES = {"ai": "pi-ai", "agent": "pi-agent-core", "coding-agent": "pi-coding-
 LAZY_NAMES = ("anthropic", "bedrock-converse-stream", "github-copilot", "image-resize-worker",
               "kimi-coding", "openai-codex", "openrouter", "radius", "xai")
 DERIVER_PATH = "packages/ai/scripts/derive-astra-catalog.ts"
+# Monorepo-only TypeScript source conditions the SDK declares. The matching src
+# trees are excluded from the SDK build, so these are never packed runtime
+# entries and can never appear in a publishable snapshot. Keep every reviewed
+# pair explicit instead of accepting any "source" condition.
+UPSTREAM_SOURCE_ONLY_EXPORTS = {
+    ("./client", "./src/client/index.ts"),
+    ("./experimental/plugin", "./src/experimental/plugin.ts"),
+}
 
 
 def sha256(body):
@@ -341,7 +355,7 @@ def require_entry(snapshot, value):
 
 def validate_package(root, directory):
     manifest = read_object(root / "package.json", "package")
-    if manifest.get("name") != "@earendil-works/" + PACKAGES[directory] or manifest.get("version") != "0.85.0":
+    if manifest.get("name") != "@earendil-works/" + PACKAGES[directory] or manifest.get("version") != UPSTREAM_VERSION:
         raise ValueError("Unexpected source package identity or version")
     sdk = directory == "coding-agent"
     snapshot = package_snapshot(root, manifest, sdk)
@@ -356,8 +370,7 @@ def validate_package(root, directory):
         raise ValueError("Missing or wrong modular runtime/type exports")
     wildcard_targets = {}
     def targets(value, export_name, conditions=()):
-        if (sdk and export_name == "./experimental/plugin" and conditions == ("source",)
-                and value == "./src/experimental/plugin.ts"):
+        if sdk and conditions == ("source",) and (export_name, value) in UPSTREAM_SOURCE_ONLY_EXPORTS:
             return
         if isinstance(value, str):
             template = require_entry(snapshot, value)
@@ -392,11 +405,15 @@ def validate_package(root, directory):
         lock = read_object(root / "npm-shrinkwrap.json", "shrinkwrap")
         lock_root = lock.get("packages", {}).get("") if isinstance(lock.get("packages"), dict) else None
         for item in (lock, lock_root):
-            if not isinstance(item, dict) or item.get("name") != manifest["name"] or item.get("version") != "0.85.0":
+            if not isinstance(item, dict) or item.get("name") != manifest["name"] or item.get("version") != UPSTREAM_VERSION:
                 raise ValueError("SDK shrinkwrap root identity/version mismatch")
         if lock.get("lockfileVersion") != 3:
             raise ValueError("Unsupported SDK shrinkwrap lock version")
-        for name in ("cli", "rpc-entry", "index", "client", "coordinator"):
+        # Upstream 0.85.1 ships no experimental client/coordinator bundle entries:
+        # src/client and src/experimental are excluded from the SDK build, and their
+        # subpaths are monorepo source conditions only. Wayang consumes the bundled
+        # CLI, RPC entry and root barrel; require exactly those.
+        for name in ("cli", "rpc-entry", "index"):
             require_entry(snapshot, f"dist/bundle/{name}.js")
         for name in LAZY_NAMES:
             require_entry(snapshot, f"dist/bundle/chunks/{name}.js")
@@ -471,7 +488,7 @@ def triplet_payload(entries, directory, revision, catalog_manifest, proof, proof
             manifest[key] = proof[field]
         manifest["wayangAiCatalogProvenanceSha256"] = proof_hash
     if directory == "coding-agent":
-        manifest["version"] = f"0.85.0-wayang.{revision[:8]}"
+        manifest["version"] = f"{UPSTREAM_VERSION}-wayang.{revision[:8]}"
         manifest["wayangRequiredCoreSourceRevision"] = revision
         lock = parse_json(entries["npm-shrinkwrap.json"][0], "shrinkwrap")
         lock["version"] = lock["packages"][""]["version"] = manifest["version"]
@@ -570,7 +587,7 @@ def main():
             if "/" in filename or filename != record["filename"] or not filename.endswith(".tgz"):
                 raise ValueError("npm pack filename must be a safe basename")
             payload = regular_bytes(staging / filename, MAX_PACKAGE_BYTES)
-            if (record.get("name") != "@earendil-works/" + name or record.get("version") != "0.85.0"
+            if (record.get("name") != "@earendil-works/" + name or record.get("version") != UPSTREAM_VERSION
                     or type(record.get("size")) is not int or record["size"] != len(payload)
                     or record.get("integrity") != integrity(payload)
                     or record.get("shasum") != hashlib.sha1(payload).hexdigest()):
@@ -590,7 +607,7 @@ def main():
                 raise ValueError("npm pack omitted required snapshot entries")
             payload = triplet_payload(entries, directory, revision, catalog_manifest, proof, args.catalog_proof_sha256)
             suffix = sha256(payload)[:8] if directory == "ai" else revision[:8]
-            filename = f"earendil-works-{name}-0.85.0-wayang.{suffix}.tgz"
+            filename = f"earendil-works-{name}-{UPSTREAM_VERSION}-wayang.{suffix}.tgz"
             # Keep the verified final bytes in the stage as well for failed-stage review.
             with (staging / filename).open("xb") as stream:
                 stream.write(payload)

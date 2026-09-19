@@ -8,10 +8,10 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const codingAgentPackageName = "@earendil-works/pi-coding-agent";
 const aiPackageName = "@earendil-works/pi-ai";
-const sourceRevision = "fa40ae91ad733a8a0bc369cfbdcaca381fa47a46";
-const sdkSha256 = "e4237a2fb91c92c5ae9da3b37bf4ddd35572ca4e36d1dcc61f1aa64e66b4fb43";
-const coreSha256 = "9484dba8364ffb89bc881b97011cbfd3194dfc754a5115e1e0db53d3da946d10";
-const aiSha256 = "22ca19ede1015ad1247309efbe79f6558dfa278f44056469bd0a8c8c1082490f";
+const sourceRevision = "4c47f7f24b59981b0b41c6b43bbff68dca74e08c";
+const sdkSha256 = "90695a28f0eb8dfeab82b6f249a57a151f833ba22c0bd0eb1d203357ae6eec96";
+const coreSha256 = "1345f9b28453f7a9695580162a3f11f2606a67300b8a4857f4167806aa3b353f";
+const aiSha256 = "ec9c86b262bd4fb40423d5768be6c656ca2a61ad8923fdeffc6f8d87dc2d4ec5";
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
@@ -24,11 +24,11 @@ test("vendored Pi coding-agent package, lockfile, artifact, and documentation st
   const specification = packageJson.dependencies?.[codingAgentPackageName];
 
   assert.equal(typeof specification, "string");
-  const match = /^file:(earendil-works-pi-coding-agent-(0\.85\.0-wayang\.[a-f0-9]{8})\.tgz)$/u.exec(specification);
+  const match = /^file:(earendil-works-pi-coding-agent-(0\.85\.1-wayang\.[a-f0-9]{8})\.tgz)$/u.exec(specification);
   assert.ok(match, `unexpected vendored Pi specification: ${specification}`);
 
   const [, artifactName, version] = match;
-  assert.equal(version, `0.85.0-wayang.${sourceRevision.slice(0, 8)}`);
+  assert.equal(version, `0.85.1-wayang.${sourceRevision.slice(0, 8)}`);
   const artifact = readFileSync(join(backendRoot, artifactName));
   const sha256 = createHash("sha256").update(artifact).digest("hex");
   assert.equal(sha256, sdkSha256);
@@ -54,7 +54,7 @@ test("vendored Pi core matches the SDK source revision and locked artifact bytes
   const packageLock = readJson(join(backendRoot, "package-lock.json"));
   const name = "@earendil-works/pi-agent-core";
   const specification = packageJson.dependencies?.[name];
-  const match = /^file:(earendil-works-pi-agent-core-(0\.85\.0)-wayang\.([a-f0-9]{8})\.tgz)$/u.exec(specification);
+  const match = /^file:(earendil-works-pi-agent-core-(0\.85\.1)-wayang\.([a-f0-9]{8})\.tgz)$/u.exec(specification);
   assert.ok(match, "an explicit paired core artifact is required");
   const [, artifactName, version, revision] = match;
   assert.equal(revision, sourceRevision.slice(0, 8));
@@ -78,7 +78,7 @@ test("vendored Pi AI package, lockfile, artifact, and documentation stay aligned
   const specification = packageJson.dependencies?.[aiPackageName];
 
   assert.equal(typeof specification, "string");
-  const match = /^file:(earendil-works-pi-ai-(0\.85\.0)-wayang\.([a-f0-9]{8})\.tgz)$/u.exec(specification);
+  const match = /^file:(earendil-works-pi-ai-(0\.85\.1)-wayang\.([a-f0-9]{8})\.tgz)$/u.exec(specification);
   assert.ok(match, `unexpected vendored Pi AI specification: ${specification}`);
 
   const [, artifactName, version, revision] = match;
